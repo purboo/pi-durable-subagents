@@ -118,7 +118,45 @@ export const JT = {
   attentionResolved: "attention-resolved",
   /** journal: { call, exec, result: CallResult } — terminal seal (V2). */
   sealed: "sealed",
+  /** journal: { status: "done"|"failed"|"parked"|"stopped", result?, error? } — workflow terminal (starter: no JT.done = pending). */
+  done: "workflow-done",
+  /** orchestrator.jsonl lifecycle records for requests addressed to "orch" (kernel DecisionRecord shapes):
+   *  admitted { rid, from, sseq, hash, kind } · applied { rid } · rejected { rid, reason } · withdrawn { rid, rids }.
+   *  Senders read them (snapshot) to learn terminal resolution and call Outbox.markResolved. */
+  admitted: "admitted",
+  applied: "applied",
+  rejected: "rejected",
+  withdrawn: "withdrawn",
 } as const;
+
+// ---------------------------------------------------------------------------
+// Request bodies addressed to the orchestrator (to: "orch"). Paths are absolute (resolved by the sender).
+// ---------------------------------------------------------------------------
+
+export interface RunBody {
+  /** Working directory of the origin session. */
+  cwd: string;
+  /** Exactly one of: workflow (script file), source (inline script), tasks, chain, call (single subagent). */
+  workflow?: string;
+  source?: string;
+  tasks?: (CallSpec & { key?: string })[];
+  chain?: (CallSpec & { key?: string })[];
+  call?: CallSpec & { key?: string };
+  args?: unknown;
+  name?: string;
+}
+/** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
+export interface SendBody { to: CallId | `${Wid}/${string}`; kind: "steer" | "answer" | "model"; message?: string; model?: string }
+/** kind "withdraw": withdraw the sender's own earlier requests (P6). */
+export interface WithdrawBody { rids: Rid[] }
+/** kind "stop": stop a workflow or one call. */
+export interface StopBody { target: Wid | CallId }
+/** kind "revise" (P14). */
+export interface ReviseBody { wid: Wid; workflow?: string; source?: string; args?: unknown }
+/** kind "resume": adopt/continue unfinished work (all when wid absent). */
+export interface ResumeBody { wid?: Wid }
+/** kind "drain": stop new dispatch; running calls finish. */
+export type DrainBody = Record<string, never>;
 
 export interface AttentionItem {
   id: string;
