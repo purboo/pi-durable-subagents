@@ -291,7 +291,7 @@ test('heap limit reports limit without killing the host', { timeout: 10000 }, as
 test('stale incarnations and duplicate exposures cannot settle current promises', { timeout: 10000 }, async () => {
   const h = await harness('return (await runs.run("a",{agent:"a",task:"a"})).output;');
   try {
-    h.start(); assert.equal((await h.next()).t, 'call'); assert.equal((await h.next()).t, 'idle');
+    h.start(); assert.equal((await h.next()).t, 'call'); { const m = await h.next(); assert.equal(m.t, 'idle'); assert.equal((m as any).exposed, 0); }
     h.start({}, {}, 2);
     h.send(exposure(0, 'stale'), {t:'stop',wid:'w',ev:1});
     assert.deepEqual(await h.next(), {t:'call',wid:'w',ev:2,pos:0,key:'a',spec:{agent:'a',task:'a'}});

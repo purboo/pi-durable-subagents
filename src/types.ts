@@ -242,8 +242,9 @@ export type EvalToOrch =
   | { t: "emit"; wid: Wid; ev: number; pos: number; value: unknown }
   /** Request a recorded nondeterministic value (n = 0-based index of such requests). */
   | { t: "need"; wid: Wid; ev: number; n: number; kind: "now" | "random" }
-  /** Event loop drained while awaiting exposures: the replay frontier signal (P11). */
-  | { t: "idle"; wid: Wid; ev: number }
+  /** Event loop drained while awaiting exposures: the replay frontier signal (P11). `exposed` = number of exposures
+   *  this incarnation has applied so far; the frontier requires exposed >= number of logged exposures sent. */
+  | { t: "idle"; wid: Wid; ev: number; exposed: number }
   | { t: "done"; wid: Wid; ev: number; result: unknown }
   | { t: "error"; wid: Wid; ev: number; error: string; kind: "script" | "limit" | "internal" };
 

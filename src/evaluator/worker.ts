@@ -144,7 +144,7 @@ function schedule() {
       schedule();
     } else if (!idle) {
       idle = true;
-      post({ t: 'idle' });
+      post({ t: 'idle', exposed: settled.size });
     }
   });
 }
