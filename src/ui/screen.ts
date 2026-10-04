@@ -1,0 +1,252 @@
+import { AssistantMessageComponent, UserMessageComponent, ToolExecutionComponent, getMarkdownTheme, getSelectListTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { Input, SelectList, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { CT } from "../types.ts";
+import { UiActions, UiData } from "./data.ts";
+import { duration, listRows, modelLabel, resultPhrase, type ListRow, type ViewState } from "./view.ts";
+import { thinkingElapsed } from "./thinking.ts";
+import { thoughtSummary } from "./session.ts";
+
+const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** UI §2–3: A single pi component owns list/watch navigation while the main agent keeps running. */
+export class SubagentScreen implements Component {
+  readonly state: ViewState;
+  private data: UiData;
+  private actions: UiActions;
+  private ctx: ExtensionContext;
+  private tui: TUI;
+  private theme: Theme;
+  private close: () => void;
+  private selected = 0;
+  private rows: ListRow[] = [];
+  private watching?: string;
+  private workflow?: string;
+  private doneTab = false;
+  private input = new Input();
+  private menu?: SelectList;
+  private menuTitle = "";
+  private search = new Input({ prompt: "> ", placeholder: "Search models" });
+  private expandedThinking = false;
+  private expandedTools = false;
+  private following = true;
+  private scroll = 0;
+  private busy = false;
+  private disposed = false;
+  private notice = "";
+  private uses = 0;
+  private thinkingRows = new Set<number>();
+  private inputRow = 0;
+  private _focused = false;
+  get focused() { return this._focused; }
+  set focused(value: boolean) { this._focused = value; this.input.focused = value; this.search.focused = value; }
+  constructor(data: UiData, actions: UiActions, ctx: ExtensionContext, tui: TUI, theme: Theme, close: () => void, state: ViewState) {
+    this.data = data; this.actions = actions; this.ctx = ctx; this.tui = tui; this.theme = theme; this.close = close; this.state = state;
+  }
+  invalidate() { this.input.invalidate(); this.search.invalidate(); this.menu?.invalidate(); }
+  dispose() { this.disposed = true; }
+  refresh() { if (!this.disposed) this.tui.requestRender(); }
+  private name = (model: string | undefined) => modelLabel(model, (p, id) => this.ctx.modelRegistry.find(p, id), this.data.aliases);
+  private current() {
+    const w = this.data.workflows.find(w => w.wid === this.workflow);
+    return { w, c: w?.calls.find(c => c.callId === this.watching) };
+  }
+  private open(w: WorkflowSnapshot, c: CallSnapshot) {
+    this.workflow = w.wid; this.watching = c.callId; this.doneTab = false; this.state.viewed.add(c.callId);
+    this.input.setValue(""); this.following = true; this.scroll = 0; this.notice = "";
+  }
+  private tabs(w: WorkflowSnapshot) { return [...w.calls.filter(c => c.phase !== "sealed").map(c => c.callId), ...(w.calls.some(c => c.phase === "sealed") ? ["done"] : [])]; }
+  private switchTab(delta: number) {
+    const { w } = this.current(); if (!w) return;
+    const tabs = this.tabs(w), index = tabs.indexOf(this.doneTab ? "done" : this.watching!);
+    const next = tabs[(index + delta + tabs.length) % tabs.length];
+    if (next === "done") { this.doneTab = true; this.selected = 0; }
+    else { const c = w.calls.find(c => c.callId === next); if (c) this.open(w, c); }
+  }
+  private selectRow(row: ListRow | undefined) {
+    if (!row) return;
+    if (row.kind === "call") this.open(row.workflow!, row.call!);
+    else if (row.kind === "workflow") { const key = row.workflow!.wid; this.state.folded.has(key) ? this.state.folded.delete(key) : this.state.folded.add(key); }
+    else if (row.kind === "finished") this.state.finished = !this.state.finished;
+    else if (row.workflow) {
+      const w = row.workflow, count = this.state.done.get(w.wid) ?? (w.calls.every(c => c.phase === "sealed") || w.calls.some(c => c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped" && !this.state.viewed.has(c.callId)) ? 8 : 0);
+      this.state.done.set(w.wid, row.kind === "more" ? count + 8 : count ? 0 : 8);
+    }
+  }
+  private async send(args: Record<string, unknown>, note: string) {
+    if (this.busy || this.disposed) return;
+    this.busy = true;
+    const target = this.watching;
+    const error = await this.actions.send(args, note);
+    this.busy = false;
+    if (!this.disposed && this.watching === target) { this.notice = error ?? "Submitted"; if (!error) { this.input.setValue(""); this.uses++; } this.refresh(); }
+  }
+  private modelMenu() {
+    const { c } = this.current(); if (!c) return;
+    this.menuTitle = `Model for ${c.key}`;
+    const models = this.ctx.modelRegistry.getAvailable();
+    this.menu = new SelectList(models.map(m => ({ value: `${m.provider}/${m.id}`, label: this.name(`${m.provider}/${m.id}`) })), 12, getSelectListTheme());
+    this.search.setValue("");
+    this.menu.onCancel = () => { this.menu = undefined; };
+    this.menu.onSelect = item => {
+      this.menu = undefined;
+      const level = this.data.facts.get(c.callId)?.thinking ?? "off";
+      void this.send({ action: "send", to: c.callId, kind: "model", model: `${item.value}:${level}` }, `switched ${c.key} to ${this.name(item.value)} · ${level}`);
+    };
+  }
+  private thinkingMenu() {
+    const { c } = this.current(); if (!c) return;
+    const model = this.data.facts.get(c.callId)?.model ?? c.model; if (!model) return;
+    this.menuTitle = `Thinking for ${c.key}`;
+    this.search.setValue("");
+    this.menu = new SelectList(levels.map(value => ({ value, label: value })), 7, getSelectListTheme());
+    this.menu.onCancel = () => { this.menu = undefined; };
+    this.menu.onSelect = item => {
+      this.menu = undefined;
+      void this.send({ action: "send", to: c.callId, kind: "model", model: `${model.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")}:${item.value}` }, `switched ${c.key} thinking to ${item.value}`);
+    };
+  }
+  private cycleThinking() {
+    const { c } = this.current(); if (!c) return;
+    const facts = this.data.facts.get(c.callId), model = facts?.model ?? c.model;
+    if (!model) { this.notice = "Model not yet recorded"; return; }
+    const level = levels[(levels.indexOf(facts?.thinking ?? "off") + 1) % levels.length]!;
+    void this.send({ action: "send", to: c.callId, kind: "model", model: `${model.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")}:${level}` }, `switched ${c.key} thinking to ${level}`);
+  }
+  private submit(followUp = false) {
+    const { w, c } = this.current(); if (!w || !c) return;
+    const message = this.input.getValue().trim(); if (!message) return;
+    if (message === "/model") { this.modelMenu(); this.input.setValue(""); return; }
+    if (message.startsWith("/model ")) {
+      const model = message.slice(7).trim();
+      void this.send({ action: "send", to: c.callId, kind: "model", model }, `switched ${c.key} to ${model}`); return;
+    }
+    if (message === "/stop") { void this.send({ action: "stop", target: c.callId }, `stopped ${c.key}`); return; }
+    if (message.startsWith("/")) { this.notice = "Commands: /model, /stop"; return; }
+    const q = w.attention.find(a => a.kind === "question" && a.call === c.callId);
+    const kind = followUp ? "follow-up" : q ? "answer" : "steer";
+    void this.send({ action: "send", to: c.callId, kind, message, ...(kind === "answer" ? { qid: q!.qid, rev: q!.rev } : {}) },
+      `${kind === "answer" ? "replied to" : followUp ? "queued follow-up for" : "steered"} ${c.key}: ${JSON.stringify(message)}`);
+  }
+  handleInput(key: string) {
+    if (this.disposed) return;
+    if (this.menu) {
+      if ((["up", "down", "enter", "escape"] as const).some(k => matchesKey(key, k))) this.menu.handleInput(key);
+      else { this.search.handleInput(key); this.menu.setFilter(this.search.getValue()); }
+    } else if (matchesKey(key, "escape")) {
+      if (this.watching) { this.watching = undefined; this.workflow = undefined; this.doneTab = false; this.selected = 0; }
+      else this.close();
+    } else if (!this.watching || this.doneTab) {
+      if (this.doneTab && (matchesKey(key, "left") || matchesKey(key, "right"))) this.switchTab(matchesKey(key, "left") ? -1 : 1);
+      else if (matchesKey(key, "up")) this.selected = Math.max(0, this.selected - 1);
+      else if (matchesKey(key, "down")) this.selected = Math.min(this.rows.length - 1, this.selected + 1);
+      else if (matchesKey(key, "enter")) this.selectRow(this.rows[this.selected]);
+    } else if (this.busy) {
+      // Preserve the draft and target until its durable submission resolves.
+    } else if (!this.input.getValue() && (matchesKey(key, "left") || matchesKey(key, "right"))) this.switchTab(matchesKey(key, "left") ? -1 : 1);
+    else if (matchesKey(key, "ctrl+l")) this.modelMenu();
+    else if (matchesKey(key, "shift+tab")) this.cycleThinking();
+    else if (matchesKey(key, "ctrl+t")) this.expandedThinking = !this.expandedThinking;
+    else if (matchesKey(key, "ctrl+o")) this.expandedTools = !this.expandedTools;
+    else if (matchesKey(key, "pageUp")) { this.following = false; this.scroll = Math.max(0, this.scroll - 10); }
+    else if (matchesKey(key, "pageDown")) { this.following = false; this.scroll += 10; }
+    else if (matchesKey(key, "end")) this.following = true;
+    else if (matchesKey(key, "alt+enter")) this.submit(true);
+    else if (matchesKey(key, "enter")) this.submit();
+    else this.input.handleInput(key);
+    this.refresh();
+  }
+  handleMouse(event: TuiMouseEvent) {
+    if (event.type === "wheel" && this.watching) { this.following = false; this.scroll = Math.max(0, this.scroll + (event.wheelDelta ?? 0)); return { handled: true, render: true }; }
+    if (event.type !== "click" || event.button !== "left" || !this.watching || this.doneTab) return;
+    if (event.y === 1) {
+      const { c } = this.current();
+      const modelEnd = c ? visibleWidth(`${c.key} · ${this.name(this.data.facts.get(c.callId)?.model ?? c.model)} ▾ · `) : Infinity;
+      if (event.x >= modelEnd) this.thinkingMenu(); else this.modelMenu();
+      return { handled: true, render: true };
+    }
+    if (this.thinkingRows.has(event.y)) { this.expandedThinking = !this.expandedThinking; return { handled: true, render: true }; }
+    if (event.y === this.inputRow) return this.input.handleMouse({ ...event, y: 0 });
+  }
+  private transcript(c: CallSnapshot, w: WorkflowSnapshot, width: number): { lines: string[]; thoughts: number[] } {
+    const entries = this.data.sessions.get(c.callId) ?? [], lines: string[] = [], thoughts: number[] = [];
+    const tools = new Map<string, ToolExecutionComponent>();
+    const components: (Component | string)[] = [];
+    const markdown = getMarkdownTheme();
+    const task = this.data.facts.get(c.callId)?.task;
+    if (task) components.push(new UserMessageComponent(task, markdown, 0));
+    for (const [index, e] of entries.entries()) {
+      if (e.type === "custom_message" && e.customType === CT.msg && (e.details as { kind?: string })?.kind !== "task") {
+        const text = typeof e.content === "string" ? e.content : e.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+        components.push(new UserMessageComponent(text, markdown, 0));
+      }
+      if (e.type !== "message") continue;
+      const m = e.message;
+      if (m.role === "user") components.push(new UserMessageComponent(typeof m.content === "string" ? m.content : m.content.filter(b => b.type === "text").map(b => b.text).join("\n"), markdown, 0));
+      if (m.role === "assistant") {
+        const thinking = m.content.filter(b => b.type === "thinking").map(b => b.thinking).join("\n");
+        const hasThinking = m.content.some(b => b.type === "thinking");
+        const elapsed = thinkingElapsed(entries, index);
+        const clock = elapsed === undefined ? "" : ` ${Math.floor(elapsed / 1000)}s`;
+        if (hasThinking) components.push(`${thinking.trim() ? (this.expandedThinking ? "▾ " : "▸ ") : ""}Thinking${clock}${thoughtSummary(thinking) ? ` · ${thoughtSummary(thinking)}` : ""}`);
+        const content = m.content.filter(b => b.type !== "toolCall" && (this.expandedThinking || b.type !== "thinking"));
+        if (content.length) components.push(new AssistantMessageComponent({ ...m, content } as AssistantMessage, false, markdown, undefined, 0));
+        for (const b of m.content) if (b.type === "toolCall") {
+          const component = new ToolExecutionComponent(b.name, b.id, b.arguments, { showImages: false }, undefined, this.tui, w.cwd ?? this.ctx.cwd);
+          component.markExecutionStarted(); component.setArgsComplete(); component.setExpanded(this.expandedTools);
+          tools.set(b.id, component); components.push(component);
+        }
+      }
+      if (m.role === "toolResult") tools.get(m.toolCallId)?.updateResult({ content: m.content, details: m.details, isError: m.isError });
+    }
+    const last = entries.at(-1);
+    const pending = c.phase === "running" && !this.data.facts.get(c.callId)?.activity &&
+      !(last?.type === "message" && last.message.role === "assistant");
+    if (pending) {
+      const elapsed = thinkingElapsed(entries);
+      components.push(`Thinking${elapsed === undefined ? "" : ` ${Math.floor(elapsed / 1000)}s`}`);
+    }
+    if (!components.length) components.push(c.phase === "queued" ? "Waiting for dispatch" : "Waiting for session output");
+    for (const component of components) {
+      if (typeof component === "string") { if (/^[▸▾]/u.test(component)) thoughts.push(lines.length); lines.push(component); }
+      else lines.push(...component.render(width));
+    }
+    return { lines, thoughts };
+  }
+  render(width: number): string[] {
+    const height = Math.max(8, this.tui.terminal.rows - 2);
+    const fit = (lines: string[]) => lines.map(line => truncateToWidth(line, Math.max(1, width)));
+    if (this.menu) return fit([this.menuTitle,...this.search.render(width), ...this.menu.render(width), "Applies from the next model call · Esc back"]);
+    if (!this.watching || this.doneTab) {
+      const w = this.current().w;
+      const selectedId = this.rows[this.selected]?.id;
+      this.rows = this.doneTab && w ? w.calls.filter(c => c.phase === "sealed").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).map(c => ({ id: c.callId, kind: "call" as const, workflow: w, call: c, text: `  ${c.key}  ${resultPhrase(c)}`, failed: !c.result?.ok })) : listRows(this.data.workflows, this.state, this.data.facts, this.name, width);
+      const retained = this.rows.findIndex(row => row.id === selectedId);
+      this.selected = Math.max(0, Math.min(retained >= 0 ? retained : this.selected, this.rows.length - 1));
+      const start = Math.max(0, this.selected - height + 4);
+      return fit([this.doneTab ? `${w?.name ?? w?.wid}: done · ← → switch` : "Subagents", ...this.rows.slice(start, start + height - 3).map((row, i) => {
+        const text = row.failed ? this.theme.fg("error", row.text) : row.text;
+        return i + start === this.selected ? this.theme.bg("selectedBg", text) : text;
+      }), ...(this.rows.length ? [] : ["No subagents"]), "↑ ↓ select · Enter open · Esc back"]);
+    }
+    const { c, w } = this.current();
+    if (!c || !w) return ["Subagent is no longer in the current revision · Esc back"];
+    const facts = this.data.facts.get(c.callId), active = w.calls.filter(c => c.phase !== "sealed"), done = w.calls.length - active.length;
+    const tabs = width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${w.name ?? w.wid}: ${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
+    const head = [tabs, `${c.key} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾`, "─".repeat(width)];
+    const transcript = this.transcript(c, w, width), available = Math.max(1, height - 8);
+    if (this.following) this.scroll = Math.max(0, transcript.lines.length - available);
+    else this.scroll = Math.min(this.scroll, Math.max(0, transcript.lines.length - available));
+    this.thinkingRows = new Set(transcript.thoughts.filter(n => n >= this.scroll && n < this.scroll + available).map(n => n - this.scroll + head.length));
+    const body = transcript.lines.slice(this.scroll, this.scroll + available);
+    const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
+    const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
+    this.inputRow = head.length + body.length + 1;
+    const empty = new Input({ prompt: "", placeholder, placeholderStyle: text => this.theme.fg("dim", text) });
+    empty.focused = this.focused;
+    const editor = this.input.getValue() ? this.input.render(width) : empty.render(width);
+    const hint = this.input.getValue().startsWith("/") ? "/model · /stop" : this.notice || (this.following ? "" : "Following paused · End resumes");
+    return fit([...head, ...body, "─".repeat(width), ...editor, hint, `${w.name ?? w.wid} › ${c.key} · ${duration(Date.now() - (c.startedAt ?? Date.now()))} · Esc back`]);
+  }
+}

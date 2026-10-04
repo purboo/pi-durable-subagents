@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ENV } from "../types.ts";
 import { registerChild } from "./child.ts";
 import { registerMain } from "./main.ts";
+import { registerUi } from "../ui/index.ts";
 
 const LOADED = Symbol.for("pi-durable-subagents.loaded");
 
@@ -16,5 +17,5 @@ export default function (pi: ExtensionAPI) {
   g[LOADED] = true;
   pi.on("session_shutdown", () => { delete g[LOADED]; });
   if (process.env[ENV.exec]) registerChild(pi);
-  else registerMain(pi);
+  else registerMain(pi, registerUi);
 }
