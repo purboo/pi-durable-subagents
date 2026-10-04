@@ -36,6 +36,7 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
     async stop(target) { await ledgers.orch.append('fake-stop', { target }); },
     async recover(wid) { await ledgers.orch.append('fake-recover', { wid }); },
     async retire() {},
+    async suspend() {},
     busy: () => busy > 0,
     async shutdown() { for (const timer of timers) clearTimeout(timer); },
   };

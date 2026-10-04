@@ -51,7 +51,10 @@ export interface Executor {
   recover(wid: Wid, journal: JournalHandle): Promise<void>;
   /** True while any call is running or pending (used for idle exit, K6). */
   busy(): boolean;
-  /** Orchestrator exit: fence running executions WITHOUT sealing (they resume on recovery); close the outbox. */
+  /** Drain with fence (stop-all): fence every running execution WITHOUT sealing; their run() promises reject with an
+   *  Error named "ExecutorShutdown"; the executor stays open and a later run() continues the call. */
+  suspend(): Promise<void>;
+  /** Orchestrator exit: suspend(), then close the outbox. */
   shutdown(): Promise<void>;
 }
 

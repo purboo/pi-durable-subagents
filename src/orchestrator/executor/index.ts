@@ -365,6 +365,7 @@ export default function createExecutor(ledgers: Ledgers): Executor {
       await (await outbox).republishPending();
     },
     async retire() { throw new Error("retire: not implemented yet (wave 3 X1)"); },
+    async suspend() { throw new Error("suspend: not implemented yet (wave 3 X1)"); },
     busy: () => active.size > 0,
     async shutdown() {
       closed = true;
