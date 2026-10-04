@@ -3,10 +3,18 @@ import { CT } from '../../types.ts';
 import type { DecisionRecord } from '../../kernel/lifecycle.ts';
 
 export interface Question { qid: string; rev: number; question: string }
-/** A1, P4, P8: Recover receipts and question revisions from the complete session history. */
-export function recover(entries: readonly SessionEntry[]) {
+/** A1, P4, P8, P37: Recover receipts and question revisions for this call generation. A generation continues the
+ *  session of the previous one (P37), but request sequences are per recipient (P5): records addressed to an earlier
+ *  generation stay in history and are skipped here: segments opened by another call's execution marker are foreign. */
+export function recover(entries: readonly SessionEntry[], call?: string) {
   const records: DecisionRecord[] = [], questions = new Map<string, Question>(), answered = new Set<string>();
+  let foreign = false;
   for (const entry of entries) {
+    if (entry.type === 'custom' && entry.customType === CT.exec) {
+      const owner = /^(.*)#\d+\.\d+$/.exec(String((entry.data as { exec?: string } | undefined)?.exec ?? ''));
+      foreign = call !== undefined && !!owner && owner[1] !== call;
+    }
+    if (foreign) continue;
     if (entry.type === 'custom') {
       const data = entry.data as Record<string, any>;
       if (!data) continue;

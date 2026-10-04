@@ -127,7 +127,7 @@ export function registerChild(pi: ExtensionAPI): void {
         // RPC command. This owned child is inert and has written nothing; exit now.
         setImmediate(() => process.exit(0)); return;
       }
-      state = recover(ctx.sessionManager.getEntries()); active = true; pi.appendEntry(CT.exec, { exec });
+      state = recover(ctx.sessionManager.getEntries(), call); active = true; pi.appendEntry(CT.exec, { exec });
       watcher = watch(inbox, () => { void serial(async () => { await consume(ctx, blocked ? 'ask' : 'idle'); }).catch(error => fail(ctx, error)); });
       watcher.on('error', error => fail(ctx, error));
       await consume(ctx, 'idle');
