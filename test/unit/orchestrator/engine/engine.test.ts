@@ -1,0 +1,361 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
+import { openJournal, readJournalSnapshot } from '../../../../src/kernel/journal.ts';
+import { publishRequest } from '../../../../src/kernel/mailbox.ts';
+import { orchInbox, orchLedger, orchLock, pinnedDir, journalPath } from '../../../../src/paths.ts';
+import { OsLock } from '../../../../src/platform/lock.ts';
+import { Engine } from '../../../../src/orchestrator/engine.ts';
+import { main } from '../../../../src/orchestrator/main.ts';
+import { EvaluatorClient, type EvaluatorTransport } from '../../../../src/orchestrator/evaluator-client.ts';
+import { JT, type Request, type RunBody, type EvalToOrch, type OrchToEval, type CallResult } from '../../../../src/types.ts';
+import type { Ledgers } from '../../../../src/orchestrator/contract.ts';
+import { fakeExecutor } from './fake.ts';
+
+class ManualEvaluator implements EvaluatorTransport {
+  messages: OrchToEval[] = [];
+  receive!: (message: EvalToOrch) => void;
+  death!: () => void;
+  async start(message: (message: EvalToOrch) => void, death: () => void) { this.receive = message; this.death = death; }
+  send(message: OrchToEval) { this.messages.push(message); }
+  async close() {}
+  current() { return this.messages.findLast(m => m.t === 'start')! as Extract<OrchToEval, { t: 'start' }>; }
+}
+async function until<T>(fn: () => T | Promise<T>, timeout = 10_000): Promise<NonNullable<T>> {
+  const end = Date.now() + timeout;
+  for (;;) { const value = await fn(); if (value) return value as NonNullable<T>; if (Date.now() >= end) throw new Error('Timed out'); await delay(10); }
+}
+async function fixture(t: test.TestContext, evaluator?: EvaluatorTransport | ((ledgers: Ledgers) => EvaluatorTransport), hold?: string) {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-engine-'));
+  await mkdir(join(home, 'project/.pi/agents'), { recursive: true });
+  await writeFile(join(home, 'project/.pi/agents/test.md'), '---\nname: test\ndescription: Test agent\n---\nSynthetic.');
+  const ledgers: Ledgers = { home, config: { k: { idleExitMs: 30 } }, orch: await openJournal(orchLedger(home)) };
+  const executor = fakeExecutor(ledgers, { delay: key => key === 'a' ? 70 : key === 'b' ? 10 : 0, hold });
+  const engine = new Engine(ledgers, executor, { evaluator: typeof evaluator === 'function' ? evaluator(ledgers) : evaluator, discovery: { home, agentDir: join(home, 'config'), globalNpmRoot: null } });
+  t.after(async () => { await engine.close(); await ledgers.orch.close(); await rm(home, { recursive: true, force: true }); });
+  const run = async (source: string, extra: Partial<RunBody> = {}, sseq = 1) => {
+    const req: Request<RunBody> = { rid: `run-${sseq}`, from: 'main:test', to: 'orch', sseq, kind: 'run', body: { cwd: join(home, 'project'), source, ...extra } };
+    await publishRequest(orchInbox(home), req); await engine.intake();
+    const created = ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid)!;
+    return engine.store.workflows.get(created.wid as string)!;
+  };
+  await engine.recover();
+  return { home, ledgers, engine, run };
+}
+const spec = (task: string) => ({ agent: 'test', task });
+const propose = (evalClient: ManualEvaluator, pos: number, key: string, task = key) => {
+  const { wid, ev } = evalClient.current(); evalClient.receive({ t: 'call', wid, ev, pos, key, spec: spec(task) });
+};
+const idle = (evalClient: ManualEvaluator, exposed: number) => {
+  const { wid, ev } = evalClient.current(); evalClient.receive({ t: 'idle', wid, ev, exposed });
+};
+
+test('intake FIFO, gap holding, immutable identity and pin copies', async t => {
+  const evaluator = new ManualEvaluator();
+  const { home, ledgers, engine } = await fixture(t, evaluator);
+  const input = join(home, 'declared.txt'); await writeFile(input, 'fixed input');
+  const one: Request = { rid: 'one', from: 'main:test', to: 'orch', sseq: 1, kind: 'run', body: { cwd: join(home, 'project'), source: 'return args;', args: { value: 7 }, inputs: { document: input } } };
+  const two: Request = { rid: 'two', from: 'main:test', to: 'orch', sseq: 2, kind: 'revise', body: {} };
+  await publishRequest(orchInbox(home), two); await engine.intake();
+  assert.equal(ledgers.orch.entries().filter(e => e.type === JT.admitted).length, 0);
+  await publishRequest(orchInbox(home), one); await engine.intake();
+  assert.deepEqual(ledgers.orch.entries().filter(e => e.type === JT.admitted).map(e => e.rid), ['one', 'two']);
+  assert.equal(ledgers.orch.entries().find(e => e.type === JT.rejected && e.rid === 'two')?.reason, 'not-implemented-yet');
+  const wid = ledgers.orch.entries().find(e => e.type === JT.created)!.wid as string;
+  assert.equal(engine.store.workflows.get(wid)!.journal.entries()[0]!.type, 'wf-created');
+  assert.deepEqual(JSON.parse(await readFile(join(pinnedDir(home, wid), 'args.json'), 'utf8')), { value: 7 });
+  const mapping = JSON.parse(await readFile(join(pinnedDir(home, wid), 'inputs.json'), 'utf8'));
+  await writeFile(input, 'changed');
+  assert.equal(await readFile(mapping.document, 'utf8'), 'fixed input');
+  assert.ok(JSON.parse(await readFile(join(pinnedDir(home, wid), 'agents.json'), 'utf8')).some((a: { name: string }) => a.name === 'test'));
+  await publishRequest(orchInbox(home), { ...one, body: { source: 'different' } }); await engine.intake();
+  assert.equal(ledgers.orch.entries().filter(e => e.type === JT.created).length, 1);
+  assert.equal(ledgers.orch.entries().filter(e => e.type === JT.applied && e.rid === 'one').length, 1);
+  assert.ok(ledgers.orch.entries().some(e => e.type === JT.rejected && e.reason === 'identity-conflict'));
+});
+
+test('live call -> run -> seal -> durable exposure -> send; host death replays sealed calls', async t => {
+  const evaluator = new ManualEvaluator();
+  const { engine, run } = await fixture(t, evaluator);
+  const wf = await run('unused');
+  propose(evaluator, 0, 'a'); idle(evaluator, 0);
+  await until(() => evaluator.messages.some(m => m.t === 'expose'));
+  const order = wf.journal.entries().map(e => e.type);
+  assert.ok(order.indexOf('call') < order.indexOf('fake-run'));
+  assert.ok(order.indexOf('fake-run') < order.indexOf(JT.sealed));
+  assert.ok(order.indexOf(JT.sealed) < order.indexOf('exposed'));
+  const ev1 = evaluator.current().ev;
+  evaluator.death(); await until(() => evaluator.current().ev === ev1 + 1);
+  evaluator.receive({ t: 'call', wid: wf.wid, ev: ev1, pos: 1, key: 'stale', spec: spec('stale') });
+  propose(evaluator, 0, 'a'); idle(evaluator, 0);
+  await engine.intake();
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 1);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'call').length, 1);
+  assert.equal(evaluator.messages.filter(m => m.t === 'expose').length, 2);
+  idle(evaluator, 1); await engine.intake();
+  assert.equal(wf.journal.entries().filter(e => e.type === JT.done).length, 0);
+});
+
+test('real evaluator rolling DAG exposes in completion order', async t => {
+  const { engine, run } = await fixture(t);
+  const wf = await run(`const a = runs.run('a', {agent:'test', task:'a'});
+const b = runs.run('b', {agent:'test', task:'b'});
+const first = await Promise.race([a,b]);
+emit(first.key);
+await runs.run('dependent', {agent:'test', task:first.key});
+await a; await b; return first.key;`);
+  await until(() => wf.journal.entries().some(e => e.type === JT.done));
+  assert.equal(wf.journal.entries().find(e => e.type === JT.done)?.result, 'b');
+  assert.deepEqual(wf.journal.entries().filter(e => e.type === 'exposed').map(e => e.pos), [1, 3, 0]);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 3);
+  await engine.intake();
+});
+
+test('real host SIGKILL: rolling DAG reproduces logged exposure order in ev+1', async t => {
+  const sent: OrchToEval[] = [], received: EvalToOrch[] = [];
+  const { ledgers, run } = await fixture(t, ledgers => {
+    const client = new EvaluatorClient(ledgers);
+    return {
+      start: (message, death) => client.start(event => { received.push(event); message(event); }, death),
+      send: event => { sent.push(event); client.send(event); },
+      close: () => client.close(),
+    };
+  }, 'tail');
+  const wf = await run(`const a = runs.run('a', {agent:'test',task:'a'});
+const b = runs.run('b', {agent:'test',task:'b'});
+const first = await Promise.race([a,b]);
+await runs.run('dependent', {agent:'test',task:first.key});
+await a; await b;
+return await runs.run('tail', {agent:'test',task:'tail'});`);
+  await until(() => wf.journal.entries().some(e => e.type === 'fake-run' && e.key === 'tail'));
+  const firstExposures = sent.flatMap(m => m.t === 'expose' && m.ev === 1 ? [m.pos] : []);
+  assert.deepEqual(firstExposures, [1, 2, 0]);
+  const host = ledgers.orch.entries().findLast(e => e.type === 'eval-tracked')!.process as { pid: number };
+  process.kill(host.pid, 'SIGKILL');
+  await until(() => received.some(m => m.t === 'idle' && m.ev === 2 && m.exposed === 3));
+  assert.deepEqual(sent.flatMap(m => m.t === 'expose' && m.ev === 2 ? [m.pos] : []), firstExposures);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 4);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'exposed').length, 3);
+  assert.equal(wf.journal.entries().filter(e => e.type === JT.done).length, 0);
+  assert.ok(ledgers.orch.entries().some(e => e.type === 'eval-fenced'));
+});
+
+test('creation intent recovers partial pins and commits created only once', async t => {
+  const evaluator = new ManualEvaluator(); const { engine, ledgers, run, home } = await fixture(t, evaluator);
+  const existing = await run('return 1;');
+  const wid = 'recovered';
+  await ledgers.orch.append('create-intent', { rid: 'interrupted', wid, origin: 'main:test', cwd: existing.cwd, pins: existing.pins });
+  await mkdir(pinnedDir(home, wid), { recursive: true });
+  await writeFile(join(pinnedDir(home, wid), 'script.js'), existing.pins.source);
+  await engine.recover();
+  const wf = engine.store.workflows.get(wid)!;
+  assert.equal(wf.journal.entries()[0]!.type, 'wf-created');
+  assert.equal(await readFile(join(pinnedDir(home, wid), 'args.json'), 'utf8'), 'null');
+  await engine.store.recover();
+  assert.equal(ledgers.orch.entries().filter(e => e.type === JT.created && e.rid === 'interrupted').length, 1);
+});
+
+test('replay mismatch parks without rerunning', async t => {
+  const evaluator = new ManualEvaluator(); const { engine, run } = await fixture(t, evaluator);
+  const wf = await run('unused'); propose(evaluator, 0, 'a'); idle(evaluator, 0);
+  await until(() => evaluator.messages.some(m => m.t === 'expose'));
+  evaluator.death(); await until(() => evaluator.current().ev === 2);
+  propose(evaluator, 0, 'a', 'changed'); await engine.intake();
+  const done = wf.journal.entries().find(e => e.type === JT.done)!;
+  assert.equal(done.status, 'parked'); assert.match(done.error as string, /mismatch/);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 1);
+});
+
+test('frontier waits for acknowledged exposures then parks missing output', async t => {
+  const evaluator = new ManualEvaluator(); const { engine, run } = await fixture(t, evaluator, 'pending');
+  const wf = await run('unused'); propose(evaluator, 0, 'a'); idle(evaluator, 0);
+  await until(() => evaluator.messages.some(m => m.t === 'expose'));
+  propose(evaluator, 1, 'pending'); await engine.intake();
+  evaluator.death(); await until(() => evaluator.current().ev === 2);
+  propose(evaluator, 0, 'a'); idle(evaluator, 0); await engine.intake();
+  assert.ok(!wf.journal.entries().some(e => e.type === JT.done));
+  idle(evaluator, 1); await engine.intake();
+  const done = wf.journal.entries().find(e => e.type === JT.done)!;
+  assert.equal(done.status, 'parked'); assert.match(done.error as string, /Missing output/);
+});
+
+test('sealed but not exposed is recovered without calling executor.run', async t => {
+  const evaluator = new ManualEvaluator(); const { engine, run } = await fixture(t, evaluator);
+  const wf = await run('unused');
+  propose(evaluator, 0, 'a');
+  await until(() => wf.journal.entries().some(e => e.type === JT.sealed));
+  assert.equal(wf.journal.entries().filter(e => e.type === 'exposed').length, 0);
+  evaluator.death(); await until(() => evaluator.current().ev === 2);
+  propose(evaluator, 0, 'a'); idle(evaluator, 0); await engine.intake();
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 1);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'exposed').length, 1);
+});
+
+test('now/random values replay and changed needs park', async t => {
+  const evaluator = new ManualEvaluator(); const { engine, run } = await fixture(t, evaluator);
+  const wf = await run('unused');
+  evaluator.receive({ t: 'need', wid: wf.wid, ev: 1, n: 0, kind: 'random' }); await engine.intake();
+  const value = wf.journal.entries().find(e => e.type === 'value')!.value;
+  evaluator.death(); await until(() => evaluator.current().ev === 2);
+  evaluator.receive({ t: 'need', wid: wf.wid, ev: 2, n: 0, kind: 'random' }); await engine.intake();
+  assert.equal((evaluator.messages.findLast(m => m.t === 'value') as { value: number }).value, value);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'value').length, 1);
+  evaluator.death(); await until(() => evaluator.current().ev === 3);
+  evaluator.receive({ t: 'need', wid: wf.wid, ev: 3, n: 0, kind: 'now' }); await engine.intake();
+  assert.equal(wf.journal.entries().find(e => e.type === JT.done)?.status, 'parked');
+});
+
+test('idle exits after K6 and held OS lock prevents opening a ledger', async t => {
+  const { engine, home } = await fixture(t, new ManualEvaluator());
+  const began = performance.now(); await engine.loop();
+  assert.ok(performance.now() - began >= 30);
+  const lock = await new OsLock().tryAcquire(orchLock(home)); assert.ok(lock);
+  try {
+    await main({ home, executor: () => { throw new Error('must not construct executor'); } });
+    const second = child(home);
+    assert.equal((await second.ended).code, 0, second.stderr());
+  }
+  finally { await lock.release(); }
+});
+
+test('unfinished work prevents idle exit; drain commits proposals without dispatching', async t => {
+  const evaluator = new ManualEvaluator(); const { engine, home, run } = await fixture(t, evaluator);
+  const wf = await run('unused');
+  await publishRequest(orchInbox(home), { rid: 'drain', from: 'cli:test', to: 'orch', sseq: 1, kind: 'drain', body: {} });
+  await engine.intake();
+  propose(evaluator, 0, 'new'); idle(evaluator, 0); await engine.intake();
+  assert.equal(wf.journal.entries().filter(e => e.type === 'call').length, 1);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 0);
+  const controller = new AbortController(), began = performance.now();
+  const timer = setTimeout(() => controller.abort(), 100);
+  try { await engine.loop(controller.signal); } finally { clearTimeout(timer); }
+  assert.ok(performance.now() - began >= 90);
+});
+
+test('run fanout, send, withdraw, stop and drain use committed lifecycle', async t => {
+  const evaluator = new ManualEvaluator(); const { engine, home, ledgers, run } = await fixture(t, evaluator);
+  const wf = await run(undefined as unknown as string, { tasks: [spec('hello')] });
+  assert.match(wf.pins.source, /runs.all/);
+  propose(evaluator, 0, 'pending'); await engine.intake();
+  const requests: Request[] = [
+    { rid: 'send', from: 'cli:test', to: 'orch', sseq: 1, kind: 'send', body: { to: `${wf.wid}/pending`, kind: 'steer', message: 'new' } },
+    { rid: 'withdraw', from: 'cli:test', to: 'orch', sseq: 2, kind: 'withdraw', body: { rids: ['send'] } },
+    { rid: 'drain', from: 'cli:test', to: 'orch', sseq: 3, kind: 'drain', body: {} },
+    { rid: 'stop', from: 'cli:test', to: 'orch', sseq: 4, kind: 'stop', body: { target: wf.wid } },
+  ];
+  await publishRequest(orchInbox(home), requests[0]!); await engine.intake();
+  for (const req of requests.slice(1)) await publishRequest(orchInbox(home), req);
+  await engine.intake();
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-forward').length, 2);
+  assert.equal(wf.journal.entries().find(e => e.type === JT.done)?.status, 'stopped');
+  assert.ok(ledgers.orch.entries().some(e => e.type === 'drain'));
+  assert.ok(ledgers.orch.entries().some(e => e.type === JT.applied && e.rid === 'withdraw'));
+  assert.ok(ledgers.orch.entries().some(e => e.type === JT.withdrawn && e.rid === 'withdraw'));
+});
+
+function child(home: string, hold?: string, crashWindow = false) {
+  const proc = spawn(process.execPath, [fileURLToPath(new URL('./fake.ts', import.meta.url))], { env: { ...process.env, DSA_HOME: home, ...(crashWindow ? { DSA_FAKE_CRASH_WINDOW: 'admitted' } : {}), ...(hold ? { DSA_FAKE_HOLD: hold } : {}) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = ''; proc.stderr.on('data', data => { stderr += data; });
+  const ended = new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => { proc.once('error', reject); proc.once('exit', (code, signal) => resolve({ code, signal })); });
+  return { proc, ended, stderr: () => stderr };
+}
+
+test('pin failures reject durably and rejected/withdrawn staging is removed', async t => {
+  const { engine, home, ledgers } = await fixture(t, new ManualEvaluator());
+  const req: Request<RunBody> = { rid: 'missing', from: 'cli:stage', to: 'orch', sseq: 1, kind: 'run', body: { cwd: join(home, 'project'), workflow: join(home, 'absent.js') } };
+  await publishRequest(orchInbox(home), req); await engine.intake();
+  assert.match(ledgers.orch.entries().find(e => e.type === JT.rejected && e.rid === req.rid)!.reason as string, /^pin-failed: .*ENOENT/);
+  await assert.rejects(readFile(join(home, 'staging', req.rid, 'snapshot.json')), { code: 'ENOENT' });
+  const withdrawn = { ...req, rid: 'withdrawn-run', sseq: 2, body: { cwd: join(home, 'project'), source: 'return 1;' } };
+  await publishRequest(orchInbox(home), withdrawn);
+  await publishRequest(orchInbox(home), { rid: 'withdraw-stage', from: 'cli:stage', to: 'orch', sseq: 3, kind: 'withdraw', body: { rids: [withdrawn.rid] } });
+  await engine.intake();
+  assert.equal(ledgers.orch.entries().find(e => e.type === JT.rejected && e.rid === withdrawn.rid)?.reason, 'withdrawn');
+  await assert.rejects(readFile(join(home, 'staging', withdrawn.rid, 'snapshot.json')), { code: 'ENOENT' });
+});
+
+test('existing staging is reused before admission even after external sources disappear', async t => {
+  const { engine, home, ledgers } = await fixture(t, new ManualEvaluator());
+  const file = join(home, 'original.js'); await writeFile(file, 'return "original";');
+  const req: Request<RunBody> = { rid: 'staged', from: 'cli:stage', to: 'orch', sseq: 1, kind: 'run', body: { cwd: join(home, 'project'), workflow: file } };
+  await engine.store.stage(req, { home, agentDir: join(home, 'config'), globalNpmRoot: null });
+  await rm(file);
+  await publishRequest(orchInbox(home), req); await engine.intake();
+  const created = ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid)!;
+  assert.equal(engine.store.workflows.get(created.wid as string)!.pins.source, 'return "original";');
+});
+
+test('sequence-gap candidates stage on first observation; a staging dir without snapshot is restaged', async t => {
+  const { engine, home, ledgers } = await fixture(t, new ManualEvaluator());
+  const file = join(home, 'gap.js'); await writeFile(file, 'return "first";');
+  const req: Request<RunBody> = { rid: 'gap', from: 'cli:gap', to: 'orch', sseq: 2, kind: 'run', body: { cwd: join(home, 'project'), workflow: file } };
+  await publishRequest(orchInbox(home), req); await engine.intake();
+  assert.ok(!ledgers.orch.entries().some(e => e.type === JT.admitted));
+  await writeFile(file, 'return "changed";');
+  await publishRequest(orchInbox(home), { rid: 'gap-first', from: 'cli:gap', to: 'orch', sseq: 1, kind: 'revise', body: {} });
+  await engine.intake();
+  const created = ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid)!;
+  assert.equal(engine.store.workflows.get(created.wid as string)!.pins.source, 'return "first";');
+  const incomplete = { ...req, rid: 'incomplete', sseq: 3 };
+  await mkdir(join(home, 'staging', incomplete.rid));
+  await publishRequest(orchInbox(home), incomplete); await engine.intake();
+  assert.ok(!ledgers.orch.entries().some(e => e.type === JT.rejected && e.rid === incomplete.rid));
+  const restaged = ledgers.orch.entries().find(e => e.type === JT.created && e.rid === incomplete.rid)!;
+  assert.equal(engine.store.workflows.get(restaged.wid as string)!.pins.source, 'return "changed";');
+});
+
+test('SIGKILL after staging and admission, before create-intent, preserves original script and inputs', { timeout: 30_000 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-stage-kill-'));
+  const children: ReturnType<typeof child>[] = [];
+  t.after(async () => {
+    for (const child of children) { if (child.proc.exitCode === null && child.proc.signalCode === null) child.proc.kill('SIGKILL'); await child.ended; }
+    await rm(home, { recursive: true, force: true });
+  });
+  const script = join(home, 'source.js'), input = join(home, 'input.txt');
+  await writeFile(script, 'return {script:"original", input:runs.input("document")};');
+  await writeFile(input, 'original input');
+  await publishRequest(orchInbox(home), { rid: 'staged-crash', from: 'main:test', to: 'orch', sseq: 1, kind: 'run', body: { cwd: home, workflow: script, inputs: { document: input } } });
+  const first = child(home, undefined, true); children.push(first);
+  await until(() => readJournalSnapshot(orchLedger(home)).some(e => e.type === JT.admitted));
+  assert.ok(!readJournalSnapshot(orchLedger(home)).some(e => e.type === 'create-intent'));
+  assert.equal(await readFile(join(home, 'staging/staged-crash/inputs/document'), 'utf8'), 'original input');
+  first.proc.kill('SIGKILL'); await first.ended;
+  await writeFile(script, 'return "modified";'); await rm(input);
+  const second = child(home); children.push(second);
+  await until(() => second.proc.exitCode !== null || second.proc.signalCode !== null);
+  assert.equal((await second.ended).code, 0, second.stderr());
+  const created = readJournalSnapshot(orchLedger(home)).find(e => e.type === JT.created)!;
+  const done = readJournalSnapshot(journalPath(home, created.wid as string)).find(e => e.type === JT.done)!;
+  assert.equal(done.status, 'done', String(done.error));
+  assert.deepEqual(done.result, { script: 'original', input: 'original input' });
+});
+
+test('SIGKILL engine mid-run: sealed result is replayed, unsealed call resumes', { timeout: 30_000 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-engine-kill-'));
+  await mkdir(join(home, 'project/.pi/agents'), { recursive: true });
+  await writeFile(join(home, 'project/.pi/agents/test.md'), '---\nname: test\ndescription: Test\n---\nTest');
+  const children: ChildProcess[] = [];
+  t.after(async () => { for (const proc of children) if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL'); await rm(home, { recursive: true, force: true }); });
+  await publishRequest(orchInbox(home), { rid: 'run', from: 'main:test', to: 'orch', sseq: 1, kind: 'run', body: { cwd: join(home, 'project'), source: `await runs.run('a', {agent:'test',task:'a'}); return await runs.run('b', {agent:'test',task:'b'});` } });
+  const first = child(home, 'b'); children.push(first.proc);
+  const created = await until(() => readJournalSnapshot(orchLedger(home)).find(e => e.type === JT.created));
+  const file = journalPath(home, created.wid as string);
+  await until(() => readJournalSnapshot(file).some(e => e.type === 'fake-run' && e.key === 'b'));
+  first.proc.kill('SIGKILL'); assert.equal((await first.ended).signal, 'SIGKILL');
+  const second = child(home); children.push(second.proc);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const exit = await Promise.race([second.ended, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`Recovery timed out: ${second.stderr()}`)), 15_000); })]).finally(() => clearTimeout(timeout));
+  assert.equal(exit.code, 0, second.stderr());
+  const entries = readJournalSnapshot(file);
+  assert.deepEqual(entries.filter(e => e.type === 'ev').map(e => e.n), [1, 2]);
+  assert.equal(entries.filter(e => e.type === 'fake-run' && e.key === 'a').length, 1);
+  assert.equal(entries.filter(e => e.type === 'fake-invoke' && e.key === 'a').length, 1);
+  assert.equal(entries.filter(e => e.type === 'fake-run' && e.key === 'b').length, 2);
+  assert.equal(entries.find(e => e.type === JT.done)?.status, 'done');
+  assert.equal(entries.filter(e => e.type === 'exposed').length, 2);
+});

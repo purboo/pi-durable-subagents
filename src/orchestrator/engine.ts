@@ -1,0 +1,289 @@
+// Private orch entries: request {request} retains immutable admitted envelopes;
+// drain {rid} records process drain intent. Workflow entries: ev {n};
+// call {pos,key,gen,spec,fingerprint}; exposed {pos}; value {n,kind,value};
+// emit {pos,value}. JT.done and JT.attention are shared terminal observations.
+import { watch, type FSWatcher } from 'node:fs';
+import { mkdir, readdir, unlink } from 'node:fs/promises';
+import { resolve, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { contentHash } from '../kernel/ids.ts';
+import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
+import { scanInbox } from '../kernel/mailbox.ts';
+import { orchInbox } from '../paths.ts';
+import { JT, type Entry, type Request, type RunBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
+import type { DiscoveryOptions } from '../compat/agents.ts';
+import type { CallTicket, Executor, Ledgers } from './contract.ts';
+import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
+import { Store, type Workflow } from './store.ts';
+
+type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Set<number>; exposures: Entry[]; sent: number; replaying: boolean; ready: Map<number, CallResult>; running: Set<number>; outputs: Map<number, Entry>; values: Entry[]; needs: number };
+export interface EngineOptions { evaluator?: EvaluatorTransport; discovery?: DiscoveryOptions }
+
+/** A1, P2, P10, P11: Serialize decisions while executions run independently. */
+export class Engine {
+  readonly store: Store;
+  private ledgers: Ledgers;
+  private executor: Executor;
+  private evaluator: EvaluatorTransport;
+  private discovery?: DiscoveryOptions;
+  private states = new Map<string, State>();
+  private queue: Promise<void> = Promise.resolve();
+  private failure?: unknown;
+  private closed = false;
+  private draining = false;
+  private watcher?: FSWatcher;
+  private poll?: ReturnType<typeof setInterval>;
+  constructor(ledgers: Ledgers, executor: Executor, options: EngineOptions = {}) {
+    this.ledgers = ledgers; this.executor = executor; this.discovery = options.discovery;
+    this.store = new Store(ledgers); this.evaluator = options.evaluator ?? new EvaluatorClient(ledgers);
+  }
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(fn);
+    this.queue = result.then(() => {}, error => { this.failure ??= error; });
+    return result;
+  }
+  private background(fn: () => Promise<void>) { if (!this.closed) void this.serial(fn).catch(() => {}); }
+  private terminal(wf: Workflow) { return wf.journal.entries().some(e => e.type === JT.done); }
+  private lifecycle(): DecisionRecord[] { return this.ledgers.orch.entries().filter(e => ['admitted', 'applied', 'rejected', 'withdrawn'].includes(e.type)) as unknown as DecisionRecord[]; }
+  /** A2, P10: Recover executor authority before replaying each unfinished workflow. */
+  async recover(): Promise<void> {
+    await this.store.recover();
+    for (const wf of this.store.workflows.values()) await this.executor.recover(wf.wid, wf.journal);
+    await this.startHost();
+    for (const wf of this.store.workflows.values()) {
+      if (!this.terminal(wf)) await this.startWorkflow(wf);
+      else await this.attention(wf);
+    }
+    await this.intake();
+  }
+  private async startHost() {
+    await this.evaluator.start(message => this.background(() => this.message(message)), () => this.background(async () => {
+      await this.startHost();
+      for (const wf of this.store.workflows.values()) if (!this.terminal(wf)) await this.startWorkflow(wf);
+    }));
+  }
+  private async startWorkflow(wf: Workflow) {
+    if (this.terminal(wf)) return;
+    const log = wf.journal.entries();
+    const ev = Math.max(0, ...log.filter(e => e.type === 'ev').map(e => e.n as number)) + 1;
+    await wf.journal.append('ev', { n: ev });
+    const calls = new Map(log.filter(e => e.type === 'call').map(e => [e.pos as number, e]));
+    const st: State = { wf, ev, calls, proposed: new Set(), exposures: log.filter(e => e.type === 'exposed'), sent: 0, replaying: true, ready: new Map(), running: new Set(), outputs: new Map(log.filter(e => e.type === 'call' || e.type === 'emit').map(e => [e.pos as number, e])), values: log.filter(e => e.type === 'value'), needs: 0 };
+    this.states.set(wf.wid, st);
+    this.evaluator.send({ t: 'start', wid: wf.wid, ev, scriptPath: wf.scriptPath, args: wf.pins.args, inputs: wf.inputs });
+  }
+  /** P5, P6, A3: Commit lifecycle decisions in kernel order before acknowledging intake. */
+  intake(): Promise<void> { return this.serial(() => this.consume()); }
+  private async consume() {
+    const scanned = (await scanInbox(orchInbox(this.ledgers.home))).filter(r => r.to === 'orch');
+    const retained = this.ledgers.orch.entries().filter(e => e.type === 'request').map(e => e.request as Request);
+    const candidates = [...retained, ...scanned];
+    const before = reduceLifecycle(this.lifecycle()), staged = new Set<string>();
+    for (const request of candidates) {
+      if (request.kind !== 'run' || before.admitted.has(request.rid) || before.tombstones.has(request.rid) || staged.has(request.rid)) continue;
+      await this.store.stage(request as Request<RunBody>, this.discovery);
+      staged.add(request.rid);
+    }
+    const records = planDecisions(this.lifecycle(), candidates, () => ({ action: 'defer' }));
+    for (const [index, record] of records.entries()) {
+      if (record.type === 'admitted') {
+        const request = candidates.find(r => r.rid === record.rid && contentHash(r) === record.hash)!;
+        await this.ledgers.orch.append('request', { request });
+      }
+      if (record.type === 'applied') {
+        const req = candidates.find(r => r.rid === record.rid);
+        if (req?.kind === 'withdraw') await this.withdraw(req);
+      }
+      const { type, ...fields } = record;
+      const withdrawal = type === 'withdrawn' ? records.slice(index + 1).find(r => r.type === 'applied') : undefined;
+      await this.ledgers.orch.append(type, { ...fields, ...(withdrawal && 'rid' in withdrawal ? { rid: withdrawal.rid } : {}) });
+    }
+    for (;;) {
+      let selected: Request | undefined;
+      planDecisions(this.lifecycle(), candidates, req => { selected ??= req; return { action: 'defer' }; });
+      if (!selected) break;
+      const decision = await this.decide(selected);
+      if (decision.action === 'defer') break;
+      const resolution = planDecisions(this.lifecycle(), candidates, req => req.rid === selected!.rid ? decision : { action: 'defer' });
+      for (const { type, ...fields } of resolution) await this.ledgers.orch.append(type, fields);
+    }
+    const view = reduceLifecycle(this.lifecycle());
+    for (const [rid, resolution] of view.resolved) {
+      if (resolution.type === 'rejected' && view.admitted.get(rid)?.kind === 'run') await this.store.discardStage(rid);
+    }
+    for (const rid of view.tombstones) await this.store.discardStage(rid);
+    for (const req of scanned) {
+      if (view.resolved.has(req.rid) || (view.admitted.has(req.rid) && view.admitted.get(req.rid)!.hash !== contentHash(req))) {
+        await unlink(join(orchInbox(this.ledgers.home), `${req.rid}.json`)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      }
+    }
+  }
+  private findCall(to: string): { wf: Workflow; entry: Entry } | undefined {
+    for (const wf of this.store.workflows.values()) {
+      const calls = wf.journal.entries().filter(e => e.type === 'call');
+      const entry = calls.findLast(e => to === `${wf.wid}@1/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}`);
+      if (entry) return { wf, entry };
+    }
+  }
+  private context(wf: Workflow, entry: Entry) { return { journal: wf.journal, widRev: `${wf.wid}@1` as const, key: entry.key as string, gen: entry.gen as number }; }
+  private async withdraw(req: Request) {
+    const rids = (req.body as { rids: string[] }).rids;
+    for (const wf of this.store.workflows.values()) {
+      const requests = this.ledgers.orch.entries().filter(e => e.type === 'request').map(e => e.request as Request);
+      const sent = requests.filter(r => r.kind === 'send' && rids.includes(r.rid));
+      const visited = new Set<string>();
+      for (const target of sent) {
+        const found = this.findCall((target.body as SendBody).to);
+        if (!found || found.wf !== wf || visited.has(found.entry.key as string)) continue;
+        visited.add(found.entry.key as string);
+        await this.executor.forward(req, this.context(wf, found.entry));
+      }
+    }
+  }
+  private async decide(req: Request): Promise<Decision> {
+    if (req.cond?.epoch) {
+      const target = req.kind === 'send' ? this.findCall((req.body as SendBody).to) : undefined;
+      if (!target || req.cond.epoch !== `${target.wf.wid}@1`) return { action: 'reject', reason: 'stale-epoch' };
+    }
+    if (req.kind === 'run') {
+      const created = this.ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid);
+      let wf = created ? this.store.workflows.get(created.wid as string) : undefined;
+      if (!wf) {
+        let pins;
+        try { pins = await this.store.staged(req as Request<RunBody>); }
+        catch (error) { return { action: 'reject', reason: `pin-failed: ${String(error)}` }; }
+        wf = await this.store.create(req as Request<RunBody>, pins);
+      }
+      if (!this.states.has(wf!.wid) && !this.terminal(wf!)) await this.startWorkflow(wf!);
+    } else if (req.kind === 'send') {
+      const target = this.findCall((req.body as SendBody)?.to);
+      if (!target) return { action: 'reject', reason: 'unknown-call' };
+      return this.executor.forward(req, this.context(target.wf, target.entry));
+    } else if (req.kind === 'stop') {
+      const target = (req.body as { target: string })?.target;
+      const call = this.findCall(target), wf = call?.wf ?? this.store.workflows.get(target);
+      if (!wf) return { action: 'reject', reason: 'unknown-workflow' };
+      await this.executor.stop({ wid: wf.wid, ...(call ? { callId: `${wf.wid}@1/${call.entry.key}@${call.entry.gen}` } : {}) });
+      if (!call) await this.finish(wf, 'stopped');
+    } else if (req.kind === 'resume') {
+      const wid = (req.body as { wid?: string })?.wid;
+      if (wid && !this.store.workflows.has(wid)) return { action: 'reject', reason: 'unknown-workflow' };
+      for (const wf of this.store.workflows.values()) if ((!wid || wf.wid === wid) && !this.states.has(wf.wid) && !this.terminal(wf)) await this.startWorkflow(wf);
+    } else if (req.kind === 'drain') {
+      await this.ledgers.orch.append('drain', { rid: req.rid }); this.draining = true;
+    } else return { action: 'reject', reason: req.kind === 'revise' ? 'not-implemented-yet' : 'unsupported-kind' };
+    return { action: 'apply' };
+  }
+  private ticket(st: State, entry: Entry): CallTicket {
+    const spec = entry.spec as CallSpec, agent = st.wf.pins.agents.find(a => a.name === spec.agent);
+    if (!agent) throw new Error(`Unknown pinned agent: ${spec.agent}`);
+    return { wid: st.wf.wid, widRev: `${st.wf.wid}@1`, key: entry.key as string, gen: entry.gen as number,
+      callId: `${st.wf.wid}@1/${entry.key}@${entry.gen}`, spec, agent, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal };
+  }
+  private sealed(st: State, entry: Entry): CallResult | undefined {
+    return st.wf.journal.entries().find(e => e.type === JT.sealed && e.call === `${st.wf.wid}@1/${entry.key}@${entry.gen}`)?.result as CallResult | undefined;
+  }
+  private dispatch(st: State, entry: Entry) {
+    const pos = entry.pos as number;
+    if (st.running.has(pos)) return;
+    const sealed = this.sealed(st, entry);
+    if (sealed) { st.ready.set(pos, sealed); return; }
+    if (this.draining) return;
+    st.running.add(pos);
+    void this.executor.run(this.ticket(st, entry)).then(() => this.background(async () => {
+      if (this.states.get(st.wf.wid) !== st || this.terminal(st.wf)) return;
+      const result = this.sealed(st, entry);
+      if (!result) throw new Error(`Executor returned without seal: ${entry.key}`);
+      st.ready.set(pos, result); await this.flush(st);
+    }), error => this.background(async () => { throw error; }));
+  }
+  private async flush(st: State) {
+    while (st.sent < st.exposures.length) {
+      const pos = st.exposures[st.sent]!.pos as number;
+      if (!st.proposed.has(pos)) return;
+      const entry = st.calls.get(pos), result = entry && this.sealed(st, entry);
+      if (!result) { await this.finish(st.wf, 'parked', undefined, `Missing sealed result at ${pos}`); return; }
+      this.evaluator.send({ t: 'expose', wid: st.wf.wid, ev: st.ev, pos, result });
+      st.ready.delete(pos); st.sent++;
+    }
+    if (st.replaying) return;
+    for (const [pos, result] of st.ready) {
+      await st.wf.journal.append('exposed', { pos });
+      this.evaluator.send({ t: 'expose', wid: st.wf.wid, ev: st.ev, pos, result });
+      st.ready.delete(pos);
+    }
+  }
+  private async message(message: EvalToOrch) {
+    const st = this.states.get(message.wid);
+    if (!st || st.ev !== message.ev || this.terminal(st.wf)) return;
+    const park = (error: string) => this.finish(st.wf, 'parked', undefined, error);
+    if (message.t === 'call') {
+      const agent = st.wf.pins.agents.find(a => a.name === message.spec.agent);
+      if (!agent) return park(`Unknown pinned agent: ${message.spec.agent}`);
+      const fingerprint = contentHash({ spec: message.spec, agent }), old = st.outputs.get(message.pos);
+      if (st.proposed.has(message.pos) || (old && (old.type !== 'call' || old.key !== message.key || old.fingerprint !== fingerprint))) return park(`Replay mismatch at ${message.pos}`);
+      if (!old && [...st.calls.values()].some(e => e.key === message.key)) return park(`Duplicate call key: ${message.key}`);
+      if (!old && st.calls.size >= (this.ledgers.config.k?.spawnBudget ?? 300)) return park('Spawn budget exceeded');
+      const entry = old ?? await st.wf.journal.append('call', { pos: message.pos, key: message.key, gen: 1, spec: message.spec, fingerprint });
+      st.calls.set(message.pos, entry); st.proposed.add(message.pos);
+      if (!st.exposures.some(e => e.pos === message.pos)) this.dispatch(st, entry);
+      await this.flush(st);
+    } else if (message.t === 'need') {
+      const old = st.values[message.n];
+      if (message.n !== st.needs++ || (old && old.kind !== message.kind)) return park(`Value mismatch at ${message.n}`);
+      const value = old?.value as number | undefined ?? (message.kind === 'now' ? Date.now() : Math.random());
+      if (!old) await st.wf.journal.append('value', { n: message.n, kind: message.kind, value });
+      this.evaluator.send({ t: 'value', wid: st.wf.wid, ev: st.ev, n: message.n, value });
+    } else if (message.t === 'emit') {
+      const old = st.outputs.get(message.pos);
+      if (old && (old.type !== 'emit' || contentHash(old.value) !== contentHash(message.value))) return park(`Emit mismatch at ${message.pos}`);
+      if (!old) await st.wf.journal.append('emit', { pos: message.pos, value: message.value });
+      st.proposed.add(message.pos);
+    } else if (message.t === 'idle') {
+      if (st.replaying && st.sent === st.exposures.length && message.exposed >= st.sent) {
+        if ([...st.outputs.keys()].some(pos => !st.proposed.has(pos)) || st.needs < st.values.length) return park('Missing output at replay frontier');
+        st.replaying = false; await this.flush(st);
+      }
+    } else if (message.t === 'done') {
+      if ([...st.outputs.keys()].some(pos => !st.proposed.has(pos)) || st.sent !== st.exposures.length || st.needs < st.values.length) return park('Missing output at replay completion');
+      await this.finish(st.wf, 'done', message.result);
+    } else if (message.t === 'error') await this.finish(st.wf, message.kind === 'script' ? 'failed' : 'parked', undefined, message.error);
+  }
+  private async attention(wf: Workflow) {
+    const done = wf.journal.entries().find(e => e.type === JT.done);
+    if (done && !wf.journal.entries().some(e => e.type === JT.attention && (e.item as { id: string }).id === `finished:${wf.wid}`)) {
+      await wf.journal.append(JT.attention, { item: { id: `finished:${wf.wid}`, rev: 1, kind: 'finished', wid: wf.wid, text: `Workflow ${done.status}` } });
+    }
+  }
+  private async finish(wf: Workflow, status: string, result?: unknown, error?: string) {
+    if (!this.terminal(wf)) await wf.journal.append(JT.done, { status, ...(result !== undefined ? { result } : {}), ...(error ? { error } : {}) });
+    await this.attention(wf);
+    const st = this.states.get(wf.wid);
+    if (st) this.evaluator.send({ t: 'stop', wid: wf.wid, ev: st.ev });
+    this.states.delete(wf.wid);
+  }
+  /** K6, P5: Watch with polling fallback and exit only after continuous quiescence. */
+  async loop(signal?: AbortSignal): Promise<void> {
+    const inbox = orchInbox(this.ledgers.home);
+    await mkdir(inbox, { recursive: true });
+    this.watcher = watch(inbox, () => this.background(() => this.consume()));
+    this.watcher.on('error', () => { this.watcher?.close(); });
+    this.poll = setInterval(() => this.background(() => this.consume()), 1000);
+    let idleSince = performance.now();
+    try {
+      while (!signal?.aborted && !this.closed) {
+        await this.queue;
+        if (this.failure) throw this.failure;
+        const files = await readdir(inbox);
+        if ([...this.store.workflows.values()].some(w => !this.terminal(w)) || this.executor.busy() || files.length) idleSince = performance.now();
+        else if (performance.now() - idleSince >= (this.ledgers.config.k?.idleExitMs ?? 60_000)) return;
+        await delay(Math.min(100, this.ledgers.config.k?.idleExitMs ?? 100));
+      }
+    } finally { this.watcher?.close(); clearInterval(this.poll); }
+  }
+  /** A1, A2: Retire asynchronous producers before closing their journals. */
+  async close(): Promise<void> {
+    this.closed = true; this.watcher?.close(); clearInterval(this.poll);
+    await this.queue; await this.evaluator.close(); await this.executor.shutdown(); await this.store.close();
+  }
+}
