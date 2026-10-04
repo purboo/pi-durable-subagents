@@ -11,7 +11,7 @@ import { FAUX, PI_BIN, REPO, script, settled, startPi, tempRoot } from "../../ha
 import { callDir, callInbox, callSession, journalPath, orchLedger } from "../../../src/paths.ts";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { scanInbox } from "../../../src/kernel/mailbox.ts";
-import { contentHash, forwardRid } from "../../../src/kernel/ids.ts";
+import { contentHash, forwardRid, ulid } from "../../../src/kernel/ids.ts";
 import { CT, JT, type JournalHandle, type Request } from "../../../src/types.ts";
 import type { CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
@@ -35,9 +35,10 @@ async function setup(t: TestContext, config: OrchestratorConfig = {}, options: P
   await mkdir(process.env.PI_CODING_AGENT_DIR, { recursive: true });
   await writeFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), JSON.stringify({ extensions: [FAUX], defaultProvider: "probe", defaultModel: "scripted" }));
   const orch = await openJournal(orchLedger(home));
-  let journal = await openJournal(journalPath(home, "wf"));
+  const wid = ulid();
+  let journal = await openJournal(journalPath(home, wid));
   const executor = createExecutor({ home, orch, config }, options);
-  const ticket = (key = "a", task = script([{ text: "full\nLEAF: final" }])): CallTicket => ({ wid: "wf", widRev: "wf@1", key, gen: 1, callId: `wf@1/${key}@1`, cwd, journal, spec: { agent: "test", task }, agent });
+  const ticket = (key = "a", task = script([{ text: "full\nLEAF: final" }])): CallTicket => ({ wid, widRev: `${wid}@1`, key, gen: 1, callId: `${wid}@1/${key}@1`, cwd, journal, spec: { agent: "test", task }, agent });
   t.after(async () => {
     try { await executor.shutdown(); } finally {
       await journal.close(); await orch.close();
@@ -45,13 +46,13 @@ async function setup(t: TestContext, config: OrchestratorConfig = {}, options: P
       await rm(root, { recursive: true, force: true });
     }
   });
-  return { root, home, cwd, orch, executor, ticket, get journal() { return journal; }, async reopen() { journal = await openJournal(journal.path); } };
+  return { wid, root, home, cwd, orch, executor, ticket, get journal() { return journal; }, async reopen() { journal = await openJournal(journal.path); } };
 }
 async function nativeSession(t: TestContext, f: Awaited<ReturnType<typeof setup>>, opts: { report?: unknown; text?: string; exec?: string; question?: boolean } = {}) {
   const ticket = f.ticket(), exec = opts.exec ?? `${ticket.callId}#1.1`;
-  await mkdir(callDir(f.home, "wf", "a", 1), { recursive: true });
+  await mkdir(callDir(f.home, f.wid, "a", 1), { recursive: true });
   await f.journal.append(JT.exec, { exec, call: ticket.callId });
-  const pi = startPi({ root: f.root, name: "native", extensions: [recorder], args: ["--session", callSession(f.home, "wf", "a", 1)], env: { TEST_EXEC: exec, ...(opts.question ? { TEST_QUESTION: "1" } : {}), ...(opts.report !== undefined ? { TEST_REPORT: JSON.stringify(opts.report) } : {}) } });
+  const pi = startPi({ root: f.root, name: "native", extensions: [recorder], args: ["--session", callSession(f.home, f.wid, "a", 1)], env: { TEST_EXEC: exec, ...(opts.question ? { TEST_QUESTION: "1" } : {}), ...(opts.report !== undefined ? { TEST_REPORT: JSON.stringify(opts.report) } : {}) } });
   t.after(() => pi.stop());
   pi.send({ type: "prompt", message: script([{ text: opts.text ?? "full\nLEAF: final" }]) });
   await pi.waitFor(settled);
@@ -66,7 +67,7 @@ function assertSealed(journal: JournalHandle, call: string, status: string) {
 test("P9 recovery reads full last text from real pi after durable settled and fence", { timeout: 30000 }, async t => {
   const f = await setup(t), { pi, exec, ticket } = await nativeSession(t, f);
   await pi.stop(); await f.journal.append("settled", { exec });
-  await f.executor.recover("wf", f.journal);
+  await f.executor.recover(f.wid, f.journal);
   const promise = f.executor.run(ticket); assert.equal(f.executor.run(ticket), promise);
   const result = await promise;
   assert.equal(result.status, "ok"); assert.equal(result.output, "full\nLEAF: final");
@@ -80,7 +81,7 @@ test("P9 report takes precedence without a settled event; recovery makes no prov
   assert.ok(identity.start); assert.equal(identity.tag, undefined);
   await f.journal.append("tracked", { exec, pid: identity.pid, start: identity.start });
   const log = await readFile(join(pi.dir, "ext.log"), "utf8");
-  await f.executor.recover("wf", f.journal);
+  await f.executor.recover(f.wid, f.journal);
   const result = await f.executor.run(ticket);
   assert.deepEqual(result.data, { verdict: "retained" });
   assert.equal(result.output, '{"verdict":"retained"}\nfull\nLEAF: final');
@@ -94,12 +95,12 @@ test("P22 executor SIGKILL after fence preserves a real session report across re
   await pi.stop();
   await f.orch.append("hold", { pool: "probe", slot: 0, exec });
   await f.journal.close();
-  const worker = fork(fileURLToPath(new URL("crash-worker.ts", import.meta.url)), [], { env: { ...process.env, DSA_HOME: f.home }, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  const worker = fork(fileURLToPath(new URL("crash-worker.ts", import.meta.url)), [], { env: { ...process.env, DSA_HOME: f.home, TEST_WID: f.wid }, stdio: ["ignore", "pipe", "pipe", "ipc"] });
   t.after(() => { worker.kill("SIGKILL"); });
   const [message] = await once(worker, "message", { signal: AbortSignal.timeout(10000) }); assert.equal(message, "fenced");
   const exited = once(worker, "exit"); worker.kill("SIGKILL"); await exited;
   await f.reopen(); ticket.journal = f.journal;
-  await f.executor.recover("wf", f.journal);
+  await f.executor.recover(f.wid, f.journal);
   assert.deepEqual((await f.executor.run(ticket)).data, { recovered: true });
   assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 1);
   assert.ok(f.orch.entries().some(e => e.type === "release" && e.exec === exec));
@@ -111,24 +112,24 @@ test("P7 deterministic steer, idempotent replay, withdrawal and sealed rejection
   const req: Request = { rid: "steer-1", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "change" } };
   assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
   const rid2 = forwardRid(req.rid, ticket.widRev, ticket.key, contentHash(req));
-  const first = await scanInbox(callInbox(f.home, "wf", "a", 1)); assert.equal(first[0]!.rid, rid2);
+  const first = await scanInbox(callInbox(f.home, f.wid, "a", 1)); assert.equal(first[0]!.rid, rid2);
   assert.deepEqual(first[0]!.body, { message: "change" });
-  await rm(join(callInbox(f.home, "wf", "a", 1), `${rid2}.json`));
-  await f.executor.recover("wf", f.journal);
-  assert.deepEqual(await scanInbox(callInbox(f.home, "wf", "a", 1)), first);
+  await rm(join(callInbox(f.home, f.wid, "a", 1), `${rid2}.json`));
+  await f.executor.recover(f.wid, f.journal);
+  assert.deepEqual(await scanInbox(callInbox(f.home, f.wid, "a", 1)), first);
   await f.executor.forward(req, ctx); assert.equal(f.journal.entries().filter(e => e.type === "forward").length, 1);
   assert.deepEqual(await f.executor.forward({ ...req, body: { changed: true } }, ctx), { action: "reject", reason: "identity-conflict" });
   const withdrawal: Request = { rid: "withdraw-1", from: req.from, to: "orch", sseq: 2, kind: "withdraw", body: { rids: [req.rid] } };
   await f.executor.forward(withdrawal, ctx);
-  const requests = await scanInbox(callInbox(f.home, "wf", "a", 1));
+  const requests = await scanInbox(callInbox(f.home, f.wid, "a", 1));
   assert.deepEqual(requests.find(r => r.kind === "withdraw")!.body, { rids: [rid2] });
-  const next = { ...req, rid: "steer-2", sseq: 3, cond: { after: withdrawal.rid, epoch: "wf@1" } };
+  const next = { ...req, rid: "steer-2", sseq: 3, cond: { after: withdrawal.rid, epoch: ticket.widRev } };
   await f.executor.forward(next, ctx);
-  const all = await scanInbox(callInbox(f.home, "wf", "a", 1));
+  const all = await scanInbox(callInbox(f.home, f.wid, "a", 1));
   assert.equal(all.find(r => r.sseq === 3)!.cond!.after, all.find(r => r.kind === "withdraw")!.rid);
   assert.equal(all.find(r => r.sseq === 3)!.cond!.epoch, undefined);
   await f.journal.append(JT.exec, { call: ticket.callId, exec: `${ticket.callId}#1.1` });
-  await f.executor.stop({ wid: "wf", callId: ticket.callId });
+  await f.executor.stop({ wid: f.wid, callId: ticket.callId });
   assert.deepEqual(await f.executor.forward({ ...req, rid: "late" }, ctx), { action: "reject", reason: "call-sealed" });
 });
 
@@ -138,7 +139,7 @@ test("P9/K2 empty recovered session at the loss bound seals failed without spawn
   await f.journal.append(JT.fenced, { exec: `${ticket.callId}#1.1` });
   await f.journal.append("loss", { exec: `${ticket.callId}#1.1` });
   await f.journal.append(JT.exec, { call: ticket.callId, exec: `${ticket.callId}#1.2` });
-  await f.executor.recover("wf", f.journal);
+  await f.executor.recover(f.wid, f.journal);
   const result = await f.executor.run(ticket); assert.equal(result.status, "failed"); assert.equal(result.error, "lost ×2");
   assertSealed(f.journal, ticket.callId, "failed");
 });
@@ -161,10 +162,10 @@ test("V1 real pi processes serialize provider slots; stop fences and seals exact
   const pa = f.executor.run(a), pb = f.executor.run(b);
   await until(() => f.journal.entries().some(e => e.type === "tracked" && e.exec === `${a.callId}#1.1`));
   assert.equal(f.orch.entries().filter(e => e.type === "hold" && e.pool === "probe").length, 1);
-  await f.executor.stop({ wid: "wf", callId: a.callId }); assert.equal((await pa).status, "stopped");
+  await f.executor.stop({ wid: f.wid, callId: a.callId }); assert.equal((await pa).status, "stopped");
   await until(() => f.journal.entries().some(e => e.type === "tracked" && e.exec === `${b.callId}#1.1`));
-  await f.executor.stop({ wid: "wf", callId: b.callId }); assert.equal((await pb).status, "stopped");
-  await f.executor.stop({ wid: "wf" });
+  await f.executor.stop({ wid: f.wid, callId: b.callId }); assert.equal((await pb).status, "stopped");
+  await f.executor.stop({ wid: f.wid });
   assertSealed(f.journal, a.callId, "stopped"); assertSealed(f.journal, b.callId, "stopped");
   const holders = new Set<string>();
   for (const e of f.orch.entries()) { if (e.type === "hold") holders.add(String(e.exec)); if (e.type === "release") holders.delete(String(e.exec)); assert.ok(holders.size <= 1); }
@@ -177,7 +178,7 @@ test("V1 pool chooses first free candidate without holding another provider", { 
   const pending = f.executor.run(ticket);
   await until(() => f.journal.entries().some(e => e.type === "tracked"));
   assert.deepEqual(f.orch.entries().filter(e => e.type === "hold").map(e => e.pool), ["memory", "probe"]);
-  await f.executor.stop({ wid: "wf" }); assert.equal((await pending).status, "stopped");
+  await f.executor.stop({ wid: f.wid }); assert.equal((await pending).status, "stopped");
 });
 
 test("V1 pending X to Y switch rejects a return to held X before Y is observed", { timeout: 30000 }, async t => {
@@ -194,7 +195,7 @@ test("V1 pending X to Y switch rejects a return to held X before Y is observed",
   const toX: Request = { ...toY, rid: "switch-back-x", sseq: 2, body: { to: ticket.callId, kind: "model", model: "probe/scripted" } };
   assert.deepEqual(await f.executor.forward(toX, ctx), { action: "reject", reason: "switch-pending" });
   assert.equal(f.journal.entries().filter(e => e.type === "forward").length, 1);
-  assert.equal((await scanInbox(callInbox(f.home, "wf", "a", 1))).filter(r => r.kind === "model").length, 1);
+  assert.equal((await scanInbox(callInbox(f.home, f.wid, "a", 1))).filter(r => r.kind === "model").length, 1);
   const result = await pending; assert.equal(result.output, "switched to Y");
   const observed = f.orch.entries().find(e => e.type === "switch-observed" && e.exec === exec)!;
   assert.ok(observed, "real Y message_start must activate the reservation");
@@ -219,9 +220,9 @@ test("V1 model forwarding reserves a target before publishing and rejects a full
   assert.equal(f.journal.entries().filter(e => e.type === "forward").length, 0);
   assert.deepEqual(await f.executor.forward({ ...req, body: { to: ticket.callId, kind: "model", model: "other/id:high" } }, ctx), { action: "apply" });
   assert.ok(f.orch.entries().some(e => e.type === "hold" && e.pool === "other" && e.reserved && e.exec === exec));
-  const forwarded = (await scanInbox(callInbox(f.home, "wf", "a", 1))).find(r => r.kind === "model")!;
+  const forwarded = (await scanInbox(callInbox(f.home, f.wid, "a", 1))).find(r => r.kind === "model")!;
   assert.deepEqual(forwarded.body, { provider: "other", model: "id", thinking: "high" });
-  await f.executor.stop({ wid: "wf" }); await pending;
+  await f.executor.stop({ wid: f.wid }); await pending;
   assert.deepEqual(f.orch.entries().filter(e => e.type === "release").map(e => e.pool).sort(), ["memory", "other", "probe"]);
 });
 
@@ -241,15 +242,15 @@ test("V1 missing model uses isolated Pi settings before acquiring a provider slo
   const pending = f.executor.run(ticket);
   await until(() => f.journal.entries().some(e => e.type === "tracked"));
   assert.equal(f.orch.entries().find(e => e.type === "hold" && e.pool === "probe")!.pool, "probe");
-  await f.executor.stop({ wid: "wf" }); await pending;
+  await f.executor.stop({ wid: f.wid }); await pending;
 });
 
 test("P9 stop wins over a durable report and repeated stop never creates a second seal", { timeout: 30000 }, async t => {
   const f = await setup(t), { pi, ticket } = await nativeSession(t, f, { report: { done: true } }); await pi.stop();
-  await f.executor.recover("wf", f.journal);
-  await f.executor.stop({ wid: "wf", callId: ticket.callId });
+  await f.executor.recover(f.wid, f.journal);
+  await f.executor.stop({ wid: f.wid, callId: ticket.callId });
   assert.equal((await f.executor.run(ticket)).status, "stopped");
-  await f.executor.stop({ wid: "wf" }); assertSealed(f.journal, ticket.callId, "stopped");
+  await f.executor.stop({ wid: f.wid }); assertSealed(f.journal, ticket.callId, "stopped");
 });
 
 test("V1 stopping a call waiting on zero capacity acquires nothing and spawns nothing", { timeout: 10000 }, async t => {
@@ -258,7 +259,7 @@ test("V1 stopping a call waiting on zero capacity acquires nothing and spawns no
   await until(() => f.journal.entries().some(e => e.type === JT.exec));
   const switchRequest: Request = { rid: "waiting-switch", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "model", model: "other/id" } };
   assert.deepEqual(await f.executor.forward(switchRequest, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 }), { action: "reject", reason: "call-not-running" });
-  await f.executor.stop({ wid: "wf" }); assert.equal((await pending).status, "stopped");
+  await f.executor.stop({ wid: f.wid }); assert.equal((await pending).status, "stopped");
   assert.equal(f.orch.entries().filter(e => e.type === "hold").length, 0);
   assert.equal(f.journal.entries().filter(e => e.type === "tracked").length, 0);
 });
@@ -266,16 +267,16 @@ test("V1 stopping a call waiting on zero capacity acquires nothing and spawns no
 test("P9 schema-bearing calls do not accept plain text instead of a report", { timeout: 30000 }, async t => {
   const f = await setup(t, { k: { lossBound: 1 } }), { pi, exec, ticket } = await nativeSession(t, f); await pi.stop();
   ticket.spec.schema = { type: "object" }; await f.journal.append("settled", { exec });
-  await f.executor.recover("wf", f.journal);
+  await f.executor.recover(f.wid, f.journal);
   assert.equal((await f.executor.run(ticket)).status, "failed");
 });
 
 test("P15 recovered native questions are recorded once and close when the call seals", { timeout: 30000 }, async t => {
   const f = await setup(t), { pi, ticket } = await nativeSession(t, f, { report: { done: true }, question: true }); await pi.stop();
-  await f.executor.recover("wf", f.journal); await f.executor.run(ticket); await f.executor.run(ticket);
+  await f.executor.recover(f.wid, f.journal); await f.executor.run(ticket); await f.executor.run(ticket);
   const attention = f.journal.entries().filter(e => e.type === JT.attention);
   assert.equal(attention.length, 1);
-  assert.deepEqual(attention[0]!.item, { id: `q:${ticket.callId}:q1`, rev: 1, kind: "question", text: "Need input", wid: "wf", call: ticket.callId, qid: "q1", session: callSession(f.home, "wf", "a", 1) });
+  assert.deepEqual(attention[0]!.item, { id: `q:${ticket.callId}:q1`, rev: 1, kind: "question", text: "Need input", wid: f.wid, call: ticket.callId, qid: "q1", session: callSession(f.home, f.wid, "a", 1) });
   assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.resolution === "retired").length, 1);
 });
 
@@ -299,11 +300,11 @@ test("C1 empty reply loses once, then continues in the same native session", { t
   const f = await setup(t), ticket = f.ticket("a", script([{ empty: true }, { text: "continued" }]));
   const result = await f.executor.run(ticket); assert.equal(result.output, "continued");
   assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 1);
-  const entries = readFileSync(callSession(f.home, "wf", "a", 1), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const entries = readFileSync(callSession(f.home, f.wid, "a", 1), "utf8").trim().split("\n").map(line => JSON.parse(line));
   assert.equal(entries.filter(e => e.type === "session").length, 1);
   assert.equal(entries.filter(e => e.customType === CT.exec).length, 2);
   assert.equal(entries.filter(e => e.type === "model_change").length, 1);
-  assert.ok((await scanInbox(callInbox(f.home, "wf", "a", 1))).some(r => r.kind === "continue"));
+  assert.ok((await scanInbox(callInbox(f.home, f.wid, "a", 1))).some(r => r.kind === "continue"));
 });
 
 test("C1 K2 consecutive empty responses seal failed", { timeout: 30000 }, async t => {
@@ -315,7 +316,7 @@ test("C1 report tool produces a structured authoritative seal", { timeout: 30000
   const f = await setup(t), ticket = f.ticket("a", script([{ tool: "report", args: { outcome: "ok", data: { done: true } } }]));
   ticket.spec.schema = { type: "object", required: ["done"], properties: { done: { type: "boolean" } }, additionalProperties: false };
   const result = await f.executor.run(ticket);
-  if (result.status !== "ok") await writeFile("/tmp/dsa-executor-report-failure.json", JSON.stringify({ result, journal: f.journal.entries(), session: await readFile(callSession(f.home, "wf", "a", 1), "utf8") }, null, 2));
+  if (result.status !== "ok") await writeFile(`/tmp/dsa-executor-report-failure-${f.wid}.json`, JSON.stringify({ result, journal: f.journal.entries(), session: await readFile(callSession(f.home, f.wid, "a", 1), "utf8") }, null, 2));
   assert.equal(result.status, "ok"); assert.deepEqual(result.data, { done: true });
 });
 
@@ -324,7 +325,7 @@ test("C1 protocol report survives an empty tool allowlist and continuation", { t
   ticket.spec.tools = [];
   ticket.spec.schema = { type: "object", required: ["done"], properties: { done: { type: "boolean" } } };
   const result = await f.executor.run(ticket);
-  assert.equal(result.status, "ok", JSON.stringify({ result, journal: f.journal.entries(), session: await readFile(callSession(f.home, "wf", "a", 1), "utf8") })); assert.deepEqual(result.data, { done: true });
+  assert.equal(result.status, "ok", JSON.stringify({ result, journal: f.journal.entries(), session: await readFile(callSession(f.home, f.wid, "a", 1), "utf8") })); assert.deepEqual(result.data, { done: true });
   assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 1);
   assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 2);
 });
@@ -352,7 +353,7 @@ test("C1 SIGKILL during a tool fences its detached orphan and continues", { time
   assert.equal((await pending).status, "ok");
   const state = await readFile(`/proc/${orphan}/stat`, "utf8").catch(() => "");
   assert.ok(!state || /\) Z /.test(state));
-  const continuation = (await scanInbox(callInbox(f.home, "wf", "a", 1))).find(r => r.kind === "continue")!;
+  const continuation = (await scanInbox(callInbox(f.home, f.wid, "a", 1))).find(r => r.kind === "continue")!;
   assert.match((continuation.body as { message: string }).message, /unknown.*bash/);
 });
 
@@ -365,7 +366,7 @@ test("C1 forwarded steer then withdraw is consumed with child receipts", { timeo
   await f.executor.forward(req, ctx);
   await f.executor.forward({ rid: "live-withdraw", from: req.from, to: "orch", sseq: 2, kind: "withdraw", body: { rids: [req.rid] } }, ctx);
   await pending;
-  const session = await readFile(callSession(f.home, "wf", "a", 1), "utf8"); assert.match(session, new RegExp(CT.withdrawn));
+  const session = await readFile(callSession(f.home, f.wid, "a", 1), "utf8"); assert.match(session, new RegExp(CT.withdrawn));
 });
 
 test("X1 shutdown fences without sealing; restart continues and retires unused forwards", { timeout: 45000 }, async t => {
@@ -379,9 +380,9 @@ test("X1 shutdown fences without sealing; restart continues and retires unused f
   assert.equal(f.journal.entries().filter(e => e.type === "stop-intent").length, 0);
   const restarted = createExecutor({ home: f.home, orch: f.orch, config: {} });
   t.after(() => restarted.shutdown());
-  await restarted.recover("wf", f.journal);
+  await restarted.recover(f.wid, f.journal);
   const result = await restarted.run(ticket);
-  assert.equal(result.status, "ok", JSON.stringify({ result, journal: f.journal.entries(), session: await readFile(callSession(f.home, "wf", "a", 1), "utf8") })); assert.equal(result.output, "resumed");
+  assert.equal(result.status, "ok", JSON.stringify({ result, journal: f.journal.entries(), session: await readFile(callSession(f.home, f.wid, "a", 1), "utf8") })); assert.equal(result.output, "resumed");
   assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 2);
 });
 
@@ -411,7 +412,7 @@ test("X1 blocked ask is not charged and does not stall", { timeout: 30000 }, asy
   assert.equal(after, before);
   const question = f.journal.entries().find(e => e.type === JT.attention && (e.item as { kind: string }).kind === "question")!;
   assert.ok(!f.journal.entries().some(e => e.seq > question.seq && e.type === JT.attention && (e.item as { kind: string }).kind === "stall"));
-  await f.executor.stop({ wid: "wf" }); await pending;
+  await f.executor.stop({ wid: f.wid }); await pending;
 });
 
 test("X1 stall resolves on activity and re-arms with the next revision", { timeout: 30000 }, async t => {
@@ -448,18 +449,36 @@ test("X1 memory refusal holds nothing and rechecks headroom before spawn", { tim
   assert.ok(await availableMemory() > 0);
 });
 
-test("X1 retire fences without seals and rejects stale forwards", { timeout: 30000 }, async t => {
-  const f = await setup(t), ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 60" } }]));
+test("X1 retire fences without seals, retires question attention and rejects stale forwards", { timeout: 30000 }, async t => {
+  const f = await setup(t), ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Retire me?" } }]));
   const pending = f.executor.run(ticket);
-  await until(() => f.journal.entries().some(e => e.type === "tracked"));
+  await until(() => f.journal.entries().some(e => e.type === JT.attention && (e.item as { kind: string }).kind === "question"));
   await f.executor.retire(ticket.widRev);
   const result = await pending; assert.equal(result.status, "stopped"); assert.equal(result.error, "retired");
   assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0);
   assert.ok(f.journal.entries().some(e => e.type === JT.fenced));
   await f.executor.retire(ticket.widRev);
   assert.equal(f.journal.entries().filter(e => e.type === "retired").length, 1);
+  const item = f.journal.entries().find(e => e.type === JT.attention)!.item as { id: string; rev: number };
+  const resolutions = f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === item.id && e.rev === item.rev);
+  assert.equal(resolutions.length, 1); assert.equal(resolutions[0]!.resolution, "retired");
   const req: Request = { rid: "retired-send", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "late" } };
   assert.deepEqual(await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 }), { action: "reject", reason: "stale-revision" });
+});
+
+test("P27 recovery completes interrupted retirement attention cleanup exactly once", { timeout: 10000 }, async t => {
+  const f = await setup(t), ticket = f.ticket(), exec = `${ticket.callId}#1.1`;
+  await f.journal.append(JT.exec, { exec, call: ticket.callId });
+  await f.journal.append(JT.attention, { item: { id: `q:${ticket.callId}:q`, rev: 1, kind: "question", call: ticket.callId, wid: f.wid, text: "Pending" } });
+  await f.journal.append("retired", { call: ticket.callId });
+  await f.executor.recover(f.wid, f.journal);
+  await f.executor.recover(f.wid, f.journal);
+  const resolutions = f.journal.entries().filter(e => e.type === JT.attentionResolved);
+  assert.equal(resolutions.length, 1);
+  assert.equal(resolutions[0]!.resolution, "retired");
+  assert.equal(resolutions[0]!.id, `q:${ticket.callId}:q`);
+  assert.ok(f.journal.entries().some(e => e.type === JT.fenced && e.seq < resolutions[0]!.seq));
+  assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0);
 });
 
 test("X1 seal retires forwards lacking child receipts and recovery never republishes them", { timeout: 30000 }, async t => {
@@ -467,11 +486,11 @@ test("X1 seal retires forwards lacking child receipts and recovery never republi
   const req: Request = { rid: "unseen", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "answer", message: "no question" }, cond: { qid: "absent", rev: 1 } };
   await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 });
   await f.journal.append(JT.exec, { exec: `${ticket.callId}#1.1`, call: ticket.callId });
-  await f.executor.stop({ wid: "wf" });
+  await f.executor.stop({ wid: f.wid });
   const retired = f.journal.entries().find(e => e.type === "forward-retired")!;
   assert.equal(retired.rid, req.rid); assert.equal(retired.reason, "retired-without-child-receipt");
-  const file = join(callInbox(f.home, "wf", "a", 1), `${retired.rid2}.json`); await rm(file);
-  await f.executor.recover("wf", f.journal);
+  const file = join(callInbox(f.home, f.wid, "a", 1), `${retired.rid2}.json`); await rm(file);
+  await f.executor.recover(f.wid, f.journal);
   assert.equal(existsSync(file), false);
 });
 
@@ -484,7 +503,7 @@ test("X1 suspend preserves the open executor and resumes the same native session
   assert.equal(f.executor.busy(), false);
   assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0);
   assert.equal((await f.executor.run(ticket)).output, "continued after suspend");
-  const native = (await readFile(callSession(f.home, "wf", "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  const native = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
   assert.equal(native.filter(e => e.type === "session").length, 1);
   assert.equal(native.filter(e => e.customType === CT.exec).length, 2);
 });
@@ -503,13 +522,13 @@ test("X1 K7 skips the third-loss candidate and changes the continuation's model"
 test("X1 durable child budget receipt outranks a report on recovery", { timeout: 10000 }, async t => {
   const f = await setup(t), ticket = f.ticket(), exec = `${ticket.callId}#1.1`;
   await f.journal.append(JT.exec, { exec, call: ticket.callId });
-  await mkdir(callDir(f.home, "wf", "a", 1), { recursive: true });
-  await writeFile(callSession(f.home, "wf", "a", 1), [
+  await mkdir(callDir(f.home, f.wid, "a", 1), { recursive: true });
+  await writeFile(callSession(f.home, f.wid, "a", 1), [
     { type: "custom", customType: CT.exec, data: { exec } },
     { type: "custom", customType: CT.report, data: { exec, outcome: "ok", data: { ignored: true } } },
     { type: "custom", customType: CT.budget, data: { exec, usage: { tokens: 1 } } },
   ].map(e => JSON.stringify(e)).join("\n") + "\n");
-  await f.executor.recover("wf", f.journal);
+  await f.executor.recover(f.wid, f.journal);
   assert.equal((await f.executor.run(ticket)).status, "budget");
   assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 1);
 });

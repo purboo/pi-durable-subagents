@@ -3,8 +3,8 @@ import { openJournal } from "../../../src/kernel/journal.ts";
 import createExecutor from "../../../src/orchestrator/executor/index.ts";
 import { JT } from "../../../src/types.ts";
 import { journalPath, orchLedger } from "../../../src/paths.ts";
-const home = process.env.DSA_HOME!;
-const journal = await openJournal(journalPath(home, "wf"));
+const home = process.env.DSA_HOME!, wid = process.env.TEST_WID!;
+const journal = await openJournal(journalPath(home, wid));
 const orch = await openJournal(orchLedger(home));
 const wrapped = { ...journal, async append<T extends string>(type: T, fields: Record<string, unknown>) {
   const e = await journal.append(type, fields);
@@ -12,4 +12,4 @@ const wrapped = { ...journal, async append<T extends string>(type: T, fields: Re
   return e;
 } };
 const executor = createExecutor({ home, orch, config: {} });
-await executor.recover("wf", wrapped);
+await executor.recover(wid, wrapped);

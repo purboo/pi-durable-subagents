@@ -59,9 +59,11 @@ export async function observeExecution(d: Dependencies) {
   lines.on("line", line => {
     let event: Record<string, unknown>;
     try { event = JSON.parse(line); } catch { return; }
-    const now = performance.now();
+    if (ending) return;
+    // P18: Apply RPC boundaries at receipt, before any in-flight scan can resume.
+    // Durable observations remain queued; clock transitions never wait on I/O.
+    clock.event(event, performance.now());
     enqueue(async () => {
-      clock.event(event, now);
       const slim = observation(event);
       if (slim) {
         await serial(() => t.journal.append("observation", { exec, event: slim }));

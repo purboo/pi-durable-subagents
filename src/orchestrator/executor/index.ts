@@ -122,6 +122,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await t.journal.append(JT.attention, { item: { id, rev: 1, kind: "budget", text: "Workflow budget reached", wid: t.wid } });
     return hit;
   }
+  async function retireAttention(journal: JournalHandle, call: string) {
+    for (const e of journal.entries().filter(e => e.type === JT.attention)) {
+      const item = e.item as { id: string; rev: number; call?: string };
+      if (item.call === call && !journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev))
+        await journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "retired" });
+    }
+  }
   async function finish(journal: JournalHandle, call: string, exec: string, result: CallResult) {
     const value = await serial(async () => {
       const old = sealed(journal, call);
@@ -135,11 +142,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await retireForwards(journal, call);
       const selected = journal.entries().find(e => e.type === "selected" && e.exec === exec);
       if (selected?.pool && result.status === "ok") await orch.append("candidate-success", { pool: selected.pool, model: `${(selected.model as Model).provider}/${(selected.model as Model).id}`, exec });
-      for (const e of journal.entries().filter(e => e.type === JT.attention)) {
-        const item = e.item as { id: string; rev: number; call?: string };
-        if (item.call === call && !journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev))
-          await journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "retired" });
-      }
+      await retireAttention(journal, call);
       return result;
     });
     await release(exec); return value;
@@ -407,7 +410,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const a = address(call), values = sessionUsage(await readSession(callSession(home, a.wid, a.key, a.gen)));
         await serial(async () => {
           for (const u of values) if (!journal.entries().some(e => e.type === "usage" && e.call === call && e.id === u.id)) await journal.append("usage", { call, ...u });
-          if (sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) await retireForwards(journal, call);
+          if (sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) {
+            await retireForwards(journal, call); await retireAttention(journal, call);
+          }
         });
       }
       for (const e of journal.entries().filter(e => e.type === "forward" && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2))) await replayForward(e);
@@ -423,7 +428,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       for (const call of calls) {
         const a = active.get(call); if (a) await a.promise;
         for (const e of journal.entries().filter(e => e.type === JT.exec && e.call === call)) { await fence(journal, String(e.exec)); await release(String(e.exec)); }
-        await serial(() => retireForwards(journal, call));
+        await serial(async () => { await retireForwards(journal, call); await retireAttention(journal, call); });
       }
     },
     busy: () => active.size > 0,
