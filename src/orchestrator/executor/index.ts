@@ -355,7 +355,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       let child: Spawned;
       try {
         child = await containment.spawn({ exec, command: "pi", args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
-          env: { DSA_HOME: home, DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}) } });
+          env: { DSA_HOME: home, DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
       } catch (error) {
         await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
       }

@@ -54,6 +54,7 @@ export async function tail(home: string, wid: string | undefined, write: (line: 
 }
 /** P1, P21, P25, P38: Dispatch the public CLI using durable requests and read-only snapshots. */
 export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner } = {}): Promise<number> {
+  if (args[0] === "chaos") return (await import("./chaos/index.ts")).chaos(args.slice(1), options.env ?? process.env, options.write);
   const { command, target, json, dryRun } = parseArgs(args), env = options.env ?? process.env;
   const home = dsaHome(env), write = options.write ?? (line => console.log(line));
   if (command === "help") { write("pi-durable-subagents: smoke | status [wid] [--json] | tail [wid] | resume [wid] | drain | stop <wid|callId> | stop-all | install-service [--dry-run] | uninstall-service [--dry-run]"); return 0; }

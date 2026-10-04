@@ -132,6 +132,13 @@ export function registerChild(pi: ExtensionAPI): void {
         setImmediate(() => process.exit(0)); return;
       }
       state = recover(ctx.sessionManager.getEntries(), call); active = true; pi.appendEntry(CT.exec, { exec });
+      // C8: pi can resolve the session's model before an extension-registered provider exists ("Unknown provider").
+      // The executor names the model it holds a slot for; apply it before any provider request if pi did not.
+      const held = process.env[ENV.model], slash = held?.indexOf('/') ?? -1;
+      if (held && slash > 0 && `${ctx.model?.provider}/${ctx.model?.id}` !== held) {
+        const model = ctx.modelRegistry.find(held.slice(0, slash), held.slice(slash + 1));
+        if (model) await pi.setModel(model);
+      }
       watcher = watch(inbox, () => { void serial(async () => { await consume(ctx, blocked ? 'ask' : 'idle'); }).catch(error => fail(ctx, error)); });
       watcher.on('error', error => fail(ctx, error));
       await consume(ctx, 'idle');

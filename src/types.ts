@@ -330,5 +330,6 @@ export const ENV = {
   inbox: "DSA_INBOX",     // absolute path of this call's inbox dir
   journal: "DSA_JOURNAL", // absolute path of the workflow journal (read-only snapshot for the launch gate)
   schema: "DSA_SCHEMA",   // absolute path of report JSON schema, if any
-  budget: "DSA_BUDGET",   // JSON {tokens?, costUsd?}: per-call budget; the child refuses the next provider request once reached (P31b)
+  budget: "DSA_BUDGET",
+  model: "DSA_MODEL",     // "provider/id" the executor holds a slot for; the child re-applies it if pi started without it (C8)   // JSON {tokens?, costUsd?}: per-call budget; the child refuses the next provider request once reached (P31b)
 } as const;
