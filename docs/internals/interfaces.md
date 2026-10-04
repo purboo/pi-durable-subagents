@@ -812,3 +812,153 @@ Not in this leaf: `chaos`, which comes later with X2.
 real engine with the fake executor; `drain`/`stop` request envelopes and
 outbox republish; `smoke` on this machine; service file generation (render
 only, never install into the real user's home: use a temp HOME).
+
+## Wave 4 contracts
+
+New pins (commit 91964e1):
+
+- `CallEffects` in `src/orchestrator/contract.ts`;
+- `CallTicket.originSession`, `CallTicket.continueFrom`, `CallTicket.opening`;
+- `RunBody.origin`, which the main agent always fills from its session file and current leaf.
+
+### X2b · Call effects (`src/orchestrator/executor/effects/`, `test/unit/orchestrator/effects/`, `test/pi/effects/`)
+
+The default export is `createEffects(ledgers): CallEffects`. The executor
+wiring belongs to X2a; you only implement and test the interface. Put
+private journal entries in the workflow journal and document them in the
+header comment.
+
+- **Worktree (P32).** For `spec.isolation === "worktree"`:
+  1. Commit `wt-intent{call, path, branch, base}`. The path is
+     `<cwd>/.dsa/<wid>/<key>`, the branch is `dsa/<wid>/<key>`, and the base
+     is `git rev-parse HEAD` in the call cwd at first prepare (recorded).
+  2. `git worktree add -b <branch> <path> <base>`.
+  3. Commit `wt-created{call}`.
+
+  Then return the path as the cwd. On a repeat, reconcile with
+  `git worktree list --porcelain` plus the branch head: reuse an existing
+  worktree; create it if the intent has no worktree.
+
+  `afterSeal`: on `ok`, remove the worktree only if
+  `git status --porcelain` is empty (`wt-removed`). A dirty worktree is kept
+  and reported through `JT.attention{kind:"unknown"}`, whose text names the
+  path. Keep everything on failure. The branch is always kept. A non-git
+  cwd is an error: `prepare` throws and the executor seals `failed`.
+- **Fork (P33).** For `spec.context === "fork"` with `t.originSession`:
+  1. Build a new pi session file at `sessionPath`. It gets a fresh header
+     (new id, cwd = the call cwd, version copied from the origin header) and
+     the origin's message and model entries in branch order, re-parented as
+     a linear chain. Drop every `dsa-*` custom entry.
+  2. Publish it no-replace with kernel `publishFile`. If an identical
+     result already exists, that counts as done.
+
+  Without `originSession`, throw `fork requested but the run has no origin
+  session`. Study pi's session JSONL format in
+  `node_modules/@earendil-works/pi-coding-agent/dist/core/session-manager.*`
+  (root-export types only in code; the format knowledge may come from
+  reading `dist`).
+- **Gate (P30).** Accepted forms are a string, or `{command, output?:"json",
+  schema?, timeoutMs?}`.
+
+  1. Commit `gate-intent{call, id:"gate:<call>#<n>"}`, where n is
+     1 + the number of earlier intents of that call.
+  2. Run `sh -c <command>` in the call cwd through `Containment.spawn`, with
+     exec = the gate id. Pass env `DSA_RESULT` (a path to the result JSON),
+     `DSA_CALL` and `DSA_OUTPUT` (the call's output text in a file).
+  3. Record `gate{id, exit, json?}`.
+
+  The outcome:
+
+  | Condition | Seal |
+  |---|---|
+  | non-zero exit | `gate-failed` |
+  | invalid JSON, or schema failure (use `src/agent/child/schema.ts` `validate`) | `gate-failed` |
+  | timeout | fence, then `gate-failed` |
+  | `ctl.signal` abort | fence, return the result unchanged |
+
+  When the gate passes, put its JSON in `result.data.gate`.
+
+  `recover(journal)`: fence every gate id that has an intent but no `gate`
+  record, then record `gate{id, unknown:true}`. `beforeSeal` then turns
+  that into status `unknown` and never re-runs the gate (A5).
+- **Outputs (P19).** For `spec.output`:
+  - **Relative path:** publish the output text immutably as
+    `artifactsDir/<key>@<gen>/<n>-<basename>` with `publishFile`, and
+    atomically point `latest` at it (symlink tmp + rename + dir fsync).
+  - **Absolute path:** write it best effort: tmp, fsync, rename, dir fsync.
+    If the existing file's hash differs from the last hash we wrote, skip it
+    and add a `JT.attention{kind:"unknown"}` naming the conflict.
+
+  Add the paths to `result.artifacts`. Use `paths.artifactsDir`.
+
+**Tests:** use real git in temp dirs, real `sh` processes, and pi-format
+session fixtures. Cover the crash windows (intent with no effect, effect
+with no record) and idempotent repeats.
+
+### X2a · Generations, hibernation, effects wiring (owns `src/orchestrator/executor/index.ts`, `engine.ts`, `store.ts`, tests)
+
+- **Generations (P37).** Engine: a `send` (steer or follow-up) to a sealed
+  call opens generation g+1.
+  1. Allocate gen = 1 + the maximum gen for (wid, key) across revisions.
+  2. Commit `generation{rid, key, gen, from: <sealed callId>}` as the
+     `send`'s resolution (A3: a retry of the same rid returns the same
+     generation).
+  3. `executor.run(ticket{continueFrom, opening})`.
+
+  Later sends are forwarded to g+1 in admission order. This also works
+  after `JT.done` of the workflow: the generation lives outside the script.
+  Its seal produces `JT.attention{kind:"finished"}` for the origin, naming
+  the call. Starter and idle exit must treat an unsealed generation as
+  pending work, and recovery re-runs unsealed generations.
+
+  Executor: the first execution of g+1 copies the session of g (no-replace
+  publish) and delivers `opening` as its task (kind steer/follow-up becomes
+  a `task` request, receipt as usual).
+- **Hibernation (P28).**
+  - **Enter:** when a child has had an open question (`CT.question` without
+    an answer) for K8 (2 min, `config.k.hibernateMs`), commit
+    `hibernated{call, qid, rev}`, fence (this is not a loss), and release
+    the provider and memory holdings.
+  - **Answer:** `forward` of an `answer` (cond qid/rev) to a hibernated
+    call. If it matches the open qid@rev, commit
+    `answer-bound{call, qid, rev, rid}` and resume. A duplicate or stale
+    answer is rejected (`already-answered`/`stale-rev`); an answer to a
+    retired question gets `retired`.
+  - **Resume:**
+    1. Reacquire the holdings without hold-and-wait.
+    2. Commit `resumed{call, rid}`.
+    3. Run a new execution whose request is a `continue` whose message
+       states the question and the answer.
+
+    The child's receipt for that message is the answer's receipt.
+    Recovery: if the session already has that receipt, do not deliver it
+    again.
+  - **Other cases:** stop, timeout, budget and retire still settle or
+    retire a hibernated call. Time spent hibernated is not active time.
+  - **Child side:** for the question to close in the child history, the
+    `continue` request carries `cond:{qid, rev}`. If the child needs a
+    change to mark the question answered on such a receipt, ask the parent
+    (`src/agent/child*` is parent-owned).
+- **Effects wiring.**
+  - Construct `createEffects(ledgers)`. Until X2b lands, use a local no-op
+    stub with the same interface in a separate file that the parent
+    replaces.
+  - Call `prepare` before the first execution of each call generation, and
+    use its cwd.
+  - Call `beforeSeal` on non-stop outcomes, passing an AbortSignal that
+    fires on a stop/timeout/budget decision.
+  - Call `afterSeal` after the seal, and `recover` in `executor.recover`.
+- **Engine pinning.** Stage `RunBody.origin` at admission: the branch to
+  `leafId` (following `parentId`), keeping only `message` and
+  `model_change` entries, written to `pinned/origin.jsonl`. Pass it as
+  `ticket.originSession`.
+
+**Tests:**
+
+- real pi tests: send to a sealed call opens g+1 on the same session and
+  seals it; a retry of the same rid gives the same generation;
+- hibernation: enter, answer, resume, with no loss counted; a duplicate
+  answer is rejected; a crash after `answer-bound` and before delivery
+  delivers exactly once; stop while hibernated;
+- the origin pin;
+- the effects call order, with a recording stub.
