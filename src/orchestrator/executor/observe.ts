@@ -1,6 +1,7 @@
 // Private workflow entries: observation{exec,event}; timeout-intent{exec,call}; settled{exec}.
 // time{exec,active} is per execution; stall attention stores exec/horizon only for live re-arm.
-import { watch } from "node:fs";
+import { appendFileSync, watch } from "node:fs";
+import { join } from "node:path";
 import { stat as fileStat } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
@@ -54,7 +55,10 @@ export async function observeExecution(d: Dependencies) {
     else if (!open && !clock.asking && performance.now() - clock.last >= (config.k?.stallMs ?? 600000))
       await t.journal.append(JT.attention, { exec, horizon: clock.last, item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text: "No execution activity", wid: t.wid, call: t.callId } });
   });
-  child.stdin.on("error", () => {}); child.stderr.resume();
+  child.stdin.on("error", () => {});
+  // Diagnostics only (never evidence for decisions): keep the first 256 KiB of the child's stderr per call.
+  let logged = 0; const log = join(callDir(home, t.wid, t.key, t.gen), "stderr.log");
+  child.stderr.on("data", (chunk: Buffer) => { if (logged < 262144) { logged += chunk.length; try { appendFileSync(log, chunk.subarray(0, Math.max(0, 262144 - logged + chunk.length))); } catch { /* best effort */ } } });
   const lines = createInterface({ input: child.stdout });
   lines.on("line", line => {
     let event: Record<string, unknown>;

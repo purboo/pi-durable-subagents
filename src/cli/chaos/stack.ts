@@ -28,7 +28,7 @@ export function stack(root: string, inherited: NodeJS.ProcessEnv) {
   const home = join(root, "dsa"), cwd = join(root, "work"), agent = join(root, "agent"), session = join(root, "main.jsonl");
   for (const dir of [home, agent, join(root, "home"), join(cwd, ".pi/agents")]) mkdirSync(dir, { recursive: true });
   const sibling = (name: string) => fileURLToPath(new URL(name + (import.meta.url.endsWith(".ts") ? ".ts" : ".js"), import.meta.url));
-  writeFileSync(join(agent, "settings.json"), JSON.stringify({ extensions: [sibling("../../agent/extension"), sibling("./provider")],
+  writeFileSync(join(agent, "settings.json"), JSON.stringify({ extensions: [sibling("./provider"), sibling("../../agent/extension"), sibling("./observer")],
     defaultProvider: "dsa-chaos", defaultModel: "scripted", retry: { enabled: false }, compaction: { enabled: false }, defaultProjectTrust: "always" }));
   writeFileSync(join(home, "config.json"), JSON.stringify({ providers: { "dsa-chaos": 3 }, k: { trackerMs: 100, checkpointMs: 200, idleExitMs: 2000 } }));
   for (const name of ["writer", "reviewer", "integrator"]) writeFileSync(join(cwd, `.pi/agents/${name}.md`), `---\nname: ${name}\ndescription: Chaos ${name}\nmodel: dsa-chaos/scripted\ntools: bash, ask\n---\nFollow the scripted task.\n`);

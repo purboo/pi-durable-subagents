@@ -30,13 +30,15 @@ export async function chaos(args: string[], env = process.env, write: (text: str
   }
   // pi's own startup faults (scripted provider missing at start) are restarted by the driver and reported honestly.
   const piStartupRetries = scenarios.reduce((n, k) => { try { return n + readFileSync(join(root, String(k), "pi-startup-retries.jsonl"), "utf8").trim().split("\n").filter(Boolean).length; } catch { return n; } }, 0);
-  const report = { passed: !failure, results, piStartupRetries, ...(failure ? { failure } : {}), ...((options.keep || failure) ? { evidence: root } : {}) };
+  const piFaults = scenarios.reduce((n, k) => { try { return n + new Set(readFileSync(join(root, String(k), "provider.jsonl"), "utf8").split("\n").filter(l => l.includes('"kind":"pi-fault"')).map(l => JSON.parse(l).exec)).size; } catch { return n; } }, 0);
+  const report = { passed: !failure, results, piStartupRetries, piFaults, ...(failure ? { failure } : {}), ...((options.keep || failure) ? { evidence: root } : {}) };
   writeFileSync(join(root, "report.json"), JSON.stringify(report, null, 2));
   if (options.json) write(JSON.stringify(report));
   else {
     const has = (n: number) => results.some(r => r.scenario === n) ? 1 : 0;
     write(`  killed host ×${has(9)} · dropped streams ×${has(1)} · empty replies ×${has(3) + 5 * has(8)} · out-of-order steers ×${has(6)}`);
     if (piStartupRetries) write(`  pi startup retries ×${piStartupRetries} (pi started without the scripted provider; restarted before the scenario)`);
+    if (piFaults) write(`  pi model-resolution faults ×${piFaults} (pi answered without a provider; recovered as a loss and continued)`);
     if (failure) write(`  scenario ${failure.scenario} FAILED: ${failure.invariant}\n  evidence: ${failure.evidence.join("\n  ")}`);
     else write(`  duplicate runs ........ 0\n  lost results .......... 0\n  restarted from scratch  0\n  AC4 wakes / reminders . pass\n  ${options.scenario ? `scenario ${options.scenario}` : "all 9 scenarios"} ....... pass`);
     if (options.keep || failure) write(`  kept: ${root}`);
