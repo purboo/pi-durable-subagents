@@ -53,7 +53,7 @@ async function respond(context: any, options: any, _state?: any, model?: any) {
 }
 
 export default function (pi: ExtensionAPI) {
-  const faux = fauxProvider({ provider: "probe", api: "probe-faux", models: [{ id: "scripted", name: "Scripted" }, { id: "scripted2", name: "Scripted Two" }], tokensPerSecond: 200 });
+  const faux = fauxProvider({ provider: "probe", api: "probe-faux", models: [{ id: "scripted", name: "Scripted" }, { id: "scripted2", name: "Scripted Two" }, { id: "thinker", name: "Thinker", reasoning: true }], tokensPerSecond: 200 });
   faux.setResponses(Array.from({ length: 500 }, () => respond as any));
   pi.registerProvider(faux.provider as any);
 

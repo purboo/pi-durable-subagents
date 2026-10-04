@@ -8,7 +8,7 @@ import { openJournal } from '../../../src/kernel/journal.ts';
 import { publishRequest } from '../../../src/kernel/mailbox.ts';
 import { startPi, tempRoot, REPO, script, settled, type PiInstance } from '../../harness/pi.ts';
 
-async function fixture(t: any, options: { stale?: boolean; fenced?: boolean; schema?: unknown } = {}) {
+async function fixture(t: any, options: { stale?: boolean; fenced?: boolean; schema?: unknown; budget?: unknown } = {}) {
   const root = tempRoot('dsa-child-'), inbox = join(root, 'inbox'), journal = join(root, 'journal.jsonl');
   await mkdir(inbox);
   const log = await openJournal(journal);
@@ -16,6 +16,7 @@ async function fixture(t: any, options: { stale?: boolean; fenced?: boolean; sch
   if (options.fenced) await log.append(JT.fenced, { exec: 'exec' });
   await log.close();
   const env: Record<string, string> = { DSA_HOME: root, DSA_EXEC: 'exec', DSA_CALL: 'call', DSA_INBOX: inbox, DSA_JOURNAL: journal };
+  if (options.budget !== undefined) env.DSA_BUDGET = JSON.stringify(options.budget);
   if (options.schema !== undefined) { env.DSA_SCHEMA = join(root, 'schema.json'); await writeFile(env.DSA_SCHEMA, JSON.stringify(options.schema)); }
   let sequence = 0;
   const send = async (kind: Request['kind'], body: unknown, cond?: Request['cond']) => {
@@ -191,4 +192,37 @@ test('report schema rejects invalid data then terminates after a valid report', 
   assert.equal(results[1].isError, false);
   assert.equal(pi.sessionEntries().filter(e => e.customType === CT.report).length, 1);
   assert.equal(pi.events.filter(e => e.type === 'message_start' && (e.message as any)?.role === 'assistant').length, 2);
+});
+
+test('follow-up waits for the run to settle while steer lands at turn_end; model switch applies thinking', { timeout: 40000 }, async t => {
+  const f = await fixture(t);
+  await f.send('task', { message: script([{ tool: 'bash', args: { command: 'sleep 1' } }, { text: 'finished' }, { text: 'after follow-up' }]) });
+  const pi = f.start(); await pi.waitFor(e => e.type === 'tool_execution_start');
+  const follow = await f.send('follow-up', { message: 'later please' });
+  const model = await f.send('model', { provider: 'probe', model: 'thinker', thinking: 'high' });
+  await until(() => receipts(pi, follow.rid).length === 1 && pi.events.some(e => e.type === 'agent_settled'), 20000);
+  const history = pi.sessionEntries();
+  const finished = history.findIndex(e => e.message?.role === 'assistant' && JSON.stringify(e.message.content).includes('finished'));
+  const delivered = history.findIndex(e => e.customType === CT.msg && e.details.rid === follow.rid);
+  assert.ok(finished >= 0 && delivered > finished, 'follow-up is delivered only after the run produced its final answer');
+  assert.ok(history.some(e => e.message?.role === 'assistant' && JSON.stringify(e.message.content).includes('after follow-up')));
+  const switched = history.find(e => e.customType === CT.model && e.data.rid === model.rid);
+  assert.equal(switched?.data.thinking, 'high');
+  const id = pi.send({ type: 'get_state' }); const state = await pi.waitFor(e => e.type === 'response' && e.id === id) as any;
+  assert.equal(state.data?.thinkingLevel, 'high');
+});
+
+test('per-call budget refuses the next provider request at the boundary', { timeout: 40000 }, async t => {
+  const f = await fixture(t, { budget: { tokens: 1 } });
+  await f.send('task', { message: script([{ tool: 'bash', args: { command: 'true' } }, { text: 'must not run' }]) });
+  const pi = f.start(); await pi.waitFor(settled);
+  const history = pi.sessionEntries();
+  const refusal = history.find(e => e.customType === CT.budget);
+  assert.ok(refusal, 'budget refusal entry'); assert.equal(refusal.data.exec, 'exec'); assert.ok(refusal.data.usage.tokens >= 1);
+  assert.ok(!history.some(e => e.message?.role === 'assistant' && JSON.stringify(e.message.content).includes('must not run')));
+  // pi records the refused turn as an aborted assistant message with zero usage; the provider saw one request only.
+  const calls = (await readFile(join(pi.dir, 'ext.log'), 'utf8')).split('\n').filter(l => l.includes(' respond ')).length;
+  assert.equal(calls, 1, 'the provider received exactly one request');
+  const last = history.filter(e => e.message?.role === 'assistant').at(-1)!.message;
+  assert.equal(last.usage.totalTokens, 0);
 });

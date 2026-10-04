@@ -2,6 +2,7 @@ import { watch, type FSWatcher } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { Type } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from '@earendil-works/pi-coding-agent';
+import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import { CT, ENV, JT, type MessageBody, type ModelBody } from '../types.ts';
 import { readJournalSnapshot } from '../kernel/journal.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
@@ -11,7 +12,22 @@ import { openness } from '../kernel/guards.ts';
 import { recover, type Question } from './child/history.ts';
 import { validate } from './child/schema.ts';
 
-type Mode = 'idle' | 'boundary' | 'ask';
+// boundary = turn_end (steer lands between turns); settle = agent_before_settle (follow-ups land only here or idle).
+type Mode = 'idle' | 'boundary' | 'settle' | 'ask';
+const MESSAGES = ['task', 'steer', 'follow-up', 'continue'];
+type SessionLike = { id?: string; type?: string; message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } } } };
+/** P31: Session usage, deduplicated by entry id, over every execution of this call's session. */
+export function usage(entries: readonly SessionLike[]): { tokens: number; costUsd: number } {
+  let tokens = 0, costUsd = 0; const seen = new Set<string>();
+  for (const e of entries) {
+    const u = e.type === 'message' && e.message?.role === 'assistant' ? e.message.usage : undefined;
+    if (!u || (e.id && seen.has(e.id))) continue;
+    if (e.id) seen.add(e.id);
+    tokens += u.totalTokens ?? (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+    costUsd += u.cost?.total ?? 0;
+  }
+  return { tokens, costUsd };
+}
 type Delivery = { content: { type: 'text'; text: string }[]; details: Record<string, unknown> };
 /** P4, P8, P23, P24: Consume the child mailbox at serialized pi boundaries, retaining native session receipts. */
 export function registerChild(pi: ExtensionAPI): void {
@@ -33,7 +49,7 @@ export function registerChild(pi: ExtensionAPI): void {
     let delivered = false;
     const plans = planDecisions(state.records, candidates, req => {
       if (req.to !== call) return { action: 'reject', reason: 'wrong-recipient' };
-      if (['task', 'steer', 'continue', 'answer'].includes(req.kind) && typeof (req.body as MessageBody)?.message !== 'string') return { action: 'reject', reason: 'malformed' };
+      if ([...MESSAGES, 'answer'].includes(req.kind) && typeof (req.body as MessageBody)?.message !== 'string') return { action: 'reject', reason: 'malformed' };
       if (req.kind === 'answer') {
         const qid = req.cond?.qid, rev = req.cond?.rev, question = qid ? state.questions.get(qid) : undefined;
         if (state.answered.has(`${qid}@${rev}`)) return { action: 'reject', reason: 'already-answered' };
@@ -46,8 +62,8 @@ export function registerChild(pi: ExtensionAPI): void {
         const body = req.body as ModelBody;
         return body && ctx.modelRegistry.find(body.provider, body.model) ? { action: 'apply' } : { action: 'reject', reason: 'unknown-model' };
       }
-      if (['task', 'steer', 'continue'].includes(req.kind)) {
-        if (mode === 'idle' && delivered) return { action: 'defer' };
+      if (MESSAGES.includes(req.kind)) {
+        if ((mode === 'idle' && delivered) || (req.kind === 'follow-up' && mode === 'boundary')) return { action: 'defer' };
         delivered = true; return { action: 'apply' };
       }
       return { action: 'reject', reason: 'unsupported' };
@@ -55,7 +71,7 @@ export function registerChild(pi: ExtensionAPI): void {
     // Idle delivery starts pi immediately. Commit only through that message's receipt;
     // later decisions must be reconsidered at the next boundary, in history order.
     if (mode === 'idle') {
-      const firstMessage = plans.findIndex(d => d.type === 'applied' && ['task', 'steer', 'continue'].includes(byRid.get(d.rid)!.kind));
+      const firstMessage = plans.findIndex(d => d.type === 'applied' && MESSAGES.includes(byRid.get(d.rid)!.kind));
       if (firstMessage >= 0) plans.splice(firstMessage + 1);
     }
     const entries: SessionBoundaryDraft[] = [];
@@ -75,7 +91,8 @@ export function registerChild(pi: ExtensionAPI): void {
         if (req.kind === 'model') {
           const body = req.body as ModelBody, model = ctx.modelRegistry.find(body.provider, body.model)!;
           if (!(await pi.setModel(model))) throw new Error(`Cannot activate model ${body.provider}/${body.model}`);
-          record(CT.model, { rid: req.rid, provider: body.provider, model: body.model });
+          if (body.thinking) pi.setThinkingLevel(body.thinking as ThinkingLevel);
+          record(CT.model, { rid: req.rid, provider: body.provider, model: body.model, ...(body.thinking ? { thinking: body.thinking } : {}) });
         } else if (mode === 'ask' && waiter) {
           const text = (req.body as MessageBody).message;
           answer = req.kind === 'answer'
@@ -88,7 +105,7 @@ export function registerChild(pi: ExtensionAPI): void {
       }
     }
     state.records.push(...plans);
-    if (mode !== 'boundary') {
+    if (mode !== 'boundary' && mode !== 'settle') {
       // A single idle message is last: once it starts pi, further work waits for a boundary.
       const message = entries.find(e => e.type === 'custom_message');
       for (const entry of entries) if (entry.type === 'custom') pi.appendEntry(entry.customType, entry.data);
@@ -113,12 +130,25 @@ export function registerChild(pi: ExtensionAPI): void {
       await consume(ctx, 'idle');
     });
   });
-  const boundary = async (_event: unknown, ctx: ExtensionContext) => {
-    try { return await serial(async () => { const entries = await consume(ctx, 'boundary'); return { entries, continue: entries.some(e => e.type === 'custom_message' || (e.type === 'custom' && e.customType === CT.model)) }; }); }
+  const boundary = (mode: 'boundary' | 'settle') => async (_event: unknown, ctx: ExtensionContext) => {
+    try { return await serial(async () => { const entries = await consume(ctx, mode); return { entries, continue: entries.some(e => e.type === 'custom_message' || (e.type === 'custom' && e.customType === CT.model)) }; }); }
     catch (error) { fail(ctx, error); }
   };
-  pi.on('turn_end', boundary);
-  pi.on('agent_before_settle', boundary);
+  pi.on('turn_end', boundary('boundary'));
+  pi.on('agent_before_settle', boundary('settle'));
+  // P31b, V8: refuse the next provider request once the per-call budget is reached (one in-flight overshoot at most).
+  const budget = process.env[ENV.budget] ? JSON.parse(process.env[ENV.budget]!) as { tokens?: number; costUsd?: number } : undefined;
+  if (budget) pi.on('context', async (_event, ctx) => {
+    if (!active) return;
+    const used = usage(ctx.sessionManager.getEntries() as unknown as SessionLike[]);
+    if ((budget.tokens === undefined || used.tokens < budget.tokens) && (budget.costUsd === undefined || used.costUsd < budget.costUsd)) return;
+    await serial(async () => {
+      if (!active) return;
+      active = false; watcher?.close();
+      pi.appendEntry(CT.budget, { exec, usage: used });
+      ctx.abort();
+    });
+  });
   pi.on('session_shutdown', async () => {
     active = false; watcher?.close(); blocked?.reject(new Error('Session shut down')); blocked = undefined; await queue;
   });
