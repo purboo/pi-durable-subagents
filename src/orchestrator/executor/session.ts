@@ -5,7 +5,7 @@ import type { Model } from "../../compat/model.ts";
 interface Block { type?: string; text?: string; id?: string; name?: string }
 interface Message { role?: string; content?: string | Block[]; stopReason?: string; toolCallId?: string; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
 export interface SessionEntry {
-  type: string; customType?: string; data?: Record<string, unknown>; message?: Message;
+  type: string; id?: string; customType?: string; data?: Record<string, unknown>; message?: Message;
   provider?: string; modelId?: string;
 }
 /** C5: Read complete native session entries, ignoring only an unfinished trailing line. */
@@ -36,7 +36,8 @@ export function evidence(entries: SessionEntry[], exec: string) {
     }
     if (m?.role === "toolResult" && m.toolCallId) tools.delete(m.toolCallId);
   }
-  return { report, text, dangling: [...tools].map(([id, name]) => `${name} (${id})`), usage };
+  const budget = segment.some(e => e.type === "custom" && e.customType === CT.budget && e.data?.exec === exec);
+  return { report, budget, text, dangling: [...tools].map(([id, name]) => `${name} (${id})`), usage };
 }
 /** P13, C8: Restore the effective provider from the native session's model changes. */
 export function sessionModel(entries: SessionEntry[]): Model | undefined {

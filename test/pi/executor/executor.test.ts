@@ -16,6 +16,7 @@ import { CT, JT, type JournalHandle, type Request } from "../../../src/types.ts"
 import type { CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
 import createExecutor from "../../../src/orchestrator/executor/index.ts";
+import { availableMemory } from "../../../src/orchestrator/executor/memory.ts";
 import { evidence } from "../../../src/orchestrator/executor/session.ts";
 
 const recorder = fileURLToPath(new URL("recorder.ts", import.meta.url));
@@ -24,7 +25,7 @@ async function until(predicate: () => boolean | Promise<boolean>, ms = 15000) {
   const deadline = Date.now() + ms;
   while (!await predicate()) { if (Date.now() >= deadline) throw new Error("Timed out waiting for durable executor evidence"); await delay(20); }
 }
-async function setup(t: TestContext, config: OrchestratorConfig = {}) {
+async function setup(t: TestContext, config: OrchestratorConfig = {}, options: Parameters<typeof createExecutor>[1] = {}) {
   const root = tempRoot("dsa-executor-"), home = join(root, "dsa"), cwd = join(root, "work");
   await mkdir(cwd, { recursive: true });
   const old = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PROBE_DIR: process.env.PROBE_DIR, PI_OFFLINE: process.env.PI_OFFLINE, PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK };
@@ -35,7 +36,7 @@ async function setup(t: TestContext, config: OrchestratorConfig = {}) {
   await writeFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), JSON.stringify({ extensions: [FAUX], defaultProvider: "probe", defaultModel: "scripted" }));
   const orch = await openJournal(orchLedger(home));
   let journal = await openJournal(journalPath(home, "wf"));
-  const executor = createExecutor({ home, orch, config });
+  const executor = createExecutor({ home, orch, config }, options);
   const ticket = (key = "a", task = script([{ text: "full\nLEAF: final" }])): CallTicket => ({ wid: "wf", widRev: "wf@1", key, gen: 1, callId: `wf@1/${key}@1`, cwd, journal, spec: { agent: "test", task }, agent });
   t.after(async () => {
     try { await executor.shutdown(); } finally {
@@ -159,7 +160,7 @@ test("V1 real pi processes serialize provider slots; stop fences and seals exact
   const a = f.ticket("a", script([{ delayMs: 60000, text: "late" }])), b = f.ticket("b", a.spec.task);
   const pa = f.executor.run(a), pb = f.executor.run(b);
   await until(() => f.journal.entries().some(e => e.type === "tracked" && e.exec === `${a.callId}#1.1`));
-  assert.equal(f.orch.entries().filter(e => e.type === "hold").length, 1);
+  assert.equal(f.orch.entries().filter(e => e.type === "hold" && e.pool === "probe").length, 1);
   await f.executor.stop({ wid: "wf", callId: a.callId }); assert.equal((await pa).status, "stopped");
   await until(() => f.journal.entries().some(e => e.type === "tracked" && e.exec === `${b.callId}#1.1`));
   await f.executor.stop({ wid: "wf", callId: b.callId }); assert.equal((await pb).status, "stopped");
@@ -175,7 +176,7 @@ test("V1 pool chooses first free candidate without holding another provider", { 
   const ticket = f.ticket(); ticket.spec.model = "pool";
   const pending = f.executor.run(ticket);
   await until(() => f.journal.entries().some(e => e.type === "tracked"));
-  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold").map(e => e.pool), ["probe"]);
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold").map(e => e.pool), ["memory", "probe"]);
   await f.executor.stop({ wid: "wf" }); assert.equal((await pending).status, "stopped");
 });
 
@@ -221,7 +222,7 @@ test("V1 model forwarding reserves a target before publishing and rejects a full
   const forwarded = (await scanInbox(callInbox(f.home, "wf", "a", 1))).find(r => r.kind === "model")!;
   assert.deepEqual(forwarded.body, { provider: "other", model: "id", thinking: "high" });
   await f.executor.stop({ wid: "wf" }); await pending;
-  assert.deepEqual(f.orch.entries().filter(e => e.type === "release").map(e => e.pool).sort(), ["other", "probe"]);
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "release").map(e => e.pool).sort(), ["memory", "other", "probe"]);
 });
 
 test("V1 an expired switch reservation is fenced before its slots are released", { timeout: 30000 }, async t => {
@@ -232,14 +233,14 @@ test("V1 an expired switch reservation is fenced before its slots are released",
   await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 });
   assert.equal((await pending).status, "failed");
   assertSealed(f.journal, ticket.callId, "failed");
-  assert.deepEqual(f.orch.entries().filter(e => e.type === "release").map(e => e.pool).sort(), ["other", "probe"]);
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "release").map(e => e.pool).sort(), ["memory", "other", "probe"]);
 });
 
 test("V1 missing model uses isolated Pi settings before acquiring a provider slot", { timeout: 30000 }, async t => {
   const f = await setup(t), ticket = f.ticket(); ticket.agent = { ...ticket.agent, model: undefined };
   const pending = f.executor.run(ticket);
   await until(() => f.journal.entries().some(e => e.type === "tracked"));
-  assert.equal(f.orch.entries().find(e => e.type === "hold")!.pool, "probe");
+  assert.equal(f.orch.entries().find(e => e.type === "hold" && e.pool === "probe")!.pool, "probe");
   await f.executor.stop({ wid: "wf" }); await pending;
 });
 
@@ -323,7 +324,7 @@ test("C1 protocol report survives an empty tool allowlist and continuation", { t
   ticket.spec.tools = [];
   ticket.spec.schema = { type: "object", required: ["done"], properties: { done: { type: "boolean" } } };
   const result = await f.executor.run(ticket);
-  assert.equal(result.status, "ok"); assert.deepEqual(result.data, { done: true });
+  assert.equal(result.status, "ok", JSON.stringify({ result, journal: f.journal.entries(), session: await readFile(callSession(f.home, "wf", "a", 1), "utf8") })); assert.deepEqual(result.data, { done: true });
   assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 1);
   assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 2);
 });
@@ -365,4 +366,160 @@ test("C1 forwarded steer then withdraw is consumed with child receipts", { timeo
   await f.executor.forward({ rid: "live-withdraw", from: req.from, to: "orch", sseq: 2, kind: "withdraw", body: { rids: [req.rid] } }, ctx);
   await pending;
   const session = await readFile(callSession(f.home, "wf", "a", 1), "utf8"); assert.match(session, new RegExp(CT.withdrawn));
+});
+
+test("X1 shutdown fences without sealing; restart continues and retires unused forwards", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 50 } });
+  const ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 60" } }, { text: "resumed" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.shutdown(); await rejected;
+  assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0);
+  assert.equal(f.journal.entries().filter(e => e.type === "stop-intent").length, 0);
+  const restarted = createExecutor({ home: f.home, orch: f.orch, config: {} });
+  t.after(() => restarted.shutdown());
+  await restarted.recover("wf", f.journal);
+  const result = await restarted.run(ticket);
+  assert.equal(result.status, "ok", JSON.stringify({ result, journal: f.journal.entries(), session: await readFile(callSession(f.home, "wf", "a", 1), "utf8") })); assert.equal(result.output, "resumed");
+  assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 2);
+});
+
+test("X1 silent CPU tool advances tracker evidence and seals timeout", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 50, checkpointMs: 50 } });
+  const ticket = f.ticket("a", script([{ tool: "bash", args: { command: "while :; do :; done" } }, { text: "never" }]));
+  ticket.spec.timeoutMs = 3500;
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "timeout"); assertSealed(f.journal, ticket.callId, "timeout");
+  const checkpoints = f.journal.entries().filter(e => e.type === "time");
+  assert.ok(Number(checkpoints.at(-1)!.active) >= 3500);
+  assert.ok(checkpoints.length > 1);
+  const observations = f.journal.entries().filter(e => e.type === "observation").map(e => e.event as Record<string, unknown>);
+  assert.ok(observations.some(e => e.type === "tool_execution_start"));
+  assert.ok(observations.every(e => e.type !== "tool_execution_update" && !e.result && !e.args && !e.message));
+});
+
+test("X1 blocked ask is not charged and does not stall", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 40, checkpointMs: 40, stallMs: 150 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Wait?" } }, { text: "answered" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === JT.attention && (e.item as { kind: string }).kind === "question"));
+  await delay(150);
+  const before = Number(f.journal.entries().findLast(e => e.type === "time")!.active);
+  await delay(500);
+  const after = Number(f.journal.entries().findLast(e => e.type === "time")!.active);
+  assert.equal(after, before);
+  const question = f.journal.entries().find(e => e.type === JT.attention && (e.item as { kind: string }).kind === "question")!;
+  assert.ok(!f.journal.entries().some(e => e.seq > question.seq && e.type === JT.attention && (e.item as { kind: string }).kind === "stall"));
+  await f.executor.stop({ wid: "wf" }); await pending;
+});
+
+test("X1 stall resolves on activity and re-arms with the next revision", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 40, stallMs: 200 } });
+  const ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 0.7; echo activity; sleep 0.7" } }, { text: "done" }]));
+  await f.executor.run(ticket);
+  const items = f.journal.entries().filter(e => e.type === JT.attention && (e.item as { kind: string }).kind === "stall");
+  assert.ok(items.length >= 2);
+  assert.deepEqual(items.map(e => (e.item as { rev: number }).rev), items.map((_, i) => i + 1));
+  assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.resolution === "activity"));
+});
+
+test("X1 call budget seals budget with truthful usage; workflow budget refuses dispatch", { timeout: 30000 }, async t => {
+  const f = await setup(t);
+  const first = f.ticket("a"); first.spec.budget = { tokens: 1 }; first.workflowBudget = { tokens: 1 };
+  const result = await f.executor.run(first);
+  assert.equal(result.status, "budget"); assert.ok(result.usage!.input + result.usage!.output >= 1);
+  const second = f.ticket("b"); second.workflowBudget = { tokens: 1 };
+  const refused = await f.executor.run(second);
+  assert.equal(refused.status, "failed"); assert.equal(refused.error, "workflow budget reached");
+  assert.ok(!f.journal.entries().some(e => e.type === "tracked" && String(e.exec).startsWith(second.callId)));
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attention && (e.item as { kind: string }).kind === "budget").length, 1);
+});
+
+test("X1 memory refusal holds nothing and rechecks headroom before spawn", { timeout: 30000 }, async t => {
+  let available = 0;
+  const f = await setup(t, { k: { trackerMs: 30 } }, { memory: async () => available });
+  const pending = f.executor.run(f.ticket());
+  await until(() => f.orch.entries().some(e => e.type === "mem"));
+  assert.equal(f.orch.entries().filter(e => e.type === "hold").length, 0);
+  available = 4096;
+  assert.equal((await pending).status, "ok");
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold").map(e => e.pool), ["memory", "probe"]);
+  assert.ok(await availableMemory() > 0);
+});
+
+test("X1 retire fences without seals and rejects stale forwards", { timeout: 30000 }, async t => {
+  const f = await setup(t), ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 60" } }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "tracked"));
+  await f.executor.retire(ticket.widRev);
+  const result = await pending; assert.equal(result.status, "stopped"); assert.equal(result.error, "retired");
+  assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0);
+  assert.ok(f.journal.entries().some(e => e.type === JT.fenced));
+  await f.executor.retire(ticket.widRev);
+  assert.equal(f.journal.entries().filter(e => e.type === "retired").length, 1);
+  const req: Request = { rid: "retired-send", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "late" } };
+  assert.deepEqual(await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 }), { action: "reject", reason: "stale-revision" });
+});
+
+test("X1 seal retires forwards lacking child receipts and recovery never republishes them", { timeout: 30000 }, async t => {
+  const f = await setup(t), ticket = f.ticket();
+  const req: Request = { rid: "unseen", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "answer", message: "no question" }, cond: { qid: "absent", rev: 1 } };
+  await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 });
+  await f.journal.append(JT.exec, { exec: `${ticket.callId}#1.1`, call: ticket.callId });
+  await f.executor.stop({ wid: "wf" });
+  const retired = f.journal.entries().find(e => e.type === "forward-retired")!;
+  assert.equal(retired.rid, req.rid); assert.equal(retired.reason, "retired-without-child-receipt");
+  const file = join(callInbox(f.home, "wf", "a", 1), `${retired.rid2}.json`); await rm(file);
+  await f.executor.recover("wf", f.journal);
+  assert.equal(existsSync(file), false);
+});
+
+test("X1 suspend preserves the open executor and resumes the same native session", { timeout: 30000 }, async t => {
+  const f = await setup(t), ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 60" } }, { text: "continued after suspend" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  assert.equal(f.executor.busy(), false);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0);
+  assert.equal((await f.executor.run(ticket)).output, "continued after suspend");
+  const native = (await readFile(callSession(f.home, "wf", "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(native.filter(e => e.type === "session").length, 1);
+  assert.equal(native.filter(e => e.customType === CT.exec).length, 2);
+});
+
+test("X1 K7 skips the third-loss candidate and changes the continuation's model", { timeout: 30000 }, async t => {
+  const f = await setup(t, { pools: { pool: ["probe/scripted", "probe/scripted2"] } });
+  const ticket = f.ticket("a", script([{ empty: true }, { empty: true }, { empty: true }, { text: "new candidate" }]));
+  ticket.spec.model = "pool";
+  assert.equal((await f.executor.run(ticket)).output, "new candidate");
+  assert.equal(f.orch.entries().filter(e => e.type === "skip").length, 1);
+  const selected = f.journal.entries().filter(e => e.type === "selected").map(e => (e.model as { id: string }).id);
+  assert.deepEqual(selected, ["scripted", "scripted", "scripted", "scripted2"]);
+  assert.ok(f.journal.entries().some(e => e.type === "observation" && (e.event as { model?: string }).model === "scripted2"));
+});
+
+test("X1 durable child budget receipt outranks a report on recovery", { timeout: 10000 }, async t => {
+  const f = await setup(t), ticket = f.ticket(), exec = `${ticket.callId}#1.1`;
+  await f.journal.append(JT.exec, { exec, call: ticket.callId });
+  await mkdir(callDir(f.home, "wf", "a", 1), { recursive: true });
+  await writeFile(callSession(f.home, "wf", "a", 1), [
+    { type: "custom", customType: CT.exec, data: { exec } },
+    { type: "custom", customType: CT.report, data: { exec, outcome: "ok", data: { ignored: true } } },
+    { type: "custom", customType: CT.budget, data: { exec, usage: { tokens: 1 } } },
+  ].map(e => JSON.stringify(e)).join("\n") + "\n");
+  await f.executor.recover("wf", f.journal);
+  assert.equal((await f.executor.run(ticket)).status, "budget");
+  assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 1);
+});
+
+test("X1 workflow budget refuses loss continuation but does not stop a running sibling", { timeout: 30000 }, async t => {
+  const f = await setup(t);
+  const a = f.ticket("a", script([{ empty: true }, { text: "should not continue" }])); a.workflowBudget = { tokens: 1 };
+  const b = f.ticket("b", script([{ delayMs: 1000, text: "running sibling survives" }])); b.workflowBudget = { tokens: 1 };
+  const [first, sibling] = await Promise.all([f.executor.run(a), f.executor.run(b)]);
+  assert.equal(first.status, "failed"); assert.equal(first.error, "workflow budget reached");
+  assert.equal(sibling.status, "ok"); assert.equal(sibling.output, "running sibling survives");
+  assert.equal(f.journal.entries().filter(e => e.type === "tracked" && String(e.exec).startsWith(`${a.callId}#1.2`)).length, 0);
 });

@@ -10,6 +10,7 @@ export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export interface CallSnapshot {
   key: string; gen: number; callId: string; agent: string; phase: CallPhase;
   result?: CallResult; model?: string; exec?: string;
+  pos?: number; refused?: string; reused?: string;
   /** Wall-clock ms of the latest durable evidence for this call (display only). */
   lastActivity?: number; startedAt?: number; endedAt?: number;
 }
@@ -27,15 +28,24 @@ export interface WorkflowSnapshot {
 export function snapshotFromEntries(wid: string, entries: readonly Entry[]): WorkflowSnapshot {
   const created = entries.find(e => e.type === "wf-created");
   const rev = Math.max(1, ...entries.filter(e => e.type === "wf-created" || e.type === "revised").map(e => Number(e.revision) || 1));
-  const done = entries.findLast(e => e.type === JT.done);
+  const boundary = entries.findLastIndex(e => e.type === "revised");
+  const current = entries.slice(Math.max(0, boundary));
+  const terminal = current.findLast(e => e.type === JT.done || e.type === "resumed");
+  const done = terminal?.type === JT.done ? terminal : undefined;
   const calls = new Map<string, CallSnapshot>();
   const byExec = new Map<string, CallSnapshot>();
   const resolved = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}@${e.rev}`));
   const attention: AttentionItem[] = [];
   for (const e of entries) {
-    if (e.type === "call") {
-      const key = String(e.key), gen = Number(e.gen) || 1, callId = `${wid}@${rev}/${key}@${gen}`;
-      calls.set(callId, { key, gen, callId, agent: String((e.spec as { agent?: string } | undefined)?.agent ?? ""), phase: "queued" });
+    if (["call", "refused", "reused"].includes(e.type)) {
+      if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
+      const key = String(e.key), gen = Number(e.gen) || (e.type === "refused" ? 0 : 1);
+      const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;
+      const result = e.type === "refused" ? { key, gen, status: "failed" as const, ok: false, error: "spawn budget exceeded", output: "" } :
+        e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
+      calls.set(callId, { key, gen, callId, pos: Number(e.pos), agent: String((e.spec as { agent?: string } | undefined)?.agent ?? ""),
+        phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),
+        ...(e.type === "refused" ? { refused: String(e.reason) } : {}), ...(e.type === "reused" ? { reused: String(e.from) } : {}) });
     } else if (e.type === JT.exec) {
       const call = calls.get(String(e.call)); if (!call) continue;
       call.exec = String(e.exec); call.phase = "running"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);

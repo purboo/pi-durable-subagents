@@ -1,7 +1,8 @@
 // Private orch entries: request {request} retains immutable admitted envelopes;
-// drain {rid} records process drain intent. Workflow entries: ev {n};
-// call {pos,key,gen,spec,fingerprint}; exposed {pos}; value {n,kind,value};
-// emit {pos,value}. JT.done and JT.attention are shared terminal observations.
+// drain {rid,fence} and undrain {rid} record durable dispatch admission.
+// Workflow entries: ev {n}; call {pos,key,gen,spec,fingerprint}; refused {pos,key,spec,fingerprint,reason};
+// reused {pos,key,gen,spec,fingerprint,from}; exposed {pos}; value {n,kind,value};
+// resumed {rid,n} supersedes a terminal park. emit {pos,value} records script outputs.
 import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readdir, unlink } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
@@ -10,11 +11,11 @@ import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox } from '../paths.ts';
-import { JT, type Entry, type Request, type RunBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
+import { JT, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
-import { Store, type Workflow } from './store.ts';
+import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
 
 type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Set<number>; exposures: Entry[]; sent: number; replaying: boolean; ready: Map<number, CallResult>; running: Set<number>; outputs: Map<number, Entry>; values: Entry[]; needs: number };
 export interface EngineOptions { evaluator?: EvaluatorTransport; discovery?: DiscoveryOptions }
@@ -43,13 +44,15 @@ export class Engine {
     return result;
   }
   private background(fn: () => Promise<void>) { if (!this.closed) void this.serial(fn).catch(() => {}); }
-  private terminal(wf: Workflow) { return wf.journal.entries().some(e => e.type === JT.done); }
+  private terminal(wf: Workflow) { return terminalEntry(revisionEntries(wf)); }
   private lifecycle(): DecisionRecord[] { return this.ledgers.orch.entries().filter(e => ['admitted', 'applied', 'rejected', 'withdrawn'].includes(e.type)) as unknown as DecisionRecord[]; }
   /** A2, P10: Recover executor authority before replaying each unfinished workflow. */
   async recover(): Promise<void> {
+    this.draining = this.ledgers.orch.entries().findLast(e => e.type === 'drain' || e.type === 'undrain')?.type === 'drain';
     await this.store.recover();
     for (const wf of this.store.workflows.values()) await this.executor.recover(wf.wid, wf.journal);
     await this.startHost();
+    for (const intent of this.ledgers.orch.entries().filter(e => e.type === 'revise-intent')) await this.revise(intent);
     for (const wf of this.store.workflows.values()) {
       if (!this.terminal(wf)) await this.startWorkflow(wf);
       else await this.attention(wf);
@@ -64,11 +67,12 @@ export class Engine {
   }
   private async startWorkflow(wf: Workflow) {
     if (this.terminal(wf)) return;
-    const log = wf.journal.entries();
-    const ev = Math.max(0, ...log.filter(e => e.type === 'ev').map(e => e.n as number)) + 1;
+    await this.resolveFinished(wf);
+    const log = revisionEntries(wf);
+    const ev = Math.max(0, ...wf.journal.entries().filter(e => e.type === 'ev').map(e => e.n as number)) + 1;
     await wf.journal.append('ev', { n: ev });
-    const calls = new Map(log.filter(e => e.type === 'call').map(e => [e.pos as number, e]));
-    const st: State = { wf, ev, calls, proposed: new Set(), exposures: log.filter(e => e.type === 'exposed'), sent: 0, replaying: true, ready: new Map(), running: new Set(), outputs: new Map(log.filter(e => e.type === 'call' || e.type === 'emit').map(e => [e.pos as number, e])), values: log.filter(e => e.type === 'value'), needs: 0 };
+    const calls = new Map(log.filter(e => ['call', 'refused', 'reused'].includes(e.type)).map(e => [e.pos as number, e]));
+    const st: State = { wf, ev, calls, proposed: new Set(), exposures: log.filter(e => e.type === 'exposed'), sent: 0, replaying: true, ready: new Map(), running: new Set(), outputs: new Map(log.filter(e => ['call', 'refused', 'reused', 'emit'].includes(e.type)).map(e => [e.pos as number, e])), values: log.filter(e => e.type === 'value'), needs: 0 };
     this.states.set(wf.wid, st);
     this.evaluator.send({ t: 'start', wid: wf.wid, ev, scriptPath: wf.scriptPath, args: wf.pins.args, inputs: wf.inputs });
   }
@@ -80,7 +84,7 @@ export class Engine {
     const candidates = [...retained, ...scanned];
     const before = reduceLifecycle(this.lifecycle()), staged = new Set<string>();
     for (const request of candidates) {
-      if (request.kind !== 'run' || before.admitted.has(request.rid) || before.tombstones.has(request.rid) || staged.has(request.rid)) continue;
+      if (!['run', 'revise'].includes(request.kind) || before.admitted.has(request.rid) || before.tombstones.has(request.rid) || staged.has(request.rid)) continue;
       await this.store.stage(request as Request<RunBody>, this.discovery);
       staged.add(request.rid);
     }
@@ -109,7 +113,7 @@ export class Engine {
     }
     const view = reduceLifecycle(this.lifecycle());
     for (const [rid, resolution] of view.resolved) {
-      if (resolution.type === 'rejected' && view.admitted.get(rid)?.kind === 'run') await this.store.discardStage(rid);
+      if (resolution.type === 'rejected' && ['run', 'revise'].includes(view.admitted.get(rid)?.kind ?? '')) await this.store.discardStage(rid);
     }
     for (const rid of view.tombstones) await this.store.discardStage(rid);
     for (const req of scanned) {
@@ -120,12 +124,12 @@ export class Engine {
   }
   private findCall(to: string): { wf: Workflow; entry: Entry } | undefined {
     for (const wf of this.store.workflows.values()) {
-      const calls = wf.journal.entries().filter(e => e.type === 'call');
-      const entry = calls.findLast(e => to === `${wf.wid}@1/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}`);
+      const calls = revisionEntries(wf).filter(e => e.type === 'call');
+      const entry = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}`);
       if (entry) return { wf, entry };
     }
   }
-  private context(wf: Workflow, entry: Entry) { return { journal: wf.journal, widRev: `${wf.wid}@1` as const, key: entry.key as string, gen: entry.gen as number }; }
+  private context(wf: Workflow, entry: Entry) { return { journal: wf.journal, widRev: `${wf.wid}@${wf.revision}` as const, key: entry.key as string, gen: entry.gen as number }; }
   private async withdraw(req: Request) {
     const rids = (req.body as { rids: string[] }).rids;
     for (const wf of this.store.workflows.values()) {
@@ -141,20 +145,31 @@ export class Engine {
     }
   }
   private async decide(req: Request): Promise<Decision> {
+    const body = req.body as { to?: string; target?: string; wid?: string } | null;
+    for (const address of [body?.to, body?.target, body?.wid, req.cond?.epoch]) {
+      const match = typeof address === 'string' && /^([^/@]+)@(\d+)(?:\/|$)/.exec(address);
+      if (match && this.store.workflows.has(match[1]!) && this.store.workflows.get(match[1]!)!.revision !== Number(match[2])) return { action: 'reject', reason: 'stale-revision' };
+    }
     if (req.cond?.epoch) {
       const target = req.kind === 'send' ? this.findCall((req.body as SendBody).to) : undefined;
-      if (!target || req.cond.epoch !== `${target.wf.wid}@1`) return { action: 'reject', reason: 'stale-epoch' };
+      if (!target || req.cond.epoch !== `${target.wf.wid}@${target.wf.revision}`) return { action: 'reject', reason: 'stale-epoch' };
     }
     if (req.kind === 'run') {
       const created = this.ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid);
       let wf = created ? this.store.workflows.get(created.wid as string) : undefined;
       if (!wf) {
-        let pins;
-        try { pins = await this.store.staged(req as Request<RunBody>); }
+        try { await this.store.staged(req as Request<RunBody>); }
         catch (error) { return { action: 'reject', reason: `pin-failed: ${String(error)}` }; }
-        wf = await this.store.create(req as Request<RunBody>, pins);
+        wf = await this.store.create(req as Request<RunBody>);
       }
       if (!this.states.has(wf!.wid) && !this.terminal(wf!)) await this.startWorkflow(wf!);
+    } else if (req.kind === 'revise') {
+      const wf = this.store.workflows.get((req.body as ReviseBody)?.wid);
+      if (!wf) return { action: 'reject', reason: 'unknown-workflow' };
+      try { await this.store.staged(req as Request<ReviseBody>); }
+      catch (error) { return { action: 'reject', reason: `pin-failed: ${String(error)}` }; }
+      await this.revise(await this.store.revisionIntent(req as Request<ReviseBody>, wf));
+      if (!this.states.has(wf.wid) && !this.terminal(wf)) await this.startWorkflow(wf);
     } else if (req.kind === 'send') {
       const target = this.findCall((req.body as SendBody)?.to);
       if (!target) return { action: 'reject', reason: 'unknown-call' };
@@ -163,25 +178,52 @@ export class Engine {
       const target = (req.body as { target: string })?.target;
       const call = this.findCall(target), wf = call?.wf ?? this.store.workflows.get(target);
       if (!wf) return { action: 'reject', reason: 'unknown-workflow' };
-      await this.executor.stop({ wid: wf.wid, ...(call ? { callId: `${wf.wid}@1/${call.entry.key}@${call.entry.gen}` } : {}) });
+      await this.executor.stop({ wid: wf.wid, ...(call ? { callId: `${wf.wid}@${wf.revision}/${call.entry.key}@${call.entry.gen}` } : {}) });
       if (!call) await this.finish(wf, 'stopped');
     } else if (req.kind === 'resume') {
       const wid = (req.body as { wid?: string })?.wid;
       if (wid && !this.store.workflows.has(wid)) return { action: 'reject', reason: 'unknown-workflow' };
-      for (const wf of this.store.workflows.values()) if ((!wid || wf.wid === wid) && !this.states.has(wf.wid) && !this.terminal(wf)) await this.startWorkflow(wf);
+      const wasDrained = this.draining;
+      if (wasDrained) {
+        await this.ledgers.orch.append('undrain', { rid: req.rid });
+        this.draining = false;
+      }
+      for (const wf of this.store.workflows.values()) {
+        const done = this.terminal(wf);
+        if ((wid && wf.wid !== wid && (!wasDrained || done)) || (done && done.status !== 'parked')) continue;
+        if (!wf.journal.entries().some(e => e.type === 'resumed' && e.rid === req.rid)) {
+          const n = (!wasDrained ? this.states.get(wf.wid)?.ev : undefined) ?? Math.max(0, ...wf.journal.entries().filter(e => e.type === 'ev').map(e => Number(e.n))) + 1;
+          await wf.journal.append('resumed', { rid: req.rid, n });
+          await this.resolveFinished(wf);
+        }
+        if (wasDrained) {
+          const st = this.states.get(wf.wid);
+          if (st) this.evaluator.send({ t: 'stop', wid: wf.wid, ev: st.ev });
+          this.states.delete(wf.wid);
+        }
+        if (!this.states.has(wf.wid)) await this.startWorkflow(wf);
+      }
     } else if (req.kind === 'drain') {
-      await this.ledgers.orch.append('drain', { rid: req.rid }); this.draining = true;
-    } else return { action: 'reject', reason: req.kind === 'revise' ? 'not-implemented-yet' : 'unsupported-kind' };
+      const fence = (req.body as DrainBody)?.fence === true;
+      if (!this.ledgers.orch.entries().some(e => e.type === 'drain' && e.rid === req.rid)) await this.ledgers.orch.append('drain', { rid: req.rid, fence });
+      this.draining = true;
+      if (fence) {
+        await this.executor.suspend();
+        for (const st of this.states.values()) st.running.clear();
+      }
+    } else return { action: 'reject', reason: 'unsupported-kind' };
     return { action: 'apply' };
   }
   private ticket(st: State, entry: Entry): CallTicket {
     const spec = entry.spec as CallSpec, agent = st.wf.pins.agents.find(a => a.name === spec.agent);
     if (!agent) throw new Error(`Unknown pinned agent: ${spec.agent}`);
-    return { wid: st.wf.wid, widRev: `${st.wf.wid}@1`, key: entry.key as string, gen: entry.gen as number,
-      callId: `${st.wf.wid}@1/${entry.key}@${entry.gen}`, spec, agent, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal };
+    return { wid: st.wf.wid, widRev: `${st.wf.wid}@${st.wf.revision}`, key: entry.key as string, gen: entry.gen as number,
+      callId: `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`, spec, agent, workflowBudget: st.wf.pins.usageBudget, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal };
   }
   private sealed(st: State, entry: Entry): CallResult | undefined {
-    return st.wf.journal.entries().find(e => e.type === JT.sealed && e.call === `${st.wf.wid}@1/${entry.key}@${entry.gen}`)?.result as CallResult | undefined;
+    if (entry.type === 'refused') return { key: String(entry.key), gen: 0, status: 'failed', ok: false, error: 'spawn budget exceeded', output: '' };
+    const call = entry.type === 'reused' ? entry.from : `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`;
+    return st.wf.journal.entries().find(e => e.type === JT.sealed && e.call === call)?.result as CallResult | undefined;
   }
   private dispatch(st: State, entry: Entry) {
     const pos = entry.pos as number;
@@ -195,7 +237,10 @@ export class Engine {
       const result = this.sealed(st, entry);
       if (!result) throw new Error(`Executor returned without seal: ${entry.key}`);
       st.ready.set(pos, result); await this.flush(st);
-    }), error => this.background(async () => { throw error; }));
+    }), error => {
+      if (error instanceof Error && error.name === 'ExecutorShutdown') return;
+      this.background(async () => { if (this.states.get(st.wf.wid) === st) throw error; });
+    });
   }
   private async flush(st: State) {
     while (st.sent < st.exposures.length) {
@@ -221,10 +266,27 @@ export class Engine {
       const agent = st.wf.pins.agents.find(a => a.name === message.spec.agent);
       if (!agent) return park(`Unknown pinned agent: ${message.spec.agent}`);
       const fingerprint = contentHash({ spec: message.spec, agent }), old = st.outputs.get(message.pos);
-      if (st.proposed.has(message.pos) || (old && (old.type !== 'call' || old.key !== message.key || old.fingerprint !== fingerprint))) return park(`Replay mismatch at ${message.pos}`);
+      if (st.proposed.has(message.pos) || (old && (!['call', 'refused', 'reused'].includes(old.type) || old.key !== message.key || old.fingerprint !== fingerprint))) return park(`Replay mismatch at ${message.pos}`);
       if (!old && [...st.calls.values()].some(e => e.key === message.key)) return park(`Duplicate call key: ${message.key}`);
-      if (!old && st.calls.size >= (this.ledgers.config.k?.spawnBudget ?? 300)) return park('Spawn budget exceeded');
-      const entry = old ?? await st.wf.journal.append('call', { pos: message.pos, key: message.key, gen: 1, spec: message.spec, fingerprint });
+      let entry = old;
+      if (!entry) {
+        const history = st.wf.journal.entries(), boundary = history.findLast(e => e.type === 'revised')?.seq ?? 0;
+        let revision = 1;
+        const matching: string[] = [];
+        for (const e of history) {
+          if (e.type === 'revised') revision = Number(e.revision);
+          if (e.seq < boundary && e.type === 'call' && e.key === message.key && e.fingerprint === fingerprint) matching.push(`${st.wf.wid}@${revision}/${e.key}@${e.gen}`);
+        }
+        const reused = history.findLast(e => e.type === JT.sealed && matching.includes(String(e.call)));
+        const fields = { pos: message.pos, key: message.key, spec: message.spec, fingerprint };
+        if (reused) entry = await st.wf.journal.append('reused', { ...fields, from: reused.call, gen: (reused.result as CallResult).gen });
+        else if (history.filter(e => e.type === 'call').length >= (st.wf.pins.maxCalls ?? 300)) {
+          entry = await st.wf.journal.append('refused', { ...fields, reason: 'spawn-budget' });
+        } else {
+          const gen = Math.max(0, ...history.filter(e => e.type === 'call' && e.key === message.key).map(e => Number(e.gen))) + 1;
+          entry = await st.wf.journal.append('call', { ...fields, gen });
+        }
+      }
       st.calls.set(message.pos, entry); st.proposed.add(message.pos);
       if (!st.exposures.some(e => e.pos === message.pos)) this.dispatch(st, entry);
       await this.flush(st);
@@ -250,10 +312,29 @@ export class Engine {
     } else if (message.t === 'error') await this.finish(st.wf, message.kind === 'script' ? 'failed' : 'parked', undefined, message.error);
   }
   private async attention(wf: Workflow) {
-    const done = wf.journal.entries().find(e => e.type === JT.done);
-    if (done && !wf.journal.entries().some(e => e.type === JT.attention && (e.item as { id: string }).id === `finished:${wf.wid}`)) {
-      await wf.journal.append(JT.attention, { item: { id: `finished:${wf.wid}`, rev: 1, kind: 'finished', wid: wf.wid, text: `Workflow ${done.status}` } });
+    const done = this.terminal(wf);
+    const rev = wf.journal.entries().filter(e => e.type === JT.done).length;
+    if (done && !wf.journal.entries().some(e => e.type === JT.attention && (e.item as { id: string; rev: number }).id === `finished:${wf.wid}` && (e.item as { rev: number }).rev === rev)) {
+      await wf.journal.append(JT.attention, { item: { id: `finished:${wf.wid}`, rev, kind: 'finished', wid: wf.wid, text: `Workflow ${done.status}` } });
     }
+  }
+  private async resolveFinished(wf: Workflow) {
+    for (const e of wf.journal.entries().filter(e => e.type === JT.attention)) {
+      const item = e.item as { id: string; rev: number; kind: string };
+      if (item.kind === 'finished' && !wf.journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev)) {
+        await wf.journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: 'resumed' });
+      }
+    }
+  }
+  private async revise(intent: Entry) {
+    const wf = this.store.workflows.get(String(intent.wid));
+    if (!wf || wf.revision >= Number(intent.revision)) return;
+    const st = this.states.get(wf.wid);
+    this.states.delete(wf.wid); // Retired promises and queued evaluator events cannot mutate the new revision.
+    await this.executor.retire(`${wf.wid}@${wf.revision}`);
+    if (st) this.evaluator.send({ t: 'stop', wid: wf.wid, ev: st.ev });
+    await this.store.revise(intent);
+    await this.resolveFinished(wf);
   }
   private async finish(wf: Workflow, status: string, result?: unknown, error?: string) {
     if (!this.terminal(wf)) await wf.journal.append(JT.done, { status, ...(result !== undefined ? { result } : {}), ...(error ? { error } : {}) });
@@ -275,7 +356,7 @@ export class Engine {
         await this.queue;
         if (this.failure) throw this.failure;
         const files = await readdir(inbox);
-        if ([...this.store.workflows.values()].some(w => !this.terminal(w)) || this.executor.busy() || files.length) idleSince = performance.now();
+        if (this.draining || [...this.store.workflows.values()].some(w => !this.terminal(w)) || this.executor.busy() || files.length) idleSince = performance.now();
         else if (performance.now() - idleSince >= (this.ledgers.config.k?.idleExitMs ?? 60_000)) return;
         await delay(Math.min(100, this.ledgers.config.k?.idleExitMs ?? 100));
       }
