@@ -1,7 +1,7 @@
 // Private entries (P31): usage{call,id,usage}; each completed assistant message is recorded once.
 import { contentHash } from "../../kernel/ids.ts";
 import { budgets } from "../../kernel/guards.ts";
-import type { CallResult, Entry } from "../../types.ts";
+import { CT, type CallResult, type Entry } from "../../types.ts";
 import type { SessionEntry } from "./session.ts";
 export type Usage = NonNullable<CallResult["usage"]>;
 
@@ -13,9 +13,14 @@ export function messageUsage(message: Record<string, unknown>) {
     input: (raw.input ?? 0) + (raw.cacheRead ?? 0) + (raw.cacheWrite ?? 0), output: raw.output ?? 0, costUsd: raw.cost?.total ?? 0,
   } };
 }
-/** P31: Reconstruct usage from native messages with the same identity as RPC observations. */
-export function sessionUsage(entries: SessionEntry[]) {
-  return entries.flatMap(e => { const u = e.message && messageUsage(e.message as Record<string, unknown>); return u ? [u] : []; });
+/** P31: Charge only messages in segments opened by this call, excluding inherited context. */
+export function sessionUsage(entries: SessionEntry[], call: string) {
+  let own = false;
+  return entries.flatMap(e => {
+    if (e.type === "custom" && e.customType === CT.exec) own = typeof e.data?.exec === "string" && e.data.exec.startsWith(`${call}#`);
+    const u = own && e.message && messageUsage(e.message as Record<string, unknown>);
+    return u ? [u] : [];
+  });
 }
 /** P31: Sum deduplicated committed message usage across executions, optionally across a whole workflow. */
 export function totalUsage(entries: readonly Entry[], call?: string): Usage {

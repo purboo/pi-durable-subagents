@@ -176,6 +176,16 @@ export class Store {
     await wf.journal.append('revised', { rid: intent.rid, revision, snapshot: intent.snapshot });
     Object.assign(wf, files, { revision });
   }
+  /** P32: Rebuild a historical ticket from that revision's immutable snapshot. */
+  async atRevision(wf: Workflow, revision: number): Promise<Workflow> {
+    if (revision === wf.revision) return wf;
+    const intent = revision === 1
+      ? this.ledgers.orch.entries().find(e => e.type === 'create-intent' && e.wid === wf.wid)
+      : wf.journal.entries().find(e => e.type === 'revised' && e.revision === revision);
+    if (!intent) throw new Error(`Missing pinned revision: ${wf.wid}@${revision}`);
+    const pins = await this.pinned(intent);
+    return { ...wf, revision, ...await this.publishPins(wf.wid, revision, pins) };
+  }
   /** A1, A5: Restore committed revisions; the engine reconciles pending retirement intents. */
   async recover(): Promise<void> {
     for (const intent of this.ledgers.orch.entries().filter(e => e.type === 'create-intent')) await this.materialize(intent);

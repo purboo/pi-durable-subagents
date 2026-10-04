@@ -53,7 +53,22 @@ export class Engine {
   async recover(): Promise<void> {
     this.draining = this.ledgers.orch.entries().findLast(e => e.type === 'drain' || e.type === 'undrain')?.type === 'drain';
     await this.store.recover();
-    for (const wf of this.store.workflows.values()) await this.executor.recover(wf.wid, wf.journal);
+    for (const wf of this.store.workflows.values()) {
+      await this.executor.recover(wf.wid, wf.journal);
+      // A seal may survive a crash before post-seal effects, even after workflow completion.
+      let revision = 1;
+      for (const entry of wf.journal.entries()) {
+        if (entry.type === 'revised') revision = Number(entry.revision);
+        if (entry.type !== 'call' && entry.type !== 'generation') continue;
+        const call = `${wf.wid}@${revision}/${entry.key}@${entry.gen}`;
+        const log = wf.journal.entries();
+        const result = log.find(e => e.type === JT.sealed && e.call === call)?.result as CallResult | undefined;
+        if (result?.status !== 'ok' || !log.some(e => e.type === 'wt-intent' && e.call === call) ||
+          log.some(e => ['wt-removed', 'wt-kept'].includes(e.type) && e.call === call)) continue;
+        const original = await this.store.atRevision(wf, revision);
+        await this.executor.run(this.ticket({ wf: original } as State, entry));
+      }
+    }
     await this.startHost();
     for (const intent of this.ledgers.orch.entries().filter(e => e.type === 'revise-intent')) await this.revise(intent);
     for (const wf of this.store.workflows.values()) {

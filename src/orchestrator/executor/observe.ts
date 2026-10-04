@@ -85,7 +85,7 @@ export async function observeExecution(d: Dependencies) {
       const nextSize = (await fileStat(session).catch(() => ({ size: 0 }))).size;
       if (nextSize > size) { clock.evidence(); size = nextSize; }
       const entries = await readSession(session);
-      await d.questions(entries); await d.recordUsage(sessionUsage(entries));
+      await d.questions(entries); await d.recordUsage(sessionUsage(entries, t.callId));
       await limits(); await stall();
       if (performance.now() - checkpoint >= (config.k?.checkpointMs ?? 10000)) { await saveTime(); checkpoint = performance.now(); }
       const reservation = d.pendingSwitch();

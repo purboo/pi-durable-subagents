@@ -21,7 +21,7 @@ import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts"
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
 import { hibernation, openQuestion } from "./hibernate.ts";
-import { evidence, readSession, sessionModel, type SessionEntry } from "./session.ts";
+import { evidence, readSession, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
 import { observeExecution } from "./observe.ts";
 import { availableMemory } from "./memory.ts";
@@ -104,10 +104,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   async function retireForwards(journal: JournalHandle, call: string) {
     const a = address(call), entries = await readSession(callSession(home, a.wid, a.key, a.gen));
-    const receipts = new Set(entries.flatMap(e => {
-      const rid = e.message?.details?.rid ?? ([CT.rejected, CT.withdrawn, CT.model].includes(e.customType as typeof CT.rejected) ? e.data?.rid : undefined);
-      return typeof rid === "string" ? [rid] : [];
-    }));
+    const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
     for (const e of journal.entries().filter(e => e.type === "forward" && e.dest === call)) {
       if (!receipts.has(String(e.rid2)) && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2))
         await journal.append("forward-retired", { rid: e.rid, rid2: e.rid2, reason: "retired-without-child-receipt" });
@@ -175,7 +172,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   const stopped = (a: Active) => a.stopped || entriesFor(a.ticket.journal, a.ticket.callId).some(e => e.type === "stop-intent");
   const interrupted = (a: Active) => closed || a.suspended || a.retired || stopped(a);
-  async function acquire(a: Active, exec: string, models: Model[], pool?: string): Promise<Model | undefined> {
+  async function acquire(a: Active, exec: string, models: Model[], pool?: string, continuation = false): Promise<Model | undefined> {
     for (;;) {
       let signal!: () => void;
       const changed = new Promise<void>(resolve => { signal = resolve; waiters.add(resolve); });
@@ -183,7 +180,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (interrupted(a) || await workflowReached(a.ticket)) return;
         if (sweepFailure) throw sweepFailure;
         for (const model of models) {
-          if (pool && orch.entries().some(e => e.type === "skip" && e.pool === pool && e.model === `${model.provider}/${model.id}` && Number(e.until) > Date.now())) continue;
+          if (!continuation && pool && orch.entries().some(e => e.type === "skip" && e.pool === pool && e.model === `${model.provider}/${model.id}` && Number(e.until) > Date.now())) continue;
           const provider = model.provider;
           const holders = holdings().filter(e => e.pool === provider);
           const limit = config.providers?.[provider ?? ""]?.slots ?? Infinity;
@@ -207,10 +204,23 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       try { await changed; } finally { clearTimeout(timer); waiters.delete(signal); }
     }
   }
+  /** P13, C5, C8: Decide holdings and CLI model restoration from the same fenced session. */
+  async function launchModel(t: CallTicket, entries: SessionEntry[], previous?: string) {
+    const recorded = sessionModel(entries);
+    const ownSegment = entries.some(e => e.type === "custom" && e.customType === CT.exec && typeof e.data?.exec === "string" && e.data.exec.startsWith(`${t.callId}#`));
+    const freshFork = t.spec.context === "fork" && !t.continueFrom && !ownSegment;
+    const raw = t.spec.model ?? t.agent.model ?? config.defaultModel ?? await defaultModel();
+    const pool = raw && config.pools?.[raw] ? raw : undefined;
+    const candidates = raw ? resolveModel(raw, config.pools) : [{ id: "" }];
+    const candidate = recorded && candidates.some(m => m.provider === recorded.provider && m.id === recorded.id);
+    const skipped = previous && ownSegment && pool && candidate && orch.entries().some(e => e.type === "skip" && e.pool === pool && e.model === `${recorded!.provider}/${recorded!.id}` && Number(e.until) > Date.now());
+    if (recorded && !freshFork && !skipped) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined };
+    return { candidates, continuation: false, pool };
+  }
   async function questions(t: CallTicket, entries: SessionEntry[]) {
     const sender = await outbox;
     for (const entry of entries) {
-      const receipt = entry.message?.details?.rid ?? ([CT.rejected, CT.withdrawn, CT.model].includes(entry.customType as typeof CT.rejected) ? entry.data?.rid : undefined);
+      const receipt = receiptId(entry);
       if (typeof receipt === "string") await sender.markResolved(receipt);
     }
     await serial(async () => {
@@ -222,8 +232,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (!t.journal.entries().some(r => r.type === JT.attention && (r.item as { id: string; rev: number }).id === id && (r.item as { rev: number }).rev === rev))
           await t.journal.append(JT.attention, { item: { id, rev, kind: "question", text: String(question), wid: t.wid, call: t.callId, qid, session: callSession(home, t.wid, t.key, t.gen) } });
         const answered = entries.some(r => {
-          const details = r.message?.details ?? (r as unknown as { details?: Record<string, unknown> }).details;
-          return details?.qid === qid && details?.rev === rev && typeof details.rid === "string";
+          const details = r.message?.details ?? r.details;
+          return details?.qid === qid && details?.rev === rev && receiptId(r) !== undefined;
         });
         if (answered && !t.journal.entries().some(r => r.type === JT.attentionResolved && r.id === id && r.rev === rev))
           await t.journal.append(JT.attentionResolved, { id, rev, resolution: "answered" });
@@ -281,11 +291,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         }
       }
       const pendingAnswer = journal.entries().findLast(e => e.type === "answer-bound" && e.call === t.callId);
-      if (!bound && pendingAnswer && !entries.some(e => e.message?.details?.rid === pendingAnswer.rid2 || (e as unknown as { details?: { rid?: string } }).details?.rid === pendingAnswer.rid2)) bound = pendingAnswer;
+      if (!bound && pendingAnswer && !entries.some(e => receiptId(e) === pendingAnswer.rid2)) bound = pendingAnswer;
       if (exec) {
         await fence(journal, exec);
         await questions(t, entries = await readSession(session));
-        await recordUsage(t, sessionUsage(entries));
+        await recordUsage(t, sessionUsage(entries, t.callId));
         const ev = evidence(entries, exec); dangling = ev.dangling;
         if (closed || a.suspended || a.retired) throw shutdownError();
         if (stopped(a)) return finish(journal, t.callId, exec, makeResult("stopped"));
@@ -313,17 +323,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await serial(() => journal.append(JT.exec, { exec, call: t.callId }));
       if (interrupted(a)) { await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("stopped")); }
       if (await serial(() => workflowReached(t))) { await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("failed", "", "workflow budget reached")); }
-      let candidates: Model[], pool: string | undefined;
+      let decision: Awaited<ReturnType<typeof launchModel>>;
       try {
-        const restored = previous && sessionModel(entries);
-        const raw = t.spec.model ?? t.agent.model ?? config.defaultModel ?? await defaultModel();
-        pool = raw && config.pools?.[raw] ? raw : undefined;
-        // C5 restores the current candidate; K7 may choose a new candidate after repeated loss.
-        candidates = pool ? resolveModel(raw!, config.pools) : restored ? [restored] : raw ? resolveModel(raw, config.pools) : [{ id: "" }];
+        decision = await launchModel(t, entries, previous);
       } catch (error) {
         await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
       }
-      const model = await acquire(a, exec, candidates, pool);
+      const model = await acquire(a, exec, decision.candidates, decision.pool, decision.continuation);
       if (!model || interrupted(a)) {
         await fence(journal, exec);
         return finish(journal, t.callId, exec, !interrupted(a) ? makeResult("failed", "", "workflow budget reached") : makeResult("stopped"));
@@ -334,29 +340,21 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await writeFile(prompt, t.agent.body);
       if (t.spec.schema !== undefined) await writeFile(schema, JSON.stringify(t.spec.schema));
       const sender = await outbox;
-      if (previous && pool) {
-        const restored = sessionModel(entries);
-        if (restored && (restored.provider !== model.provider || restored.id !== model.id))
-          await sender.send(t.callId, "model", { provider: model.provider, model: model.id }, undefined, { rid: contentHash([exec, "pool-switch"]) });
-      }
       if (bound) await serial(async () => {
         if (!journal.entries().some(e => e.type === "resumed" && e.call === t.callId && e.rid === bound!.rid)) await journal.append("resumed", { call: t.callId, rid: bound!.rid, exec });
       });
       // The answer uses its stable forwarded identity across every recovery incarnation.
       const unresolved = journal.entries().findLast(e => e.type === "answer-bound" && e.call === t.callId);
-      const receipt = unresolved && entries.some(e => e.message?.details?.rid === unresolved.rid2 || (e as unknown as { details?: { rid?: string } }).details?.rid === unresolved.rid2);
+      const receipt = unresolved && entries.some(e => receiptId(e) === unresolved.rid2);
       const openingRid = t.opening && contentHash([t.opening.rid, "dispatch"]);
-      const openingReceived = openingRid && entries.some(e => (e as unknown as { details?: { rid?: string } }).details?.rid === openingRid);
+      const openingReceived = openingRid && entries.some(e => receiptId(e) === openingRid);
       if (openingRid && !openingReceived) await sender.send(t.callId, "task", { message: t.opening!.message }, undefined, { rid: openingRid });
       else if (unresolved && !receipt) await sender.send(t.callId, "continue", { message: String(unresolved.message) }, { qid: String(unresolved.qid), rev: Number(unresolved.rev) }, { rid: String(unresolved.rid2) });
       else await sender.send(t.callId, previous ? "continue" : "task", { message: previous ? `Continue the task. Tool calls whose outcomes are unknown: ${dangling.join(", ") || "none"}.` : t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
       if (interrupted(a)) { await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("stopped")); }
-      // C5, C8: only a session that already records a model is a continuation (pi restores that model). A session
-      // fenced before pi persisted anything has none: without --model pi would fall back to its own default.
-      const recorded = !!sessionModel(await readSession(session));
       let child: Spawned;
       try {
-        child = await containment.spawn({ exec, command: "pi", args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: recorded, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
+        child = await containment.spawn({ exec, command: "pi", args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
           env: { DSA_HOME: home, DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}) } });
       } catch (error) {
         await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
@@ -506,7 +504,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const exec = String(e.exec); await fence(journal, exec); await release(exec);
       }
       for (const call of new Set(journal.entries().filter(e => e.type === JT.exec).map(e => String(e.call)))) {
-        const a = address(call), values = sessionUsage(await readSession(callSession(home, a.wid, a.key, a.gen)));
+        const a = address(call), values = sessionUsage(await readSession(callSession(home, a.wid, a.key, a.gen)), call);
         await serial(async () => {
           for (const u of values) if (!journal.entries().some(e => e.type === "usage" && e.call === call && e.id === u.id)) await journal.append("usage", { call, ...u });
           if (sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) {

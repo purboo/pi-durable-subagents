@@ -1,5 +1,5 @@
 // Private workflow records (A5): wt-intent{call,path,branch,base}, wt-created{call},
-// wt-remove-intent{call}, wt-removed{call}; fork-intent{call,header,hash,path}, fork-created{call}.
+// wt-remove-intent{call}, wt-removed{call}, wt-kept{call}; fork-intent{call,header,hash,path}, fork-created{call}.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
@@ -61,7 +61,7 @@ export async function prepareWorktree(t: CallTicket): Promise<string> {
 /** P32: Remove only a clean successful worktree, retaining its branch and failed work. */
 export async function cleanWorktree(t: CallTicket): Promise<void> {
   const intent = records(t, "wt-intent")[0];
-  if (!intent || records(t, "wt-removed").length) return;
+  if (!intent || records(t, "wt-removed").length || records(t, "wt-kept").length) return;
   const path = String(intent.path), tree = (await worktrees(t.cwd)).find(w => w.worktree === path);
   if (!tree) {
     if (records(t, "wt-remove-intent").length) await t.journal.append("wt-removed", { call: t.callId });
@@ -69,7 +69,8 @@ export async function cleanWorktree(t: CallTicket): Promise<void> {
   }
   if (tree.branch !== `refs/heads/${intent.branch}` || tree.HEAD !== await branchHead(t.cwd, String(intent.branch))) throw new Error(`Worktree identity conflict: ${path}`);
   if (await git(path, "status", "--porcelain", "--untracked-files=all")) {
-    await attention(t, "worktree", `Dirty worktree kept: ${path}`); return;
+    await attention(t, "worktree", `Dirty worktree kept: ${path}`);
+    await t.journal.append("wt-kept", { call: t.callId }); return;
   }
   if (!records(t, "wt-remove-intent").length) await t.journal.append("wt-remove-intent", { call: t.callId });
   await git(t.cwd, "worktree", "remove", path);

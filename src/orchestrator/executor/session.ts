@@ -6,7 +6,7 @@ interface Block { type?: string; text?: string; id?: string; name?: string }
 interface Message { role?: string; content?: string | Block[]; stopReason?: string; toolCallId?: string; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
 export interface SessionEntry {
   type: string; id?: string; customType?: string; data?: Record<string, unknown>; message?: Message;
-  provider?: string; modelId?: string;
+  provider?: string; modelId?: string; details?: Record<string, unknown>;
 }
 /** C5: Read complete native session entries, ignoring only an unfinished trailing line. */
 export async function readSession(path: string): Promise<SessionEntry[]> {
@@ -14,6 +14,12 @@ export async function readSession(path: string): Promise<SessionEntry[]> {
   const lines = bytes.split("\n");
   if (lines.at(-1) !== "") lines.pop();
   return lines.filter(Boolean).map(line => JSON.parse(line) as SessionEntry);
+}
+/** P4, P27: Native message receipts and control resolutions share one identity lookup. */
+export function receiptId(entry: SessionEntry): string | undefined {
+  const rid = entry.message?.details?.rid ?? (entry.type === "custom_message" ? entry.details?.rid : undefined) ??
+    (entry.type === "custom" && [CT.rejected, CT.withdrawn, CT.model].includes(entry.customType as typeof CT.rejected) ? entry.data?.rid : undefined);
+  return typeof rid === "string" ? rid : undefined;
 }
 /** P9: Derive evidence only after this execution's own launch receipt. */
 export function evidence(entries: SessionEntry[], exec: string) {

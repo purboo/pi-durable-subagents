@@ -47,6 +47,7 @@ test("dirty worktree is retained with deduplicated attention and reused by the n
   assert.equal(await readFile(join(cwd, "dirty"), "utf8"), "user work");
   const items = f.journal.entries().filter(e => e.type === "attention");
   assert.equal(items.length, 1); assert.match(JSON.stringify(items[0]), new RegExp(cwd));
+  assert.equal(f.journal.entries().filter(e => e.type === "wt-kept" && e.call === f.t.callId).length, 1);
   assert.deepEqual(await f.effects().prepare({ ...f.t, gen: 2, callId: "W@1/task@2", continueFrom: f.t.callId }, { sessionPath: f.sessionPath }), { cwd });
 });
 test("non-git cwd and foreign branches refuse isolation", async ctx => {

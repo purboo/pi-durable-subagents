@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { FAUX, PI_BIN, REPO, script, settled, startPi, tempRoot } from "../../harness/pi.ts";
-import { callDir, callInbox, callSession, journalPath, orchLedger } from "../../../src/paths.ts";
+import { callDir, callInbox, callSession, journalPath, orchLedger, outboxRoot } from "../../../src/paths.ts";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { scanInbox } from "../../../src/kernel/mailbox.ts";
 import { contentHash, forwardRid, ulid } from "../../../src/kernel/ids.ts";
@@ -656,6 +656,67 @@ test("X1 workflow budget refuses loss continuation but does not stop a running s
   assert.equal(first.status, "failed"); assert.equal(first.error, "workflow budget reached");
   assert.equal(sibling.status, "ok"); assert.equal(sibling.output, "running sibling survives");
   assert.equal(f.journal.entries().filter(e => e.type === "tracked" && String(e.exec).startsWith(`${a.callId}#1.2`)).length, 0);
+});
+
+test("X2 generation inherits the switched provider and charges only its own messages", { timeout: 30000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 1 }, "switch-probe": { slots: 1 } } });
+  await writeFile(join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({ extensions: [FAUX, fileURLToPath(new URL("switch-provider.ts", import.meta.url))] }));
+  const first = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 1" } }, { text: "switch" }]));
+  const pending = f.executor.run(first);
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  await f.executor.forward({ rid: "switch-generation", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: first.callId, kind: "model", model: "switch-probe/target" } }, { journal: f.journal, widRev: first.widRev, key: first.key, gen: 1 });
+  assert.equal((await pending).status, "ok");
+  const next: CallTicket = { ...first, gen: 2, callId: `${f.wid}@1/a@2`, continueFrom: first.callId, opening: { rid: "next", kind: "follow-up", message: "next turn" } };
+  const result = await f.executor.run(next);
+  assert.equal(result.status, "ok");
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold" && String(e.exec).startsWith(`${next.callId}#`)).map(e => e.pool), ["memory", "switch-probe"]);
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 2), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  const start = rows.findIndex(e => e.customType === CT.exec && String(e.data?.exec).startsWith(`${next.callId}#`));
+  const own = rows.slice(start + 1).filter(e => e.message?.role === "assistant");
+  assert.deepEqual([...new Set(own.map(e => `${e.message.provider}/${e.message.model}`))], ["switch-probe/target"]);
+  assert.equal(f.journal.entries().filter(e => e.type === "usage" && e.call === next.callId).length, own.length);
+  assert.equal(result.usage!.input, own.reduce((n, e) => n + e.message.usage.input + e.message.usage.cacheRead + e.message.usage.cacheWrite, 0));
+  await f.executor.recover(f.wid, f.journal);
+  assert.equal(f.journal.entries().filter(e => e.type === "usage" && e.call === next.callId).length, own.length);
+});
+
+test("X2 fresh fork selects and holds its own model and excludes origin usage", { timeout: 30000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 1 }, "switch-probe": { slots: 0 } } });
+  await writeFile(join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({ extensions: [FAUX, fileURLToPath(new URL("switch-provider.ts", import.meta.url))] }));
+  const originSession = join(f.root, "origin.jsonl");
+  await writeFile(originSession, [
+    { type: "session", version: 3, id: "origin", cwd: f.cwd, timestamp: new Date().toISOString() },
+    { type: "model_change", id: "model", parentId: null, provider: "switch-probe", modelId: "target" },
+    { type: "message", id: "inherited", parentId: "model", message: { role: "assistant", content: [{ type: "text", text: "origin" }], provider: "switch-probe", model: "target", api: "switch-probe-faux", stopReason: "stop", timestamp: 1, usage: { input: 1000000, output: 1000000, cacheRead: 0, cacheWrite: 0, totalTokens: 2000000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 100 } } } },
+  ].map(e => JSON.stringify(e)).join("\n") + "\n");
+  const ticket = f.ticket(); ticket.spec.context = "fork"; ticket.originSession = originSession; ticket.workflowBudget = { tokens: 100000 };
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "ok"); assert.ok(result.usage!.input < 1000000); assert.ok(result.usage!.costUsd < 100);
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold").map(e => e.pool), ["memory", "probe"]);
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(rows.filter(e => e.message?.role === "assistant").at(-1).message.provider, "probe");
+  assert.equal(f.journal.entries().filter(e => e.type === "usage").length, 1);
+  await f.executor.recover(f.wid, f.journal);
+  assert.equal(f.journal.entries().filter(e => e.type === "usage").length, 1);
+});
+
+test("X2 native g+1 follow-up receipt resolves outbox before seal and is never retired", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 20 } }), first = f.ticket();
+  assert.equal((await f.executor.run(first)).status, "ok");
+  const next: CallTicket = { ...first, gen: 2, callId: `${f.wid}@1/a@2`, continueFrom: first.callId, opening: { rid: "opening", kind: "follow-up", message: script([{ delayMs: 1200, text: "second" }]) } };
+  const pending = f.executor.run(next);
+  await until(() => f.journal.entries().some(e => e.type === "tracked" && String(e.exec).startsWith(`${next.callId}#`)));
+  const req: Request = { rid: "follow", from: "main:test", to: "orch", sseq: 2, kind: "send", body: { to: next.callId, kind: "follow-up", message: script([{ delayMs: 1200, text: "followed" }]) } };
+  await f.executor.forward(req, { journal: f.journal, widRev: next.widRev, key: "a", gen: 2 });
+  const forwarded = f.journal.entries().find(e => e.type === "forward" && e.rid === req.rid)!;
+  await until(() => readJournalSnapshot(join(outboxRoot(f.home), "outbox", "orch.jsonl")).some(e => e.type === "resolved" && e.rid === forwarded.rid2));
+  assert.ok(!f.journal.entries().some(e => e.type === JT.sealed && e.call === next.callId), "receipt resolves while the follow-up is still running");
+  assert.equal((await pending).status, "ok");
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 2), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(rows.filter(e => e.type === "custom_message" && e.details?.rid === forwarded.rid2).length, 1);
+  assert.ok(!f.journal.entries().some(e => e.type === "forward-retired" && e.rid2 === forwarded.rid2));
+  await f.executor.recover(f.wid, f.journal);
+  assert.ok(!f.journal.entries().some(e => e.type === "forward-retired" && e.rid2 === forwarded.rid2));
 });
 
 test("C5/C8 an execution fenced before pi persisted its session restarts with the selected model, not pi's default", { timeout: 30000 }, async t => {
