@@ -16,10 +16,14 @@ import { validate } from './child/schema.ts';
 type Mode = 'idle' | 'boundary' | 'settle' | 'ask';
 const MESSAGES = ['task', 'steer', 'follow-up', 'continue'];
 type SessionLike = { id?: string; type?: string; message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } } } };
-/** P31: Session usage, deduplicated by entry id, over every execution of this call's session. */
-export function usage(entries: readonly SessionLike[]): { tokens: number; costUsd: number } {
-  let tokens = 0, costUsd = 0; const seen = new Set<string>();
+/** P31, P33, P37: Usage of this call only — assistant messages in segments opened by this call's executions,
+ *  deduplicated by entry id. Context inherited from an earlier generation or a forked origin is not charged. */
+export function usage(entries: readonly SessionLike[], call?: string): { tokens: number; costUsd: number } {
+  let tokens = 0, costUsd = 0, own = call === undefined; const seen = new Set<string>();
   for (const e of entries) {
+    if (e.type === 'custom' && (e as { customType?: string }).customType === CT.exec)
+      own = call === undefined || String((e as { data?: { exec?: string } }).data?.exec ?? '').startsWith(`${call}#`) || !/#\d+\.\d+$/.test(String((e as { data?: { exec?: string } }).data?.exec ?? ''));
+    if (!own) continue;
     const u = e.type === 'message' && e.message?.role === 'assistant' ? e.message.usage : undefined;
     if (!u || (e.id && seen.has(e.id))) continue;
     if (e.id) seen.add(e.id);
@@ -143,7 +147,7 @@ export function registerChild(pi: ExtensionAPI): void {
   const budget = process.env[ENV.budget] ? JSON.parse(process.env[ENV.budget]!) as { tokens?: number; costUsd?: number } : undefined;
   if (budget) pi.on('context', async (_event, ctx) => {
     if (!active) return;
-    const used = usage(ctx.sessionManager.getEntries() as unknown as SessionLike[]);
+    const used = usage(ctx.sessionManager.getEntries() as unknown as SessionLike[], call);
     if ((budget.tokens === undefined || used.tokens < budget.tokens) && (budget.costUsd === undefined || used.costUsd < budget.costUsd)) return;
     await serial(async () => {
       if (!active) return;

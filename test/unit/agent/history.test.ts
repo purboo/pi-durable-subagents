@@ -24,3 +24,18 @@ test("P28: a continue receipt bound to qid@rev is recovered as an answer", () =>
   const state = recover([custom(CT.exec, { exec: "c#1.1" }), custom(CT.question, { qid: "q", rev: 2, question: "?" }), msg("r", { qid: "q", rev: 2 })], "c");
   assert.ok(state.answered.has("q@2"));
 });
+
+test("P31, P33, P37: per-call usage excludes inherited context and earlier generations", async () => {
+  const { usage } = await import("../../../src/agent/child.ts");
+  const assistant = (id: string, tokens: number) => ({ id, type: "message", message: { role: "assistant", usage: { totalTokens: tokens, cost: { total: tokens / 100 } } } });
+  const entries = [
+    assistant("fork-origin", 1000),
+    custom(CT.exec, { exec: "w@1/k@1#1.1" }), assistant("g1", 10),
+    custom(CT.exec, { exec: "w@1/k@2#1.1" }), assistant("g2a", 5),
+    custom(CT.exec, { exec: "w@1/k@2#1.2" }), assistant("g2b", 7), assistant("g2b", 7),
+  ];
+  const g2 = usage(entries as never, "w@1/k@2"), g1 = usage(entries as never, "w@1/k@1");
+  assert.equal(g2.tokens, 12); assert.ok(Math.abs(g2.costUsd - 0.12) < 1e-9);
+  assert.equal(g1.tokens, 10); assert.ok(Math.abs(g1.costUsd - 0.1) < 1e-9);
+  assert.equal(usage(entries as never).tokens, 1022, "without a call identity everything counts (legacy/test use)");
+});
