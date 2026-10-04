@@ -33,7 +33,7 @@ export function stack(root: string, inherited: NodeJS.ProcessEnv) {
   writeFileSync(join(home, "config.json"), JSON.stringify({ providers: { "dsa-chaos": 3 }, k: { trackerMs: 100, checkpointMs: 200, idleExitMs: 2000 } }));
   for (const name of ["writer", "reviewer", "integrator"]) writeFileSync(join(cwd, `.pi/agents/${name}.md`), `---\nname: ${name}\ndescription: Chaos ${name}\nmodel: dsa-chaos/scripted\ntools: bash, ask\n---\nFollow the scripted task.\n`);
   const env = { PATH: inherited.PATH, HOME: join(root, "home"), TMPDIR: root, PI_CODING_AGENT_DIR: agent,
-    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", DSA_HOME: home, DSA_CHAOS_ROOT: root, DSA_ORCHESTRATOR_ENTRY: sibling("./host") };
+    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", JITI_FS_CACHE: "false", DSA_HOME: home, DSA_CHAOS_ROOT: root, DSA_ORCHESTRATOR_ENTRY: sibling("./host") };
   const instances: { child: ChildProcessWithoutNullStreams; events: any[]; prompt(steps: unknown[]): Promise<void> }[] = [];
   function launch() {
     let child!: ChildProcessWithoutNullStreams, events: any[] = [], buffer = "", error: Error | undefined, requestId = 0, ready = false;
@@ -72,11 +72,17 @@ export function stack(root: string, inherited: NodeJS.ProcessEnv) {
             const state = (await request({ type: "get_state" })).data;
             appendFileSync(join(root, "readiness.jsonl"), JSON.stringify({ pid: child.pid, attempt, state }) + "\n");
             return state?.model?.provider === "dsa-chaos" && state.model.id === "scripted";
-          }, "scripted model ready", 8_000);
+          }, "scripted model ready", 4_000);
           return;
         } catch (failure) {
-          if (attempt >= 3) throw failure;
-          appendFileSync(join(root, "pi-startup-retries.jsonl"), JSON.stringify({ pid: child.pid, attempt, reason: String(failure) }) + "\n");
+          // Distinguish "registered but not selected" (select it) from "never registered" (restart pi).
+          const available = await request({ type: "get_available_models" }).then(r => (r.data?.models ?? []) as { provider: string; id: string }[], () => []);
+          appendFileSync(join(root, "pi-startup-retries.jsonl"), JSON.stringify({ pid: child.pid, attempt, providers: [...new Set(available.map(m => m.provider))] }) + "\n");
+          if (available.some(m => m.provider === "dsa-chaos" && m.id === "scripted")) {
+            await request({ type: "set_model", provider: "dsa-chaos", modelId: "scripted" });
+            return;
+          }
+          if (attempt >= 5) throw failure;
           try { process.kill(-child.pid!, "SIGKILL"); } catch {}
           await until(() => child.exitCode !== null || child.signalCode !== null, "unready main exited", 5_000);
           start();
