@@ -1,4 +1,138 @@
-// Main session agent (wave 2 · M1). Placeholder until M1 lands.
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-/** P1, P15, P16, P25, P38: subagents tool, outbox, starter, attention presentation. */
-export function registerMain(_pi: ExtensionAPI): void {}
+import { spawn } from "node:child_process";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
+import { defineTool, type ExtensionAPI, type ExtensionContext, type CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
+import { Outbox, scanInbox } from "../kernel/mailbox.ts";
+import { readJournalSnapshot } from "../kernel/journal.ts";
+import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
+import { OsLock } from "../platform/lock.ts";
+import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
+import { CT, JT, type AttentionItem } from "../types.ts";
+import { attention, presented, resolved, workflows } from "./main/snapshots.ts";
+import { parameters, request } from "./main/tool.ts";
+
+let noteSink: ((text: string) => void) | undefined;
+/** P16: Queue a UI note for the next boundary without waking the model. */
+export function presentNote(text: string): void { noteSink?.(text); }
+
+/** P1, P15, P16, P25, P38: Register durable submission and serialized main-session presentation. */
+export function registerMain(pi: ExtensionAPI): void {
+  const home = dsaHome();
+  let ctx: ExtensionContext | undefined, sender = "", outbox: Outbox | undefined;
+  let queue: Promise<unknown> = Promise.resolve(), timer: ReturnType<typeof setInterval> | undefined;
+  let reserved: AttentionItem[] = [], notes: string[] = [], stopped = true, lastStarter = 0;
+  let polling = false;
+  const sink = (text: string) => { notes.push(text); };
+  function serial<T>(fn: () => Promise<T>): Promise<T> {
+    const result = queue.then(fn); queue = result.catch(() => {}); return result;
+  }
+  function ledger() { return readJournalSnapshot(orchLedger(home)); }
+  async function reconcile() {
+    const records = ledger().filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[];
+    for (const rid of reduceLifecycle(records).resolved.keys()) await outbox?.markResolved(rid);
+    for (const entry of ledger()) if (entry.type === JT.created) await outbox?.markResolved(String(entry.rid));
+  }
+  function pendingOutbox() {
+    const pending = new Set<string>();
+    for (const entry of readJournalSnapshot(join(outboxRoot(home), "outbox", `${sender}.jsonl`))) {
+      if (entry.type === "sent") pending.add((entry.request as { rid: string }).rid);
+      else if (entry.type === "resolved") pending.delete(String(entry.rid));
+    }
+    return pending.size > 0;
+  }
+  async function starter(submitting = false) {
+    if (stopped) return;
+    await reconcile();
+    const pending = submitting || pendingOutbox() || (await scanInbox(orchInbox(home))).length > 0 || workflows(home).some(w => !w.entries.some(e => e.type === JT.done));
+    if (!pending) return;
+    await mkdir(home, { recursive: true });
+    const lock = await new OsLock().tryAcquire(orchLock(home));
+    if (!lock) return;
+    await lock.release();
+    const entry = process.env.DSA_ORCHESTRATOR_ENTRY ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../orchestrator/main.ts" : "../orchestrator/main.js", import.meta.url));
+    const child = spawn(process.execPath, [entry], { detached: true, stdio: "ignore", env: { ...process.env, DSA_HOME: home } });
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.unref();
+  }
+  function collect() { return ctx ? attention(home, sender, [...presented(ctx), ...reserved]) : []; }
+  function message(items: AttentionItem[]): CustomMessageEntryDraft {
+    return { type: "custom_message", customType: CT.attention, content: items.map(i => i.text).join("\n"), display: true, details: { items } };
+  }
+  async function idle() {
+    if (stopped || !ctx?.isIdle()) return;
+    const items = collect();
+    if (!items.length) return;
+    // Reserve until pi has appended its receipt; all presentation paths share this queue.
+    reserved.push(...items);
+    try { pi.sendMessage(message(items), { triggerTurn: true }); }
+    catch (error) { reserved = reserved.filter(item => !items.includes(item)); throw error; }
+  }
+  const boundary = async (_event: unknown, context: ExtensionContext) => serial(async () => {
+    if (stopped) return;
+    ctx = context;
+    const items = collect(), entries: CustomMessageEntryDraft[] = [];
+    if (items.length) { entries.push(message(items)); reserved.push(...items); }
+    if (notes.length) entries.push({ type: "custom_message", customType: CT.note, content: notes.splice(0).join("\n"), display: true });
+    return entries.length ? { entries, ...(items.length ? { continue: true } : {}) } : undefined;
+  });
+  async function close() {
+    stopped = true; clearInterval(timer); timer = undefined;
+    await queue; await outbox?.close(); outbox = undefined;
+    if (noteSink === sink) noteSink = undefined;
+    reserved = []; notes = []; ctx = undefined;
+  }
+  async function start(context: ExtensionContext) {
+    await close(); ctx = context; sender = `main:${context.sessionManager.getSessionId()}`; stopped = false;
+    outbox = await Outbox.open(outboxRoot(home), sender, () => orchInbox(home)); noteSink = sink;
+    await reconcile(); await outbox.republishPending(); await starter(); lastStarter = Date.now();
+    timer = setInterval(() => {
+      if (polling || stopped) return;
+      polling = true;
+      void serial(async () => {
+        if (stopped) return;
+        if (Date.now() - lastStarter >= 30_000) { lastStarter = Date.now(); await starter(); }
+        await idle();
+      }).catch(error => console.error("durable-subagents:", error)).finally(() => { polling = false; });
+    }, 200);
+    timer.unref();
+  }
+  pi.on("session_start", async (_event, context) => start(context));
+  pi.on("session_shutdown", close);
+  pi.on("turn_end", boundary); pi.on("agent_before_settle", boundary);
+  pi.on("context", async event => ({ messages: event.messages.map(msg => {
+    if (msg.role !== "custom" || msg.customType !== CT.attention) return msg;
+    const items = (msg.details as { items?: AttentionItem[] } | undefined)?.items;
+    if (!items) return msg;
+    return { ...msg, content: items.map(item => resolved(home, item) ? `(resolved: ${item.text})` : item.text).join("\n") };
+  }) }));
+  pi.registerTool(defineTool({
+    name: "subagents", label: "Subagents", description: "Run durable subagent workflows; send, stop, revise, resume, drain or inspect fresh status.", parameters,
+    async execute(_id, args, signal, _update, context) {
+      const reply = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value });
+      if (args.action === "status") return reply(workflows(home).sort((a, b) => Number(b.origin === sender) - Number(a.origin === sender)));
+      const normalized = request(args, context.cwd);
+      const sent = await serial(async () => {
+        if (!outbox || stopped) throw new Error("Main session is not active");
+        signal?.throwIfAborted();
+        await starter(true);
+        if (normalized.replaces?.length) {
+          const withdrawn = await outbox.send("orch", "withdraw", { rids: normalized.replaces });
+          normalized.cond = { ...normalized.cond, after: withdrawn.rid };
+        }
+        return outbox.send("orch", normalized.kind, normalized.body, normalized.cond);
+      });
+      if (sent.kind === "run") {
+        const deadline = performance.now() + 10_000;
+        while (true) {
+          const receipt = ledger().find(e => e.type === JT.created && e.rid === sent.rid);
+          if (receipt) { await serial(async () => { await outbox?.markResolved(sent.rid); }); return reply({ wid: receipt.wid }); }
+          if (performance.now() >= deadline || signal?.aborted) break;
+          await delay(Math.min(100, deadline - performance.now()));
+        }
+      }
+      return reply({ submitted: { rid: sent.rid } });
+    },
+  }));
+}
