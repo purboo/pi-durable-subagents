@@ -1,0 +1,34 @@
+{
+  "name": "pi-durable-subagents",
+  "version": "0.0.0",
+  "description": "Subagents for pi that never lose work and never do it twice. Crash-safe workflows, automatic recovery, and a live view just like the main agent.",
+  "type": "module",
+  "license": "MIT",
+  "author": "purboo",
+  "keywords": ["pi-package", "subagents", "workflow", "durable", "orchestration", "multi-agent"],
+  "engines": { "node": ">=22.18" },
+  "bin": { "pi-durable-subagents": "dist/cli/main.js" },
+  "pi": { "extensions": ["dist/agent/extension.js"] },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint:imports": "node scripts/check-imports.mjs",
+    "test": "node --test --test-concurrency=4 'test/**/*.test.ts'",
+    "test:unit": "node --test 'test/unit/**/*.test.ts'",
+    "test:pi": "node --test --test-concurrency=1 'test/pi/**/*.test.ts'",
+    "check": "npm run typecheck && npm run lint:imports && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.2",
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@earendil-works/pi-tui": "1.0.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
