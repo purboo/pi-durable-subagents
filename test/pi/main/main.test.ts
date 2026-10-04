@@ -8,7 +8,7 @@ import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts
 import { Outbox, scanInbox } from "../../../src/kernel/mailbox.ts";
 import { OsLock } from "../../../src/platform/lock.ts";
 import { orchInbox, orchLedger, orchLock, journalPath } from "../../../src/paths.ts";
-import { CT, JT, type AttentionItem } from "../../../src/types.ts";
+import { CT, JT, type AttentionItem, type RunBody } from "../../../src/types.ts";
 
 const extension = join(REPO, "src/agent/extension.ts"), observer = join(REPO, "test/pi/main/fixtures/observe.ts");
 const fake = join(REPO, "test/pi/main/fixtures/orchestrator.ts");
@@ -65,7 +65,10 @@ test("run publishes pinned call body through the durable outbox and returns crea
   await prompt(pi, [{ tool: "subagents", args: { action: "run", agent: "worker", task: "Implement", model: "probe/scripted", timeoutMs: 1234 } }, { text: "done" }]);
   const [req] = await scanInbox(orchInbox(home));
   assert.ok(req); assert.equal(req.kind, "run"); assert.equal(req.from, sender); assert.equal(req.to, "orch"); assert.equal(req.sseq, 1);
-  assert.deepEqual(req.body, { cwd: join(pi.dir, "work"), call: { agent: "worker", task: "Implement", model: "probe/scripted", timeoutMs: 1234 } });
+  const { origin, ...body } = req.body as RunBody;
+  assert.deepEqual(body, { cwd: join(pi.dir, "work"), call: { agent: "worker", task: "Implement", model: "probe/scripted", timeoutMs: 1234 } });
+  // P33: the origin branch is offered for pinning: the live session file and its current leaf.
+  assert.ok(origin && existsSync(origin.sessionFile) && typeof origin.leafId === "string");
   assert.equal(result(pi).isError, false); assert.deepEqual(result(pi).result.details, { wid: `w-${req.rid}` });
   const entries = readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
   assert.deepEqual(entries.find(e => e.type === "sent")?.request, req);
@@ -79,7 +82,8 @@ test("run returns submitted after 10 seconds, including an absolute workflow pat
   await prompt(pi, [{ tool: "subagents", args: { action: "run", workflow: "./flow.js", args: { value: 3 } } }, { text: "done" }]);
   assert.ok(performance.now() - start >= 10000);
   const [req] = await scanInbox(orchInbox(home)); assert.ok(req);
-  assert.deepEqual(req.body, { cwd: join(pi.dir, "work"), workflow: join(pi.dir, "work/flow.js"), args: { value: 3 } });
+  const { origin: _origin, ...body } = req.body as RunBody;
+  assert.deepEqual(body, { cwd: join(pi.dir, "work"), workflow: join(pi.dir, "work/flow.js"), args: { value: 3 } });
   assert.deepEqual(result(pi).result.details, { submitted: { rid: req.rid } });
 });
 
