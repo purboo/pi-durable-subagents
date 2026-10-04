@@ -962,3 +962,73 @@ with no record) and idempotent repeats.
   delivers exactly once; stop while hibernated;
 - the origin pin;
 - the effects call order, with a recording stub.
+
+### L1b · `chaos` (`src/cli/chaos/`, `test/pi/chaos/`; one registration line in `src/cli/main.ts`)
+
+`pi-durable-subagents chaos [--scenario <n>] [--keep] [--json]` runs the
+AC2 fault suite offline in about a minute, on the real product stack:
+orchestrator, executor, evaluator, and real child pi processes. It needs
+only the `pi` binary on PATH.
+
+**Isolation.** Everything runs in a temp root:
+
+- `DSA_HOME`;
+- `PI_CODING_AGENT_DIR`, whose `settings.json` loads the shipped scripted
+  provider `src/cli/chaos/provider.ts` (a pi extension built on
+  `fauxProvider` from `@earendil-works/pi-ai`, which is resolvable inside
+  pi extensions) as `defaultProvider`/`defaultModel`;
+- the project cwd with `.pi/agents/{writer,reviewer,integrator}.md`.
+
+Never touch the user's `~/.pi` or real `DSA_HOME`. `--keep` keeps the temp
+root and prints its path.
+
+**Workflow under test.** A 3-leaf rolling DAG, writer → reviewer →
+integrator, in the style of `exec-template.js`: the reviewer parses a
+`LEAF:` line from the writer, and the integrator parses a `REVIEW:` line.
+The main session submits it through the real `subagents` tool. That main
+session is a real pi RPC session with this extension and a scripted main
+model.
+
+**Scenarios.** Each injects one fault and asserts the outcome:
+
+| # | Fault | Expected outcome |
+|---|---|---|
+| 1 | Stream drop: a provider error mid-turn | Continues the same session; partial tool results kept |
+| 2 | Silent timeout: a CPU-burning silent tool with `timeoutMs` | Seals `timeout` (tracker evidence), and the script handles it |
+| 3 | Empty reply | Continuation, then ok |
+| 4 | Main pi restart: kill the main session mid-run, restart on the same session | Work continues; one `finished` presentation |
+| 5 | The child asks; the main session steers while the question is open | The steer interrupts; the question stays open; a later answer completes |
+| 6 | Two steers, where the second declares `replaces` the first, published in reverse order | Only the second applies; the first is tombstoned or withdrawn |
+| 7 | Refusal by verdict: the reviewer returns a rejecting `REVIEW:` | The integrator is never dispatched |
+| 8 | Dependency failure: the writer fails after K2 losses | Dependents skipped |
+| 9 | SIGKILL of the orchestrator mid-run; the starter restarts it | No sealed call is re-executed; the running call continues on its session |
+
+Faults are injected through the scripted provider: steps in the task text,
+as in `test/harness/faux-provider.ts`, plus process kills by the driver.
+
+**Global invariants**, checked from the journals and sessions after every
+scenario:
+
+- **Duplicate runs = 0:** no call is sealed twice; no request rid has two
+  receipts in any session; no sealed call gets a later execution.
+- **Lost results = 0:** expected outputs are present in the workflow
+  result.
+- **Restarted from scratch = 0:** every continuation reuses the session
+  file of the previous execution, so the session only grows.
+- **AC4:** wakes in the main session ≤ leaves × 2 + questions; no stale
+  reminder, meaning no presented `item@rev` that was already resolved at
+  presentation time.
+
+**Output.** One summary in the style of README `design/copy.md` (killed
+host ×N · dropped streams ×N · …, then the invariant lines and
+`all 9 scenarios pass`); `--json` gives machine-readable output. A failure
+prints the scenario, the invariant, and the evidence paths, and exits
+non-zero.
+
+**Tests.** `test/pi/chaos/chaos.test.ts` runs the full suite once (it may
+take a few minutes; give it an explicit timeout) and one scenario through
+the CLI entry.
+
+If a scenario exposes a product defect, do **not** fix product code. Stop
+and report it to the parent with the evidence path; the parent owns the
+fix.
