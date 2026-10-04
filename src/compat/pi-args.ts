@@ -8,6 +8,9 @@ export interface PiArgsOptions {
   continuation?: boolean;
   /** A candidate selected and recorded by the orchestrator when using pools. */
   model?: Model;
+  /** Protocol tools registered by the child agent (ask; report when DSA_SCHEMA is set). They are part of the
+   *  durable protocol, not agent capabilities, so they are added to any explicit allowlist (incl. an empty one). */
+  controlTools?: readonly string[];
   /** Resolve logical skill names to pinned skill files or directories. */
   resolveSkill?: (name: string) => string;
 }
@@ -17,7 +20,8 @@ export function buildPiArgs(agent: AgentDefinition, spec: CallSpec, options: PiA
   const args = ["--mode", "rpc", "--session", options.sessionPath,
     agent.systemPromptMode === "append" ? "--append-system-prompt" : "--system-prompt", options.systemPromptPath];
   const tools = spec.tools ?? agent.tools;
-  if (tools) args.push(...(tools.length ? ["--tools", tools.join(",")] : ["--no-tools"]));
+  const allowed = tools && [...new Set([...tools, ...(options.controlTools ?? [])])];
+  if (allowed) args.push(...(allowed.length ? ["--tools", allowed.join(",")] : ["--no-tools"]));
   if (!agent.inheritProjectContext) args.push("--no-context-files");
   if (!agent.inheritSkills) args.push("--no-skills");
   for (const skill of spec.skills ?? agent.skills ?? []) args.push("--skill", options.resolveSkill?.(skill) ?? skill);
