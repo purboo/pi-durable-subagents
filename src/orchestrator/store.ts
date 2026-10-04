@@ -16,11 +16,28 @@ import type { Ledgers } from './contract.ts';
 
 export interface Pins {
   source: string; args: unknown; agents: AgentDefinition[]; inputs: Record<string, string>;
-  inputSources?: Record<string, string>; usageBudget?: RunBody['usageBudget']; maxCalls?: number;
+  inputSources?: Record<string, string>; origin?: string; usageBudget?: RunBody['usageBudget']; maxCalls?: number;
 }
 export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string> }
 type SnapshotRef = { path: string; hash: string };
 type Snapshot = { hash: string; pins?: Pins; error?: string };
+
+/** P33: Capture the selected branch before admission and exclude extension receipts. */
+async function pinOrigin(origin: NonNullable<RunBody['origin']>): Promise<string> {
+  const rows = (await readFile(origin.sessionFile, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line) as { type: string; id?: string; parentId?: string | null; message?: { customType?: string } });
+  const header = rows.find(e => e.type === 'session');
+  if (!header) throw new Error('Origin session has no header');
+  const byId = new Map(rows.filter(e => e.type !== 'session' && e.id).map(e => [e.id!, e]));
+  let id = origin.leafId === undefined ? rows.findLast(e => e.type !== 'session' && e.id)?.id : origin.leafId;
+  const branch: typeof rows = [], seen = new Set<string>();
+  while (id) {
+    if (seen.has(id)) throw new Error('Cyclic origin branch');
+    seen.add(id);
+    const entry = byId.get(id); if (!entry) throw new Error('Missing origin branch entry');
+    branch.unshift(entry); id = entry.parentId;
+  }
+  return [header, ...branch.filter(e => ['message', 'model_change'].includes(e.type) && !e.message?.customType?.startsWith('dsa-'))].map(e => JSON.stringify(e)).join('\n') + '\n';
+}
 
 /** P11, A5: Capture immutable admission inputs before publishing any workflow files. */
 export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions): Promise<Pins> {
@@ -33,6 +50,7 @@ export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions): P
   const found = discoverAgents(body.cwd, discovery);
   if (found.diagnostics.length) throw new Error(found.diagnostics.map(d => `${d.sourcePath}: ${d.error}`).join('\n'));
   return { source, args: body.args ?? null, agents: found.agents, inputs, inputSources: body.inputs ?? {},
+    ...(body.origin ? { origin: await pinOrigin(body.origin) } : {}),
     ...(body.usageBudget ? { usageBudget: body.usageBudget } : {}), ...(body.maxCalls !== undefined ? { maxCalls: body.maxCalls } : {}) };
 }
 
@@ -44,7 +62,7 @@ export function revisionEntries(wf: Workflow): readonly Entry[] {
 
 /** A1, A5: A resume supersedes a terminal observation without deleting history. */
 export function terminalEntry(entries: readonly Entry[]): Entry | undefined {
-  const last = entries.findLast(e => e.type === JT.done || e.type === 'resumed' || e.type === 'revised');
+  const last = entries.findLast(e => e.type === JT.done || (e.type === 'resumed' && !e.call) || e.type === 'revised');
   return last?.type === JT.done ? last : undefined;
 }
 
@@ -75,6 +93,7 @@ export class Store {
           if (change.workflow !== undefined && change.source !== undefined) throw new Error('invalid-revise');
         } else body = req.body as RunBody;
         snapshot = { hash: contentHash(req), pins: await prepareRun({ ...body, maxCalls: body.maxCalls ?? this.ledgers.config.k?.spawnBudget ?? 300 }, discovery) };
+        if (req.kind === 'revise') snapshot.pins!.origin = this.workflows.get((req.body as ReviseBody).wid)?.pins.origin;
       } catch (error) { snapshot = { hash: contentHash(req), error: String(error) }; }
       await publishFile(dir, 'snapshot.json', JSON.stringify(snapshot));
       await syncDirectory(join(this.ledgers.home, 'staging'));
@@ -136,6 +155,7 @@ export class Store {
     const publish = async (directory: string, name: string, bytes: string | Buffer) => {
       if (await publishFile(directory, name, bytes) === 'conflict') throw new Error(`Pinned content conflict: ${directory}/${name}`);
     };
+    if (pins.origin !== undefined) await publish(dir, 'origin.jsonl', pins.origin);
     await publish(dir, 'script.js', pins.source);
     await publish(dir, 'args.json', JSON.stringify(pins.args));
     await publish(dir, 'agents.json', JSON.stringify(pins.agents));

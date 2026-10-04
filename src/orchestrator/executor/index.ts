@@ -1,6 +1,7 @@
 // Private journal entries (A1): tracked{exec,pid,start}; loss{exec}; settled{exec};
 // stop-intent{call}; forward{rid,rid2,dest,hash,envelope:{to,kind,body,cond?}};
 // observation{exec,event}; selected{exec,model}; switch-observed{exec,rid,pool}.
+// P28 entries are documented in hibernate.ts; generation session publication in generation.ts.
 // The orchestrator ledger owns
 // hold/release{pool,slot,exec}. All transitions are serialized before publication.
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -16,7 +17,10 @@ import { Containment } from "../../platform/containment.ts";
 import { buildPiArgs } from "../../compat/pi-args.ts";
 import { parseModel, resolveModel, type Model } from "../../compat/model.ts";
 import { buildCallResult } from "../../compat/result.ts";
-import type { CallTicket, Executor, Ledgers } from "../contract.ts";
+import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts";
+import createEffects from "./effects/index.ts";
+import { continueSession } from "./generation.ts";
+import { hibernation, openQuestion } from "./hibernate.ts";
 import { evidence, readSession, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
 import { observeExecution } from "./observe.ts";
@@ -25,7 +29,7 @@ import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 import { skipLostCandidate, sweepExecutions } from "./sweep.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
-type Active = { ticket: CallTicket; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean };
+type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean };
 const shutdownError = () => Object.assign(new Error("executor shutdown; call resumes on recovery"), { name: "ExecutorShutdown" });
 const extension = fileURLToPath(new URL(`../../agent/extension.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url));
 const entriesFor = (journal: JournalHandle, call: string) => journal.entries().filter(e => e.call === call);
@@ -45,9 +49,9 @@ async function defaultModel(): Promise<string | undefined> {
 }
 
 /** P2, P9, P22: Construct the journal-owned execution authority under the engine's OS lock. */
-export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number } = {}): Executor {
+export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects } = {}): Executor {
   const { home, config, orch } = ledgers;
-  const containment = new Containment();
+  const containment = new Containment(), effects = options.effects ?? createEffects(ledgers);
   const active = new Map<string, Active>(), completed = new Map<string, Promise<CallResult>>(), journals = new Map<string, JournalHandle>();
   let queue: Promise<unknown> = Promise.resolve(), closed = false;
   let suspending: Promise<void> | undefined;
@@ -124,12 +128,30 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   async function retireAttention(journal: JournalHandle, call: string) {
     for (const e of journal.entries().filter(e => e.type === JT.attention)) {
-      const item = e.item as { id: string; rev: number; call?: string };
+      const item = e.item as { id: string; rev: number; call?: string; kind?: string };
+      if (item.kind === "finished") continue;
       if (item.call === call && !journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev))
         await journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "retired" });
     }
   }
   async function finish(journal: JournalHandle, call: string, exec: string, result: CallResult) {
+    const a = active.get(call);
+    if (a && !sealed(journal, call) && !["stopped", "timeout", "budget"].includes(result.status)) {
+      const started = Date.now(), prior = activeTotal(journal.entries(), call);
+      const check = async () => {
+        if (stopped(a)) a.controller.abort();
+        if (a.ticket.spec.timeoutMs !== undefined && prior + Date.now() - started >= a.ticket.spec.timeoutMs) {
+          a.controller.abort();
+          await serial(async () => { if (!has(journal, "timeout-intent", exec)) await journal.append("timeout-intent", { exec, call }); });
+        }
+        if (reached(totalUsage(journal.entries(), call), a.ticket.spec.budget)) a.controller.abort();
+      };
+      let checking = Promise.resolve();
+      const timer = setInterval(() => { checking = checking.then(check); }, config.k?.trackerMs ?? 1000);
+      try { await check(); result = await effects.beforeSeal(a.ticket, exec, result, { signal: a.controller.signal }); await check(); }
+      catch (error) { result = buildCallResult({ key: result.key, gen: result.gen, status: "failed", output: result.output, error: String(error) }); }
+      finally { clearInterval(timer); await checking; }
+    }
     const value = await serial(async () => {
       const old = sealed(journal, call);
       if (old) return old;
@@ -137,6 +159,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (!has(journal, JT.fenced, exec)) throw new Error(`Unfenced seal: ${exec}`);
       if (closed || active.get(call)?.suspended || journal.entries().some(e => e.type === "retired" && e.call === call)) throw shutdownError();
       if (entriesFor(journal, call).some(e => e.type === "stop-intent")) result = buildCallResult({ key: result.key, gen: result.gen, status: "stopped", output: "" });
+      else if (has(journal, "timeout-intent", exec)) result = buildCallResult({ key: result.key, gen: result.gen, status: "timeout", output: "" });
+      else if (a && reached(totalUsage(journal.entries(), call), a.ticket.spec.budget)) result = buildCallResult({ key: result.key, gen: result.gen, status: "budget", output: "" });
       result = { ...result, usage: totalUsage(journal.entries(), call) };
       await journal.append(JT.sealed, { call, exec, result });
       await retireForwards(journal, call);
@@ -145,7 +169,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await retireAttention(journal, call);
       return result;
     });
-    await release(exec); return value;
+    await release(exec);
+    if (a) await effects.afterSeal(a.ticket, value);
+    return value;
   }
   const stopped = (a: Active) => a.stopped || entriesFor(a.ticket.journal, a.ticket.callId).some(e => e.type === "stop-intent");
   const interrupted = (a: Active) => closed || a.suspended || a.retired || stopped(a);
@@ -195,7 +221,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const id = `q:${t.callId}:${qid}`;
         if (!t.journal.entries().some(r => r.type === JT.attention && (r.item as { id: string; rev: number }).id === id && (r.item as { rev: number }).rev === rev))
           await t.journal.append(JT.attention, { item: { id, rev, kind: "question", text: String(question), wid: t.wid, call: t.callId, qid, session: callSession(home, t.wid, t.key, t.gen) } });
-        const answered = entries.some(r => r.message?.role === "toolResult" && r.message.details?.qid === qid && r.message.details?.rev === rev && typeof r.message.details?.rid === "string");
+        const answered = entries.some(r => {
+          const details = r.message?.details ?? (r as unknown as { details?: Record<string, unknown> }).details;
+          return details?.qid === qid && details?.rev === rev && typeof details.rid === "string";
+        });
         if (answered && !t.journal.entries().some(r => r.type === JT.attentionResolved && r.id === id && r.rev === rev))
           await t.journal.append(JT.attentionResolved, { id, rev, resolution: "answered" });
       }
@@ -221,12 +250,38 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const t = a.ticket, journal = t.journal;
     const session = callSession(home, t.wid, t.key, t.gen), dir = callDir(home, t.wid, t.key, t.gen);
     const makeResult = (status: CallResult["status"], output = "", error?: string) => buildCallResult({ key: t.key, gen: t.gen, status, output, ...(error ? { error } : {}) });
+    let cwd = t.cwd;
+    if (sealed(journal, t.callId)) { const result = sealed(journal, t.callId)!; await effects.afterSeal(t, result); return result; }
+    try {
+      await continueSession(home, t, session);
+      cwd = (await effects.prepare(t, { sessionPath: session })).cwd;
+    } catch (error) {
+      const exec = current(journal, t.callId) ?? `${t.callId}#1.1`;
+      if (!current(journal, t.callId)) await serial(() => journal.append(JT.exec, { call: t.callId, exec }));
+      await fence(journal, exec);
+      return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
+    }
     for (;;) {
       const old = sealed(journal, t.callId); if (old) return old;
       if (closed || a.suspended || a.retired || journal.entries().some(e => e.type === "retired" && e.call === t.callId)) throw shutdownError();
       let exec = current(journal, t.callId);
       let entries = await readSession(session);
       let dangling: string[] = [];
+      let bound: Entry | undefined;
+      const sleeping = hibernation(journal, t.callId);
+      if (exec && sleeping?.exec === exec) {
+        await fence(journal, exec); await release(exec);
+        for (;;) {
+          if (interrupted(a) || has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs) break;
+          if (reached(totalUsage(journal.entries(), t.callId), t.spec.budget) || reached(totalUsage(journal.entries()), t.workflowBudget))
+            return finish(journal, t.callId, exec, makeResult("budget"));
+          bound = journal.entries().find(e => e.type === "answer-bound" && e.call === t.callId && e.qid === sleeping.qid && e.rev === sleeping.rev);
+          if (bound) break;
+          await new Promise<void>(resolve => { const timer = setTimeout(resolve, config.k?.trackerMs ?? 1000); a.wake = () => { clearTimeout(timer); resolve(); }; });
+        }
+      }
+      const pendingAnswer = journal.entries().findLast(e => e.type === "answer-bound" && e.call === t.callId);
+      if (!bound && pendingAnswer && !entries.some(e => e.message?.details?.rid === pendingAnswer.rid2 || (e as unknown as { details?: { rid?: string } }).details?.rid === pendingAnswer.rid2)) bound = pendingAnswer;
       if (exec) {
         await fence(journal, exec);
         await questions(t, entries = await readSession(session));
@@ -237,6 +292,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs)
           return finish(journal, t.callId, exec, makeResult("timeout"));
         if (ev.budget || reached(totalUsage(journal.entries(), t.callId), t.spec.budget)) return finish(journal, t.callId, exec, makeResult("budget"));
+        if (!bound) {
         if (ev.report) return finish(journal, t.callId, exec, buildCallResult({ key: t.key, gen: t.gen, status: ev.report.outcome as "ok" | "failed", output: ev.text, usage: ev.usage,
           ...(Object.hasOwn(ev.report, "data") ? { report: { data: ev.report.data } } : {}), ...(Array.isArray(ev.report.artifacts) ? { artifacts: ev.report.artifacts as string[] } : {}) }));
         if (t.spec.schema === undefined && has(journal, "settled", exec) && ev.text)
@@ -249,6 +305,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const losses = journal.entries().filter(e => e.type === "loss" && String(e.exec).startsWith(`${t.callId}#`)).length;
         if (losses >= (config.k?.lossBound ?? 5)) return finish(journal, t.callId, exec, makeResult("failed", "", `lost ×${losses}`));
         await release(exec);
+        }
       }
       const previous = exec;
       const epoch = previous ? Number(previous.split(".").at(-1)) + 1 : 1;
@@ -282,11 +339,24 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (restored && (restored.provider !== model.provider || restored.id !== model.id))
           await sender.send(t.callId, "model", { provider: model.provider, model: model.id }, undefined, { rid: contentHash([exec, "pool-switch"]) });
       }
-      await sender.send(t.callId, previous ? "continue" : "task", { message: previous ? `Continue the task. Tool calls whose outcomes are unknown: ${dangling.join(", ") || "none"}.` : t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
+      if (bound) await serial(async () => {
+        if (!journal.entries().some(e => e.type === "resumed" && e.call === t.callId && e.rid === bound!.rid)) await journal.append("resumed", { call: t.callId, rid: bound!.rid, exec });
+      });
+      // The answer uses its stable forwarded identity across every recovery incarnation.
+      const unresolved = journal.entries().findLast(e => e.type === "answer-bound" && e.call === t.callId);
+      const receipt = unresolved && entries.some(e => e.message?.details?.rid === unresolved.rid2 || (e as unknown as { details?: { rid?: string } }).details?.rid === unresolved.rid2);
+      const openingRid = t.opening && contentHash([t.opening.rid, "dispatch"]);
+      const openingReceived = openingRid && entries.some(e => (e as unknown as { details?: { rid?: string } }).details?.rid === openingRid);
+      if (openingRid && !openingReceived) await sender.send(t.callId, "task", { message: t.opening!.message }, undefined, { rid: openingRid });
+      else if (unresolved && !receipt) await sender.send(t.callId, "continue", { message: String(unresolved.message) }, { qid: String(unresolved.qid), rev: Number(unresolved.rev) }, { rid: String(unresolved.rid2) });
+      else await sender.send(t.callId, previous ? "continue" : "task", { message: previous ? `Continue the task. Tool calls whose outcomes are unknown: ${dangling.join(", ") || "none"}.` : t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
       if (interrupted(a)) { await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("stopped")); }
+      // C5, C8: only a session that already records a model is a continuation (pi restores that model). A session
+      // fenced before pi persisted anything has none: without --model pi would fall back to its own default.
+      const recorded = !!sessionModel(await readSession(session));
       let child: Spawned;
       try {
-        child = await containment.spawn({ exec, command: "pi", args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: !!previous, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd: t.cwd,
+        child = await containment.spawn({ exec, command: "pi", args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: recorded, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
           env: { DSA_HOME: home, DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}) } });
       } catch (error) {
         await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
@@ -296,7 +366,18 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         await observeExecution({ home, config, ticket: t, exec, child, serial,
           setWake: fn => { a.wake = fn; }, interrupted: () => !!interrupted(a),
           track: () => track(journal, exec!), fence: () => fence(journal, exec!, child),
-          questions: entries => questions(t, entries), recordUsage: values => recordUsage(t, values),
+          questions: async entries => {
+            await questions(t, entries);
+            const q = openQuestion(entries);
+            const segment = entries.findLastIndex(e => e.type === "custom" && e.customType === CT.exec && e.data?.exec === exec);
+            if (!q || interrupted(a) || segment < 0 || !entries.slice(segment + 1).some(e => e.customType === CT.question && e.data?.qid === q.qid) || journal.entries().some(e => e.type === "answer-bound" && e.call === t.callId && e.qid === q.qid && e.rev === q.rev)) return;
+            await serial(async () => {
+              const attention = journal.entries().find(e => e.type === JT.attention && (e.item as { qid?: string; call?: string; rev?: number }).qid === q.qid && (e.item as { call?: string }).call === t.callId && (e.item as { rev?: number }).rev === q.rev);
+              if (attention && Date.now() - attention.ts >= (config.k?.hibernateMs ?? 120000) && !has(journal, JT.fenced, exec!) && hibernation(journal, t.callId)?.exec !== exec) {
+                await journal.append("hibernated", { call: t.callId, exec, qid: q.qid, rev: q.rev }); a.wake();
+              }
+            });
+          }, recordUsage: values => recordUsage(t, values),
           switched: event => switched(exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
       } finally { await fence(journal, exec, child); }
@@ -311,7 +392,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const existing = completed.get(ticket.callId); if (existing) return existing;
       if (closed || suspending) return Promise.reject(shutdownError());
       journals.set(ticket.wid, ticket.journal);
-      const a: Active = { ticket, stopped: false, wake: () => {}, promise: undefined! };
+      const a: Active = { ticket, controller: new AbortController(), stopped: false, wake: () => {}, promise: undefined! };
       active.set(ticket.callId, a);
       a.promise = execute(a).catch(error => {
         completed.delete(ticket.callId);
@@ -331,14 +412,31 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       return serial(async () => {
         const dest = `${ctx.widRev}/${ctx.key}@${ctx.gen}`, hash = contentHash(req);
         journals.set(address(dest).wid, ctx.journal);
-        if (ctx.journal.entries().some(e => e.type === "retired" && e.call === dest)) return { action: "reject", reason: "stale-revision" } as const;
+        if (ctx.journal.entries().some(e => e.type === "retired" && e.call === dest)) return { action: "reject", reason: req.kind === "send" && (req.body as SendBody).kind === "answer" ? "retired" : "stale-revision" } as const;
+        const opening = active.get(dest)?.ticket.opening;
+        if (opening && !sealed(ctx.journal, dest)) await (await outbox).send(dest, "task", { message: opening.message }, undefined, { rid: contentHash([opening.rid, "dispatch"]) });
         const prior = ctx.journal.entries().find(e => e.type === "forward" && e.rid === req.rid && e.dest === dest);
         if (prior) {
           if (prior.hash !== hash) return { action: "reject", reason: "identity-conflict" } as const;
           if (!ctx.journal.entries().some(e => e.type === "forward-retired" && e.rid2 === prior.rid2)) await replayForward(prior);
           return { action: "apply" } as const;
         }
-        if (sealed(ctx.journal, dest)) return { action: "reject", reason: "call-sealed" } as const;
+        const boundRetry = ctx.journal.entries().find(e => e.type === "answer-bound" && e.call === dest && e.rid === req.rid);
+        if (boundRetry) return boundRetry.hash === hash ? { action: "apply" } as const : { action: "reject", reason: "identity-conflict" } as const;
+        if (sealed(ctx.journal, dest)) return { action: "reject", reason: req.kind === "send" && (req.body as SendBody).kind === "answer" ? "retired" : "call-sealed" } as const;
+        if (req.kind === "send" && (req.body as SendBody).kind === "answer") {
+          const sleeping = hibernation(ctx.journal, dest);
+          const priorAnswer = ctx.journal.entries().find(e => e.type === "answer-bound" && e.call === dest && e.qid === req.cond?.qid && e.rev === req.cond?.rev);
+          if (priorAnswer) return priorAnswer.rid === req.rid && priorAnswer.hash === hash ? { action: "apply" } as const : { action: "reject", reason: "already-answered" } as const;
+          if (sleeping && current(ctx.journal, dest) === sleeping.exec) {
+            if (sleeping.qid !== req.cond?.qid || sleeping.rev !== req.cond?.rev) return { action: "reject", reason: "stale-rev" } as const;
+            const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
+            const item = ctx.journal.entries().find(e => e.type === JT.attention && (e.item as { call?: string; qid?: string; rev?: number }).call === dest && (e.item as { qid?: string }).qid === sleeping.qid && (e.item as { rev?: number }).rev === sleeping.rev)?.item as { text?: string } | undefined;
+            await ctx.journal.append("answer-bound", { call: dest, qid: sleeping.qid, rev: sleeping.rev, rid: req.rid, rid2, hash, message: `Question: ${item?.text ?? sleeping.qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
+            active.get(dest)?.wake(); wake();
+            return { action: "apply" } as const;
+          }
+        }
         let kind: Request["kind"], body: unknown;
         if (req.kind === "withdraw") {
           kind = "withdraw";
@@ -384,7 +482,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const journal = journals.get(target.wid); if (!journal) return;
       const calls = new Set(journal.entries().filter(e => e.type === JT.exec && (!target.callId || e.call === target.callId)).map(e => String(e.call)));
       for (const a of active.values()) if (a.ticket.wid === target.wid && (!target.callId || a.ticket.callId === target.callId)) calls.add(a.ticket.callId);
-      for (const call of calls) { const a = active.get(call); if (a) a.stopped = true; }
+      for (const call of calls) { const a = active.get(call); if (a) { a.stopped = true; a.controller.abort(); } }
       await serial(async () => {
         for (const call of calls) if (!sealed(journal, call) && !entriesFor(journal, call).some(e => e.type === "stop-intent")) await journal.append("stop-intent", { call });
       });
@@ -403,6 +501,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     },
     async recover(wid, journal) {
       journals.set(wid, journal);
+      await effects.recover(journal);
       for (const e of journal.entries().filter(e => e.type === JT.exec)) {
         const exec = String(e.exec); await fence(journal, exec); await release(exec);
       }
@@ -421,7 +520,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     async retire(widRev) {
       const journal = journals.get(widRev.slice(0, widRev.lastIndexOf("@"))); if (!journal) return;
       const calls = new Set(journal.entries().filter(e => e.type === JT.exec && String(e.call).startsWith(`${widRev}/`)).map(e => String(e.call)));
-      for (const a of active.values()) if (a.ticket.widRev === widRev) { a.retired = true; calls.add(a.ticket.callId); }
+      for (const a of active.values()) if (a.ticket.widRev === widRev) { a.retired = true; a.controller.abort(); calls.add(a.ticket.callId); }
       await serial(async () => { for (const call of calls) if (!journal.entries().some(e => e.type === "retired" && e.call === call)) await journal.append("retired", { call }); });
       for (const call of calls) active.get(call)?.wake();
       wake();
@@ -434,7 +533,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     busy: () => active.size > 0,
     suspend() {
       if (suspending) return suspending;
-      for (const a of active.values()) { a.suspended = true; a.wake(); }
+      for (const a of active.values()) { a.suspended = true; a.controller.abort(); a.wake(); }
       wake();
       suspending = (async () => {
         const results = await Promise.allSettled([...active.values()].map(a => a.promise));

@@ -2,6 +2,8 @@
 // drain {rid,fence} and undrain {rid} record durable dispatch admission.
 // Workflow entries: ev {n}; call {pos,key,gen,spec,fingerprint}; refused {pos,key,spec,fingerprint,reason};
 // reused {pos,key,gen,spec,fingerprint,from}; exposed {pos}; value {n,kind,value};
+// generation{rid,key,gen,from,spec,revision,opening} is a send resolution outside the script;
+// its seal has a finished attention independent of workflow completion.
 // resumed {rid,n} supersedes a terminal park. emit {pos,value} records script outputs.
 import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readdir, unlink } from 'node:fs/promises';
@@ -10,7 +12,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
-import { orchInbox } from '../paths.ts';
+import { orchInbox, pinnedDir } from '../paths.ts';
 import { JT, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
@@ -31,6 +33,7 @@ export class Engine {
   private queue: Promise<void> = Promise.resolve();
   private failure?: unknown;
   private closed = false;
+  private generations = new Set<string>();
   private draining = false;
   private watcher?: FSWatcher;
   private poll?: ReturnType<typeof setInterval>;
@@ -56,6 +59,7 @@ export class Engine {
     for (const wf of this.store.workflows.values()) {
       if (!this.terminal(wf)) await this.startWorkflow(wf);
       else await this.attention(wf);
+      for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     }
     await this.intake();
   }
@@ -124,8 +128,9 @@ export class Engine {
   }
   private findCall(to: string): { wf: Workflow; entry: Entry } | undefined {
     for (const wf of this.store.workflows.values()) {
-      const calls = revisionEntries(wf).filter(e => e.type === 'call');
-      const entry = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}`);
+      const calls = revisionEntries(wf).filter(e => e.type === 'call' || e.type === 'generation');
+      const named = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}`);
+      const entry = named && calls.findLast(e => e.key === named.key);
       if (entry) return { wf, entry };
     }
   }
@@ -171,9 +176,18 @@ export class Engine {
       await this.revise(await this.store.revisionIntent(req as Request<ReviseBody>, wf));
       if (!this.states.has(wf.wid) && !this.terminal(wf)) await this.startWorkflow(wf);
     } else if (req.kind === 'send') {
+      const existing = [...this.store.workflows.values()].flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && e.rid === req.rid).map(entry => ({ wf, entry })))[0];
+      if (existing) { this.dispatchGeneration(existing.wf, existing.entry); return { action: 'apply' }; }
       const target = this.findCall((req.body as SendBody)?.to);
       if (!target) return { action: 'reject', reason: 'unknown-call' };
-      return this.executor.forward(req, this.context(target.wf, target.entry));
+      const { wf, entry } = target, send = req.body as SendBody;
+      const from = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
+      if (['steer', 'follow-up'].includes(send.kind) && wf.journal.entries().some(e => e.type === JT.sealed && e.call === from)) {
+        const gen = Math.max(0, ...wf.journal.entries().filter(e => ['call', 'generation'].includes(e.type) && e.key === entry.key).map(e => Number(e.gen))) + 1;
+        const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec: entry.spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message: send.message ?? '' } });
+        this.dispatchGeneration(wf, opened); return { action: 'apply' };
+      }
+      return this.executor.forward(req, this.context(wf, entry));
     } else if (req.kind === 'stop') {
       const target = (req.body as { target: string })?.target;
       const call = this.findCall(target), wf = call?.wf ?? this.store.workflows.get(target);
@@ -203,6 +217,7 @@ export class Engine {
         }
         if (!this.states.has(wf.wid)) await this.startWorkflow(wf);
       }
+      for (const wf of this.store.workflows.values()) for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     } else if (req.kind === 'drain') {
       const fence = (req.body as DrainBody)?.fence === true;
       if (!this.ledgers.orch.entries().some(e => e.type === 'drain' && e.rid === req.rid)) await this.ledgers.orch.append('drain', { rid: req.rid, fence });
@@ -214,11 +229,28 @@ export class Engine {
     } else return { action: 'reject', reason: 'unsupported-kind' };
     return { action: 'apply' };
   }
+  private dispatchGeneration(wf: Workflow, entry: Entry) {
+    const ticket = this.ticket({ wf } as State, entry), id = ticket.callId;
+    if (this.generations.has(id) || this.draining || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
+    this.generations.add(id);
+    void this.executor.run(ticket).then(() => this.background(async () => {
+      if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);
+      if (!wf.journal.entries().some(e => e.type === JT.attention && (e.item as { id?: string }).id === `finished:${id}`))
+        await wf.journal.append(JT.attention, { item: { id: `finished:${id}`, rev: 1, kind: 'finished', wid: wf.wid, call: id, text: `Finished ${id}`, origin: wf.origin } });
+      this.generations.delete(id);
+    }), error => {
+      this.generations.delete(id);
+      if (error instanceof Error && error.name === 'ExecutorShutdown') return;
+      this.background(async () => { throw error; });
+    });
+  }
   private ticket(st: State, entry: Entry): CallTicket {
     const spec = entry.spec as CallSpec, agent = st.wf.pins.agents.find(a => a.name === spec.agent);
     if (!agent) throw new Error(`Unknown pinned agent: ${spec.agent}`);
     return { wid: st.wf.wid, widRev: `${st.wf.wid}@${st.wf.revision}`, key: entry.key as string, gen: entry.gen as number,
-      callId: `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`, spec, agent, workflowBudget: st.wf.pins.usageBudget, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal };
+      callId: `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`, spec, agent, workflowBudget: st.wf.pins.usageBudget, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal,
+      ...(st.wf.pins.origin !== undefined ? { originSession: join(pinnedDir(this.ledgers.home, st.wf.wid), ...(st.wf.revision === 1 ? [] : [`r${st.wf.revision}`]), 'origin.jsonl') } : {}),
+      ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}) };
   }
   private sealed(st: State, entry: Entry): CallResult | undefined {
     if (entry.type === 'refused') return { key: String(entry.key), gen: 0, status: 'failed', ok: false, error: 'spawn budget exceeded', output: '' };
@@ -283,7 +315,7 @@ export class Engine {
         else if (history.filter(e => e.type === 'call').length >= (st.wf.pins.maxCalls ?? 300)) {
           entry = await st.wf.journal.append('refused', { ...fields, reason: 'spawn-budget' });
         } else {
-          const gen = Math.max(0, ...history.filter(e => e.type === 'call' && e.key === message.key).map(e => Number(e.gen))) + 1;
+          const gen = Math.max(0, ...history.filter(e => ['call', 'generation'].includes(e.type) && e.key === message.key).map(e => Number(e.gen))) + 1;
           entry = await st.wf.journal.append('call', { ...fields, gen });
         }
       }
@@ -356,7 +388,7 @@ export class Engine {
         await this.queue;
         if (this.failure) throw this.failure;
         const files = await readdir(inbox);
-        if (this.draining || [...this.store.workflows.values()].some(w => !this.terminal(w)) || this.executor.busy() || files.length) idleSince = performance.now();
+        if (this.draining || this.generations.size || [...this.store.workflows.values()].some(w => !this.terminal(w)) || this.executor.busy() || files.length) idleSince = performance.now();
         else if (performance.now() - idleSince >= (this.ledgers.config.k?.idleExitMs ?? 60_000)) return;
         await delay(Math.min(100, this.ledgers.config.k?.idleExitMs ?? 100));
       }

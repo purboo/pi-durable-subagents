@@ -240,7 +240,7 @@ test('unfinished work prevents idle exit; drain commits proposals without dispat
 });
 
 test('run fanout, send, withdraw, stop and drain use committed lifecycle', async t => {
-  const evaluator = new ManualEvaluator(); const { engine, home, ledgers, run } = await fixture(t, evaluator);
+  const evaluator = new ManualEvaluator(); const { engine, home, ledgers, run } = await fixture(t, evaluator, 'pending');
   const wf = await run(undefined as unknown as string, { tasks: [spec('hello')] });
   assert.match(wf.pins.source, /runs.all/);
   propose(evaluator, 0, 'pending'); await engine.intake();
@@ -450,10 +450,11 @@ test('revision re-pins inputs, reuses matching seals, allocates changed generati
   const stale = await submit(engine, home, 'send', { to: `${wf.wid}@1/changed@1`, kind: 'steer', message: 'stale' }, 2);
   assert.equal(ledgers.orch.entries().find(e => e.type === JT.rejected && e.rid === stale)!.reason, 'stale-revision');
   await submit(engine, home, 'send', { to: `${wf.wid}/changed`, kind: 'steer', message: 'current' }, 3);
-  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-forward').length, 1);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'generation').length, 1);
+  await until(() => wf.journal.entries().filter(e => e.type === 'fake-run').length === 4);
   evaluator.death(); await until(() => evaluator.current().ev === 3);
   propose(evaluator, 0, 'same'); propose(evaluator, 1, 'changed', 'different task'); idle(evaluator, 0); await engine.intake();
-  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 3);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 4);
   assert.equal(evaluator.messages.filter(m => m.t === 'expose' && m.ev === 3).length, 2);
 });
 

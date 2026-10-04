@@ -30,14 +30,14 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
   const rev = Math.max(1, ...entries.filter(e => e.type === "wf-created" || e.type === "revised").map(e => Number(e.revision) || 1));
   const boundary = entries.findLastIndex(e => e.type === "revised");
   const current = entries.slice(Math.max(0, boundary));
-  const terminal = current.findLast(e => e.type === JT.done || e.type === "resumed");
+  const terminal = current.findLast(e => e.type === JT.done || (e.type === "resumed" && !e.call));
   const done = terminal?.type === JT.done ? terminal : undefined;
   const calls = new Map<string, CallSnapshot>();
   const byExec = new Map<string, CallSnapshot>();
   const resolved = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}@${e.rev}`));
   const attention: AttentionItem[] = [];
   for (const e of entries) {
-    if (["call", "refused", "reused"].includes(e.type)) {
+    if (["call", "generation", "refused", "reused"].includes(e.type)) {
       if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
       const key = String(e.key), gen = Number(e.gen) || (e.type === "refused" ? 0 : 1);
       const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;

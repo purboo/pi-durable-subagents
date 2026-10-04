@@ -64,6 +64,121 @@ function assertSealed(journal: JournalHandle, call: string, status: string) {
   assert.ok(journal.entries().some(e => e.type === JT.fenced && e.exec === seals[0]!.exec && e.seq < seals[0]!.seq));
 }
 
+test("P28 hibernates without loss, binds once, resumes with one receipt", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  await until(() => f.orch.entries().filter(e => e.type === "release").length >= 2);
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+  const req: Request = { rid: "answer", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: "yes " + script([{ text: "resumed" }]) } };
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  assert.deepEqual(await f.executor.forward({ ...req, rid: "stale", cond: { qid: String(h.qid), rev: 9 } }, ctx), { action: "reject", reason: "stale-rev" });
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  assert.deepEqual(await f.executor.forward({ ...req, rid: "duplicate" }, ctx), { action: "reject", reason: "already-answered" });
+  const result = await pending;
+  assert.equal(result.status, "ok");
+  const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  assert.equal(rows.filter(e => e.type === "custom_message" && e.details?.rid === bound.rid2).length, 1);
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+  assert.equal(f.journal.entries().filter(e => e.type === "resumed").length, 1);
+  assert.deepEqual(await f.executor.forward({ ...req, rid: "retired" }, ctx), { action: "reject", reason: "retired" });
+});
+
+test("P28 recovery after answer-bound before delivery preserves the answer identity", { timeout: 30000 }, async t => {
+  const config = { k: { hibernateMs: 20, trackerMs: 20 } };
+  const f = await setup(t, config), ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Crash?" } }]));
+  const pending = f.executor.run(ticket); void pending.catch(() => {});
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  await f.executor.suspend(); await assert.rejects(pending, { name: "ExecutorShutdown" });
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  const req: Request = { rid: "recover-answer", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: script([{ text: "recovered" }]) } };
+  await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 });
+  assert.equal(f.journal.entries().filter(e => e.type === "resumed").length, 0);
+  await f.executor.shutdown();
+  const fresh = createExecutor({ home: f.home, orch: f.orch, config });
+  try {
+    await fresh.recover(f.wid, f.journal);
+    assert.equal((await fresh.run(ticket)).output, "recovered");
+    const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
+    const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+    assert.equal(rows.filter(e => e.type === "custom_message" && e.details?.rid === bound.rid2).length, 1);
+    assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+  } finally { await fresh.shutdown(); }
+});
+
+test("P28 stop while hibernated settles without a loss", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 20, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Wait?" } }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  await f.executor.stop({ wid: f.wid });
+  assert.equal((await pending).status, "stopped");
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+});
+
+for (const reason of ["timeout", "budget", "retire"] as const) test(`P28 ${reason} while hibernated settles or retires`, { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 20, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Wait?" } }]));
+  if (reason === "budget") ticket.spec.budget = { tokens: 1000000 };
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  if (reason === "timeout") await f.journal.append("timeout-intent", { call: ticket.callId, exec: `${ticket.callId}#1.1` });
+  if (reason === "budget") await f.journal.append("usage", { call: ticket.callId, id: "budget-observation", usage: { input: 1000000, output: 0, costUsd: 0 } });
+  if (reason === "retire") await f.executor.retire(ticket.widRev);
+  const result = await pending;
+  assert.equal(result.status, reason === "retire" ? "stopped" : reason);
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+  if (reason === "retire") assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0);
+});
+
+test("P28 receipt-before-crash does not redeliver the answer", { timeout: 30000 }, async t => {
+  const config = { k: { hibernateMs: 20, trackerMs: 20 } }, f = await setup(t, config);
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Receipt?" } }]));
+  const pending = f.executor.run(ticket); void pending.catch(() => {});
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  const req: Request = { rid: "answer-before-crash", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: script([{ delayMs: 1000, text: "after receipt" }]) } };
+  await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 });
+  const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
+  const rows = async () => (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  await until(async () => (await rows()).some(e => e.type === "custom_message" && e.details?.rid === bound.rid2));
+  await f.executor.shutdown(); await assert.rejects(pending, { name: "ExecutorShutdown" });
+  const fresh = createExecutor({ home: f.home, orch: f.orch, config });
+  try {
+    await fresh.recover(f.wid, f.journal); assert.equal((await fresh.run(ticket)).status, "ok");
+    assert.equal((await rows()).filter(e => e.type === "custom_message" && e.details?.rid === bound.rid2).length, 1);
+    assert.equal(f.journal.entries().filter(e => e.type === "resumed").length, 1);
+  } finally { await fresh.shutdown(); }
+});
+
+test("P30 stop during beforeSeal aborts the effect and wins the seal", { timeout: 30000 }, async t => {
+  let entered!: () => void;
+  const ready = new Promise<void>(resolve => { entered = resolve; });
+  const f = await setup(t, {}, { effects: {
+    prepare: async ticket => ({ cwd: ticket.cwd }), recover: async () => {}, afterSeal: async () => {},
+    beforeSeal: async (_ticket, _exec, result, ctl) => { entered(); await new Promise<void>(resolve => { if (ctl.signal.aborted) resolve(); else ctl.signal.addEventListener("abort", () => resolve(), { once: true }); }); return result; },
+  } });
+  const ticket = f.ticket(), pending = f.executor.run(ticket);
+  await ready; await f.executor.stop({ wid: f.wid }); assert.equal((await pending).status, "stopped");
+});
+
+test("P19 P30 effects prepare, fence, beforeSeal, seal, afterSeal order", { timeout: 30000 }, async t => {
+  const order: string[] = [];
+  const f = await setup(t, {}, { effects: {
+    prepare: async ticket => { order.push("prepare"); return { cwd: ticket.cwd }; },
+    beforeSeal: async (ticket, exec, result) => { assert.ok(ticket.journal.entries().some(e => e.type === JT.fenced && e.exec === exec)); assert.ok(!ticket.journal.entries().some(e => e.type === JT.sealed)); order.push("before"); return result; },
+    afterSeal: async ticket => { assert.ok(ticket.journal.entries().some(e => e.type === JT.sealed)); order.push("after"); },
+    recover: async () => { order.push("recover"); },
+  } });
+  await f.executor.recover(f.wid, f.journal);
+  assert.equal((await f.executor.run(f.ticket())).status, "ok");
+  assert.deepEqual(order, ["recover", "prepare", "before", "after"]);
+});
+
 test("P9 recovery reads full last text from real pi after durable settled and fence", { timeout: 30000 }, async t => {
   const f = await setup(t), { pi, exec, ticket } = await nativeSession(t, f);
   await pi.stop(); await f.journal.append("settled", { exec });
@@ -541,4 +656,19 @@ test("X1 workflow budget refuses loss continuation but does not stop a running s
   assert.equal(first.status, "failed"); assert.equal(first.error, "workflow budget reached");
   assert.equal(sibling.status, "ok"); assert.equal(sibling.output, "running sibling survives");
   assert.equal(f.journal.entries().filter(e => e.type === "tracked" && String(e.exec).startsWith(`${a.callId}#1.2`)).length, 0);
+});
+
+test("C5/C8 an execution fenced before pi persisted its session restarts with the selected model, not pi's default", { timeout: 30000 }, async t => {
+  // The agent's model differs from the isolated settings default, so a missing --model would be visible.
+  const f = await setup(t), ticket = { ...f.ticket("a", script([{ delayMs: 3000, text: "slow" }, { text: "on the selected model" }])), agent: { ...agent, model: "probe/scripted2" } };
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "tracked"));
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  assert.equal(existsSync(callSession(f.home, f.wid, "a", 1)), false, "fenced before the first assistant message: no session file yet");
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "ok");
+  const native = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  const models = native.filter(e => e.type === "message" && e.message.role === "assistant").map(e => `${e.message.provider}/${e.message.model}`);
+  assert.ok(models.length >= 1); assert.deepEqual([...new Set(models)], ["probe/scripted2"]);
 });
