@@ -158,6 +158,14 @@ export interface ResumeBody { wid?: Wid }
 /** kind "drain": stop new dispatch; running calls finish. */
 export type DrainBody = Record<string, never>;
 
+// Request bodies addressed to a child (to: CallId), written by the orchestrator (own requests or P7 forwards).
+/** kinds "task" | "steer" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */
+export interface MessageBody { message: string }
+/** kind "model": parsed from "provider/id[:thinking]" by the orchestrator. */
+export interface ModelBody { provider: string; model: string; thinking?: string }
+/** Arguments of the child `report` tool (P24); `data` is validated against DSA_SCHEMA. */
+export interface ReportArgs { outcome: "ok" | "failed"; summary?: string; data?: unknown }
+
 export interface AttentionItem {
   id: string;
   rev: number;
