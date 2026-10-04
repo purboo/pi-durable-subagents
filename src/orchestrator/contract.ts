@@ -6,6 +6,8 @@ import type { CallId, CallResult, CallSpec, JournalHandle, Request, Wid, WidRev 
 
 /** User configuration: $DSA_HOME/config.json (all optional). */
 export interface OrchestratorConfig {
+  /** Default model when neither the call nor the agent names one (before pi's own settings default). */
+  defaultModel?: string;
   /** Model pools: name -> ordered "provider/id[:thinking]" candidates (P12, D10). */
   pools?: Record<string, string[]>;
   /** Provider slot capacities (V1). Missing provider = unlimited. */
