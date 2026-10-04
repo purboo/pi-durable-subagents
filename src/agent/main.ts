@@ -150,7 +150,12 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   }
   ui?.(pi, { home, presentNote, submit: args => submit({ ...args, by: "user" }, ctx?.cwd ?? process.cwd()) });
   pi.registerTool(defineTool({
-    name: "subagents", label: "Subagents", description: "Run durable subagent workflows; send, stop, revise, resume, drain or inspect fresh status.", parameters,
+    name: "subagents", label: "Subagents", description: [
+      "Durable subagents: crash-safe, never run twice, survive pi restarts. Always asynchronous: run returns {wid}; you are woken once when it finishes or a subagent asks you something.",
+      "run — exactly one of: agent+task (one subagent; optional model 'provider/id[:thinking]', cwd, timeoutMs, schema, gate, isolation:'worktree', context:'fork', budget); tasks:[...] (parallel); chain:[...] ({previous} = previous output); workflow:'./script.js' or source (a script using runs.run(key, spec), runs.all([...]), emit(value), args, runs.input(name); return value = result). Optional: args, name, usageBudget {tokens|costUsd}, maxCalls, inputs {name: path}.",
+      "send — to: '<wid>/<key>' or a call id; kind: steer | follow-up | answer (with qid, rev from the question) | model (model:'provider/id[:thinking]'); replaces: [rid] supersedes your earlier send.",
+      "status — fresh snapshot of all workflows. stop target:<wid|call>. revise wid + workflow/source/args. resume [wid]. drain.",
+    ].join("\n"), parameters,
     async execute(_id, args, signal, _update, context) {
       const value = await submit(args as Record<string, unknown>, context.cwd, signal);
       return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value };

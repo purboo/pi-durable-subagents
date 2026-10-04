@@ -10,6 +10,8 @@ export const parameters = Type.Object({
   to: Type.Optional(Type.String()), kind: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("follow-up"), Type.Literal("answer"), Type.Literal("model")])),
   message: Type.Optional(Type.String()), qid: Type.Optional(Type.String()), rev: Type.Optional(Type.Integer({ minimum: 1 })),
   replaces: Type.Optional(Type.Array(Type.String())), target: Type.Optional(Type.String()), wid: Type.Optional(Type.String()),
+  usageBudget: Type.Optional(Type.Object({ tokens: Type.Optional(Type.Number()), costUsd: Type.Optional(Type.Number()) })),
+  maxCalls: Type.Optional(Type.Integer({ minimum: 1 })), inputs: Type.Optional(Type.Record(Type.String(), Type.String())),
 }, { additionalProperties: true });
 
 type Args = Record<string, unknown>;
@@ -28,7 +30,7 @@ function call(value: unknown, cwd: string): CallSpec {
 export function request(args: Args, cwd: string): { kind: RequestKind; body: unknown; cond?: Conditions; replaces?: string[] } {
   const action = string(args, "action");
   if (action === "run") {
-    const { action: _, workflow, source, tasks, chain, args: inputs, name, ...spec } = args;
+    const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, by: _by, ...spec } = args;
     const choices = [workflow, source, tasks, chain, spec.agent === undefined && spec.task === undefined ? undefined : spec];
     if (choices.filter(v => v !== undefined).length !== 1) throw new Error("run requires exactly one of workflow, source, tasks, chain, or agent/task");
     const body: RunBody = { cwd };
@@ -41,6 +43,17 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     } else body.call = call(spec, cwd);
     if (inputs !== undefined) body.args = inputs;
     if (name !== undefined) body.name = string(args, "name");
+    // P31a, P36, P11: workflow-level limits and declared input files (absolute paths, pinned at admission).
+    if (usageBudget !== undefined) {
+      const b = usageBudget as { tokens?: unknown; costUsd?: unknown };
+      if (!b || typeof b !== "object" || ![b.tokens, b.costUsd].some(v => typeof v === "number" && v > 0)) throw new Error("usageBudget needs tokens or costUsd");
+      body.usageBudget = { ...(typeof b.tokens === "number" ? { tokens: b.tokens } : {}), ...(typeof b.costUsd === "number" ? { costUsd: b.costUsd } : {}) };
+    }
+    if (maxCalls !== undefined) { if (!Number.isSafeInteger(maxCalls) || Number(maxCalls) < 1) throw new Error("maxCalls must be a positive integer"); body.maxCalls = maxCalls as number; }
+    if (files !== undefined) {
+      if (!files || typeof files !== "object" || Array.isArray(files)) throw new Error("inputs must map names to file paths");
+      body.inputs = Object.fromEntries(Object.entries(files).map(([k, v]) => { if (typeof v !== "string" || !v) throw new Error(`inputs.${k} must be a path`); return [k, resolve(cwd, v)]; }));
+    }
     return { kind: "run", body };
   }
   if (action === "send") {
