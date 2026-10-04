@@ -32,6 +32,29 @@ export interface CallTicket {
   journal: JournalHandle;
   /** Pinned workflow usage budget (P31a); the executor refuses dispatches and continuations once reached. */
   workflowBudget?: { tokens?: number; costUsd?: number };
+  /** P33: pinned origin branch (JSONL of pi session entries, message/model entries only), when the run had one. */
+  originSession?: string;
+  /** P37: this generation continues the session of an earlier, sealed generation of the same key. */
+  continueFrom?: CallId;
+  /** P37: the send that opened this generation; its message is the first thing the generation receives. */
+  opening?: { rid: string; kind: "steer" | "follow-up"; message: string };
+}
+
+/** P19, P30, P32, P33: Call-scoped effects around executions, implemented in src/orchestrator/executor/effects/
+ *  (default export `createEffects(ledgers): CallEffects`) and called by the executor run loop. Every method is
+ *  idempotent from the workflow journal (intent entries are committed before effects) and safe to repeat after a crash. */
+export interface CallEffects {
+  /** Before the first execution of a call generation: create the worktree (P32) and/or the forked session (P33,
+   *  published no-replace at `sessionPath`). Returns the working directory for every execution of the call. */
+  prepare(t: CallTicket, ctx: { sessionPath: string }): Promise<{ cwd: string }>;
+  /** After the fence and before the seal of an outcome that is not stopped/timeout/budget: run the gate (P30,
+   *  contained as `gate:<call>#<attempt>`) and publish outputs (P19). May turn the result into gate-failed/unknown and
+   *  add artifacts. `ctl.signal` aborts when stop/timeout/budget is decided during the gate: fence it and return. */
+  beforeSeal(t: CallTicket, exec: string, result: CallResult, ctl: { signal: AbortSignal }): Promise<CallResult>;
+  /** After the seal: remove a clean worktree after success; keep it otherwise (P32). */
+  afterSeal(t: CallTicket, result: CallResult): Promise<void>;
+  /** Recovery for one workflow: fence gate identities with an intent but no outcome (they then seal unknown). */
+  recover(journal: JournalHandle): Promise<void>;
 }
 
 export interface Executor {

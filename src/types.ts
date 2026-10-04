@@ -151,6 +151,8 @@ export interface RunBody {
   usageBudget?: { tokens?: number; costUsd?: number };
   /** Spawn budget override (P36, upstream maxSubagentSpawnsPerRun); default K11 = 300. */
   maxCalls?: number;
+  /** Origin session for `context: "fork"` (P33): its branch up to `leafId` is pinned at admission. */
+  origin?: { sessionFile: string; leafId?: string | null };
 }
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
 export interface SendBody {

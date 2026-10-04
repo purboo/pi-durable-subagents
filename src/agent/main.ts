@@ -9,7 +9,7 @@ import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
-import { CT, JT, type AttentionItem } from "../types.ts";
+import { CT, JT, type AttentionItem, type RunBody } from "../types.ts";
 import { attention, presented, resolved, workflows } from "./main/snapshots.ts";
 import { parameters, request } from "./main/tool.ts";
 
@@ -119,6 +119,9 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal): Promise<unknown> {
     if (args.action === "status") return workflows(home).sort((a, b) => Number(b.origin === sender) - Number(a.origin === sender));
     const normalized = request(args as Parameters<typeof request>[0], cwd);
+    // P33: any call of the run may fork the origin context, so the origin branch is always offered for pinning.
+    const sessionFile = ctx?.sessionManager.getSessionFile();
+    if (normalized.kind === "run" && sessionFile) (normalized.body as RunBody).origin = { sessionFile, leafId: ctx!.sessionManager.getLeafId() };
     const sent = await serial(async () => {
       if (!outbox || stopped) throw new Error("Main session is not active");
       signal?.throwIfAborted();
