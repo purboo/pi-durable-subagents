@@ -14,4 +14,6 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint:imports
-      - run: npm test
+      - run: npm run test:unit
+      - run: npm run test:pi
+      - run: npm run pack:smoke

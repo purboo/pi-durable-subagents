@@ -34,10 +34,12 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint:imports": "node scripts/check-imports.mjs",
-    "test": "node --test --test-concurrency=4 'test/**/*.test.ts'",
+    "test": "npm run test:unit && npm run test:pi",
     "test:unit": "node --test 'test/unit/**/*.test.ts'",
     "test:pi": "node --test --test-concurrency=1 'test/pi/**/*.test.ts'",
-    "check": "npm run typecheck && npm run lint:imports && npm test"
+    "check": "npm run typecheck && npm run lint:imports && npm test",
+    "pack:smoke": "node scripts/pack-smoke.mjs",
+    "prepack": "npm run build"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
