@@ -146,6 +146,10 @@ export interface RunBody {
   /** Declared inputs: name -> absolute file path; copied into pinned/ at admission, served by runs.input(name). */
   inputs?: Record<string, string>;
   name?: string;
+  /** Workflow usage budget (P31a, upstream usageBudget): once reached, new dispatches and continuations are refused. */
+  usageBudget?: { tokens?: number; costUsd?: number };
+  /** Spawn budget override (P36, upstream maxSubagentSpawnsPerRun); default K11 = 300. */
+  maxCalls?: number;
 }
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
 export interface SendBody { to: CallId | `${Wid}/${string}`; kind: "steer" | "answer" | "model"; message?: string; model?: string }

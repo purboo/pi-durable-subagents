@@ -622,3 +622,190 @@ again after integration, and mark them clearly. Cover:
 - recovery after the executor's own process is killed: the report already in
   the session is sealed without a new model call;
 - provider slot capacity 1 with two calls → serialised, never two holders.
+
+## Wave 3 contracts
+
+Baseline: the integration commit that adds this section. New pins:
+`RunBody.usageBudget`, `RunBody.maxCalls`, `CallTicket.workflowBudget`,
+`Executor.retire`, and shutdown semantics (fence, never seal). P20 and the
+integration-target pool are not shipped (D43).
+
+Every leaf in this wave works as follows:
+
+- Keep cross-file effects inside the files it owns.
+- Document private journal entries in that file's header comment.
+- Add tests that would fail without the change.
+- Leave anything not listed in its section to later leaves.
+
+### X1 · Executor lifecycle (`src/orchestrator/executor/`, `test/pi/executor/`, `test/unit/orchestrator/executor/`)
+
+Add new logic in new modules (for example `time.ts`, `memory.ts`,
+`sweep.ts`). Keep the edits to `index.ts` to the hook points.
+
+1. **Shutdown and observation fixes.**
+   - `shutdown()` fences every active execution and returns without
+     sealing anything. After restart, `recover` and `run` continue the
+     calls.
+   - Record only `message_end` (with usage and message id),
+     `tool_execution_start`/`end` (tool name and id only, no result
+     payloads) and `message_start` (provider/model) as observations. Never
+     store `tool_execution_update` events.
+2. **Active time (P18, V6) and timeout.**
+   - Measure on a monotonic clock.
+   - The evidence horizon advances on child RPC events, on session-file
+     growth, and, while a tool call is open, on a tracker scan showing CPU
+     progress (`ProcessTable` rows for tracked pids; add a CPU-time field
+     only inside your modules if the platform does not provide one; read
+     `/proc/<pid>/stat` or `ps -o time=`).
+   - Exclude `ask` (an open question), slot/memory waits and
+     backoff/continuation gaps.
+   - Commit a checkpoint `time{exec, active}` every K3 (10 s), plus a final
+     one at fence.
+   - After a crash, the unobserved tail is not charged.
+   - `spec.timeoutMs`: when active time across all executions of the call
+     reaches it, decide a timeout: fence, then seal `timeout` (precedence
+     as for stop).
+3. **Stall (K4 = 10 min).** No RPC event, no session growth and no CPU
+   progress for K4, with no open `ask`, raises
+   `JT.attention{kind:"stall", id:"stall:<call>", rev:n}`. New activity
+   resolves it, and the next stall uses rev n+1. At most one is open per
+   call.
+4. **Budgets (P31, V8).**
+   - Usage is the sum of `message_end` usage, deduplicated by message id,
+     over all executions of the call. Reconstruct it from sessions on
+     recovery.
+   - **Per-call `spec.budget`:** once reached, settle at the next
+     boundary: fence, then seal `budget`. Overshoot is recorded truthfully.
+   - **`ticket.workflowBudget`:** the sum over all calls of the workflow.
+     Once reached, refuse new dispatches (seal `failed`, error
+     `workflow budget reached`) and refuse loss continuations (same seal).
+     Running children are not stopped.
+   - Raise `JT.attention{kind:"budget"}` once per workflow when its budget
+     is reached.
+5. **Memory admission (P29, V1).**
+   - Before each spawn, read available memory (Linux
+     `/proc/meminfo` MemAvailable; macOS `vm_stat`), commit
+     `mem{available}` to `orchestrator.jsonl`, and hold the pool `memory`
+     only if `available − reserve ≥ perChild` (K9 from `config.memory`;
+     defaults 2048/300 MB).
+   - Never wait while holding the provider slot. Acquire the memory hold
+     first or together, with no hold-and-wait.
+   - Release it with the execution. Never revoke existing holds.
+6. **Pool skip (K7) and switch timeout (K5).**
+   - Three consecutive losses on one pool candidate skip that candidate
+     for 10 min, within the pool. Journal this as `skip{pool, model, until}`.
+   - The default `switchTimeoutMs` becomes 300000 (K5).
+7. **Retirement.**
+   - `retire(widRev)` per the contract.
+   - At seal (P27), every forward to the call that has no child receipt
+     gets `forward-retired{rid, rid2, reason:"retired-without-child-receipt"}`.
+8. **Sweep (P23).** Every K1 (30 s), kill tagged or tracked processes
+   belonging to fenced or retired executions; the tracker rescan uses
+   `Containment.fence`.
+
+**Tests** (real pi with the faux provider where the child matters; unit
+tests otherwise):
+
+- shutdown then restart continues the call, with no `stopped` seal;
+- `tool_execution_update` events are not journaled;
+- a silent CPU-burning bash tool advances active time and triggers
+  `timeoutMs`;
+- `ask` waiting is not charged;
+- a stall item, then a new item after new activity;
+- per-call budget → `budget`;
+- workflow budget refuses the second dispatch;
+- memory refusal waits without holding a provider slot (inject the reader);
+- K7 skip;
+- `retire` fences and never seals;
+- `forward-retired` after a seal;
+- the sweep kills a tagged straggler.
+
+### E2 · Engine extensions (`src/orchestrator/engine.ts`, `store.ts`, `main.ts`, `evaluator-client.ts`, `test/unit/orchestrator/engine/`)
+
+1. **Budget plumbing.** Pin `RunBody.usageBudget` at admission and pass it
+   as `CallTicket.workflowBudget`.
+2. **Spawn budget (P36).**
+   - `RunBody.maxCalls`, defaulting to `config.k.spawnBudget` and then 300.
+   - A proposal beyond the budget is not dispatched. Commit
+     `refused{pos, key, reason:"spawn-budget"}` and expose a synthesized
+     result `{status:"failed", ok:false, error:"spawn budget exceeded", output:""}`.
+   - This must be deterministic on replay.
+3. **Revision (P14).** Handle `revise` (`ReviseBody`):
+   1. `executor.retire(oldWidRev)`;
+   2. retire the old evaluator worker;
+   3. pin the new script and/or args as revision r+1, with the same
+      staging-before-admission rule;
+   4. start the evaluator.
+
+   **Reuse:** when a proposal's fingerprint equals a sealed call of an
+   earlier revision under the same key, expose that sealed result without
+   dispatching. Commit `reused{pos, from}`.
+
+   **Stale requests:** requests that name an old revision (`to` containing
+   `wid@<old r>`) are rejected with `stale-revision` (V3). `stop`,
+   `resume` and `status` apply to the current revision.
+4. **Status snapshot for other domains.** Export a pure function
+   `src/orchestrator/snapshot.ts: workflowSnapshot(home, wid)` that reads
+   only journals and returns:
+
+   ```
+   { wid, rev, name, status, calls:[{key, gen, callId, status:"queued"|"running"|"asking"|"sealed", result?, model?, lastActivity?}], counts, startedAt, endedAt? }
+   ```
+
+   U1 and L1 import it. Keep it independent of the engine's in-memory
+   state.
+5. **Resume.** `resume{wid?}` re-admits parked workflows: a parked
+   workflow whose cause is gone (for example an evaluator limit) restarts
+   with ev+1. Always record `resumed{n}`.
+
+**Tests:** the spawn budget is refused deterministically across replay;
+budget plumbing reaches the ticket; revise reuses matching seals and
+dispatches only changed calls; old-revision requests are rejected;
+snapshot shapes are checked against journals written by the real engine
+with the fake executor; resume of a parked workflow.
+
+### U1 · UI (`src/ui/`, `test/pi/ui/`, `test/unit/ui/`)
+
+Implement `design/ui.md`: the main-session line, the list (`↓` on an empty
+editor), and the watch view with `←`/`→`, thinking, interacting (model
+switch and steer go through M1's existing `subagents` send path, so they
+are durable), and notes (P16, via M1's `presentNote`).
+
+- **Data.** It comes only from journals and child session files:
+  `workflowSnapshot`, plus tailing `x/<key>@<gen>/session.jsonl` for the
+  watch view. Use pi's exported TUI components and message renderers
+  (root exports only).
+- **Registration.** `src/agent/main.ts` is parent-owned now. Export
+  `registerUi(pi, deps)` from `src/ui/index.ts`; the parent wires it into
+  `registerMain` during integration. If you need one line in `main.ts` to
+  test this, describe it in your report instead of editing the file.
+- **Degradation (P21).** If a UI surface is unavailable (no TTY, RPC
+  mode), register nothing and never throw.
+- **Tests:**
+  - Unit-test the pure view models (list grouping, status phrases,
+    durations, done rows).
+  - Run one isolated real-pi TUI test, either a pty or
+    `--mode interactive` with a scripted terminal if feasible. Otherwise
+    render the components to strings and snapshot them.
+  - Provide one screenshot-like text capture of the list and the watch
+    view as evidence.
+
+### L1a · CLI (`src/cli/`, `test/unit/cli/`, `test/pi/cli/`)
+
+The `pi-durable-subagents` binary is `src/cli/main.ts`; `package.json`
+already points `bin` at `dist/cli/main.js`. Subcommands:
+
+| Subcommand | Behaviour |
+|---|---|
+| `smoke` | Check C1/C2/C3 surfaces: process-table read, tag visibility, spawn + fence of a tagged child, lock, `publishFile`, pi binary present and its version. Report execution and UI capability (P21); exit non-zero if any execution surface fails. |
+| `tail [wid]` | Follow the workflow journal(s) as human-readable lines, using `workflowSnapshot`. |
+| `status [wid] [--json]` | Print `workflowSnapshot`. |
+| `resume [wid]`, `drain`, `stop <wid\|callId>`, `stop-all` | Durable requests through a CLI sender Outbox (sender id `cli:<user>@<host>`). Start the orchestrator the same way M1's starter does: `spawn(process.execPath, [entry])` detached, with the lock check. `stop-all` = `drain` + `stop` for every unfinished workflow; journals stay resumable. |
+| `install-service`, `uninstall-service` | Optional starter service (P1): a systemd user unit (Linux) or a launchd agent (macOS) that runs `pi-durable-subagents resume` at login and every K1. `uninstall` removes it. |
+
+Not in this leaf: `chaos`, which comes later with X2.
+
+**Tests:** argument parsing; `status`/`tail` against journals made by the
+real engine with the fake executor; `drain`/`stop` request envelopes and
+outbox republish; `smoke` on this machine; service file generation (render
+only, never install into the real user's home: use a temp HOME).

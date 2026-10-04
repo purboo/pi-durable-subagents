@@ -364,6 +364,7 @@ export default function createExecutor(ledgers: Ledgers): Executor {
       for (const e of journal.entries().filter(e => e.type === "forward")) await replayForward(e);
       await (await outbox).republishPending();
     },
+    async retire() { throw new Error("retire: not implemented yet (wave 3 X1)"); },
     busy: () => active.size > 0,
     async shutdown() {
       closed = true;

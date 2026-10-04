@@ -30,6 +30,8 @@ export interface CallTicket {
   cwd: string;
   /** The workflow journal (shared handle; append-only; engine and executor both write). */
   journal: JournalHandle;
+  /** Pinned workflow usage budget (P31a); the executor refuses dispatches and continuations once reached. */
+  workflowBudget?: { tokens?: number; costUsd?: number };
 }
 
 export interface Executor {
@@ -41,11 +43,15 @@ export interface Executor {
   forward(req: Request, ctx: { journal: JournalHandle; widRev: WidRev; key: string; gen: number }): Promise<{ action: "apply" } | { action: "reject"; reason: string }>;
   /** Stop a call or a whole workflow (fence, then seal "stopped"). */
   stop(target: { wid: Wid; callId?: CallId }): Promise<void>;
+  /** P14: retire every call of one workflow revision: fence its executions and commit `retired{call}` (no seal);
+   *  pending run() promises for those calls resolve with status "stopped" error "retired". Idempotent. */
+  retire(widRev: WidRev): Promise<void>;
   /** Startup recovery for one workflow, BEFORE the engine replays it: fence every exec without JT.fenced
    *  (using persisted tracked identities), and re-derive pool holdings. Unsealed calls are settled later via run(). */
   recover(wid: Wid, journal: JournalHandle): Promise<void>;
   /** True while any call is running or pending (used for idle exit, K6). */
   busy(): boolean;
+  /** Orchestrator exit: fence running executions WITHOUT sealing (they resume on recovery); close the outbox. */
   shutdown(): Promise<void>;
 }
 
