@@ -35,6 +35,7 @@ export function usage(entries: readonly SessionLike[], call?: string): { tokens:
 type Delivery = { content: { type: 'text'; text: string }[]; details: Record<string, unknown> };
 /** P4, P8, P23, P24: Consume the child mailbox at serialized pi boundaries, retaining native session receipts. */
 export function registerChild(pi: ExtensionAPI): void {
+  let target = process.env[ENV.model];
   const exec = process.env[ENV.exec]!, call = process.env[ENV.call]!, inbox = process.env[ENV.inbox]!, journal = process.env[ENV.journal]!;
   let active = false, watcher: FSWatcher | undefined, queue: Promise<unknown> = Promise.resolve();
   let state = recover([]), blocked: (Question & { resolve: (result: Delivery) => void; reject: (error: Error) => void }) | undefined;
@@ -96,6 +97,7 @@ export function registerChild(pi: ExtensionAPI): void {
           const body = req.body as ModelBody, model = ctx.modelRegistry.find(body.provider, body.model)!;
           if (!(await pi.setModel(model))) throw new Error(`Cannot activate model ${body.provider}/${body.model}`);
           if (body.thinking) pi.setThinkingLevel(body.thinking as ThinkingLevel);
+          target = `${body.provider}/${body.model}`;
           record(CT.model, { rid: req.rid, provider: body.provider, model: body.model, ...(body.thinking ? { thinking: body.thinking } : {}) });
         } else if (mode === 'ask' && waiter) {
           const text = (req.body as MessageBody).message;
@@ -159,6 +161,16 @@ export function registerChild(pi: ExtensionAPI): void {
   pi.on('agent_before_settle', boundary('settle'));
   // P31b, V8: refuse the next provider request once the per-call budget is reached (one in-flight overshoot at most).
   const budget = process.env[ENV.budget] ? JSON.parse(process.env[ENV.budget]!) as { tokens?: number; costUsd?: number } : undefined;
+  // C8: last line of defence before each provider request — pi 1.0.2 occasionally starts a resumed turn with its
+  // placeholder model ("unknown"); re-apply the model the executor holds a slot for.
+  // A model request applied by this child (P12) replaces the target.
+  pi.on('context', async (_event, ctx) => {
+    const slash = target?.indexOf('/') ?? -1;
+    if (!target || slash <= 0 || `${ctx.model?.provider}/${ctx.model?.id}` === target) return;
+    const model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
+    if (model) await pi.setModel(model);
+    else console.error(`durable-subagents: model ${target} is not registered before a provider request`);
+  });
   if (budget) pi.on('context', async (_event, ctx) => {
     if (!active) return;
     const used = usage(ctx.sessionManager.getEntries() as unknown as SessionLike[], call);

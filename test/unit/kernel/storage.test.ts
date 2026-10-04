@@ -120,3 +120,29 @@ test('P7, P38: Outbox.send with a fixed rid is idempotent across reopen and reje
   assert.deepEqual((await readdir(inbox)).filter(n => n.endsWith('.json')).sort(), ['fwd-1.json', `${c.rid}.json`].sort());
   await box.close();
 });
+
+test('A1, C11: snapshots are shared, frozen and extended incrementally; a torn tail is re-read once complete', async () => {
+  const { mkdtemp, appendFile, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { openJournal, readJournalSnapshot } = await import('../../../src/kernel/journal.ts');
+  const dir = await mkdtemp(join(tmpdir(), 'dsa-snap-')), path = join(dir, 'j.jsonl');
+  const j = await openJournal(path);
+  await j.append('a', { n: 1 });
+  const first = readJournalSnapshot(path);
+  assert.equal(first.length, 1); assert.ok(Object.isFrozen(first) && Object.isFrozen(first[0]));
+  assert.equal(readJournalSnapshot(path), first, 'unchanged file: same shared snapshot');
+  assert.equal(j.entries(), j.entries(), 'handle view is shared until the next append');
+  await j.append('b', { n: 2 });
+  const second = readJournalSnapshot(path);
+  assert.deepEqual(second.map(e => e.type), ['a', 'b']); assert.equal(second[0], first[0], 'prefix entries reused');
+  await appendFile(path, '0000');
+  assert.deepEqual(readJournalSnapshot(path).map(e => e.type), ['a', 'b'], 'torn tail ignored');
+  await j.close();
+  const reopened = await openJournal(path); // repairs the torn tail
+  await reopened.append('c', { n: 3 });
+  assert.deepEqual(readJournalSnapshot(path).map(e => e.type), ['a', 'b', 'c']);
+  await reopened.close();
+  await writeFile(path, '');
+  assert.deepEqual(readJournalSnapshot(path), [], 'a shorter file is read from scratch');
+});
