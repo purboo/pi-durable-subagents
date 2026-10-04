@@ -627,3 +627,17 @@ test('drain with fence survives restart without dispatch, then resume continues 
   assert.equal(readJournalSnapshot(file).filter(e => e.type === JT.sealed).length, 1);
   assert.equal(workflowSnapshot(home, String(created.wid)).status, 'done');
 });
+
+test('P15: finished attention names exceptions by key and follow-up outcomes', async () => {
+  const { finishedText } = await import('../../../../src/orchestrator/engine.ts');
+  const e = (seq: number, type: string, f: Record<string, unknown>) => ({ seq, ts: seq, type, ...f });
+  const res = (key: string, status: string, output = '') => ({ key, gen: 1, status, ok: status === 'ok', output });
+  const entries = [
+    e(1, 'wf-created', { name: 'nightly', origin: 'o', cwd: '/', revision: 1 }),
+    e(2, 'call', { key: 'a', gen: 1, spec: { agent: 'x' } }), e(3, 'call', { key: 'b', gen: 1, spec: { agent: 'x' } }), e(4, 'call', { key: 'c', gen: 1, spec: { agent: 'x' } }),
+    e(5, 'sealed', { call: 'w@1/a@1', result: res('a', 'ok', 'line1\nDONE: a') }), e(6, 'sealed', { call: 'w@1/b@1', result: res('b', 'timeout') }),
+    e(7, 'sealed', { call: 'w@1/c@1', result: res('c', 'skipped') }), e(8, 'workflow-done', { status: 'done' }),
+  ];
+  assert.equal(finishedText('w', entries as never), 'nightly (w) done: 1 ok; b timeout; c skipped. Details: subagents status.');
+  assert.equal(finishedText('w', entries as never, 'w@1/a@1'), 'nightly/a@1 (follow-up) ok: DONE: a');
+});

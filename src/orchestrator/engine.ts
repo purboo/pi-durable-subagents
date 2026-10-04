@@ -18,6 +18,23 @@ import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
+import { snapshotFromEntries } from './snapshot.ts';
+
+const clip = (text: string, n = 300) => text.length > n ? `${text.slice(0, n)}…` : text;
+/** P15: A finished item tells the origin agent what happened without a status round trip: exceptions by key. */
+export function finishedText(wid: string, entries: readonly Entry[], call?: string): string {
+  const snap = snapshotFromEntries(wid, entries), label = snap.name ?? wid;
+  if (call) {
+    const c = snap.calls.find(x => x.callId === call), r = c?.result;
+    return `${label}/${c?.key ?? call}@${c?.gen ?? '?'} (follow-up) ${r?.status ?? 'finished'}${r?.output ? `: ${clip(r.output.trim().split('\n').at(-1) ?? '')}` : r?.error ? `: ${clip(r.error)}` : ''}`;
+  }
+  const latest = new Map(snap.calls.map(c => [c.key, c]));
+  const calls = [...latest.values()], ok = calls.filter(c => c.result?.ok).length;
+  const bad = calls.filter(c => c.result && !c.result.ok && c.result.status !== 'skipped').map(c => `${c.key} ${c.result!.status}`);
+  const skipped = calls.filter(c => c.result?.status === 'skipped').map(c => c.key);
+  const parts = [`${ok} ok`, bad.length ? `${bad.join(', ')}` : '', skipped.length ? `${skipped.join(', ')} skipped` : ''].filter(Boolean);
+  return `${label} (${wid}) ${snap.status}: ${parts.join('; ')}${snap.error ? `. Error: ${clip(snap.error)}` : ''}. Details: subagents status.`;
+}
 
 type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Set<number>; exposures: Entry[]; sent: number; replaying: boolean; ready: Map<number, CallResult>; running: Set<number>; outputs: Map<number, Entry>; values: Entry[]; needs: number };
 export interface EngineOptions { evaluator?: EvaluatorTransport; discovery?: DiscoveryOptions }
@@ -251,7 +268,7 @@ export class Engine {
     void this.executor.run(ticket).then(() => this.background(async () => {
       if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);
       if (!wf.journal.entries().some(e => e.type === JT.attention && (e.item as { id?: string }).id === `finished:${id}`))
-        await wf.journal.append(JT.attention, { item: { id: `finished:${id}`, rev: 1, kind: 'finished', wid: wf.wid, call: id, text: `Finished ${id}`, origin: wf.origin } });
+        await wf.journal.append(JT.attention, { item: { id: `finished:${id}`, rev: 1, kind: 'finished', wid: wf.wid, call: id, text: finishedText(wf.wid, wf.journal.entries(), id), origin: wf.origin } });
       this.generations.delete(id);
     }), error => {
       this.generations.delete(id);
@@ -362,7 +379,7 @@ export class Engine {
     const done = this.terminal(wf);
     const rev = wf.journal.entries().filter(e => e.type === JT.done).length;
     if (done && !wf.journal.entries().some(e => e.type === JT.attention && (e.item as { id: string; rev: number }).id === `finished:${wf.wid}` && (e.item as { rev: number }).rev === rev)) {
-      await wf.journal.append(JT.attention, { item: { id: `finished:${wf.wid}`, rev, kind: 'finished', wid: wf.wid, text: `Workflow ${done.status}` } });
+      await wf.journal.append(JT.attention, { item: { id: `finished:${wf.wid}`, rev, kind: 'finished', wid: wf.wid, text: finishedText(wf.wid, wf.journal.entries()) } });
     }
   }
   private async resolveFinished(wf: Workflow) {

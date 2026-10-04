@@ -48,6 +48,9 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
 }
 function failed(c: CallSnapshot) { return c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped"; }
 
+/** P37: Calls are named by key; later generations of a key carry their generation. */
+export const label = (c: { key: string; gen: number }) => c.gen > 1 ? `${c.key}@${c.gen}` : c.key;
+
 /** UI §1,4: One working sentence, or a completion sentence naming only exceptions. */
 export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
@@ -55,9 +58,10 @@ export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undef
   if (working) return `${working} subagent${working === 1 ? "" : "s"} working  ↓`;
   const w = workflows.filter(w => w.status !== "running").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
   if (!w) return undefined;
-  const good = w.calls.filter(c => c.result?.ok).length;
-  const bad = w.calls.filter(c => failed(c)).map(c => c.key);
-  const skipped = w.calls.filter(c => c.result?.status === "skipped").map(c => c.key);
+  const latest = [...new Map(w.calls.map(c => [c.key, c])).values()]; // the newest generation of each key (P37)
+  const good = latest.filter(c => c.result?.ok).length;
+  const bad = latest.filter(c => failed(c)).map(c => c.key);
+  const skipped = latest.filter(c => c.result?.status === "skipped").map(c => c.key);
   return `${w.name ?? w.wid} finished: ${[good ? `${good} done` : "", bad.length ? `${bad.join(", ")} failed` : "", skipped.length ? `${skipped.join(", ")} skipped` : ""].filter(Boolean).join("; ") || w.status}.  ↓`;
 }
 
@@ -83,7 +87,7 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
   if (state.finished) visible.push(...finished);
   const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
-    rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), text: `${indent}${c.key}  ${width >= 60 ? `${name(f?.model ?? c.model)}  ` : ""}${statusPhrase(c, w, f, now)}${age ? `  ${age}` : ""}` });
+    rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), text: `${indent}${label(c)}  ${width >= 60 ? `${name(f?.model ?? c.model)}  ` : ""}${statusPhrase(c, w, f, now)}${age ? `  ${age}` : ""}` });
   };
   for (const w of visible) {
     if (w.calls.length === 1) { callRow(w, w.calls[0]!, "  "); continue; }

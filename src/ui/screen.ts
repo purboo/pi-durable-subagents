@@ -4,7 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { duration, listRows, modelLabel, resultPhrase, type ListRow, type ViewState } from "./view.ts";
+import { duration, label, listRows, modelLabel, resultPhrase, type ListRow, type ViewState } from "./view.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
 
@@ -50,7 +50,11 @@ export class SubagentScreen implements Component {
   private name = (model: string | undefined) => modelLabel(model, (p, id) => this.ctx.modelRegistry.find(p, id), this.data.aliases);
   private current() {
     const w = this.data.workflows.find(w => w.wid === this.workflow);
-    return { w, c: w?.calls.find(c => c.callId === this.watching) };
+    let c = w?.calls.find(c => c.callId === this.watching);
+    // P37: watching a key follows its newest generation (a continued call reopens on the same session).
+    const newest = c && w!.calls.filter(x => x.key === c!.key && x.gen > c!.gen).sort((a, b) => b.gen - a.gen)[0];
+    if (newest) { this.watching = newest.callId; c = newest; }
+    return { w, c };
   }
   private open(w: WorkflowSnapshot, c: CallSnapshot) {
     this.workflow = w.wid; this.watching = c.callId; this.doneTab = false; this.state.viewed.add(c.callId);
@@ -127,7 +131,7 @@ export class SubagentScreen implements Component {
     const q = w.attention.find(a => a.kind === "question" && a.call === c.callId);
     const kind = followUp ? "follow-up" : q ? "answer" : "steer";
     void this.send({ action: "send", to: c.callId, kind, message, ...(kind === "answer" ? { qid: q!.qid, rev: q!.rev } : {}) },
-      `${kind === "answer" ? "replied to" : followUp ? "queued follow-up for" : "steered"} ${c.key}: ${JSON.stringify(message)}`);
+      `${kind === "answer" ? "replied to" : followUp ? "queued follow-up for" : c.phase === "sealed" ? "continued" : "steered"} ${label(c)}: ${JSON.stringify(message)}`);
   }
   handleInput(key: string) {
     if (this.disposed) return;
@@ -221,7 +225,7 @@ export class SubagentScreen implements Component {
     if (!this.watching || this.doneTab) {
       const w = this.current().w;
       const selectedId = this.rows[this.selected]?.id;
-      this.rows = this.doneTab && w ? w.calls.filter(c => c.phase === "sealed").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).map(c => ({ id: c.callId, kind: "call" as const, workflow: w, call: c, text: `  ${c.key}  ${resultPhrase(c)}`, failed: !c.result?.ok })) : listRows(this.data.workflows, this.state, this.data.facts, this.name, width);
+      this.rows = this.doneTab && w ? w.calls.filter(c => c.phase === "sealed").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).map(c => ({ id: c.callId, kind: "call" as const, workflow: w, call: c, text: `  ${label(c)}  ${resultPhrase(c)}`, failed: !c.result?.ok })) : listRows(this.data.workflows, this.state, this.data.facts, this.name, width);
       const retained = this.rows.findIndex(row => row.id === selectedId);
       this.selected = Math.max(0, Math.min(retained >= 0 ? retained : this.selected, this.rows.length - 1));
       const start = Math.max(0, this.selected - height + 4);
@@ -234,7 +238,7 @@ export class SubagentScreen implements Component {
     if (!c || !w) return ["Subagent is no longer in the current revision · Esc back"];
     const facts = this.data.facts.get(c.callId), active = w.calls.filter(c => c.phase !== "sealed"), done = w.calls.length - active.length;
     const tabs = width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${w.name ?? w.wid}: ${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
-    const head = [tabs, `${c.key} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾`, "─".repeat(width)];
+    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾`, "─".repeat(width)];
     const transcript = this.transcript(c, w, width), available = Math.max(1, height - 8);
     if (this.following) this.scroll = Math.max(0, transcript.lines.length - available);
     else this.scroll = Math.min(this.scroll, Math.max(0, transcript.lines.length - available));
