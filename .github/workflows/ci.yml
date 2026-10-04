@@ -6,14 +6,17 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # 22.18 is the engines floor (first release that runs .ts without flags); the real-pi suite runs on 24.
+        node: ["24", "22.18"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 24 }
+        with: { node-version: "${{ matrix.node }}" }
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint:imports
       - run: npm run test:unit
       - run: npm run test:pi
+        if: matrix.node == '24'
       - run: npm run pack:smoke

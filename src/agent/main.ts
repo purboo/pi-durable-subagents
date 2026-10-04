@@ -10,13 +10,8 @@ import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type RunBody } from "../types.ts";
-import { attention, presented, resolved, workflows } from "./main/snapshots.ts";
+import { attention, presented, resolved, unfinishedWorkflow, workflows } from "./main/snapshots.ts";
 import { parameters, request } from "./main/tool.ts";
-
-/** P37: a generation opened by a send (possibly after the workflow finished) that has no seal yet is pending work. */
-function openGeneration(entries: readonly { type: string; [k: string]: unknown }[]): boolean {
-  return entries.some(g => g.type === "generation" && !entries.some(s => s.type === JT.sealed && String(s.call).endsWith(`/${String(g.key)}@${String(g.gen)}`)));
-}
 
 /** Capabilities the UI (U1) receives from the main agent; every action goes through the same durable outbox. */
 export interface UiDeps {
@@ -58,7 +53,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   async function starter(submitting = false) {
     if (stopped) return;
     await reconcile();
-    const pending = submitting || pendingOutbox() || (await scanInbox(orchInbox(home))).length > 0 || workflows(home).some(w => !w.entries.some(e => e.type === JT.done) || openGeneration(w.entries));
+    const pending = submitting || pendingOutbox() || (await scanInbox(orchInbox(home))).length > 0 || unfinishedWorkflow(home);
     if (!pending) return;
     await mkdir(home, { recursive: true });
     const lock = await new OsLock().tryAcquire(orchLock(home));

@@ -6,11 +6,11 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { dsaHome } from "../paths.ts";
 import { allWorkflows, workflowSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
-import { submit, type Control } from "./control.ts";
+import { start, startOrchestrator, submit, type Control } from "./control.ts";
 import { smoke } from "./smoke.ts";
 import { serviceFiles, manageService, type ServiceRunner } from "./service.ts";
 
-const commands = ["smoke", "tail", "status", "resume", "drain", "stop", "stop-all", "install-service", "uninstall-service", "help"] as const;
+const commands = ["smoke", "tail", "status", "start", "resume", "drain", "stop", "stop-all", "install-service", "uninstall-service", "help"] as const;
 type Command = typeof commands[number];
 export interface Arguments { command: Command; target?: string; json: boolean; dryRun?: boolean }
 /** P25: Reject ambiguous CLI arguments before any durable action. */
@@ -52,12 +52,20 @@ export async function tail(home: string, wid: string | undefined, write: (line: 
     try { await delay(interval, undefined, { signal }); } catch (error) { if (!signal.aborted) throw error; }
   }
 }
+/** P1: A service bound to an npx cache path breaks when the cache is pruned; require a stable install. */
+export function serviceEntryError(entry: string): string | undefined {
+  if (/[/\\]_npx[/\\]/.test(entry)) return `install-service refuses to run from an npx cache (${entry}); the cache can be pruned and the service would break. Install the CLI with \`npm i -g pi-durable-subagents\` and run \`pi-durable-subagents install-service\` again.`;
+  return undefined;
+}
+export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | tail [wid] | start | resume [wid] | drain | stop <wid|callId> | stop-all | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
 /** P1, P21, P25, P38: Dispatch the public CLI using durable requests and read-only snapshots. */
-export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner } = {}): Promise<number> {
+export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string } = {}): Promise<number> {
   if (args[0] === "chaos") return (await import("./chaos/index.ts")).chaos(args.slice(1), options.env ?? process.env, options.write);
   const { command, target, json, dryRun } = parseArgs(args), env = options.env ?? process.env;
   const home = dsaHome(env), write = options.write ?? (line => console.log(line));
-  if (command === "help") { write("pi-durable-subagents: smoke | status [wid] [--json] | tail [wid] | resume [wid] | drain | stop <wid|callId> | stop-all | install-service [--dry-run] | uninstall-service [--dry-run]"); return 0; }
+  if (command === "help") { write(HELP); return 0; }
+  // Quiet when idle: the optional service runs this every K1 and must not fill the system log.
+  if (command === "start") { if (await start(home, env, options.starter)) write("start: work pending; orchestrator started unless already running"); return 0; }
   if (command === "smoke") {
     const report = await smoke(env);
     for (const [domain, checks] of [["execution", report.execution], ["UI", report.ui]] as const)
@@ -74,7 +82,9 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     return 0;
   }
   if (command === "install-service" || command === "uninstall-service") {
-    const files = serviceFiles(env.HOME ?? homedir(), home, fileURLToPath(import.meta.url));
+    const entry = options.entry ?? fileURLToPath(import.meta.url), refused = command === "install-service" ? serviceEntryError(entry) : undefined;
+    if (refused) { (options.write ?? (line => console.error(line)))(refused); return 1; }
+    const files = serviceFiles(env.HOME ?? homedir(), home, entry);
     await manageService(files, command === "install-service", { dryRun, runner: options.serviceRunner, write });
     files.forEach(f => write(`${command}: ${f.path}`));
     return 0;

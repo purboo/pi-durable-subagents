@@ -126,10 +126,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   async function retireAttention(journal: JournalHandle, call: string) {
     for (const e of journal.entries().filter(e => e.type === JT.attention)) {
       const item = e.item as { id: string; rev: number; call?: string; kind?: string };
-      if (item.kind === "finished") continue;
+      if (item.kind === "finished" || item.id === `unknown:${call}`) continue;
       if (item.call === call && !journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev))
         await journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "retired" });
     }
+  }
+  /** P15, AC4: A call sealed `unknown` raises exactly one unknown item for its origin; seal and recovery both run this. */
+  async function unknownAttention(journal: JournalHandle, call: string) {
+    const result = sealed(journal, call), id = `unknown:${call}`;
+    if (result?.status !== "unknown" || journal.entries().some(e => e.type === JT.attention && (e.item as { id?: string }).id === id)) return;
+    const text = `Call ${call} ended with an unknown outcome: ${result.error || "no evidence of what it did"}. It was not re-run; check its effects before continuing.`;
+    await journal.append(JT.attention, { item: { id, rev: 1, kind: "unknown", text, wid: address(call).wid, call } });
   }
   async function finish(journal: JournalHandle, call: string, exec: string, result: CallResult) {
     const a = active.get(call);
@@ -164,6 +171,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const selected = journal.entries().find(e => e.type === "selected" && e.exec === exec);
       if (selected?.pool && result.status === "ok") await orch.append("candidate-success", { pool: selected.pool, model: `${(selected.model as Model).provider}/${(selected.model as Model).id}`, exec });
       await retireAttention(journal, call);
+      await unknownAttention(journal, call);
       return result;
     });
     await release(exec);
@@ -508,7 +516,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         await serial(async () => {
           for (const u of values) if (!journal.entries().some(e => e.type === "usage" && e.call === call && e.id === u.id)) await journal.append("usage", { call, ...u });
           if (sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) {
-            await retireForwards(journal, call); await retireAttention(journal, call);
+            await retireForwards(journal, call); await retireAttention(journal, call); await unknownAttention(journal, call);
           }
         });
       }

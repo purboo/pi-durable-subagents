@@ -21,7 +21,8 @@ test('service dry-run renders both platforms without filesystem or runner effect
   for (const command of ['install-service', 'uninstall-service']) {
     const output: string[] = [];
     assert.equal(await main([command, '--dry-run'], { env: { HOME: home, DSA_HOME: join(home, 'state') }, serviceRunner: runner, write: line => output.push(line) }), 0);
-    assert.ok(output.some(line => line.includes('resume')));
+    assert.ok(output.some(line => / start\n|<string>start<\/string>/.test(line)));
+    assert.ok(!output.some(line => line.includes('resume')));
     assert.deepEqual(await readdir(home), []);
   }
   assert.equal(calls, 0);

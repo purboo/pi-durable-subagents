@@ -20,6 +20,15 @@ export function workflows(home: string): { wid: string; origin?: string; entries
   });
 }
 
+/** P37: a generation opened by a send (possibly after the workflow finished) that has no seal yet is pending work. */
+export function openGeneration(entries: readonly { type: string; [k: string]: unknown }[]): boolean {
+  return entries.some(g => g.type === "generation" && !entries.some(s => s.type === JT.sealed && String(s.call).endsWith(`/${String(g.key)}@${String(g.gen)}`)));
+}
+/** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation. */
+export function unfinishedWorkflow(home: string): boolean {
+  return workflows(home).some(w => !w.entries.some(e => e.type === JT.done) || openGeneration(w.entries));
+}
+
 /** P15, V7: Rebuild session-wide receipts, including entries hidden by compaction. */
 export function presented(ctx: ExtensionContext): { id: string; rev: number }[] {
   return ctx.sessionManager.getEntries().flatMap(entry => entry.type === "custom_message" && entry.customType === CT.attention

@@ -623,6 +623,53 @@ test("X1 suspend preserves the open executor and resumes the same native session
   assert.equal(native.filter(e => e.customType === CT.exec).length, 2);
 });
 
+test("P9 P15 AC4 a once call whose tool was cut off seals unknown, raises one unknown item and never re-runs the tool", { timeout: 30000 }, async t => {
+  const f = await setup(t), marker = join(f.root, "ran");
+  const base = f.ticket("a", script([{ tool: "bash", args: { command: `echo ran >> '${marker}'; sleep 60` } }, { text: "must not continue" }]));
+  const ticket: CallTicket = { ...base, spec: { ...base.spec, once: true } };
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  await until(() => existsSync(marker));
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0);
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "unknown");
+  assert.match(String(result.error), /Unknown tool outcomes: bash/);
+  assertSealed(f.journal, ticket.callId, "unknown");
+  const items = () => f.journal.entries().filter(e => e.type === JT.attention).map(e => e.item as { id: string; rev: number; kind: string; text: string; wid: string; call: string });
+  assert.equal(items().length, 1);
+  assert.deepEqual({ ...items()[0]!, text: "" }, { id: `unknown:${ticket.callId}`, rev: 1, kind: "unknown", text: "", wid: f.wid, call: ticket.callId });
+  assert.match(items()[0]!.text, new RegExp(`${ticket.callId.replace(/[@/]/g, ".")}.*unknown outcome.*Unknown tool outcomes: bash`));
+  assert.ok(!f.journal.entries().some(e => e.type === JT.attentionResolved));
+  // The tool ran once and no execution was relaunched after the cut-off one.
+  await delay(200);
+  assert.equal(readFileSync(marker, "utf8"), "ran\n");
+  assert.equal(f.journal.entries().filter(e => e.type === JT.exec && e.call === ticket.callId).length, 1);
+  const native = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(native.filter(e => e.customType === CT.exec).length, 1);
+  assert.ok(!JSON.stringify(native.filter(e => e.message?.role === "assistant")).includes("must not continue"));
+  // Recovery is idempotent: neither the item nor the seal is repeated, and the item is not retired.
+  await f.executor.recover(f.wid, f.journal);
+  assert.equal((await f.executor.run(ticket)).status, "unknown");
+  assert.equal(items().length, 1);
+  assert.ok(!f.journal.entries().some(e => e.type === JT.attentionResolved));
+  assertSealed(f.journal, ticket.callId, "unknown");
+});
+
+test("P15 AC4 recovery raises the unknown item for a seal committed before its attention", { timeout: 10000 }, async t => {
+  const f = await setup(t), ticket = f.ticket(), exec = `${ticket.callId}#1.1`;
+  await f.journal.append(JT.exec, { exec, call: ticket.callId });
+  await f.journal.append(JT.fenced, { exec });
+  await f.journal.append(JT.sealed, { call: ticket.callId, exec, result: { key: "a", gen: 1, status: "unknown", ok: false, output: "", error: "Gate outcome unknown after recovery" } });
+  await f.executor.recover(f.wid, f.journal);
+  await f.executor.recover(f.wid, f.journal);
+  const items = f.journal.entries().filter(e => e.type === JT.attention).map(e => e.item as { id: string; text: string });
+  assert.equal(items.length, 1);
+  assert.equal(items[0]!.id, `unknown:${ticket.callId}`);
+  assert.match(items[0]!.text, /Gate outcome unknown after recovery/);
+});
+
 test("X1 K7 skips the third-loss candidate and changes the continuation's model", { timeout: 30000 }, async t => {
   const f = await setup(t, { pools: { pool: ["probe/scripted", "probe/scripted2"] } });
   const ticket = f.ticket("a", script([{ empty: true }, { empty: true }, { empty: true }, { text: "new candidate" }]));

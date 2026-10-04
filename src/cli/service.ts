@@ -9,16 +9,16 @@ const name = "pi-durable-subagents";
 const quote = (s: string, exec = true) => `"${s.replace(/[%$\\"\n\r]/g, c => c === "$" ? exec ? "$$" : "$" : ({ "%": "%%", "\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r" })[c]!)}"`;
 const xml = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[c]!);
 export interface ServiceFile { path: string; content: string }
-/** P1, K1: Render a login and 30-second starter using absolute runtime paths. */
+/** P1, K1: Render a login and 30-second starter using absolute runtime paths; it runs `start`, never `resume`. */
 export function serviceFiles(home: string, dsa: string, entry: string, platform: string = process.platform, node = process.execPath): ServiceFile[] {
   if (platform === "linux") {
     const dir = join(home, ".config/systemd/user");
     return [
-      { path: join(dir, `${name}.service`), content: `[Unit]\nDescription=Durable subagents starter\n\n[Service]\nType=oneshot\n# Keep the detached orchestrator alive after the starter exits.\nKillMode=process\nEnvironment=${quote(`DSA_HOME=${dsa}`, false)}\nExecStart=${quote(node)} ${quote(entry)} resume\n` },
+      { path: join(dir, `${name}.service`), content: `[Unit]\nDescription=Durable subagents starter\n\n[Service]\nType=oneshot\n# Keep the detached orchestrator alive after the starter exits.\nKillMode=process\nEnvironment=${quote(`DSA_HOME=${dsa}`, false)}\nExecStart=${quote(node)} ${quote(entry)} start\n` },
       { path: join(dir, `${name}.timer`), content: `[Unit]\nDescription=Durable subagents periodic starter\n\n[Timer]\nOnStartupSec=1s\nOnUnitActiveSec=30s\nAccuracySec=1s\nUnit=${name}.service\n\n[Install]\nWantedBy=timers.target\n` },
     ];
   }
-  if (platform === "darwin") return [{ path: join(home, "Library/LaunchAgents", `${name}.plist`), content: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${name}</string>\n<key>ProgramArguments</key><array>${[node, entry, "resume"].map(s => `<string>${xml(s)}</string>`).join("")}</array>\n<key>EnvironmentVariables</key><dict><key>DSA_HOME</key><string>${xml(dsa)}</string></dict>\n<key>RunAtLoad</key><true/>\n<!-- Keep the detached orchestrator alive after the starter exits. -->\n<key>AbandonProcessGroup</key><true/>\n<key>StartInterval</key><integer>30</integer>\n</dict></plist>\n` }];
+  if (platform === "darwin") return [{ path: join(home, "Library/LaunchAgents", `${name}.plist`), content: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${name}</string>\n<key>ProgramArguments</key><array>${[node, entry, "start"].map(s => `<string>${xml(s)}</string>`).join("")}</array>\n<key>EnvironmentVariables</key><dict><key>DSA_HOME</key><string>${xml(dsa)}</string></dict>\n<key>RunAtLoad</key><true/>\n<!-- Keep the detached orchestrator alive after the starter exits. -->\n<key>AbandonProcessGroup</key><true/>\n<key>StartInterval</key><integer>30</integer>\n</dict></plist>\n` }];
   throw new Error(`Starter service unavailable on ${platform}`);
 }
 /** P1: Invoke the platform service manager, surfacing the exact failed command. */

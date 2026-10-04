@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile, writeFile, mkdir, unlink } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, readdir, writeFile, mkdir, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseArgs, main, tail } from '../../../src/cli/main.ts';
-import { submit } from '../../../src/cli/control.ts';
+import { parseArgs, main, tail, serviceEntryError } from '../../../src/cli/main.ts';
+import { pendingWork, submit } from '../../../src/cli/control.ts';
 import { serviceFiles, manageService } from '../../../src/cli/service.ts';
 import { OsLock } from '../../../src/platform/lock.ts';
 import { openJournal, readJournalSnapshot } from '../../../src/kernel/journal.ts';
@@ -106,11 +106,12 @@ test('service files and activation use temporary HOME and fake runners on both p
     await manageService(files, true, { platform, uid: 123, runner, write() {} });
     for (const f of files) assert.equal(await readFile(f.path, 'utf8'), f.content);
     if (platform === 'linux') {
-      assert.match(files[0]!.content, /ExecStart="\/node dir\/node" "\/node dir\/cli.ts" resume/);
+      assert.match(files[0]!.content, /ExecStart="\/node dir\/node" "\/node dir\/cli.ts" start\n/);
+      assert.doesNotMatch(files[0]!.content, /resume/);
       assert.match(files[0]!.content, /\[Service\][\s\S]*KillMode=process\n/);
       assert.match(files[1]!.content, /OnUnitActiveSec=30s/);
       assert.deepEqual(commands, ['systemctl --user daemon-reload', 'systemctl --user enable --now pi-durable-subagents.timer']);
-    } else { assert.match(files[0]!.content, /<key>AbandonProcessGroup<\/key><true\/>/); assert.match(files[0]!.content, /&amp;/); assert.match(files[0]!.content, /<integer>30<\/integer>/); assert.match(commands[0]!, /^launchctl bootstrap gui\/123 /); }
+    } else { assert.match(files[0]!.content, /<string>\/node dir\/cli.ts<\/string><string>start<\/string><\/array>/); assert.doesNotMatch(files[0]!.content, /resume/); assert.match(files[0]!.content, /<key>AbandonProcessGroup<\/key><true\/>/); assert.match(files[0]!.content, /&amp;/); assert.match(files[0]!.content, /<integer>30<\/integer>/); assert.match(commands[0]!, /^launchctl bootstrap gui\/123 /); }
     await manageService(files, true, { platform, runner, write() {} });
     await manageService(files, false, { platform, uid: 123, runner, write() {} });
     for (const f of files) await assert.rejects(readFile(f.path), { code: 'ENOENT' });
@@ -128,4 +129,73 @@ test('service files and activation use temporary HOME and fake runners on both p
   const quoted = serviceFiles(home, '/state/$x%q', '/cli/$x%q', 'linux')[0]!.content;
   assert.match(quoted, /DSA_HOME=\/state\/\$x%%q/);
   assert.match(quoted, /\/cli\/\$\$x%%q/);
+});
+
+test('P1 start publishes nothing and invokes the starter only while work is pending', { timeout: 15000 }, async t => {
+  const home = await root(t), env = { HOME: home, DSA_HOME: home };
+  const started: string[] = [], starter = async (h: string) => { started.push(h); };
+  const run = async () => { const out: string[] = []; assert.equal(await main(['start'], { env, starter, write: s => out.push(s) }), 0); return out.join('\n'); };
+  const quiet = async () => { const before = started.length; assert.equal(await run(), '', 'idle start is silent'); assert.equal(started.length, before); };
+  await quiet();
+  // A drained / finished workflow is not pending; `start` must not undo the drain the way `resume` would.
+  const done = await openJournal(join(home, 'w', 'finished', 'journal.jsonl'));
+  await done.append('wf-created', { revision: 1 }); await done.append(JT.done, { status: 'parked' }); await done.close();
+  await quiet();
+  // A sender's request to the orchestrator that the ledger already resolved is not pending either.
+  const outbox = await openJournal(join(home, 'outbox', 'main_x.jsonl'));
+  await outbox.append('sent', { request: { rid: 'old', from: 'main:x', to: 'orch', sseq: 1, kind: 'resume', body: {} } });
+  await outbox.append('sent', { request: { rid: 'child', from: 'main:x', to: 'w@1/a@1', sseq: 1, kind: 'task', body: {} } });
+  const ledger = await openJournal(orchLedger(home)); await ledger.append('applied', { rid: 'old' }); await ledger.close();
+  await quiet();
+  assert.deepEqual(await scanInbox(orchInbox(home)), []);
+  assert.ok(!readJournalSnapshot(orchLedger(home)).some(e => e.type !== 'applied'));
+  // Each pending-work source starts the orchestrator.
+  await outbox.append('sent', { request: { rid: 'new', from: 'main:x', to: 'orch', sseq: 2, kind: 'drain', body: {} } });
+  assert.match(await run(), /work pending/); assert.equal(started.length, 1);
+  await outbox.append('resolved', { rid: 'new' }); await outbox.close();
+  assert.equal(await pendingWork(home), false);
+  await publishRequest(orchInbox(home), { rid: 'inbox', from: 'test', to: 'orch', sseq: 1, kind: 'resume', body: {} });
+  assert.equal(await pendingWork(home), true);
+  await unlink(join(orchInbox(home), 'inbox.json'));
+  const gen = await openJournal(join(home, 'w', 'finished', 'journal.jsonl'));
+  await gen.append('generation', { key: 'a', gen: 2 });
+  await run(); assert.equal(started.length, 2);
+  await gen.append(JT.sealed, { call: 'finished@1/a@2', exec: 'x', result: {} });
+  assert.equal(await pendingWork(home), false);
+  const running = await openJournal(join(home, 'w', 'running', 'journal.jsonl'));
+  await running.append('wf-created', { revision: 1 }); await gen.close(); await running.close();
+  await run(); assert.deepEqual(started, [home, home, home]);
+  assert.deepEqual(await scanInbox(orchInbox(home)), []);
+  assert.throws(() => parseArgs(['start', 'w']));
+});
+
+test('P1 start reuses the lock-checked detached starter', { timeout: 10000 }, async t => {
+  const home = await root(t), entry = join(home, 'starter.cjs'), marker = join(home, 'started');
+  await writeFile(entry, `require('fs').appendFileSync(${JSON.stringify(marker)},'x')`);
+  const env = { ...process.env, HOME: home, DSA_HOME: home, PI_CODING_AGENT_DIR: join(home, 'agent'), DSA_ORCHESTRATOR_ENTRY: entry };
+  const running = await openJournal(join(home, 'w', 'running', 'journal.jsonl')); await running.append('wf-created', { revision: 1 }); await running.close();
+  const held = await new OsLock().tryAcquire(orchLock(home)); assert.ok(held);
+  try { assert.equal(await main(['start'], { env, write() {} }), 0); await delay(300); await assert.rejects(readFile(marker), { code: 'ENOENT' }); } finally { await held.release(); }
+  assert.equal(await main(['start'], { env, write() {} }), 0);
+  await until(async () => (await readFile(marker, 'utf8').catch(() => '')) === 'x');
+  assert.deepEqual(await scanInbox(orchInbox(home)), []);
+});
+
+test('P1 install-service refuses an npx cache entry and recommends a global install', async t => {
+  const home = await root(t), out: string[] = [];
+  const entry = join(home, '.npm/_npx/0123abcd/node_modules/pi-durable-subagents/dist/cli/main.js');
+  assert.match(serviceEntryError(entry)!, /npm i -g pi-durable-subagents/);
+  assert.equal(serviceEntryError('/usr/lib/node_modules/pi-durable-subagents/dist/cli/main.js'), undefined);
+  assert.equal(serviceEntryError('C:\\Users\\u\\AppData\\Local\\npm-cache\\_npx\\1\\main.js') !== undefined, true);
+  const runner = async () => { throw new Error('must not run'); };
+  assert.equal(await main(['install-service'], { env: { HOME: home, DSA_HOME: join(home, 'state') }, entry, serviceRunner: runner, write: s => out.push(s) }), 1);
+  assert.match(out.join('\n'), /npx cache.*npm i -g pi-durable-subagents/s);
+  assert.deepEqual((await readdir(home)).filter(n => n !== '.npm'), []);
+  assert.equal(await main(['uninstall-service', '--dry-run'], { env: { HOME: home, DSA_HOME: join(home, 'state') }, entry, serviceRunner: runner, write() {} }), 0);
+});
+
+test('help lists start and chaos', async () => {
+  const out: string[] = [];
+  assert.equal(await main(['help'], { write: s => out.push(s) }), 0);
+  assert.match(out[0]!, /\| start \|/); assert.match(out[0]!, /\| chaos /);
 });

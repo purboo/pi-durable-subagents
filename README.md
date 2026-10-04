@@ -16,7 +16,7 @@ $ npx pi-durable-subagents chaos
   all 9 scenarios ....... pass
 ```
 
-You can run this yourself, offline, in about a minute. It runs a three-step
+You can run this yourself, offline, in about 1.5 minutes. It runs a three-step
 writer → reviewer → integrator workflow through the real product (a real pi
 main session, the orchestrator, real subagent pi processes and a scripted
 model). It injects one fault per scenario, then checks the journals and
@@ -32,13 +32,19 @@ pi install npm:pi-durable-subagents
 This needs pi 1.0.x and Node.js 22.18 or later. It has been tested with
 pi 1.0.2 on Linux. The CI configuration covers Linux and macOS.
 
+The `pi-durable-subagents` command line (below) is optional. Run it without
+installing through `npx pi-durable-subagents …`, or install it once with
+`npm i -g pi-durable-subagents`. Use the global install if you want the
+optional login service (`install-service`): a service must not point into
+the npx cache, so `install-service` refuses to run from there.
+
 ## What happens when…
 
 | Situation | What Durable Subagents does |
 |---|---|
 | The stream drops, or the model returns nothing | Continues the **same** session. Finished tool results are kept. |
 | A step runs past its `timeoutMs` (even inside a silent tool) | Stops it cleanly as `timeout`. Only time spent working counts; waiting for you does not. |
-| You quit pi, or pi crashes, while subagents run | The work keeps running. When you come back you get **one** message about what needs you. |
+| You quit pi, or pi crashes, while subagents run | The work keeps running. When you come back, the session that started the work is told what needs you. |
 | The machine or the orchestrator dies mid-run | The next pi you open resumes the work. Finished results are kept and nothing runs twice. |
 | You steer a subagent while it is asking you a question | Your message reaches it, in order. Nothing is rejected or lost. |
 | Two steers arrive out of order and the second replaces the first | Only the second one applies. |
@@ -75,7 +81,8 @@ A workflow is a plain script. These are the globals it can use:
 | `runs.input(name)` | A declared input file |
 | `now()` / `random()` | Logged, so the run can be replayed |
 
-The script's `return` value is the workflow result.
+The script's `return` value is the workflow result. A workflow script is a
+single file: it cannot `import` or `require` other modules.
 
 `spec` fields:
 
@@ -101,8 +108,8 @@ components. `←`/`→` switch between the subagents of one workflow.
 
 Typing steers the subagent you are watching (`Alt+Enter` queues a
 follow-up instead), or answers it if it is asking you something. `/model`
-switches its model. Every action is journaled as coming from you, and the
-main agent sees a note at its next turn.
+switches its model. Steers, answers and model switches are journaled as
+coming from you, and the main agent sees a note at its next turn.
 
 ### Quiet by design
 
@@ -146,16 +153,21 @@ unchanged, with zero edited lines.
 
 ```text
 pi-durable-subagents smoke              check this machine and this pi (offline, < 60 s)
-pi-durable-subagents chaos              run the fault suite (offline, about a minute)
+pi-durable-subagents chaos              run the fault suite (offline, about 1.5 minutes)
 pi-durable-subagents status [wid] [--json]
 pi-durable-subagents tail [wid]
-pi-durable-subagents resume [wid]       continue unfinished or parked work
+pi-durable-subagents start              start the orchestrator if work is pending; sends nothing
+pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)
 pi-durable-subagents drain              start nothing new; running work finishes
 pi-durable-subagents stop <wid|call>
 pi-durable-subagents stop-all           pause everything; journals stay resumable
-pi-durable-subagents install-service    optional: resume work at login (systemd / launchd)
+pi-durable-subagents install-service    optional: run `start` at login and every 30 s (systemd / launchd)
 pi-durable-subagents uninstall-service
 ```
+
+The service only runs `start`: it never resumes work you drained or
+stopped. Install the CLI globally (`npm i -g pi-durable-subagents`) before
+`install-service`.
 
 ## Configuration
 
@@ -195,10 +207,12 @@ Subagents again later, `resume` picks the work up.
 ## Survives pi upgrades
 
 It uses only pi's public CLI, RPC and extension API, through root exports.
-On load, it checks every pi surface it needs.
+On load, it checks the pi exports and API methods it uses.
 
 - If an execution surface is missing, Durable Subagents disables itself
-  with one exact message. Running work is untouched.
+  with one exact message. Running work is untouched. A subagent that
+  starts on such a pi exits with that message, and its step fails after
+  the usual retries instead of hanging.
 - If a UI surface is missing, only the watch view is disabled.
 
 `smoke` runs the same checks inside your pi.
