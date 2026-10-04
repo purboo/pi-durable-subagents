@@ -143,6 +143,8 @@ export interface RunBody {
   chain?: (CallSpec & { key?: string })[];
   call?: CallSpec & { key?: string };
   args?: unknown;
+  /** Declared inputs: name -> absolute file path; copied into pinned/ at admission, served by runs.input(name). */
+  inputs?: Record<string, string>;
   name?: string;
 }
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
