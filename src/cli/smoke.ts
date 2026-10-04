@@ -1,5 +1,8 @@
-import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
+import type { CapabilityReport } from "../agent/capabilities.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -14,7 +17,7 @@ export interface SmokeReport { execution: Capability[]; ui: Capability[]; gap: s
 /** P21, C1–C4, C11: Measure execution surfaces independently and report UI degradation. */
 export async function smoke(env: NodeJS.ProcessEnv = process.env, tty = Boolean(process.stdin.isTTY && process.stdout.isTTY)): Promise<SmokeReport> {
   const root = await mkdtemp(join(tmpdir(), "dsa-smoke-"));
-  const execution: Capability[] = [];
+  const execution: Capability[] = [], ui: Capability[] = [];
   const check = async (name: string, fn: () => Promise<string>) => {
     try { execution.push({ name, ok: true, detail: await fn() }); }
     catch (error) { execution.push({ name, ok: false, detail: String(error) }); }
@@ -55,6 +58,34 @@ export async function smoke(env: NodeJS.ProcessEnv = process.env, tty = Boolean(
       if (!stdout.trim()) throw new Error("pi returned no version");
       return stdout.trim();
     });
+    // AC5: load the extension inside the real pi in probe mode and read its capability report.
+    let surfaces: CapabilityReport | undefined;
+    await check("pi-surfaces", async () => {
+      surfaces = await probe(env, root);
+      if (!surfaces.execution) throw new Error(surfaces.messages.join(" "));
+      return `${surfaces.missing.length ? `missing ${surfaces.missing.map(m => m.name).join(", ")}` : "all execution surfaces present"}`;
+    });
+    ui.push({ name: "pi-ui-surfaces", ok: !!surfaces?.ui, detail: surfaces ? (surfaces.ui ? "native watch view available" : surfaces.messages.join(" ")) : "not probed" });
   } finally { await rm(root, { recursive: true, force: true }); }
-  return { execution, ui: [{ name: "interactive-terminal", ok: tty, detail: tty ? "TTY available; UI hooks require interactive pi" : "No interactive TTY; UI degrades to CLI/RPC" }], gap: "A process that clears its tag and leaves the process tree before the first scan cannot be discovered (C1–C3)." };
+  ui.unshift({ name: "interactive-terminal", ok: tty, detail: tty ? "TTY available; UI hooks require interactive pi" : "No interactive TTY; UI degrades to CLI/RPC" });
+  return { execution, ui, gap: "A process that clears its tag and leaves the process tree before the first scan cannot be discovered (C1–C3)." };
+}
+
+/** AC5: Run pi once with the extension in probe mode (it only writes its capability report) and read the report. */
+async function probe(env: NodeJS.ProcessEnv, root: string): Promise<CapabilityReport> {
+  const report = join(root, "capabilities.json");
+  const extension = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../agent/extension.ts" : "../agent/extension.js", import.meta.url));
+  const child = spawn(env.DSA_PI_BIN ?? "pi", ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extension], {
+    cwd: root, stdio: ["pipe", "ignore", "pipe"], env: { ...env, DSA_PROBE: report, HOME: root, PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" } });
+  let stderr = "", failed: Error | undefined; child.stderr.on("data", chunk => { stderr += chunk; });
+  const exited = new Promise(resolve => { child.once("close", resolve); child.once("error", error => { failed = error; resolve(undefined); }); });
+  try {
+    for (let waited = 0; waited < 15_000; waited += 100) {
+      const text = await readFile(report, "utf8").catch(() => undefined);
+      if (text) return JSON.parse(text) as CapabilityReport;
+      if (child.exitCode !== null || failed) break;
+      await delay(100);
+    }
+    throw new Error(`pi did not load the extension: ${failed?.message ?? (stderr.trim().slice(-300) || "no report")}`);
+  } finally { child.stdin.on("error", () => {}); child.stdin.end(); child.kill("SIGTERM"); await exited; }
 }
