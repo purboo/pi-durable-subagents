@@ -425,3 +425,200 @@ fake orchestrator entry script, and hand-written journals. Cover:
 - a resolved item is rewritten by the `context` hook;
 - the starter spawns the fake orchestrator once when the lock is free, and
   never while it is held.
+
+## Wave 2b contracts: the orchestrator (O1a engine and O1b executor)
+
+The orchestrator is the single process that owns every workflow journal,
+every execution and every pool (P2). It is built in two parallel parts that
+meet at the parent-owned `src/orchestrator/contract.ts` (`Executor`,
+`CallTicket`, `Ledgers`, `OrchestratorConfig`). The `JT` entries listed in
+`types.ts` are cross-domain: other domains read them. Entries private to the
+orchestrator are named and documented by their writer, in a header comment at
+the top of the file that writes them.
+
+### O1a · Engine (`src/orchestrator/main.ts`, `engine.ts`, `evaluator-client.ts`, `store.ts`)
+
+**`main.ts`, the process entry:**
+
+1. Read `home` from `dsaHome()`.
+2. Call `OsLock.tryAcquire(orchLock(home))`. If the lock is held, exit 0.
+3. Open `orchestrator.jsonl` and `config.json`.
+4. Construct the Executor (O1b's default export factory, `createExecutor(ledgers)`)
+   and the Engine.
+5. Recover, then loop.
+6. Exit after K6 (60 s) when there is no unfinished workflow, `busy()` is
+   false and the inbox is empty.
+
+**Intake.** The engine watches `orchInbox(home)`, plus a poll every 1 s as a
+fallback. It runs `planDecisions` and commits the records to
+`orchestrator.jsonl` (`JT.admitted`, `applied`, `rejected`, `withdrawn`) in
+order. Its domain `decide` handles each request kind as follows:
+
+| Kind | Handling |
+|---|---|
+| `run` | Create workflow `wid` (a ULID), revision `@1`. Pin the script or the compiled fan-out (via `compileFanout`), the args, the declared inputs (copied), and the discovered agents (`discoverAgents(cwd)`, as JSON) under `pinnedDir`. Write the first journal entry, then `JT.created {rid, wid, origin: req.from}` in the ledger. Start the workflow. |
+| `send` | Resolve `to` to the call's current generation, then call `executor.forward`. |
+| `withdraw` | The kernel lifecycle handles the "orch" level. Withdrawing a forwarded rid is passed to `executor.forward`. |
+| `stop` | `executor.stop`. |
+| `resume` | (Re)start any unfinished workflow. |
+| `drain` | Set a flag so that no new dispatch happens. |
+| `revise` | Reject with `not-implemented-yet`; that belongs to O2. |
+
+**Evaluator client.** Spawn one evaluator host, `node <src|dist>/evaluator/host.ts`,
+and speak `OrchToEval`/`EvalToOrch`. If the host dies, increment `ev` for
+every running workflow and replay them all (P10).
+
+**Workflow journal entries owned by the engine:**
+
+| Entry | Written when |
+|---|---|
+| `wf-created {rid, origin, cwd, revision}` | the workflow is created |
+| `ev {n}` | a new evaluator incarnation starts |
+| `call {pos, key, gen, spec, fingerprint}` | a call is proposed |
+| `exposed {pos}` | **before** the matching `expose` is sent |
+| `value {n, kind, value}` | `now()` or `random()` is answered |
+| `emit {pos, value}` | the script emits a value |
+| `JT.done` | the workflow ends |
+| `JT.attention {item: finished}` | the workflow ends |
+
+The fingerprint is a `contentHash` over the spec, the agent definition and
+the pinned inputs it references.
+
+**Live operation.**
+
+1. For each new proposal, commit `call`.
+2. Build a `CallTicket`.
+3. `await executor.run(ticket)`.
+4. Commit `exposed {pos}`.
+5. Send `expose`.
+
+The sealed `CallResult` comes from the `JT.sealed` entry for that call.
+
+**Replay (P11).** Start a new `ev`, then:
+
+- **Values.** Answer `need` from the logged `value` entries in order.
+- **Re-proposals.** Each re-proposal must equal the logged `call` at the
+  same `pos` (key plus fingerprint). A mismatch parks the workflow:
+  `JT.done {status: "parked", error}`.
+- **Logged exposures.** Re-send them in logged order. Each one waits until
+  its `pos` has been re-proposed.
+- **Running, unsealed calls** (logged but not yet exposed): call
+  `executor.run` again. The executor makes this idempotent from the
+  journal.
+- **The frontier** is reached when every logged exposure has been sent and
+  the evaluator is `idle`. If any logged call has still not been
+  re-proposed at that point, park.
+- **Beyond the log**, proposals are live.
+
+**Tests (`test/unit/orchestrator/engine/`).** Use a fake Executor that seals
+synthetic results, so no real pi is needed. Cover:
+
+- intake ordering and identity conflicts at "orch";
+- `run`, which writes `created` and pins;
+- live order versus replay order with the rolling-DAG fixture;
+- an engine crash (killed process) mid-run, followed by replay with no
+  duplicate `executor.run` for sealed calls;
+- a mismatch parks the workflow;
+- the missing-output frontier parks the workflow;
+- host death followed by ev+1 replay;
+- idle exit;
+- a second engine exits on the held lock.
+
+### O1b · Executor (`src/orchestrator/executor/`, with default export `createExecutor(ledgers): Executor`)
+
+**Per call.** Execution id: `${callId}#${attempt}.${epoch}`.
+
+1. Commit `JT.exec {exec, call}`.
+2. Hold a provider slot in `orchestrator.jsonl` (`hold {pool: provider,
+   slot, exec}` / `release`). Capacity comes from `config.providers`; the
+   provider comes from the resolved model (`resolveModel` with pools; pick
+   the first candidate that has a free slot, without blocking while holding
+   another slot). When no slot is free, the call waits without holding
+   anything.
+3. Write the system prompt (the agent body) to the call directory.
+4. Publish the task request (kind `task`, `MessageBody{message: spec.task}`)
+   through the orchestrator `Outbox` (sender `"orch"`, to `callId`) into
+   `callInbox`.
+5. Spawn through `Containment.spawn`: `<pi> --mode rpc --session <callSession> -e <extension entry> ...buildPiArgs(...)`.
+   - The extension entry is `src/agent/extension.ts`, or the `dist` `.js`
+     equivalent.
+   - The environment carries `DSA_HOME`, `DSA_EXEC`, `DSA_CALL`,
+     `DSA_INBOX`, `DSA_JOURNAL` and, if there is a schema, `DSA_SCHEMA` (the
+     schema written to a file).
+   - A continuation (a new epoch on the same session) passes no model flags
+     (C5).
+
+**Observation.** Read RPC stdout as JSON lines and track:
+
+- `agent_settled`;
+- `message_start` (the model in use);
+- `tool_execution_*`;
+- `message_end` usage.
+
+Run a tracker scan every K10 (1 s). Commit each newly discovered identity as
+`tracked {exec, pid, start}`.
+
+**Settle (P9).** On `agent_settled` or an observed process death:
+
+1. Close stdin.
+2. `Containment.fence(exec, tracked)`.
+3. Commit `JT.fenced {exec}`.
+4. Read the final session and take its current segment (the entries after
+   `CT.exec {exec}`).
+5. Decide the outcome:
+   - a `CT.report` → seal from the report;
+   - otherwise, the last non-empty assistant text of a settled turn (not
+     aborted, not an error) → seal `ok`, using
+     `buildCallResult({output: fullText})`;
+   - otherwise it is a loss. While the number of losses is below K2 (5):
+     commit `loss {exec}`, start epoch+1 on the same session, and publish
+     `continue` (`MessageBody`, listing the dangling tool calls as
+     unknown). Once losses reach K2: seal `failed: lost ×N`.
+6. Seal by committing `JT.sealed {call, exec, result}`, guarded by V2. Then
+   release the slots.
+
+**Stop.** A decided stop fences the execution and seals `stopped` through
+the same V2-guarded transition.
+
+**Forward (P7).**
+
+- `send` to a sealed call → reject `call-sealed`.
+- Otherwise: commit `forward {rid, rid2, dest}` with the full envelope,
+  `rid2 = forwardRid(...)`. Publish `rid2` into the child inbox through the
+  orchestrator `Outbox`, which provides the outbox republish behaviour of
+  P38.
+- A model string becomes `ModelBody`, using `parseModel`.
+- Withdrawing a forwarded rid forwards `withdraw{rids: [rid2]}`.
+
+**Attention, questions only in O1b.** Watch each running child session file.
+
+- A `CT.question` appears → commit `JT.attention {item: {id:
+  "q:<call>:<qid>", rev, kind: "question", text, wid, call, qid, session}}`.
+- The child session later shows that question answered → commit
+  `JT.attentionResolved`.
+
+**Recover.** Before the engine replays a workflow:
+
+1. Fence every `JT.exec` that has no `JT.fenced`, using the persisted
+   `tracked` identities and the tag.
+2. Re-derive pool holdings: a hold whose exec is fenced is treated as
+   released.
+
+Unsealed calls are settled when `run()` is called again: report first (P9),
+then continue.
+
+**Tests (real pi with the faux provider; `test/pi/executor/`).** The child
+agent C1 is still being built. Tests that need child-side consumption must
+skip while `src/agent/child.ts` is the placeholder. Write them now, run them
+again after integration, and mark them clearly. Cover:
+
+- spawn plus settle with plain text → seal `ok` with the full text;
+- an empty reply → loss → continue on the same session → `ok`;
+- K2 losses → `failed`;
+- a report from the session is used;
+- SIGKILL of the child mid-tool → fence kills the orphan → continue;
+- stop → `stopped`, and no second seal;
+- forward of a steer and a withdraw;
+- recovery after the executor's own process is killed: the report already in
+  the session is sealed without a new model call;
+- provider slot capacity 1 with two calls → serialised, never two holders.
