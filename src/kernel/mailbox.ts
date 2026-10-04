@@ -9,24 +9,30 @@ function safeName(name: string): string {
   if (!name || name === '.' || name === '..' || /[/\\\0]/.test(name)) throw new Error('Invalid mailbox identity');
   return name;
 }
-/** P3, C11: Publish an immutable envelope with atomic no-replace semantics. */
-export async function publishRequest(inboxDir: string, req: Request): Promise<Publication> {
-  const bytes = JSON.stringify(req), target = join(inboxDir, `${safeName(req.rid)}.json`);
-  await mkdir(inboxDir, { recursive: true });
-  const temp = join(inboxDir, `.${ulid()}.tmp`), file = await open(temp, 'wx', 0o600);
+/** C11: Publish immutable bytes as dir/name (temp + fsync + no-replace link + dir fsync). `same` decides whether an
+ *  existing file counts as identical (default: byte equality). Used for request envelopes, pins and artifacts. */
+export async function publishFile(dir: string, name: string, bytes: string | Uint8Array, same: (existing: Buffer) => boolean = existing => existing.equals(Buffer.from(bytes))): Promise<Publication> {
+  const target = join(dir, safeName(name));
+  await mkdir(dir, { recursive: true });
+  const temp = join(dir, `.${ulid()}.tmp`), file = await open(temp, 'wx', 0o600);
   try {
     await file.writeFile(bytes); await file.sync(); await file.close();
     try { await link(temp, target); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       let identical = false;
-      try { identical = contentHash(JSON.parse(await readFile(target, 'utf8'))) === contentHash(JSON.parse(bytes)); } catch { /* A malformed existing file is a conflict. */ }
-      await syncDirectory(inboxDir);
+      try { identical = same(await readFile(target)); } catch { /* An unreadable existing file is a conflict. */ }
+      await syncDirectory(dir);
       return identical ? 'exists-identical' : 'conflict';
     }
-    await syncDirectory(inboxDir);
+    await syncDirectory(dir);
     return 'published';
   } finally { await file.close(); await unlink(temp).catch(() => {}); }
+}
+/** P3, C11: Publish an immutable envelope with atomic no-replace semantics. */
+export async function publishRequest(inboxDir: string, req: Request): Promise<Publication> {
+  const bytes = JSON.stringify(req);
+  return publishFile(inboxDir, `${req.rid}.json`, bytes, existing => contentHash(JSON.parse(existing.toString('utf8'))) === contentHash(req));
 }
 function isRequest(value: unknown): value is Request {
   if (!value || typeof value !== 'object') return false;
