@@ -56,6 +56,7 @@ export class Outbox {
   private sender: string;
   private inbox: (to: string) => string;
   private pending = new Map<string, Request>();
+  private sent = new Map<string, Request>();
   private high = new Map<string, number>();
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
@@ -65,7 +66,7 @@ export class Outbox {
       if (entry.type === 'sent') {
         const req = entry.request as Request;
         this.high.set(req.to, Math.max(this.high.get(req.to) ?? 0, req.sseq));
-        this.pending.set(req.rid, req);
+        this.pending.set(req.rid, req); this.sent.set(req.rid, req);
       } else if (entry.type === 'resolved') this.pending.delete(entry.rid as string);
     }
   }
@@ -80,13 +81,22 @@ export class Outbox {
   private async publish(req: Request): Promise<void> {
     if (await publishRequest(this.inbox(req.to), req) === 'conflict') throw new Error(`Outbox identity conflict: ${req.rid}`);
   }
-  /** P5, P38: Persist the next per-recipient sequence before publication. */
-  send(to: string, kind: RequestKind, body: unknown, cond?: Conditions): Promise<Request> {
+  /** P5, P38, P7: Persist the next per-recipient sequence before publication. With opts.rid (a deterministic
+   *  identity, e.g. a forward's rid2) the send is idempotent: a rid already sent returns the recorded envelope
+   *  (same sseq) and republishes it if still pending; reusing it for a different recipient/kind/body is an error. */
+  send(to: string, kind: RequestKind, body: unknown, cond?: Conditions, opts: { rid?: string } = {}): Promise<Request> {
     const payload = structuredClone({ body, cond });
     return this.serial(async () => {
-      const req: Request = { rid: ulid(), from: this.sender, to, sseq: (this.high.get(to) ?? 0) + 1, kind, body: payload.body, ...(payload.cond ? { cond: payload.cond } : {}) };
+      const prior = opts.rid ? this.sent.get(opts.rid) : undefined;
+      if (prior) {
+        if (prior.to !== to || prior.kind !== kind || contentHash({ body: prior.body, cond: prior.cond }) !== contentHash({ body: payload.body, cond: payload.cond }))
+          throw new Error(`Outbox identity conflict: ${opts.rid}`);
+        if (this.pending.has(prior.rid)) await this.publish(prior);
+        return structuredClone(prior);
+      }
+      const req: Request = { rid: opts.rid ?? ulid(), from: this.sender, to, sseq: (this.high.get(to) ?? 0) + 1, kind, body: payload.body, ...(payload.cond ? { cond: payload.cond } : {}) };
       await this.journal.append('sent', { request: req });
-      this.high.set(to, req.sseq); this.pending.set(req.rid, req);
+      this.high.set(to, req.sseq); this.pending.set(req.rid, req); this.sent.set(req.rid, req);
       await this.publish(req); return structuredClone(req);
     });
   }

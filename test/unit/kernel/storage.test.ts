@@ -100,3 +100,23 @@ test('canonical identities and monotonic ULIDs', () => {
   assert.notEqual(forwardRid('r', 'w@1', 'k', 'h'), forwardRid('r', 'w@2', 'k', 'h'));
   const values = Array.from({ length: 1000 }, ulid); assert.deepEqual(values, [...values].sort()); assert.equal(new Set(values).size, values.length);
 });
+
+test('P7, P38: Outbox.send with a fixed rid is idempotent across reopen and rejects conflicting reuse', async () => {
+  const { mkdtemp, readdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { Outbox } = await import('../../../src/kernel/mailbox.ts');
+  const root = await mkdtemp(join(tmpdir(), 'dsa-outbox-rid-'));
+  const inbox = join(root, 'inbox');
+  let box = await Outbox.open(root, 'orch', () => inbox);
+  const a = await box.send('call-1', 'steer', { message: 'x' }, undefined, { rid: 'fwd-1' });
+  await box.close();
+  box = await Outbox.open(root, 'orch', () => inbox);
+  const b = await box.send('call-1', 'steer', { message: 'x' }, undefined, { rid: 'fwd-1' });
+  assert.equal(b.sseq, a.sseq); assert.equal(b.rid, 'fwd-1');
+  const c = await box.send('call-1', 'steer', { message: 'y' });
+  assert.equal(c.sseq, a.sseq + 1);
+  await assert.rejects(box.send('call-1', 'steer', { message: 'DIFFERENT' }, undefined, { rid: 'fwd-1' }), /identity conflict/);
+  assert.deepEqual((await readdir(inbox)).filter(n => n.endsWith('.json')).sort(), ['fwd-1.json', `${c.rid}.json`].sort());
+  await box.close();
+});
