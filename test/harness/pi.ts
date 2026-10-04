@@ -11,6 +11,9 @@ export const REPO = path.resolve(HERE, "../..");
 export const PI_BIN = path.join(REPO, "node_modules/.bin/pi");
 export const FAUX = path.join(HERE, "faux-provider.ts");
 
+// Tests must never reach a real provider: drop provider credentials from this process and everything it spawns.
+for (const key of Object.keys(process.env)) if (/(_API_KEY|_AUTH_TOKEN|_ACCESS_TOKEN)$/.test(key)) delete process.env[key];
+
 export interface PiEvent { type: string; _t: number; [k: string]: unknown }
 
 export interface PiInstance {
