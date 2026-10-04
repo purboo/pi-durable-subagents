@@ -88,6 +88,7 @@ export type Resolution =
 // ---------------------------------------------------------------------------
 
 export const CT = {
+  admitted: "dsa-admitted",    // custom: { rid, from, sseq, hash, kind } — lifecycle admission record (kernel DecisionRecord)
   exec: "dsa-exec",            // custom: { exec } — start of an execution segment
   msg: "dsa-msg",              // custom_message: details { rid, kind, from } — applied request (receipt)
   rejected: "dsa-rejected",    // custom: { rid, reason }
@@ -98,6 +99,39 @@ export const CT = {
   attention: "dsa-attention",  // custom_message (main session): details { items: {id, rev}[] }
   note: "dsa-note",            // custom_message (main session), never triggers a turn
 } as const;
+
+// ---------------------------------------------------------------------------
+// Orchestrator journal entries that OTHER domains read (snapshot only; never written by them).
+// orchestrator.jsonl (user-level ledger) and w/<wid>/journal.jsonl (per workflow).
+// ---------------------------------------------------------------------------
+
+export const JT = {
+  /** orchestrator.jsonl: { rid, wid, origin } — a `run` request was applied; origin = "main:<sessionId>". */
+  created: "created",
+  /** journal: { exec, call } — the current execution of `call` (last one wins). Launch gate P23. */
+  exec: "exec",
+  /** journal: { exec } — execution retired (A2). Launch gate P23. */
+  fenced: "fenced",
+  /** journal: { item: AttentionItem } — an attention item for the origin session (P15). */
+  attention: "attention",
+  /** journal: { id, rev, resolution } — the item is resolved; never present it as open again. */
+  attentionResolved: "attention-resolved",
+  /** journal: { call, exec, result: CallResult } — terminal seal (V2). */
+  sealed: "sealed",
+} as const;
+
+export interface AttentionItem {
+  id: string;
+  rev: number;
+  kind: "question" | "finished" | "stall" | "unknown" | "budget";
+  /** Human-readable one-liner shown to the main agent. */
+  text: string;
+  wid: Wid;
+  call?: CallId;
+  qid?: Qid;
+  /** Child session file, for late refresh of question state (P15). */
+  session?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Call spec and result (compat with pi-subagents runs.run; spec mapping table)
