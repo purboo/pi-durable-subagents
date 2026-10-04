@@ -5,11 +5,31 @@
   "type": "module",
   "license": "MIT",
   "author": "purboo",
-  "keywords": ["pi-package", "subagents", "workflow", "durable", "orchestration", "multi-agent"],
-  "engines": { "node": ">=22.18" },
-  "bin": { "pi-durable-subagents": "dist/cli/main.js" },
-  "pi": { "extensions": ["dist/agent/extension.js"] },
-  "files": ["dist", "README.md", "LICENSE"],
+  "keywords": [
+    "pi-package",
+    "subagents",
+    "workflow",
+    "durable",
+    "orchestration",
+    "multi-agent"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "pi-durable-subagents": "dist/cli/main.js"
+  },
+  "pi": {
+    "extensions": [
+      "dist/agent/extension.js"
+    ]
+  },
+  "files": [
+    "dist",
+    "agents",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
