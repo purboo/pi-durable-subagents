@@ -171,8 +171,9 @@ export interface StopBody { target: Wid | CallId }
 export interface ReviseBody { wid: Wid; workflow?: string; source?: string; args?: unknown }
 /** kind "resume": adopt/continue unfinished work (all when wid absent). */
 export interface ResumeBody { wid?: Wid }
-/** kind "drain": stop new dispatch; running calls finish. */
-export type DrainBody = Record<string, never>;
+/** kind "drain": durable; no new dispatch and no continuation until `resume`. Running calls finish, unless
+ *  `fence` (CLI stop-all): then every running execution is fenced WITHOUT sealing, so journals stay resumable. */
+export interface DrainBody { fence?: boolean }
 
 // Request bodies addressed to a child (to: CallId), written by the orchestrator (own requests or P7 forwards).
 /** kinds "task" | "steer" | "follow-up" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */
