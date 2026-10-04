@@ -11,6 +11,7 @@ import { readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { publishRequest } from "../../../src/kernel/mailbox.ts";
 import { JT, type Request, type RunBody } from "../../../src/types.ts";
 import { main } from "../../../src/orchestrator/main.ts";
+import { workflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
 
 test("E2E: chain of two real child calls runs to workflow-done with the previous output threaded", { timeout: 120_000 }, async t => {
   const root = tempRoot("dsa-e2e-"), home = join(root, "dsa"), cwd = join(root, "work"), agentDir = join(root, "agent");
@@ -53,4 +54,7 @@ test("E2E: chain of two real child calls runs to workflow-done with the previous
   assert.equal(entries.filter(e => e.type === JT.exec).length, 2);
   const second = entries.filter(e => e.type === "call")[1]!;
   assert.match((second.spec as { task: string }).task, /^after alpha: /);
+  const snap = workflowSnapshot(home, wid!);
+  assert.equal(snap.status, "done"); assert.equal(snap.counts.sealed, 2); assert.equal(snap.calls[0]!.model, "probe/scripted");
+  assert.deepEqual(snap.calls.map(c => c.result?.output), ["alpha", "beta"]);
 });

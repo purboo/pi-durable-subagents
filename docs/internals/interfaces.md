@@ -744,16 +744,19 @@ tests otherwise):
    **Stale requests:** requests that name an old revision (`to` containing
    `wid@<old r>`) are rejected with `stale-revision` (V3). `stop`,
    `resume` and `status` apply to the current revision.
-4. **Status snapshot for other domains.** Export a pure function
-   `src/orchestrator/snapshot.ts: workflowSnapshot(home, wid)` that reads
-   only journals and returns:
+4. **Status snapshot.** The parent provides
+   `src/orchestrator/snapshot.ts` (`snapshotFromEntries`,
+   `workflowSnapshot`, `allWorkflows`). It is pure and reads journals only.
+   U1 and L1 import it.
 
-   ```
-   { wid, rev, name, status, calls:[{key, gen, callId, status:"queued"|"running"|"asking"|"sealed", result?, model?, lastActivity?}], counts, startedAt, endedAt? }
-   ```
+   E2 owns it from now on and extends it for:
+   - `name` in `wf-created`, which E2 adds from `RunBody.name`;
+   - `revised{revision}`;
+   - `refused` and `reused` positions.
 
-   U1 and L1 import it. Keep it independent of the engine's in-memory
-   state.
+   **Ledger bloat fix:** `create-intent` must reference the staged snapshot
+   (`staging/<rid>/snapshot.json` hash), not embed the pins. Inputs can be
+   large, and `orchestrator.jsonl` is read in full on every start.
 5. **Resume.** `resume{wid?}` re-admits parked workflows: a parked
    workflow whose cause is gone (for example an evaluator limit) restarts
    with ev+1. Always record `resumed{n}`.
