@@ -264,7 +264,7 @@ map onto session entries as follows:
 | `admitted` | `custom` entry `CT.admitted` with `{rid, from, sseq, hash, kind}` |
 | `applied` | the effect entry itself, carrying `rid` (see below) |
 | `rejected` | `custom` entry `CT.rejected` with `{rid, reason}` |
-| `withdrawn` | `custom` entry `CT.withdrawn` with `{rids}` |
+| `withdrawn` | `custom` entry `CT.withdrawn` with `{rid, rids}`; this is also the withdraw request's receipt |
 
 How an applied request is recorded depends on its kind:
 

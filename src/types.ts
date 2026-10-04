@@ -92,7 +92,7 @@ export const CT = {
   exec: "dsa-exec",            // custom: { exec } — start of an execution segment
   msg: "dsa-msg",              // custom_message: details { rid, kind, from } — applied request (receipt)
   rejected: "dsa-rejected",    // custom: { rid, reason }
-  withdrawn: "dsa-withdrawn",  // custom: { rids }
+  withdrawn: "dsa-withdrawn",  // custom: { rid, rids } — tombstones AND the withdraw request's receipt (rebuild: withdrawn{rids} + applied{rid})
   question: "dsa-question",    // custom: { qid, rev, question }
   report: "dsa-report",        // custom: { exec, outcome, data?, artifacts? }
   model: "dsa-model",          // custom: { rid, provider, model } — model change receipt
