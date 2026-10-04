@@ -243,3 +243,185 @@ definition plus a `CallSpec` to the `pi --mode rpc` arguments: system prompt
 file, tool allowlist, skills, and model/thinking for the first execution only
 (C5: a continuation passes no `--model`). Check the flags against
 `node_modules/.bin/pi --help`.
+
+## Wave 2 contracts
+
+The kernel APIs are available from `src/kernel/`: `journal.ts`, `ids.ts`,
+`mailbox.ts` (`publishRequest`, `scanInbox`, `Outbox`), `lifecycle.ts`
+(`reduceLifecycle`, `planDecisions`, `DecisionRecord`) and `guards.ts`. Read
+them before you start. Paths come from `src/paths.ts`. Entry types read
+across domains are `CT` and `JT` in `src/types.ts`. The extension entry
+`src/agent/extension.ts` is parent-owned: it calls `registerChild(pi)` when
+`DSA_EXEC` is set and `registerMain(pi)` otherwise.
+
+### C1 · Child session agent (`src/agent/child.ts`, plus helpers in `src/agent/child/`)
+
+The child domain's log is its own pi session file (C5). Lifecycle records
+map onto session entries as follows:
+
+| Lifecycle record | Session entry |
+|---|---|
+| `admitted` | `custom` entry `CT.admitted` with `{rid, from, sseq, hash, kind}` |
+| `applied` | the effect entry itself, carrying `rid` (see below) |
+| `rejected` | `custom` entry `CT.rejected` with `{rid, reason}` |
+| `withdrawn` | `custom` entry `CT.withdrawn` with `{rids}` |
+
+How an applied request is recorded depends on its kind:
+
+| Kind | Applied entry |
+|---|---|
+| `task`, `steer`, `continue` | `custom_message` entry `CT.msg`, with `details` `{rid, kind, from}`; the content is the text shown to the model |
+| `model` | `custom` entry `CT.model` with `{rid, provider, model}`, after `pi.setModel` |
+| `answer` | the `ask` tool result, whose `details` include `{rid, qid, rev}` |
+
+To rebuild lifecycle state, read `ctx.sessionManager.getEntries()`.
+
+**Environment.** The child reads `DSA_EXEC`, `DSA_CALL`, `DSA_INBOX`,
+`DSA_JOURNAL` and optionally `DSA_SCHEMA`.
+
+**Launch gate (P23).** At `session_start`, read a snapshot of the workflow
+journal (`readJournalSnapshot`). The child is current only if:
+
+- the last `JT.exec` entry for `DSA_CALL` is `DSA_EXEC`; and
+- there is no `JT.fenced` entry for `DSA_EXEC`.
+
+If it is current, append `custom` `CT.exec` `{exec}`. Otherwise do nothing
+further and call `ctx.shutdown()`.
+
+**Consumption points (C6).** All of them funnel through one in-process
+queue:
+
+- `session_start`;
+- `turn_end` and `agent_before_settle`, which return
+  `{entries: [custom_message…], continue: true}` when something is applied;
+- an idle trigger: `fs.watch(DSA_INBOX)`, then, only if `ctx.isIdle()`,
+  `pi.sendMessage(customMessage, {triggerTurn: true})`;
+- inside `ask`.
+
+At each point the child:
+
+1. scans the inbox (`scanInbox`);
+2. runs `planDecisions(records, candidates, decide)`;
+3. writes the resulting records as session entries **in order**.
+
+Inbox files are never deleted by the child.
+
+**Domain decide.**
+
+- `task`, `steer`, `continue` → apply.
+- `model` → apply via `ctx.modelRegistry.find(provider, id)` then
+  `pi.setModel`. If the model is not found, reject with `unknown-model`.
+- `answer`:
+  - apply only while `ask` is blocked on `cond.qid@cond.rev`;
+  - defer if the question is open but not blocked;
+  - reject `already-answered` if the question is closed.
+- Any other kind → reject `unsupported`.
+
+**`ask({question})` (P8).**
+
+1. Append `CT.question` `{qid, rev, question}`. `qid` is stable per question
+   text within the execution; `rev` starts at 1 and increments on re-ask.
+2. Block, consuming through the queue:
+   - a matching answer → the tool returns the answer text, with `details`
+     `{rid, qid, rev}`;
+   - a steer → the tool returns `{interrupted_by: "steer", open: qid}` plus
+     the steer text, with `details` `{rid}`. The question stays open.
+3. Honour the tool's abort signal.
+
+**`report` (P24).** Register this tool only when `DSA_SCHEMA` is set.
+
+1. Validate the payload against the JSON schema, using a small built-in
+   validator that covers `type`, `required`, `properties`, `items`, `enum`
+   and `additionalProperties`. No new dependencies.
+2. If invalid, throw, so the model sees the errors.
+3. Otherwise append `CT.report` `{exec, outcome, data}` and return
+   `terminate: true` (C8).
+
+**Tests (real pi via `test/harness/pi.ts`).** Start pi with `-e
+src/agent/extension.ts` and the `DSA_*` environment set to temp paths. Use a
+hand-written journal (written with kernel `openJournal`) and publish inbox
+requests with kernel `publishRequest`. Cover:
+
+- a task published before spawn starts a turn at boot;
+- a steer published during a tool lands at `turn_end`;
+- a restart on the same session file applies no duplicates;
+- withdraw before delivery;
+- `ask` + answer;
+- `ask` interrupted by a steer;
+- a model change takes effect on the next call (`message_start` model);
+- a stale exec exits through the gate without writing anything;
+- `report` with a schema terminates the run, and invalid payloads are
+  rejected.
+
+### M1 · Main session agent (`src/agent/main.ts`, plus helpers in `src/agent/main/`)
+
+**Sender identity.** The sender id is `main:<pi session id>`. Requests go
+through a kernel `Outbox` rooted at `outboxRoot(home)` to the orchestrator
+inbox (`orchInbox(home)`). Call `republishPending()` at `session_start`.
+
+**Tool `subagents` (P25 and the compatibility mapping).** Actions:
+
+- `run`: `{workflow?: path, args?, tasks?, chain?, agent?, task?, model?, …CallSpec}`;
+- `send`: `{to: callKey | CallId, kind: 'steer' | 'answer', message, qid?, rev?, replaces?: rid[]}`;
+- `stop`;
+- `revise`;
+- `status`;
+- `resume`;
+- `drain`.
+
+Notes on the actions:
+
+- **`run`** waits up to 10 s for a `JT.created` entry with its `rid` in a
+  snapshot of `orchLedger(home)`. It returns the `wid`, or `submitted{rid}`
+  if the entry has not appeared.
+- **`send` with `replaces`** publishes `withdraw{rids}` and then the new
+  request with `after: <withdraw rid>` (AC2).
+- **`status`** returns a fresh snapshot read from the journals: workflows
+  whose origin is this session first, then the others.
+
+**Starter (P1).** At `session_start`, before submitting, and every K1 (30 s):
+
+1. If `orchLock(home)` is free (`OsLock.tryAcquire`, then release
+   immediately) and there is pending work or a pending outbox, spawn the
+   orchestrator detached: `process.execPath <orchestratorEntry>` with
+   `DSA_HOME`.
+2. `orchestratorEntry` is configurable through `DSA_ORCHESTRATOR_ENTRY`.
+   The default is `src/orchestrator/main.ts`, or `dist/orchestrator/main.js`
+   when running from `dist`.
+3. Tests inject a fake orchestrator script.
+
+**Attention (P15).**
+
+1. Scan the workflow journals whose `JT.created.origin` is this session.
+2. Collect every `JT.attention` item that has no `JT.attentionResolved` for
+   the same `id@rev` and has not yet been presented in this session.
+   "Presented" means a `CT.attention` `custom_message` with
+   `details.items` containing it.
+3. Present through one queue:
+   - if `ctx.isIdle()`: `pi.sendMessage(…, {triggerTurn: true})`;
+   - otherwise at the next `turn_end` or `agent_before_settle` boundary,
+     with `continue: true`.
+
+**Late refresh (P15).** In the `context` hook, for every presented question
+item, read its child `session` file. If the question has been answered
+there (an `ask` tool result whose `details` has the same `qid` and `rev`),
+or `JT.attentionResolved` exists, rewrite the item's text in the outgoing
+messages to `"(resolved: …)"`.
+
+**Notes (P16).** Export `presentNote(text)` for the UI. It is presented at
+the next boundary as `CT.note` and never triggers a turn.
+
+**Tests (real pi).** Use main mode (no `DSA_EXEC`), a temp `DSA_HOME`, a
+fake orchestrator entry script, and hand-written journals. Cover:
+
+- the faux model calling the `subagents` tool with `run` publishes a correct
+  request in `orchInbox`;
+- the `created` receipt path, and the `submitted` path after a timeout;
+- `send` with `replaces` produces `withdraw`, then the new request with
+  `after`;
+- an attention item is presented exactly once, including after a restart on
+  the same session;
+- an idle main triggers a turn; a busy main receives the item at `turn_end`;
+- a resolved item is rewritten by the `context` hook;
+- the starter spawns the fake orchestrator once when the lock is free, and
+  never while it is held.
