@@ -38,7 +38,7 @@ function isRequest(value: unknown): value is Request {
   if (!value || typeof value !== 'object') return false;
   const r = value as Request;
   return typeof r.rid === 'string' && typeof r.from === 'string' && typeof r.to === 'string' && Number.isSafeInteger(r.sseq) && r.sseq > 0 &&
-    ['run','send','stop','revise','resume','drain','task','steer','answer','model','continue','withdraw','call','emit'].includes(r.kind) && Object.hasOwn(r, 'body');
+    ['run','send','stop','revise','resume','drain','task','steer','follow-up','answer','model','continue','withdraw','call','emit'].includes(r.kind) && Object.hasOwn(r, 'body');
 }
 /** P3: Scan immutable requests, reporting invalid files without admitting them. */
 export async function scanInbox(inboxDir: string, report: (path: string, error: unknown) => void = (path, error) => console.warn(path, error)): Promise<Request[]> {

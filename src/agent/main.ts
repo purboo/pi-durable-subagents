@@ -13,12 +13,20 @@ import { CT, JT, type AttentionItem } from "../types.ts";
 import { attention, presented, resolved, workflows } from "./main/snapshots.ts";
 import { parameters, request } from "./main/tool.ts";
 
+/** Capabilities the UI (U1) receives from the main agent; every action goes through the same durable outbox. */
+export interface UiDeps {
+  home: string;
+  /** Same semantics as the `subagents` tool (P25, P38); returns its reply value. Actions are journaled with by:"user". */
+  submit(args: Record<string, unknown>): Promise<unknown>;
+  presentNote(text: string): void;
+}
+
 let noteSink: ((text: string) => void) | undefined;
 /** P16: Queue a UI note for the next boundary without waking the model. */
 export function presentNote(text: string): void { noteSink?.(text); }
 
 /** P1, P15, P16, P25, P38: Register durable submission and serialized main-session presentation. */
-export function registerMain(pi: ExtensionAPI): void {
+export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiDeps) => void): void {
   const home = dsaHome();
   let ctx: ExtensionContext | undefined, sender = "", outbox: Outbox | undefined;
   let queue: Promise<unknown> = Promise.resolve(), timer: ReturnType<typeof setInterval> | undefined;
@@ -107,32 +115,37 @@ export function registerMain(pi: ExtensionAPI): void {
     if (!items) return msg;
     return { ...msg, content: items.map(item => resolved(home, item) ? `(resolved: ${item.text})` : item.text).join("\n") };
   }) }));
+  /** P25, P38: One durable submission path for the tool and the UI. */
+  async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal): Promise<unknown> {
+    if (args.action === "status") return workflows(home).sort((a, b) => Number(b.origin === sender) - Number(a.origin === sender));
+    const normalized = request(args as Parameters<typeof request>[0], cwd);
+    const sent = await serial(async () => {
+      if (!outbox || stopped) throw new Error("Main session is not active");
+      signal?.throwIfAborted();
+      await starter(true);
+      if (normalized.replaces?.length) {
+        const withdrawn = await outbox.send("orch", "withdraw", { rids: normalized.replaces });
+        normalized.cond = { ...normalized.cond, after: withdrawn.rid };
+      }
+      return outbox.send("orch", normalized.kind, normalized.body, normalized.cond);
+    });
+    if (sent.kind === "run") {
+      const deadline = performance.now() + 10_000;
+      while (true) {
+        const receipt = ledger().find(e => e.type === JT.created && e.rid === sent.rid);
+        if (receipt) { await serial(async () => { await outbox?.markResolved(sent.rid); }); return { wid: receipt.wid }; }
+        if (performance.now() >= deadline || signal?.aborted) break;
+        await delay(Math.min(100, deadline - performance.now()));
+      }
+    }
+    return { submitted: { rid: sent.rid } };
+  }
+  ui?.(pi, { home, presentNote, submit: args => submit({ ...args, by: "user" }, ctx?.cwd ?? process.cwd()) });
   pi.registerTool(defineTool({
     name: "subagents", label: "Subagents", description: "Run durable subagent workflows; send, stop, revise, resume, drain or inspect fresh status.", parameters,
     async execute(_id, args, signal, _update, context) {
-      const reply = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value });
-      if (args.action === "status") return reply(workflows(home).sort((a, b) => Number(b.origin === sender) - Number(a.origin === sender)));
-      const normalized = request(args, context.cwd);
-      const sent = await serial(async () => {
-        if (!outbox || stopped) throw new Error("Main session is not active");
-        signal?.throwIfAborted();
-        await starter(true);
-        if (normalized.replaces?.length) {
-          const withdrawn = await outbox.send("orch", "withdraw", { rids: normalized.replaces });
-          normalized.cond = { ...normalized.cond, after: withdrawn.rid };
-        }
-        return outbox.send("orch", normalized.kind, normalized.body, normalized.cond);
-      });
-      if (sent.kind === "run") {
-        const deadline = performance.now() + 10_000;
-        while (true) {
-          const receipt = ledger().find(e => e.type === JT.created && e.rid === sent.rid);
-          if (receipt) { await serial(async () => { await outbox?.markResolved(sent.rid); }); return reply({ wid: receipt.wid }); }
-          if (performance.now() >= deadline || signal?.aborted) break;
-          await delay(Math.min(100, deadline - performance.now()));
-        }
-      }
-      return reply({ submitted: { rid: sent.rid } });
+      const value = await submit(args as Record<string, unknown>, context.cwd, signal);
+      return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value };
     },
   }));
 }

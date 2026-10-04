@@ -7,7 +7,7 @@ export const parameters = Type.Object({
   workflow: Type.Optional(Type.String()), source: Type.Optional(Type.String()), args: Type.Optional(Type.Unknown()),
   tasks: Type.Optional(Type.Array(Type.Any())), chain: Type.Optional(Type.Array(Type.Any())),
   agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
-  to: Type.Optional(Type.String()), kind: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("answer"), Type.Literal("model")])),
+  to: Type.Optional(Type.String()), kind: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("follow-up"), Type.Literal("answer"), Type.Literal("model")])),
   message: Type.Optional(Type.String()), qid: Type.Optional(Type.String()), rev: Type.Optional(Type.Integer({ minimum: 1 })),
   replaces: Type.Optional(Type.Array(Type.String())), target: Type.Optional(Type.String()), wid: Type.Optional(Type.String()),
 }, { additionalProperties: true });
@@ -45,8 +45,8 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   }
   if (action === "send") {
     const kind = string(args, "kind");
-    if (!["steer", "answer", "model"].includes(kind)) throw new Error("Unsupported send kind");
-    const body = { to: string(args, "to"), kind, ...(kind === "model" ? { model: string(args, "model") } : { message: string(args, "message") }) };
+    if (!["steer", "follow-up", "answer", "model"].includes(kind)) throw new Error("Unsupported send kind");
+    const body = { to: string(args, "to"), kind, ...(kind === "model" ? { model: string(args, "model") } : { message: string(args, "message") }), ...(args.by === "user" ? { by: "user" } : {}) };
     const cond: Conditions = {};
     if (kind === "answer") {
       cond.qid = string(args, "qid");

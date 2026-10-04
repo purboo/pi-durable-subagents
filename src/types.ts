@@ -51,7 +51,7 @@ export type RequestKind =
   // to orchestrator from main/cli
   | "run" | "send" | "stop" | "revise" | "resume" | "drain"
   // orchestrator to child (forwarded or own)
-  | "task" | "steer" | "answer" | "model" | "continue" | "withdraw"
+  | "task" | "steer" | "follow-up" | "answer" | "model" | "continue" | "withdraw"
   // evaluator to orchestrator
   | "call" | "emit";
 
@@ -97,6 +97,7 @@ export const CT = {
   report: "dsa-report",        // custom: { exec, outcome, data?, artifacts? }
   model: "dsa-model",          // custom: { rid, provider, model } — model change receipt
   attention: "dsa-attention",  // custom_message (main session): details { items: {id, rev}[] }
+  budget: "dsa-budget",        // custom: { exec, usage } — the child refused its next provider request: per-call budget reached (P31b)
   note: "dsa-note",            // custom_message (main session), never triggers a turn
 } as const;
 
@@ -152,7 +153,16 @@ export interface RunBody {
   maxCalls?: number;
 }
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
-export interface SendBody { to: CallId | `${Wid}/${string}`; kind: "steer" | "answer" | "model"; message?: string; model?: string }
+export interface SendBody {
+  to: CallId | `${Wid}/${string}`;
+  /** steer: next boundary (interrupts between turns); follow-up: only after the current run settles; answer; model. */
+  kind: "steer" | "follow-up" | "answer" | "model";
+  message?: string;
+  /** "provider/id[:thinking]". */
+  model?: string;
+  /** Provenance for display and notes (ui.md: user actions are journaled as coming from the user). */
+  by?: "user" | "agent";
+}
 /** kind "withdraw": withdraw the sender's own earlier requests (P6). */
 export interface WithdrawBody { rids: Rid[] }
 /** kind "stop": stop a workflow or one call. */
@@ -165,7 +175,7 @@ export interface ResumeBody { wid?: Wid }
 export type DrainBody = Record<string, never>;
 
 // Request bodies addressed to a child (to: CallId), written by the orchestrator (own requests or P7 forwards).
-/** kinds "task" | "steer" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */
+/** kinds "task" | "steer" | "follow-up" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */
 export interface MessageBody { message: string }
 /** kind "model": parsed from "provider/id[:thinking]" by the orchestrator. */
 export interface ModelBody { provider: string; model: string; thinking?: string }
@@ -317,4 +327,5 @@ export const ENV = {
   inbox: "DSA_INBOX",     // absolute path of this call's inbox dir
   journal: "DSA_JOURNAL", // absolute path of the workflow journal (read-only snapshot for the launch gate)
   schema: "DSA_SCHEMA",   // absolute path of report JSON schema, if any
+  budget: "DSA_BUDGET",   // JSON {tokens?, costUsd?}: per-call budget; the child refuses the next provider request once reached (P31b)
 } as const;
