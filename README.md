@@ -2,8 +2,221 @@
 
 **Subagents that never lose work, and never do it twice.**
 
-**Status:** in development. Nothing is released yet.
+Streams drop. Requests time out. Models return nothing. You quit pi. Your
+laptop reboots. Durable Subagents keeps going: it picks every subagent up
+where it stopped, in the same session, without running anything twice.
 
-Author: purboo. License: MIT. Small parts may be adapted from
-[pi-subagents](https://github.com/nicobailon/pi-subagents) (MIT), with
-attribution.
+```text
+$ npx pi-durable-subagents chaos
+  killed host ×1 · dropped streams ×1 · empty replies ×6 · out-of-order steers ×1
+  duplicate runs ........ 0
+  lost results .......... 0
+  restarted from scratch  0
+  AC4 wakes / reminders . pass
+  all 9 scenarios ....... pass
+```
+
+You can run this yourself, offline, in about a minute. It runs a three-step
+writer → reviewer → integrator workflow through the real product (a real pi
+main session, the orchestrator, real subagent pi processes and a scripted
+model). It injects one fault per scenario, then checks the journals and
+sessions: nothing ran twice, nothing was lost, and nothing restarted from
+scratch.
+
+## Install
+
+```bash
+pi install npm:pi-durable-subagents
+```
+
+This needs pi 1.0.x and Node.js 22.18 or later. It has been tested with
+pi 1.0.2 on Linux. The CI configuration covers Linux and macOS.
+
+## What happens when…
+
+| Situation | What Durable Subagents does |
+|---|---|
+| The stream drops, or the model returns nothing | Continues the **same** session. Finished tool results are kept. |
+| A step runs past its `timeoutMs` (even inside a silent tool) | Stops it cleanly as `timeout`. Only time spent working counts; waiting for you does not. |
+| You quit pi, or pi crashes, while subagents run | The work keeps running. When you come back you get **one** message about what needs you. |
+| The machine or the orchestrator dies mid-run | The next pi you open resumes the work. Finished results are kept and nothing runs twice. |
+| You steer a subagent while it is asking you a question | Your message reaches it, in order. Nothing is rejected or lost. |
+| Two steers arrive out of order and the second replaces the first | Only the second one applies. |
+| A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
+| A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. |
+
+## Use it
+
+The main agent gets one tool, `subagents`. You ask in plain language, and
+the agent calls it:
+
+```text
+subagents({ action: "run", agent: "worker", task: "Fix the flaky lease test" })
+subagents({ action: "run", tasks: [{ agent: "scout", task: "…" }, { agent: "reviewer", task: "…" }] })
+subagents({ action: "run", chain: [{ agent: "worker", task: "…" }, { agent: "reviewer", task: "Review: {previous}" }] })
+subagents({ action: "run", workflow: "./batch.js", args: { … }, usageBudget: { costUsd: 20 } })
+subagents({ action: "send", to: "<wid>/<key>", kind: "steer", message: "Don't touch the tests yet" })
+subagents({ action: "status" })
+```
+
+Every run is asynchronous. The agent is woken once, when the workflow
+finishes or when a subagent asks it something.
+
+### Workflow scripts
+
+A workflow is a plain script. These are the globals it can use:
+
+| Global | Meaning |
+|---|---|
+| `runs.run(key, spec)` | Run one subagent |
+| `runs.all([...])` | Run several |
+| `emit(value)` | Report progress |
+| `args` | The workflow's arguments |
+| `runs.input(name)` | A declared input file |
+| `now()` / `random()` | Logged, so the run can be replayed |
+
+The script's `return` value is the workflow result.
+
+`spec` fields:
+
+- `agent`, `task`, `model` (`provider/id[:thinking]` or a pool name), `cwd`;
+- `timeoutMs` (active time), `output` (a relative path becomes an artifact);
+- `schema` (a structured `report`);
+- `gate` (a command, or `{command, output: "json", schema, timeoutMs}`);
+- `isolation: "worktree"`, `context: "fork"`, `budget`.
+
+The result has `ok`, `status`, the full `output` text and the structured
+`data`.
+
+A script is replayed after a crash. Finished calls are not run again, and a
+changed script is detected rather than silently mixed. Keep scripts
+deterministic: use `now()`/`random()`, not `Date`/`Math.random`.
+
+### Watch any subagent like the main agent
+
+While subagents work, one dim line appears above the editor. Press `↓` on an
+empty editor to open the list, then `Enter` to watch a subagent. You see
+its task, thinking, tool calls and output, rendered with pi's own
+components. `←`/`→` switch between the subagents of one workflow.
+
+Typing steers the subagent you are watching (`Alt+Enter` queues a
+follow-up instead), or answers it if it is asking you something. `/model`
+switches its model. Every action is journaled as coming from you, and the
+main agent sees a note at its next turn.
+
+### Quiet by design
+
+The main agent is interrupted only when there is something to decide:
+
+- a question;
+- a finished workflow;
+- a stalled subagent;
+- an unknown outcome;
+- a reached budget.
+
+Each one arrives once. A reminder that was already resolved is shown as
+resolved, never as open.
+
+## Your pi-subagents scripts, unchanged
+
+Agent files, discovery and precedence follow `pi-subagents` 0.75.0. That
+covers user, project and package agents, `model:thinking`, `tools` and
+`skills`. The builtin agents (`worker`, `reviewer`, `scout`, `researcher`,
+`oracle`, `delegate`, `evidence-auditor`) are included.
+
+| pi-subagents | Durable Subagents |
+|---|---|
+| `subagent({workflow: './x.js', async: true})` | `subagents({action: 'run', workflow: './x.js'})`; always asynchronous |
+| `runs.run`, `runs.all`, `emit`, `args`, `return` | the same |
+| `tasks: [...]`, `chain: [...]` | the same |
+| `action: 'steer'`, supervisor `reply` | `send` (`steer`, `answer`) |
+| `resume` an ended subagent | `send` to it: a new generation continues the same session |
+| `contact_supervisor` in the subagent | `ask` |
+| `outputSchema` | `schema` (the subagent calls `report`) |
+| `context: 'fork'`, `gate`, `worktree: true` | `context: 'fork'`, `gate`, `isolation: 'worktree'` |
+| `usageBudget`, `maxSubagentSpawnsPerRun` | `usageBudget`, `maxCalls` |
+
+**Not supported:** external CLI agents, missions, schedules, intercom,
+`acceptance` policies (use `gate`), and nested subagents.
+
+A real rolling-DAG batch generated by a production template ran here
+unchanged, with zero edited lines.
+
+## Command line
+
+```text
+pi-durable-subagents smoke              check this machine and this pi (offline, < 60 s)
+pi-durable-subagents chaos              run the fault suite (offline, about a minute)
+pi-durable-subagents status [wid] [--json]
+pi-durable-subagents tail [wid]
+pi-durable-subagents resume [wid]       continue unfinished or parked work
+pi-durable-subagents drain              start nothing new; running work finishes
+pi-durable-subagents stop <wid|call>
+pi-durable-subagents stop-all           pause everything; journals stay resumable
+pi-durable-subagents install-service    optional: resume work at login (systemd / launchd)
+pi-durable-subagents uninstall-service
+```
+
+## Configuration
+
+State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
+`config.json` there is optional:
+
+```json
+{
+  "defaultModel": "provider/id",
+  "pools": { "fast": ["anthropic/claude-haiku-4-5", "openai/gpt-5-mini"] },
+  "providers": { "anthropic": { "slots": 4 } },
+  "memory": { "reserveMb": 2048, "perChildMb": 300 }
+}
+```
+
+- **Pools:** a model can name a pool. The first candidate with a free slot is
+  used, and a candidate that keeps failing is skipped for 10 minutes.
+- **Provider slots:** never exceeded, including while a model switch is in
+  progress.
+- **Memory:** new subagents wait while memory is short. Running ones are
+  never stopped for memory.
+
+## Switching back
+
+Durable Subagents registers the tool `subagents`, so it can be installed
+next to `pi-subagents` (tool `subagent`). To switch back:
+
+1. Optionally, run `pi-durable-subagents drain` (running work finishes) or
+   `pi-durable-subagents stop-all` (pauses everything; resumable later).
+2. Optionally, run `pi-durable-subagents uninstall-service`.
+3. In `~/.pi/agent/settings.json`, replace `npm:pi-durable-subagents` with
+   `npm:pi-subagents` under `packages`. New sessions use it.
+
+Journals and pending questions stay on disk. If you install Durable
+Subagents again later, `resume` picks the work up.
+
+## Survives pi upgrades
+
+It uses only pi's public CLI, RPC and extension API, through root exports.
+On load, it checks every pi surface it needs.
+
+- If an execution surface is missing, Durable Subagents disables itself
+  with one exact message. Running work is untouched.
+- If a UI surface is missing, only the watch view is disabled.
+
+`smoke` runs the same checks inside your pi.
+
+## What we do not promise
+
+- A tool that already ran inside a subagent may run again after a crash, if
+  its result never reached the session. Make external side effects
+  idempotent, or mark the step `once: true` (it then stops as `unknown`
+  instead of repeating).
+- After a crash, the model call that was in flight is paid for again.
+- Process containment uses process tags plus a 1-second tracker. A process
+  that clears its tag and leaves the process tree within its first second
+  cannot be found.
+- Model and tool behaviour belong to the models and tools you use.
+
+## License
+
+MIT © purboo. The builtin agent definitions are adapted from
+[pi-subagents](https://github.com/nicobailon/pi-subagents) (MIT, © Nico
+Bailon); see `agents/LICENSE`.
