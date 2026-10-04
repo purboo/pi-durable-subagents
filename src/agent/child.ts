@@ -100,7 +100,10 @@ export function registerChild(pi: ExtensionAPI): void {
             : { content: [{ type: 'text', text: `${JSON.stringify({ interrupted_by: 'steer', open: waiter.qid })}\n${text}` }], details: { rid: req.rid, kind: 'steer' } };
           if (req.kind === 'answer') state.answered.add(`${waiter.qid}@${waiter.rev}`);
         } else {
-          entries.push({ type: 'custom_message', customType: CT.msg, content: (req.body as MessageBody).message, display: true, details: { rid: req.rid, kind: req.kind, from: req.from } });
+          // P28: a continue bound to a question (hibernation resume) is that question's answer receipt.
+          const bound = req.kind === 'continue' && req.cond?.qid && req.cond.rev ? { qid: req.cond.qid, rev: req.cond.rev } : undefined;
+          if (bound) state.answered.add(`${bound.qid}@${bound.rev}`);
+          entries.push({ type: 'custom_message', customType: CT.msg, content: (req.body as MessageBody).message, display: true, details: { rid: req.rid, kind: req.kind, from: req.from, ...bound } });
         }
       }
     }

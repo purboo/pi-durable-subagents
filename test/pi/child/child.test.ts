@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CT, JT, type Request } from '../../../src/types.ts';
@@ -225,4 +226,26 @@ test('per-call budget refuses the next provider request at the boundary', { time
   assert.equal(calls, 1, 'the provider received exactly one request');
   const last = history.filter(e => e.message?.role === 'assistant').at(-1)!.message;
   assert.equal(last.usage.totalTokens, 0);
+});
+
+test('P28: a continue bound to qid@rev answers the question and survives restart', { timeout: 60000 }, async t => {
+  const f = await fixture(t);
+  await f.send('task', { message: script([{ tool: 'ask', args: { question: 'Hibernate?' } }, { text: 'unused' }]) });
+  const pi = f.start(), q = await question(pi);
+  const session = pi.sessionFile()!; await pi.stop();
+  const entries = () => readFileSync(session, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+  const resumed = f.start(['--session', session], false);
+  const id = resumed.send({ type: 'get_state' }); await resumed.waitFor(e => e.type === 'response' && e.id === id);
+  const bound = await f.send('continue', { message: `Answer to "Hibernate?": yes. ${script([{ text: 'resumed' }])}` }, { qid: q.qid, rev: q.rev });
+  await resumed.waitFor(settled);
+  const receipt = entries().find(e => e.customType === CT.msg && e.details?.rid === bound.rid);
+  assert.deepEqual({ qid: receipt.details.qid, rev: receipt.details.rev }, { qid: q.qid, rev: 1 });
+  const late = await f.send('answer', { message: 'late' }, { qid: q.qid, rev: 1 });
+  await until(() => entries().some(e => e.customType === CT.rejected && e.data.rid === late.rid && e.data.reason === 'already-answered'));
+  await resumed.stop();
+  const again = f.start(['--session', session], false);
+  const id2 = again.send({ type: 'get_state' }); await again.waitFor(e => e.type === 'response' && e.id === id2);
+  const later = await f.send('answer', { message: 'later' }, { qid: q.qid, rev: 1 });
+  await f.send('continue', { message: script([{ text: 'third' }]) });
+  await until(() => entries().some(e => e.customType === CT.rejected && e.data.rid === later.rid && e.data.reason === 'already-answered'), 20000);
 });

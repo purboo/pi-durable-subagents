@@ -19,7 +19,10 @@ export function recover(entries: readonly SessionEntry[]) {
       if (entry.customType === CT.model) records.push({ type: 'applied', rid: data.rid });
       if (entry.customType === CT.question) questions.set(data.qid, data as unknown as Question);
     } else if (entry.type === 'custom_message' && entry.customType === CT.msg) {
-      records.push({ type: 'applied', rid: (entry.details as { rid: string }).rid });
+      const details = entry.details as { rid: string; qid?: string; rev?: number };
+      records.push({ type: 'applied', rid: details.rid });
+      // P28: a hibernation resume delivers the answer as a continue message; its receipt answers qid@rev.
+      if (details.qid && details.rev) answered.add(`${details.qid}@${details.rev}`);
     } else if (entry.type === 'message' && entry.message.role === 'toolResult' && entry.message.toolName === 'ask') {
       const details = entry.message.details as { rid?: string; qid?: string; rev?: number } | undefined;
       if (details?.rid) records.push({ type: 'applied', rid: details.rid });
