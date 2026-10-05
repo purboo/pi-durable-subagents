@@ -1,18 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readSession, evidence, sessionModel } from "../../../src/orchestrator/executor/session.ts";
+import { readSession, readSessionState, evidence, sessionModel } from "../../../src/orchestrator/executor/session.ts";
 import { CT } from "../../../src/types.ts";
 import { tempRoot } from "../../harness/pi.ts";
 import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 
-test("C5 snapshot tolerates a torn trailing line but refuses interior corruption", async t => {
+test("C5 E4 snapshot ignores a torn trailing line and skips (reports) interior corruption like pi", async t => {
   const root = tempRoot("dsa-session-"), file = join(root, "session.jsonl");
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(file, '{"type":"session"}\n{"type":');
   assert.deepEqual(await readSession(file), [{ type: "session" }]);
   await writeFile(file, '{oops}\n{"type":"session"}\n');
-  await assert.rejects(readSession(file), SyntaxError);
+  assert.deepEqual(await readSessionState(file), { entries: [{ type: "session" }], corrupt: [1] });
 });
 
 test("P9 current report correlation and tool results close only matching calls", () => {

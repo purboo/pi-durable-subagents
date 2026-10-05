@@ -17,6 +17,8 @@ type Dependencies = {
   home: string; config: OrchestratorConfig; ticket: CallTicket; exec: string; child: Spawned;
   setWake(fn: () => void): void; interrupted(): boolean;
   serial<T>(fn: () => Promise<T>): Promise<T>;
+  /** Incremental native session read (defaults to readSession of the call's session). */
+  read?(): Promise<SessionEntry[]>;
   track(): Promise<ProcInfo[]>; fence(): Promise<void>;
   questions(entries: SessionEntry[]): Promise<void>;
   recordUsage(values: { id: string; usage: Usage }[]): Promise<void>;
@@ -88,7 +90,7 @@ export async function observeExecution(d: Dependencies) {
       clock.scan(await d.track());
       const nextSize = (await fileStat(session).catch(() => ({ size: 0 }))).size;
       if (nextSize > size) { clock.evidence(); size = nextSize; }
-      const entries = await readSession(session);
+      const entries = await (d.read ? d.read() : readSession(session));
       await d.questions(entries); await d.recordUsage(sessionUsage(entries, t.callId));
       await limits(); await stall();
       if (performance.now() - checkpoint >= (config.k?.checkpointMs ?? 10000)) { await saveTime(); checkpoint = performance.now(); }

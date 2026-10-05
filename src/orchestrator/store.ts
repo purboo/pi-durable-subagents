@@ -4,8 +4,10 @@
 // input bytes in the ledger. Workflow wf-created {rid,origin,cwd,name?,revision} and
 // revised {rid,revision,snapshot} commit publications; old pins remain immutable.
 import { readFile, stat, rm } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { basename, extname, join, relative } from 'node:path';
 import { discoverAgents, type AgentDefinition, type DiscoveryOptions } from '../compat/agents.ts';
+import { parseFrontmatter } from '../compat/frontmatter.ts';
 import { compileFanout } from '../compat/fanout.ts';
 import { contentHash, ulid } from '../kernel/ids.ts';
 import { openJournal, syncDirectory } from '../kernel/journal.ts';
@@ -20,7 +22,26 @@ export interface Pins {
 }
 export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string> }
 type SnapshotRef = { path: string; hash: string };
-type Snapshot = { hash: string; pins?: Pins; error?: string };
+type Snapshot = { hash: string; pins?: Pins; error?: string; warnings?: string[] };
+
+// E3: errors of the machine rather than of the request; they propagate so the next intake retries the request.
+const TRANSIENT = /\b(EIO|ENOSPC|EDQUOT|EMFILE|ENFILE|ENOMEM|EAGAIN|EBUSY|EINTR|ETIMEDOUT|EROFS)\b/;
+/** E3: Reading the request's own inputs: a missing or unreadable input is deterministic; resource errors are not. */
+const transientInput = (error: unknown) => TRANSIENT.test(String((error as NodeJS.ErrnoException)?.code ?? ''));
+/** E3: Publishing staging files (temp file, link, fsync): every system error is transient. */
+const transientWrite = (error: unknown) => typeof (error as NodeJS.ErrnoException)?.code === 'string';
+
+/** E3: Names an agent file with a diagnostic may define: its frontmatter name (with a package prefix) and file name. */
+function diagnosticNames(sourcePath: string): string[] {
+  const names = [basename(sourcePath, extname(sourcePath))];
+  try {
+    const { frontmatter: f } = parseFrontmatter(readFileSync(sourcePath, 'utf8'));
+    if (f.name) names.push(f.name, ...(f.package ? [`${f.package.trim().toLowerCase()}.${f.name}`] : []));
+  } catch { /* An unreadable file is named by its file name only. */ }
+  return names;
+}
+/** E3, P11: A run references an agent when its pinned source names it as a string literal (fan-out specs compile to JSON). */
+const references = (source: string, name: string) => ['"', "'", '`'].some(q => source.includes(`${q}${name}${q}`));
 
 /** P33: Capture the selected branch before admission and exclude extension receipts. */
 async function pinOrigin(origin: NonNullable<RunBody['origin']>): Promise<string> {
@@ -39,16 +60,23 @@ async function pinOrigin(origin: NonNullable<RunBody['origin']>): Promise<string
   return [header, ...branch.filter(e => ['message', 'model_change'].includes(e.type) && !e.message?.customType?.startsWith('dsa-'))].map(e => JSON.stringify(e)).join('\n') + '\n';
 }
 
-/** P11, A5: Capture immutable admission inputs before publishing any workflow files. */
-export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions): Promise<Pins> {
+/** P11, A5, E3: Capture immutable admission inputs before publishing any workflow files. Agent diagnostics reject the
+ *  run only for agents its source references; the others are appended to `warnings`. */
+export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, warnings: string[] = []): Promise<Pins> {
   if (!body || typeof body.cwd !== 'string' || [body.workflow, body.source, body.tasks, body.chain, body.call].filter(x => x !== undefined).length !== 1) throw new Error('invalid-run');
   if (body.maxCalls !== undefined && (!Number.isSafeInteger(body.maxCalls) || body.maxCalls < 0)) throw new Error('invalid-maxCalls');
   if (body.usageBudget && Object.values(body.usageBudget).some(n => !Number.isFinite(n) || n < 0)) throw new Error('invalid-usageBudget');
   const source = body.source ?? (body.workflow ? await readFile(body.workflow, 'utf8') : compileFanout(body.tasks ? { tasks: body.tasks } : body.chain ? { chain: body.chain } : { tasks: [body.call!] }).source);
   const inputs: Record<string, string> = Object.create(null);
   for (const [name, file] of Object.entries(body.inputs ?? {})) inputs[name] = (await readFile(file)).toString('base64');
-  const found = discoverAgents(body.cwd, discovery);
-  if (found.diagnostics.length) throw new Error(found.diagnostics.map(d => `${d.sourcePath}: ${d.error}`).join('\n'));
+  const found = discoverAgents(body.cwd, discovery), blocking: string[] = [];
+  for (const d of found.diagnostics) {
+    const text = `${d.sourcePath}: ${d.error}`;
+    if (!diagnosticNames(d.sourcePath).some(name => references(source, name))) { warnings.push(text); continue; }
+    if (TRANSIENT.test(d.error)) throw Object.assign(new Error(text), { code: TRANSIENT.exec(d.error)![1] });
+    blocking.push(text);
+  }
+  if (blocking.length) throw new Error(blocking.join('\n'));
   return { source, args: body.args ?? null, agents: found.agents, inputs, inputSources: body.inputs ?? {},
     ...(body.origin ? { origin: await pinOrigin(body.origin) } : {}),
     ...(body.usageBudget ? { usageBudget: body.usageBudget } : {}), ...(body.maxCalls !== undefined ? { maxCalls: body.maxCalls } : {}) };
@@ -82,6 +110,7 @@ export class Store {
     try { await stat(join(dir, 'snapshot.json')); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; exists = false; }
     if (!exists) {
       let snapshot: Snapshot;
+      const warnings: string[] = [];
       try {
         let body: RunBody;
         if (req.kind === 'revise') {
@@ -92,9 +121,13 @@ export class Store {
             usageBudget: wf.pins.usageBudget, maxCalls: wf.pins.maxCalls };
           if (change.workflow !== undefined && change.source !== undefined) throw new Error('invalid-revise');
         } else body = req.body as RunBody;
-        snapshot = { hash: contentHash(req), pins: await prepareRun({ ...body, maxCalls: body.maxCalls ?? this.ledgers.config.k?.spawnBudget ?? 300 }, discovery) };
+        snapshot = { hash: contentHash(req), pins: await prepareRun({ ...body, maxCalls: body.maxCalls ?? this.ledgers.config.k?.spawnBudget ?? 300 }, discovery, warnings),
+          ...(warnings.length ? { warnings } : {}) };
         if (req.kind === 'revise') snapshot.pins!.origin = this.workflows.get((req.body as ReviseBody).wid)?.pins.origin;
-      } catch (error) { snapshot = { hash: contentHash(req), error: String(error) }; }
+      } catch (error) {
+        if (transientInput(error)) throw error;
+        snapshot = { hash: contentHash(req), error: String(error) };
+      }
       await publishFile(dir, 'snapshot.json', JSON.stringify(snapshot));
       await syncDirectory(join(this.ledgers.home, 'staging'));
     }
@@ -109,7 +142,10 @@ export class Store {
         if (await publishFile(join(dir, 'inputs'), file, Buffer.from(bytes, 'base64')) === 'conflict') throw new Error(`Staging input conflict: ${name}`);
       }
       await syncDirectory(dir);
-    } catch (error) { await publishFile(dir, 'failure.json', JSON.stringify({ error: String(error) })); }
+    } catch (error) {
+      if (transientWrite(error)) throw error;
+      await publishFile(dir, 'failure.json', JSON.stringify({ error: String(error) }));
+    }
   }
   /** P11: Resolve admission only from the durable staging snapshot. */
   async staged(req: Request<RunBody | ReviseBody>): Promise<Pins> {

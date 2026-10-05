@@ -2,22 +2,38 @@
 // gate-tracked{id,process}; gate{id,exit,json?,error?,unknown?,aborted?}.
 // DSA_RESULT and DSA_OUTPUT are immutable gate inputs; JSON output is read from stdout.
 import { join } from "node:path";
-import { Containment } from "../../../platform/containment.ts";
 import { publishFile } from "../../../kernel/mailbox.ts";
 import { callDir } from "../../../paths.ts";
 import { validate } from "../../../agent/child/schema.ts";
-import type { CallResult, Entry, JournalHandle, ProcInfo } from "../../../types.ts";
+import { recordFenceFailure, resolveFenceAttention } from "../sweep.ts";
+import type { CallResult, Containment, Entry, JournalHandle, ProcInfo } from "../../../types.ts";
 import type { CallTicket } from "../../contract.ts";
 
 const tracked = (journal: JournalHandle, id: string) => journal.entries().filter(e => e.type === "gate-tracked" && e.id === id).map(e => e.process as ProcInfo);
 
-/** P30, A5: Fence unresolved gate identities before recording their outcome as unknown. */
-export async function recoverGates(journal: JournalHandle, containment: Containment): Promise<void> {
+/** P30, F1: A gate proven retired after a failed fence gets its unknown outcome once and its attention resolved. */
+export async function gateRetired(journal: JournalHandle, id: string): Promise<void> {
+  if (!journal.entries().some(e => e.type === "gate" && e.id === id)) await journal.append("gate", { id, unknown: true });
+  await resolveFenceAttention(journal, id);
+}
+/** F1: Fence a gate identity; a failure is recorded once (timeouts raise an unknown attention) and left to the sweep. */
+async function fenceGate(journal: JournalHandle, intent: Entry, containment: Pick<Containment, "fence">): Promise<boolean> {
+  const id = String(intent.id);
+  try { await containment.fence(id, tracked(journal, id)); return true; }
+  catch (error) {
+    if (!journal.entries().some(e => e.type === "fence-failed" && e.exec === id)) console.error(`durable-subagents: fence of ${id} failed: ${String(error)}`);
+    if (/Fence timeout/.test(String(error))) await recordFenceFailure(journal, id, String(intent.call), error);
+    else if (!journal.entries().some(e => e.type === "fence-failed" && e.exec === id)) await journal.append("fence-failed", { exec: id, error: String(error) });
+    return false;
+  }
+}
+/** P30, A5, F1: Fence unresolved gate identities before recording their outcome as unknown; a gate whose fence fails
+ *  never fails recovery: it stays without an outcome and the executor sweep retries it every K1. */
+export async function recoverGates(journal: JournalHandle, containment: Pick<Containment, "fence">): Promise<void> {
   for (const intent of journal.entries().filter(e => e.type === "gate-intent")) {
     const id = String(intent.id);
     if (journal.entries().some(e => e.type === "gate" && e.id === id)) continue;
-    await containment.fence(id, tracked(journal, id));
-    await journal.append("gate", { id, unknown: true });
+    if (await fenceGate(journal, intent, containment)) await gateRetired(journal, id);
   }
 }
 function apply(result: CallResult, record: Entry): CallResult {
@@ -36,8 +52,10 @@ export async function runGate(t: CallTicket, home: string, cwd: string, exec: st
     const intent = prior.at(-1)!;
     let record = t.journal.entries().find(e => e.type === "gate" && e.id === intent.id);
     if (!record) {
-      await containment.fence(String(intent.id), tracked(t.journal, String(intent.id)));
-      record = await t.journal.append("gate", { id: intent.id, unknown: true });
+      // A gate that cannot be fenced is never re-run: its outcome is unknown now and recorded once the sweep retires it.
+      if (!await fenceGate(t.journal, intent, containment)) return apply(result, { unknown: true } as unknown as Entry);
+      await gateRetired(t.journal, String(intent.id));
+      record = t.journal.entries().find(e => e.type === "gate" && e.id === intent.id)!;
     }
     return apply(result, record);
   }
