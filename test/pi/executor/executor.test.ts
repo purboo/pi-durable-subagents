@@ -44,7 +44,7 @@ async function setup(t: TestContext, config: OrchestratorConfig = {}, options: P
     try { await executor.shutdown(); } finally {
       await journal.close(); await orch.close();
       for (const [key, value] of Object.entries(old)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-      await rm(root, { recursive: true, force: true });
+      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true });
     }
   });
   return { wid, root, home, cwd, orch, executor, ticket, get journal() { return journal; }, async reopen() { journal = await openJournal(journal.path); } };
