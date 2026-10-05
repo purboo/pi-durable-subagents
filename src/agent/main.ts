@@ -130,10 +130,32 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     return { ...msg, content: items.map(item => resolved(home, item) ? `(resolved: ${item.text})` : item.text).join("\n") };
   }) }));
   /** P25, P38, T6, T10: One durable submission path for the tool and the UI; replies say what happened when known within 10 s. */
+  /** v12 §2, §6: An answer finds its open question (qid, rev and target) from whatever the caller gave; a send without a
+   *  target names the addresses that would work. */
+  function completeSend(args: Record<string, unknown>): Record<string, unknown> {
+    const own = statusView(home, { origin: sender }).workflows;
+    const short = (call: string) => call.replace(/@\d+\/([^@/]+)@\d+$/, "/$1");
+    if (args.kind === "answer" && !(typeof args.to === "string" && args.qid !== undefined && args.rev !== undefined)) {
+      const open = own.flatMap(w => w.attention.filter(a => a.kind === "question" && a.call && a.qid));
+      const to = typeof args.to === "string" ? args.to : undefined;
+      const match = open.filter(a => args.qid !== undefined ? a.qid === args.qid : to ? a.call === to || short(a.call!) === to || a.call!.startsWith(`${to}@`) : true);
+      if (match.length !== 1) throw new Error(match.length ? `Several questions are open; give qid: ${match.map(a => `${short(a.call!)} qid=${a.qid}`).join(", ")}` :
+        `No open question matches${open.length ? `; open: ${open.map(a => `${short(a.call!)} qid=${a.qid} rev=${a.rev}`).join(", ")}` : " (none is open)"}`);
+      const q = match[0]!;
+      return { ...args, to: to ?? q.call, qid: q.qid, rev: args.rev ?? q.rev };
+    }
+    if (typeof args.to !== "string" || !args.to) {
+      const want = args.kind === "follow-up" ? (c: { phase: string }) => c.phase === "sealed" : (c: { phase: string }) => c.phase !== "sealed";
+      const targets = own.flatMap(w => w.calls.filter(want).map(c => `${w.wid}/${c.key}`));
+      throw new Error(`to is required: '<wid>/<key>'${targets.length ? `; ${args.kind === "follow-up" ? "finished" : "running"}: ${targets.slice(0, 12).join(", ")}` : ""}`);
+    }
+    return args;
+  }
   async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal, wait = true): Promise<unknown> {
     if (args.action === "status") return typeof args.wid === "string" && args.wid ? statusDetail(home, args.wid) : statusView(home, { origin: sender });
     if (args.action === "agents") return agentsAt(cwd).map(({ name, description, model, source }) =>
       ({ name, description, ...(model === undefined ? {} : { model }), source }));
+    if (args.action === "send") args = completeSend(args);
     const normalized = request(args as Parameters<typeof request>[0], cwd);
     if (normalized.kind === "run") {
       const body = normalized.body as RunBody;
@@ -183,10 +205,10 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   } catch { /* Discovery problems surface when a run is pinned. */ }
   pi.registerTool(defineTool({
     name: "subagents", label: "Subagents", description: [
-      "Durable asynchronous subagents; run returns {wid} when created (or {submitted:{rid}} while pending). A finished workflow or question wakes you; crash recovery resumes its session, not external side effects.",
+      "Durable asynchronous subagents; run returns {wid} when created (or {submitted:{rid}} while pending). A finished workflow (its notice carries every agent's result) or a question wakes you, so after starting work end your turn: never poll with sleep or repeated status. Crash recovery resumes sessions, not external side effects.",
       "run (action optional for exactly one launch form): agent+task; tasks:[call specs] parallel; chain:[call specs] sequential ({previous}); workflow:'./script.js' or source (runs.run(key,spec), runs.all([...]), emit(value), args, runs.input(name)). Optional name, model, cwd, timeoutMs, usageBudget, maxCalls, inputs. Explicit unknown agents are rejected BEFORE creation, with available names; unknown script agents fail only their call.",
       "agents: list names, descriptions, default models and source for this cwd; use these names for run.",
-      "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn. answer needs open qid+rev (stale rejected). model switches at next provider request. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
+      "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn. answer: give the qid (or just the call, or nothing when one question is open); to and rev are filled in. model switches at next provider request. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
       "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); a sealed call → already-sealed:<status>, a finished workflow → terminal:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. status [wid] gives a digest. revise wid + workflow/source/args starts a revision.",
       "Control replies are {applied:true,rid} or {applied:false,reason,rid} when decided; otherwise {submitted:{rid}} after 10s.",
       ...(agents ? [`Available agents: ${agents}.`] : []),
