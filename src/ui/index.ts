@@ -31,6 +31,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
       if (stopped) return;
       try {
         data.refresh(); actions.reconcile();
+        for (const result of actions.resolutions.splice(0)) screen?.controlResult(result);
         const own = `main:${ctx.sessionManager.getSessionId()}`;
         data.workflows = orderWorkflows(data.workflows, own);
         const line = mainLine(data.workflows);

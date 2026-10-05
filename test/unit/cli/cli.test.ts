@@ -55,7 +55,7 @@ test('status and tail follow real engine journals with fake executor', { timeout
   // T10: the list view is the compact projection; events are a timeline without observation noise.
   const out: string[] = [], env = { DSA_HOME: home }, write = (s: string) => { out.push(s); };
   assert.equal(await main(['status'], { env, write }), 0);
-  assert.match(out.join('\n'), new RegExp(`^${wid}@1: done · 1/1 sealed\n  a@1 ok "hello"\n  finished: ".* done: 1 ok\\. Details: subagents status\\."$`));
+  assert.match(out.join('\n'), new RegExp(`^${wid}@1: done · 1/1 done\n  a@1 ok "hello"\n  finished: ".* done: 1 ok"$`));
   out.length = 0; assert.equal(await main(['status', '--json'], { env, write }), 0);
   const view = JSON.parse(out[0]!);
   assert.deepEqual(view.workflows[0].calls, [{ key: 'a', gen: 1, callId: `${wid}@1/a@1`, phase: 'sealed', status: 'ok', ok: true, lastLine: 'hello' }]);

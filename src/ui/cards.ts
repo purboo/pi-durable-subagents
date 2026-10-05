@@ -15,6 +15,12 @@ const HEAD: Record<AttentionItem["kind"], { icon: string; title: string; tone: T
 };
 const keyOf = (item: AttentionItem) => item.call ? item.call.split("/").at(-1)!.replace(/@1$/, "") : item.wid;
 
+/** v12 §3: The finished digest body — first line prominent, per-agent lines dim, each clipped to the card's inner width. */
+export function digestLines(text: string, dim: (line: string) => string, width: number): string[] {
+  const [first = "", ...rest] = text.split("\n");
+  return [truncateToWidth(first, Math.max(1, width)), ...rest.filter(line => line.trim()).map(line => dim(truncateToWidth(line, Math.max(1, width))))];
+}
+
 /** UI §1: A rounded card in the tone's colour: heading in the top border, wrapped body lines inside. */
 export function card(theme: Theme, tone: Tone, heading: string, body: readonly string[], width: number, expanded = false): string[] {
   const w = Math.max(3, Math.floor(width)), inner = w - 4, border = (t: string) => theme.fg(tone, t);
@@ -46,7 +52,12 @@ export function registerCards(pi: ExtensionAPI, home: string): void {
     return { invalidate() {}, render: (width: number) => items.flatMap(item => {
       const h = HEAD[item.kind] ?? HEAD.unknown, closed = item.kind === "question" && isResolved(item);
       const heading = `${h.icon} ${item.kind === "finished" && !item.call ? "Workflow" : `Subagent ${keyOf(item)}`} ${closed ? "— answered" : h.title}`;
-      return card(theme, closed ? "muted" : h.tone, heading, [closed ? theme.fg("dim", item.text) : item.text], width, options.expanded);
+      // v12 §3: a finished digest is first line + dim per-agent lines, clipped; old single-line items read exactly as before.
+      const inner = Math.max(1, Math.max(3, Math.floor(width)) - 4);
+      const body = item.kind === "finished" && !closed
+        ? digestLines(item.text, line => theme.fg("dim", line), inner)
+        : [closed ? theme.fg("dim", item.text) : item.text];
+      return card(theme, closed ? "muted" : h.tone, heading, body, width, options.expanded);
     }) };
   });
   pi.registerMessageRenderer(CT.note, (message, options, theme) => {

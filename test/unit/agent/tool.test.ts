@@ -1,6 +1,35 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { request } from "../../../src/agent/main/tool.ts";
+import { request, parameters } from "../../../src/agent/main/tool.ts";
+import { registerMain } from "../../../src/agent/main.ts";
+import { tempRoot } from "../../harness/pi.ts";
+
+test("v12 §2: omitted action infers only a single launch form; invalid omission lists actions", () => {
+  assert.ok(!((parameters as { required?: string[] }).required ?? []).includes("action"));
+  for (const args of [
+    { agent: "worker", task: "work" }, { tasks: [{ agent: "worker", task: "work" }] },
+    { chain: [{ agent: "worker", task: "work" }] }, { workflow: "flow.js" }, { source: "return 1" },
+  ]) assert.equal(request(args, "/w").kind, "run");
+  for (const args of [{}, { agent: "a", task: "work", source: "return 1" }, { tasks: [], chain: [] }, { to: "w/k", kind: "steer", message: "hi" }]) {
+    assert.throws(() => request(args, "/w"), /action is required: run, agents, send, stop, revise, status, resume, drain/);
+  }
+  assert.throws(() => request({ action: "impossible" }, "/w"), /Unsupported action: impossible; use run, agents/);
+});
+
+test("v12 §6: tool description teaches discovery, addresses, verb meaning and list controls", () => {
+  const root = tempRoot("dsa-description-");
+  const old = { HOME: process.env.HOME, DSA_HOME: process.env.DSA_HOME, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_OFFLINE: process.env.PI_OFFLINE };
+  let description = "";
+  try {
+    process.env.HOME = root; process.env.DSA_HOME = root; process.env.PI_CODING_AGENT_DIR = root; process.env.PI_OFFLINE = "1";
+    registerMain({ on() {}, registerTool(tool: { description: string }) { description = tool.description; } } as unknown as Parameters<typeof registerMain>[0]);
+  } finally {
+    for (const [name, value] of Object.entries(old)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
+  }
+  for (const phrase of ["agents:", "Available agents:", "<wid>/<key>", "single-call", "steer", "follow-up", "answer", "model", "stop", "drain", "resume", "status", "↓", "Enter", "s steer", "x stop", "m model", "a answer", "f follow-up"]) {
+    assert.ok(description.includes(phrase), `missing ${phrase}`);
+  }
+});
 
 test("P31a, P36, P11: run carries workflow-level budget, spawn limit and resolved input files, not as call fields", () => {
   const { body } = request({ action: "run", workflow: "flow.js", usageBudget: { tokens: 5000 }, maxCalls: 7, inputs: { plan: "plan.json" }, name: "nightly" }, "/w");

@@ -37,16 +37,51 @@ export class SubagentScreen implements Component {
   private busy = false;
   private disposed = false;
   private notice = "";
+  private listNotice?: { text: string; until: number; rid?: string };
+  private listInput?: { kind: "steer" | "follow-up" | "answer"; call: CallSnapshot; workflow: WorkflowSnapshot; editor: Input; qid?: string; rev?: number };
+  private stopTarget?: { id: string; name: string };
+  private listPending = new Set<string>();
   private uses = 0;
   private thinkingRows = new Set<number>();
   private inputRow = 0;
   private _focused = false;
   get focused() { return this._focused; }
-  set focused(value: boolean) { this._focused = value; this.input.focused = value; this.search.focused = value; }
+  set focused(value: boolean) { this._focused = value; this.input.focused = value; this.search.focused = value; if (this.listInput) this.listInput.editor.focused = value; }
   constructor(data: UiData, actions: UiActions, ctx: ExtensionContext, tui: TUI, theme: Theme, close: () => void, state: ViewState) {
     this.data = data; this.actions = actions; this.ctx = ctx; this.tui = tui; this.theme = theme; this.close = close; this.state = state;
   }
-  invalidate() { this.input.invalidate(); this.search.invalidate(); this.menu?.invalidate(); }
+  invalidate() { this.input.invalidate(); this.search.invalidate(); this.listInput?.editor.invalidate(); this.menu?.invalidate(); }
+  /** v12 §5: Show a durable control decision on the list for a bounded interval. */
+  controlResult(result: { rid: string; applied: boolean; reason?: string }) {
+    if (!this.listPending.delete(result.rid) || this.disposed) return;
+    this.listNotice = { text: result.applied ? "✓ applied" : `✗ ${result.reason ?? "rejected"}`, until: Date.now() + 4000 };
+    this.refresh();
+  }
+  private report(result: { state: "applied" | "submitted" | "rejected"; reason?: string; rid?: string }) {
+    if (result.rid && result.state === "submitted") this.listPending.add(result.rid);
+    this.listNotice = { text: result.state === "applied" ? "✓ applied" : result.state === "rejected" ? `✗ ${result.reason ?? "rejected"}` : "submitted…", until: Date.now() + 4000, rid: result.rid };
+    this.refresh();
+  }
+  private selectedRow() { return this.rows[this.selected]; }
+  private listAction(args: Record<string, unknown>, note: string) {
+    if (this.busy) return;
+    this.busy = true;
+    void this.actions.send(args, note).then(result => { if (!this.disposed) this.report(result); }).finally(() => { this.busy = false; this.refresh(); });
+  }
+  private beginListInput(kind: "steer" | "follow-up" | "answer", row: ListRow) {
+    const c = row.call!, w = row.workflow!;
+    const q = w.attention.find(a => a.kind === "question" && a.call === c.callId);
+    this.listInput = { kind, call: c, workflow: w, editor: new Input({ prompt: `${kind} ${label(c)}: ` }), ...(kind === "answer" && q ? { qid: q.qid, rev: q.rev } : {}) };
+    this.listInput.editor.focused = this.focused;
+    this.listNotice = undefined;
+  }
+  private submitListInput() {
+    const draft = this.listInput; if (!draft || this.busy) return;
+    const message = draft.editor.getValue().trim(); if (!message) return;
+    this.listInput = undefined;
+    const { call: c, kind } = draft;
+    this.listAction({ action: "send", to: c.callId, kind, message, ...(kind === "answer" ? { qid: draft.qid, rev: draft.rev } : {}) }, `${kind} ${label(c)}: ${JSON.stringify(message)}`);
+  }
   dispose() { this.disposed = true; }
   refresh() { if (!this.disposed) this.tui.requestRender(); }
   private name = (model: string | undefined) => modelLabel(model, (p, id) => this.ctx.modelRegistry.find(p, id), this.data.aliases);
@@ -84,12 +119,12 @@ export class SubagentScreen implements Component {
     if (this.busy || this.disposed) return;
     this.busy = true;
     const target = this.watching;
-    const error = await this.actions.send(args, note);
+    const result = await this.actions.send(args, note);
     this.busy = false;
-    if (!this.disposed && this.watching === target) { this.notice = error ?? "Submitted"; if (!error) { this.input.setValue(""); this.uses++; } this.refresh(); }
+    if (!this.disposed && this.watching === target) { this.notice = result.state === "rejected" ? `${note}: ${result.reason}` : "Submitted"; if (result.state !== "rejected") { this.input.setValue(""); this.uses++; } this.refresh(); }
   }
-  private modelMenu() {
-    const { c } = this.current(); if (!c) return;
+  private modelMenu(target?: CallSnapshot) {
+    const c = target ?? this.current().c; if (!c) return;
     this.menuTitle = `Model for ${c.key}`;
     const models = this.ctx.modelRegistry.getAvailable();
     this.menu = new SelectList(models.map(m => ({ value: `${m.provider}/${m.id}`, label: this.name(`${m.provider}/${m.id}`) })), 12, getSelectListTheme());
@@ -98,7 +133,9 @@ export class SubagentScreen implements Component {
     this.menu.onSelect = item => {
       this.menu = undefined;
       const level = this.data.facts.get(c.callId)?.thinking ?? "off";
-      void this.send({ action: "send", to: c.callId, kind: "model", model: `${item.value}:${level}` }, `switched ${c.key} to ${this.name(item.value)} · ${level}`);
+      const args = { action: "send", to: c.callId, kind: "model", model: `${item.value}:${level}` };
+      const note = `switched ${c.key} to ${this.name(item.value)} · ${level}`;
+      if (target) this.listAction(args, note); else void this.send(args, note);
     };
   }
   private thinkingMenu() {
@@ -140,6 +177,13 @@ export class SubagentScreen implements Component {
     if (this.menu) {
       if ((["up", "down", "enter", "escape"] as const).some(k => matchesKey(key, k))) this.menu.handleInput(key);
       else { this.search.handleInput(key); this.menu.setFilter(this.search.getValue()); }
+    } else if (this.listInput) {
+      if (matchesKey(key, "escape")) this.listInput = undefined;
+      else if (matchesKey(key, "enter")) this.submitListInput();
+      else this.listInput.editor.handleInput(key.replace(/\r\n|\r|\n/g, " ")); // pasted lines (LF or CR) join with spaces
+    } else if (this.stopTarget) {
+      const target = this.stopTarget; this.stopTarget = undefined;
+      if (key === "y") this.listAction({ action: "stop", target: target.id }, `stopped ${target.name}`);
     } else if (matchesKey(key, "escape")) {
       // Back in the list, the selection lands on the call just watched (UI §2 stable selection).
       if (this.watching) { this.selectedId = this.doneTab ? this.selectedId : this.watching; this.watching = undefined; this.workflow = undefined; this.doneTab = false; }
@@ -154,7 +198,18 @@ export class SubagentScreen implements Component {
         if (this.rows[next]) this.selected = next;
         this.selectedId = this.rows[this.selected]?.id;
       }
-      else if (matchesKey(key, "enter")) this.selectRow(this.rows[this.selected]);
+      else if (matchesKey(key, "enter")) this.selectRow(this.selectedRow());
+      else if (!this.busy) {
+        const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined, w = row?.workflow;
+        const asking = c && w?.attention.some(a => a.kind === "question" && a.call === c.callId);
+        if (key === "s" && c && c.phase !== "sealed") this.beginListInput("steer", row!);
+        else if (key === "f" && c?.phase === "sealed") this.beginListInput("follow-up", row!);
+        else if (key === "a" && c && asking) this.beginListInput("answer", row!);
+        else if (key === "m" && c) this.modelMenu(c);
+        else if (key === "x" && (c && c.phase !== "sealed" || row?.kind === "workflow" && w?.status === "running")) {
+          this.stopTarget = c ? { id: c.callId, name: label(c) } : { id: w!.wid, name: w!.name ?? w!.wid };
+        }
+      }
     } else if (this.busy) {
       // Preserve the draft and target until its durable submission resolves.
     } else if (!this.input.getValue() && (matchesKey(key, "left") || matchesKey(key, "right"))) this.switchTab(matchesKey(key, "left") ? -1 : 1);
@@ -251,8 +306,18 @@ export class SubagentScreen implements Component {
         const text = row.failed ? this.theme.fg("error", fit) : row.kind === "preview" ? this.theme.fg("dim", fit) : row.kind === "workflow" ? this.theme.bold(fit) : fit;
         return i + start === this.selected ? this.theme.bg("selectedBg", text) : text;
       });
-      const keys = "↑ ↓ select · Enter open · Esc back";
-      return panel(this.rows.length ? lines : ["No subagents"], this.doneTab ? `${w?.name ?? w?.wid} › done` : `Subagents · ${summaryText(this.data.workflows)}`, this.doneTab ? `← → switch · ${keys}` : keys);
+      const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined;
+      const asking = c && row?.workflow?.attention.some(a => a.kind === "question" && a.call === c.callId);
+      const narrow = size.width < 72;
+      const keys = [narrow ? "↑↓" : "↑ ↓ select", row && row.kind !== "preview" ? `Enter ${narrow ? "" : row.kind === "workflow" ? (this.state.folded.has(row.workflow!.wid) ? "expand" : "collapse") : row.kind === "call" ? "watch" : "open"}`.trim() : "",
+        c && c.phase !== "sealed" ? (narrow ? "s" : "s steer") : "", c?.phase === "sealed" ? (narrow ? "f" : "f follow-up") : "",
+        c && c.phase !== "sealed" || row?.kind === "workflow" && row.workflow?.status === "running" ? (narrow ? "x" : "x stop") : "",
+        c ? (narrow ? "m" : "m model") : "", asking ? (narrow ? "a" : "a answer") : "", "Esc back"].filter(Boolean).join(" · ");
+      const notice = this.listNotice && this.listNotice.until > Date.now() ? this.listNotice.text : "";
+      const footer = this.listInput ? this.listInput.editor.render(size.width) : this.stopTarget ? [`Stop ${this.stopTarget.name}? y confirm · any other key cancels`] : notice ? [notice] : [];
+      const body = this.rows.length ? lines.slice(0, Math.max(0, size.height - footer.length)) : ["No subagents"];
+      while (body.length < size.height - footer.length) body.push("");
+      return panel([...body, ...footer], this.doneTab ? `${w?.name ?? w?.wid} › done` : `Subagents · ${summaryText(this.data.workflows)}`, this.listInput ? "Enter send · Esc cancel" : this.stopTarget ? "y confirm · any other key cancels" : this.doneTab ? `← → switch · ${keys}` : keys);
     }
     const { c, w } = this.current();
     if (!c || !w) return panel(["Subagent is no longer in the current revision"], "Subagents", "Esc back");

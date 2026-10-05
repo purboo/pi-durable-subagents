@@ -1,9 +1,10 @@
 // Read-only status snapshots (P25: `status` is always a fresh snapshot). Pure readers of committed journals:
 // never depend on orchestrator memory, so the UI, the CLI and the main agent see the same durable state.
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { compileFanout } from "../compat/fanout.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
-import { journalPath, orchLedger, workflowDir } from "../paths.ts";
+import { journalPath, orchLedger, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, type AttentionItem, type CallResult, type Entry } from "../types.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
@@ -39,8 +40,40 @@ export interface WorkflowSnapshot {
   startedAt?: number; endedAt?: number;
   /** Drain: the orchestrator is drained (stop-all); queued calls start only after resume. */
   paused?: boolean;
+  /** v12 §4: planned total — the tasks/chain length pinned at admission; scripts have none. */
+  planned?: number;
   /** P31: every call ever charged to this workflow, across revisions (always set by snapshotFromEntries). */
   usage?: Usage;
+}
+
+/** v12 §4: done/total of one workflow: `done` counts keys whose latest generation is sealed; `total` is the planned
+ *  count when known, else keys proposed so far (`plus` marks the `n+` script case while the workflow runs). */
+export function progressOf(wf: Pick<WorkflowSnapshot, "calls" | "planned" | "status">): { done: number; total: number; plus: boolean } {
+  const latest = new Map(wf.calls.map(c => [c.key, c] as const)); // later generations of a key replace earlier ones
+  const done = [...latest.values()].filter(c => c.phase === "sealed").length;
+  return { done, total: wf.planned ?? latest.size, plus: wf.planned === undefined && wf.status === "running" };
+}
+
+// v12 §4: the exact bodies compileFanout emits after the `const steps = [...];` line, so only true fanouts count as planned.
+const fanoutBodies = [compileFanout({ tasks: [] }).source, compileFanout({ chain: [] }).source].map(s => s.slice(s.indexOf("\n") + 1));
+/** v12 §4: The planned total of a pinned script: its steps count when it is a compiled tasks/chain fanout; scripts have none. */
+export function plannedFromScript(source: string): number | undefined {
+  const cut = source.indexOf("\n"), head = source.slice(0, Math.max(0, cut)), rest = source.slice(cut + 1);
+  if (!head.startsWith("const steps = ") || !head.endsWith(";") || !fanoutBodies.some(body => rest === body)) return undefined;
+  try {
+    const steps = JSON.parse(head.slice("const steps = ".length, -1)) as unknown;
+    return Array.isArray(steps) ? steps.length : undefined;
+  } catch { return undefined; }
+}
+// v12 §4: pins are write-once (kernel publishFile), so the parsed planned total is cached by script path for the process.
+const plannedByPath = new Map<string, number | undefined>();
+/** v12 §4: The current revision's planned total, read lazily from the pinned run body and cached (pins are immutable). */
+function plannedTotal(home: string, wid: string, rev: number): number | undefined {
+  const path = join(pinnedDir(home, wid), rev === 1 ? "script.js" : join(`r${rev}`, "script.js"));
+  if (!plannedByPath.has(path)) {
+    try { plannedByPath.set(path, plannedFromScript(readFileSync(path, "utf8"))); } catch { plannedByPath.set(path, undefined); }
+  }
+  return plannedByPath.get(path);
 }
 
 const zero = (): Usage => ({ input: 0, output: 0, costUsd: 0 });
@@ -149,9 +182,11 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
   };
 }
 
-/** P25: Snapshot one workflow from its durable journal. */
+/** P25: Snapshot one workflow from its durable journal (v12 §4: plus the planned total of its pinned run body). */
 export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
-  return snapshotFromEntries(wid, readJournalSnapshot(journalPath(home, wid)));
+  const wf = snapshotFromEntries(wid, readJournalSnapshot(journalPath(home, wid)));
+  const planned = plannedTotal(home, wid, wf.rev);
+  return planned === undefined ? wf : { ...wf, planned };
 }
 
 /** Ops: wids archived by `prune` (orchestrator ledger `pruned{wid}`); they no longer exist for any reader. */
@@ -199,6 +234,10 @@ export interface StatusCall {
 export interface StatusWorkflow {
   wid: string; name?: string; origin?: string; status: WorkflowSnapshot["status"]; rev: number;
   startedAt?: number; endedAt?: number; error?: string; usage: Usage; counts: Record<CallPhase, number>;
+  /** v12 §4: planned total (tasks/chain length) when known; absent for scripts. */
+  planned?: number;
+  /** v12 §4: keys of the current revision whose latest generation is sealed (the `done` of done/total). */
+  done: number;
   calls: StatusCall[]; attention: Pick<AttentionItem, "id" | "rev" | "kind" | "text" | "call" | "qid">[];
 }
 export interface StatusView {
@@ -213,10 +252,12 @@ export type StatusDetail = WorkflowSnapshot & { scriptLog?: string };
 
 /** P25, T10: Compact one workflow snapshot: per-call one-line facts, usage, open attention; no outputs or entries. */
 export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
+  const progress = progressOf(wf); // v12 §4
   return {
     wid: wf.wid, ...(wf.name ? { name: wf.name } : {}), ...(wf.origin ? { origin: wf.origin } : {}), status: wf.status, rev: wf.rev,
     ...(wf.startedAt !== undefined ? { startedAt: wf.startedAt } : {}), ...(wf.endedAt !== undefined ? { endedAt: wf.endedAt } : {}),
     ...(wf.error ? { error: clip(wf.error, 500) } : {}), usage: wf.usage ?? zero(), counts: wf.counts,
+    ...(wf.planned !== undefined ? { planned: wf.planned } : {}), done: progress.done,
     calls: wf.calls.map(c => {
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
       return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...(r ? { status: r.status, ok: r.ok } : {}),

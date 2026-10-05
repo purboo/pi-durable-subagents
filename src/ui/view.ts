@@ -1,5 +1,6 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import type { CallStatus } from "../types.ts";
 import type { sessionFacts } from "./session.ts";
 
 export type Facts = ReturnType<typeof sessionFacts>;
@@ -7,7 +8,7 @@ export interface ViewState {
   folded: Set<string>; done: Map<string, number>; viewed: Set<string>; finished: boolean;
   observed?: Map<string, { working: number; failures: Set<string> }>;
 }
-export interface ListRow { id: string; kind: "workflow" | "call" | "preview" | "done" | "more" | "finished"; text: string; workflow?: WorkflowSnapshot; call?: CallSnapshot; failed?: boolean }
+export interface ListRow { id: string; kind: "workflow" | "call" | "preview" | "done" | "more" | "finished"; text: string; workflow?: WorkflowSnapshot; call?: CallSnapshot; failed?: boolean; /** v12 §5: rows of finished workflows are dimmed, never hidden. */ dim?: boolean }
 export type ModelName = (model: string | undefined) => string;
 
 /** UI §2: Render compact wall-clock durations; never present these as charged active time. */
@@ -70,7 +71,8 @@ export function resultPhrase(call: CallSnapshot): string {
   if (r.status === "ok") return last ? `done · ${last}` : "done";
   if (r.status === "skipped") return r.error ? `skipped (${r.error})` : "skipped";
   if (r.status === "parked") return r.error ? `parked: ${r.error}` : "parked";
-  return `failed: ${r.error ?? r.status}`;
+  const word = resultWord(r.status); // v12 §4: stopped/timeout/budget/unknown keep their own word, never "failed"
+  return r.error ? `${word}: ${r.error}` : word;
 }
 /** UI §2: Explain durable state in ordinary phrases without inventing retry or queue evidence. */
 export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, facts: Facts | undefined, now: number): string {
@@ -85,20 +87,27 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
 }
 function failed(c: CallSnapshot) { return c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped"; }
 
-/** P37: Calls are named by key; later generations of a key carry their generation. */
+/** UI §2, P37: Calls are named by key; later generations of a key carry their generation. */
 export const label = (c: { key: string; gen: number }) => c.gen > 1 ? `${c.key}@${c.gen}` : c.key;
 
-/** UI §1,4: One working sentence, or a completion sentence naming only exceptions. */
-export function summary(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; done: number; total: number } {
+const WORDS: Record<CallStatus, string> = { ok: "done", stopped: "stopped", failed: "failed", "gate-failed": "failed", timeout: "timeout", budget: "budget", unknown: "unknown", skipped: "skipped", parked: "parked" };
+/** v12 §4: The result word of a sealed status — a stopped call is never called failed; timeout/budget/unknown are named as such. */
+export const resultWord = (status: CallStatus): string => WORDS[status] ?? "failed";
+const WORD_ORDER = ["done", "stopped", "failed", "timeout", "budget", "unknown", "skipped", "parked"];
+
+/** UI §1,4, v12 §4: One working sentence; done/total uses planned totals, `n+` while a script workflow keeps proposing. */
+export function summary(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; done: number; total: number; plus: boolean } {
   const running = workflows.filter(w => w.status === "running"), calls = running.flatMap(w => w.calls);
   const asking = running.reduce((n, w) => n + w.calls.filter(c => c.phase !== "sealed" && w.attention.some(a => a.kind === "question" && a.call === c.callId)).length, 0);
-  return { working: calls.filter(c => c.phase !== "sealed").length - asking, asking, done: calls.filter(c => c.phase === "sealed").length, total: calls.length };
+  const progress = running.map(progressOf);
+  return { working: calls.filter(c => c.phase !== "sealed").length - asking, asking,
+    done: progress.reduce((n, p) => n + p.done, 0), total: progress.reduce((n, p) => n + p.total, 0), plus: progress.some(p => p.plus) };
 }
-/** UI §1: What needs you first, then what is running, then progress — e.g. "1 asks you · 3 working · 12/40 done". */
+/** UI §1, v12 §4: What needs you first, then what is running, then progress — e.g. "1 asks you · 3 working · 12/40 done". */
 export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
   const s = summary(workflows), finished = workflows.filter(w => w.status !== "running").length;
   if (!s.total) return finished ? `${finished} finished` : "nothing running";
-  return [s.asking ? `${s.asking} asks you` : "", s.working ? `${s.working} working` : "", `${s.done}/${s.total} done`].filter(Boolean).join(" · ");
+  return [s.asking ? `${s.asking} asks you` : "", s.working ? `${s.working} working` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
 }
 export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
@@ -107,13 +116,15 @@ export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undef
   const w = workflows.filter(w => w.status !== "running").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
   if (!w) return undefined;
   const latest = [...new Map(w.calls.map(c => [c.key, c])).values()]; // the newest generation of each key (P37)
-  const good = latest.filter(c => c.result?.ok).length;
-  const bad = latest.filter(c => failed(c)).map(c => c.key);
-  const skipped = latest.filter(c => c.result?.status === "skipped").map(c => c.key);
-  return `${w.name ?? w.wid} finished: ${[good ? `${good} done` : "", bad.length ? `${bad.join(", ")} failed` : "", skipped.length ? `${skipped.join(", ")} skipped` : ""].filter(Boolean).join("; ") || w.status}.  ↓`;
+  // v12 §4: the completion sentence uses result words, e.g. "3 done · 1 stopped · 1 failed".
+  const words = new Map<string, number>();
+  for (const c of latest) { const r = c.result; if (r) words.set(resultWord(r.status), (words.get(resultWord(r.status)) ?? 0) + 1); }
+  const parts = WORD_ORDER.filter(word => words.has(word)).map(word => `${words.get(word)} ${word}`);
+  return `${w.name ?? w.wid} finished: ${parts.join(" · ") || w.status}.  ↓`;
 }
 
-/** UI §2: Group workflows, keep unviewed failures visible, and page newest done rows eight at a time. */
+/** UI §2, v12 §5: Group workflows (finished ones stay listed, dimmed and expandable — never hidden behind a toggle),
+ *  keep unviewed failures visible, and page newest done rows eight at a time. */
 export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewState, facts: ReadonlyMap<string, Facts>, name: ModelName, width: number, now = Date.now()): ListRow[] {
   const rows: ListRow[] = [];
   state.observed ??= new Map();
@@ -122,41 +133,44 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     const working = w.calls.filter(c => c.phase !== "sealed").length;
     const failures = new Set(w.calls.filter(c => failed(c)).map(c => c.callId));
     const newFailure = [...failures].some(id => !state.viewed.has(id) && !previous?.failures.has(id));
-    if (newFailure || (!working && previous?.working !== 0)) {
+    // Reopen only on an observed transition, so workflows first seen already finished stay compact.
+    const completed = previous !== undefined && previous.working > 0 && working === 0;
+    if (newFailure || completed) {
       state.done.set(w.wid, Math.max(8, state.done.get(w.wid) ?? 0));
       state.folded.delete(w.wid);
     }
     state.observed.set(w.wid, { working, failures });
   }
   const unviewed = (w: WorkflowSnapshot) => w.calls.some(c => failed(c) && !state.viewed.has(c.callId));
-  const finished = workflows.filter(w => w.status !== "running" && !unviewed(w));
-  const visible = workflows.filter(w => w.status === "running" || unviewed(w)); // caller order: newest first
-  if (state.finished) visible.push(...finished);
+  const live = workflows.filter(w => w.status === "running" || unviewed(w)); // caller order: newest first
+  const ended = workflows.filter(w => w.status !== "running" && !unviewed(w));
+  const visible = [...live, ...ended];
   // Aligned columns across the whole list (UI §2): key and model start at the same column on every row.
   const shownCalls = visible.flatMap(w => w.calls);
   const cols = { key: Math.min(18, Math.max(0, ...shownCalls.map(c => visibleWidth(label(c))))),
     model: Math.min(26, Math.max(0, ...shownCalls.map(c => visibleWidth(name(facts.get(c.callId)?.model ?? c.model))))) };
-  const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string) => {
+  const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string, dim = false) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
     const text = rowText(indent, label(c), name(f?.model ?? c.model), statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
-    rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), text });
+    rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), dim, text });
     // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.
-    if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)) });
+    if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, dim, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)) });
   };
   for (const w of visible) {
-    if (w.calls.length === 1) { callRow(w, w.calls[0]!, "  ", "    "); continue; }
+    const dim = w.status !== "running"; // v12 §5: finished workflows are dimmed, not hidden
+    if (w.calls.length === 1) { callRow(w, w.calls[0]!, "  ", "    ", dim); continue; }
     // Stable order (UI §2): active rows keep proposal (snapshot) order; done rows by immutable end time.
     const done = doneOrder(w.calls), active = w.calls.filter(c => c.phase !== "sealed"), folded = state.folded.has(w.wid);
-    rows.push({ id: w.wid, kind: "workflow", workflow: w, text: `${folded ? "▸" : "▾"} ${w.name ?? w.wid} · ${done.length}/${w.calls.length} · ${duration((w.endedAt ?? now) - (w.startedAt ?? now))}` });
+    const progress = progressOf(w); // v12 §4: done/planned, `n+` while a script workflow keeps proposing
+    rows.push({ id: w.wid, kind: "workflow", workflow: w, dim, text: `${folded ? "▸" : "▾"} ${w.name ?? w.wid} · ${progress.done}/${progress.total}${progress.plus ? "+" : ""} · ${duration((w.endedAt ?? now) - (w.startedAt ?? now))}` });
     if (folded) continue;
-    active.forEach((c, i) => { const last = i === active.length - 1 && !done.length; callRow(w, c, last ? "  └ " : "  ├ ", last ? "      " : "  │   "); });
+    active.forEach((c, i) => { const last = i === active.length - 1 && !done.length; callRow(w, c, last ? "  └ " : "  ├ ", last ? "      " : "  │   ", dim); });
     if (!done.length) continue;
-    const count = state.done.get(w.wid) ?? (!active.length || unviewed(w) ? 8 : 0), shown = done.slice(0, count);
-    rows.push({ id: `${w.wid}:done`, kind: "done", workflow: w, text: `  └ ${count ? "▾" : "▸"} ${done.length} done` });
+    const count = state.done.get(w.wid) ?? (w.status === "running" && !active.length || unviewed(w) ? 8 : 0), shown = done.slice(0, count);
+    rows.push({ id: `${w.wid}:done`, kind: "done", workflow: w, dim, text: `  └ ${count ? "▾" : "▸"} ${progress.done} done` });
     const more = count && done.length > count;
-    shown.forEach((c, i) => callRow(w, c, i === shown.length - 1 && !more ? "      └ " : "      ├ "));
-    if (more) rows.push({ id: `${w.wid}:more`, kind: "more", workflow: w, text: `      └ … ${done.length - count} more` });
+    shown.forEach((c, i) => callRow(w, c, i === shown.length - 1 && !more ? "      └ " : "      ├ ", undefined, dim));
+    if (more) rows.push({ id: `${w.wid}:more`, kind: "more", workflow: w, dim, text: `      └ … ${done.length - count} more` });
   }
-  if (finished.length) rows.push({ id: "finished", kind: "finished", text: `${state.finished ? "▾" : "▸"} ${finished.length} finished workflow${finished.length === 1 ? "" : "s"}` });
   return rows;
 }

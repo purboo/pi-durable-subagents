@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openJournal } from '../../../../src/kernel/journal.ts';
-import { journalPath, orchLedger } from '../../../../src/paths.ts';
+import { journalPath, orchLedger, pinnedDir } from '../../../../src/paths.ts';
+import { compileFanout } from '../../../../src/compat/fanout.ts';
 import { finishedText } from '../../../../src/orchestrator/engine.ts';
-import { compactWorkflow, eventsFromEntries, renderEvent, snapshotFromEntries, statusDetail, statusView } from '../../../../src/orchestrator/snapshot.ts';
+import { compactWorkflow, eventsFromEntries, plannedFromScript, progressOf, renderEvent, snapshotFromEntries, statusDetail, statusView, workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
 import { JT, type Entry } from '../../../../src/types.ts';
 
 const e = (seq: number, type: string, f: Record<string, unknown> = {}) => ({ seq, ts: 1_700_000_000_000 + seq, type, ...f }) as Entry;
@@ -46,7 +48,7 @@ test('P31: snapshots carry per-call and workflow usage from seals and deduplicat
   assert.deepEqual(by.c!.usage, u(7, 3, 0), 'live usage before a seal');
   assert.equal(by.b!.tools, 1); assert.equal(by.b!.model, 'p/m');
   assert.equal(snap.usage!.input, 1307); assert.equal(snap.usage!.output, 73); assert.ok(Math.abs(snap.usage!.costUsd - 0.13) < 1e-9);
-  assert.equal(finishedText('w', entries), 'nightly (w) stopped: 1 ok; b stopped. Usage: 1.3K in / 73 out, $0.13. Details: subagents status.');
+  assert.equal(finishedText('w', entries), 'nightly (w) stopped: 1 ok; 1 stopped; 1 unknown\nold: ok\n  a\nfinal old\nb: stopped\nc: unknown\nUsage: 1.3K in / 73 out, $0.13\nFull output: subagents status wid:w');
 });
 
 test('T10: events keep the meaningful timeline only', () => {
@@ -121,6 +123,73 @@ test('P7 P27: sends per call are pending until the child receipt, then delivered
   assert.match(text[5]!, /^2023-\S+Z #9 delivered  steer delivered to b rid=s1$/);
   assert.match(text[7]!, /follow-up delivered to b \(rejected: withdrawn\) rid=f1$/);
   assert.match(text[9]!, /#14 retired    steer retired \(call ended first\) key=b rid=s2$/);
+});
+
+test('v12 §4: plannedFromScript counts only compiled tasks/chain fanouts', () => {
+  const step = { agent: 'x', task: 't' };
+  assert.equal(plannedFromScript(compileFanout({ tasks: [step, { ...step }, { ...step }] }).source), 3);
+  assert.equal(plannedFromScript(compileFanout({ chain: [step, { ...step }] }).source), 2);
+  assert.equal(plannedFromScript(compileFanout({ tasks: [step] }).source), 1, 'a single-agent run is a one-step fanout');
+  assert.equal(plannedFromScript('const steps = [{key:"a"}];\ncomplete(1);\n'), undefined, 'a user script that happens to start with const steps is not a fanout');
+  assert.equal(plannedFromScript('complete(1);\n'), undefined);
+});
+
+test('v12 §4: planned totals come from the pinned run body; follow-ups never change the denominator', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-planned-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const step = { agent: 'x', task: 't' };
+  const fanout = (n: number, kind: 'tasks' | 'chain' = 'tasks') => compileFanout({ [kind]: Array.from({ length: n }, () => ({ ...step })) } as never).source;
+  const append = async (wid: string, list: Entry[]) => {
+    const journal = await openJournal(journalPath(home, wid));
+    for (const { seq: _s, ts: _t, type, ...fields } of list) await journal.append(type, fields);
+    await journal.close();
+  };
+  const open = async (wid: string, list: Entry[], script: string) => {
+    const pinned = pinnedDir(home, wid);
+    mkdirSync(pinned, { recursive: true }); writeFileSync(join(pinned, 'script.js'), script);
+    await append(wid, list);
+  };
+  // tasks of three: one sealed, one running -> 1/3; the planned total is fixed at admission
+  await open('01T00', [
+    e(1, 'wf-created', { revision: 1, origin: 'main:o' }),
+    e(2, 'call', { key: 'a', gen: 1, spec: step }),
+    e(3, 'sealed', { call: '01T00@1/a@1', result: res('a', 'ok') }),
+    e(4, 'call', { key: 'b', gen: 1, spec: step }),
+    e(5, 'exec', { call: '01T00@1/b@1', exec: '01T00@1/b@1#1.1' }),
+  ], fanout(3));
+  let wf = workflowSnapshot(home, '01T00');
+  assert.equal(wf.planned, 3);
+  let compact = compactWorkflow(wf);
+  assert.equal(compact.planned, 3); assert.equal(compact.done, 1); assert.equal(compact.counts.sealed, 1);
+  // a follow-up reopens the sealed key as generation 2: done drops, the denominator stays 3
+  await append('01T00', [
+    e(6, 'generation', { key: 'a', gen: 2, from: '01T00@1/a@1', rid: 'r1', opening: { kind: 'follow-up' } }),
+    e(7, 'exec', { call: '01T00@1/a@2', exec: '01T00@1/a@2#1.1' }),
+  ]);
+  wf = workflowSnapshot(home, '01T00');
+  assert.equal(wf.planned, 3, 'the pinned run body never changes');
+  compact = compactWorkflow(wf);
+  assert.equal(compact.done, 0, 'the followed-up key runs again');
+  assert.equal(compact.planned, 3);
+  // a script has no planned total: proposed so far, `plus` while it runs
+  await open('01S00', [
+    e(1, 'wf-created', { revision: 1 }),
+    e(2, 'call', { key: 's1', gen: 1, spec: step }),
+    e(3, 'exec', { call: '01S00@1/s1@1', exec: '01S00@1/s1@1#1.1' }),
+  ], 'complete(1);\n');
+  const script = workflowSnapshot(home, '01S00');
+  assert.equal(script.planned, undefined);
+  assert.equal(progressOf(script).plus, true);
+  assert.equal(progressOf({ ...script, status: 'done' }).plus, false, 'a finished script drops the +');
+  assert.equal(compactWorkflow(script).planned, undefined);
+  // an impostor `const steps` script is not a fanout
+  await open('01X00', [e(1, 'wf-created', { revision: 1 })], 'const steps = [{key:"a"}];\ncomplete(1);\n');
+  assert.equal(workflowSnapshot(home, '01X00').planned, undefined);
+  // the status view carries the same projection
+  const byWid = new Map(statusView(home).workflows.map(w => [w.wid, w]));
+  assert.equal(byWid.get('01T00')!.planned, 3); assert.equal(byWid.get('01T00')!.done, 0);
+  assert.equal(byWid.get('01S00')!.planned, undefined);
+  assert.equal(statusDetail(home, '01T00').planned, 3);
 });
 
 test('ops: a pruned workflow is gone for status, even while its directory removal is unfinished', async t => {

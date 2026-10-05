@@ -26,7 +26,7 @@ function setup(t: { after(fn: () => Promise<void>): void }, receipt = true) {
   mkdirSync(home);
   function launch(name = "main", args: string[] = [], mainExtension = extension) {
     const pi = startPi({ root, name, extensions: [mainExtension, observer], args: [...(args.includes("--session") ? [] : ["--session-id", sessionId]), ...args],
-      env: { DSA_HOME: home, DSA_ORCHESTRATOR_ENTRY: fake, DSA_FAKE_RECEIPT: receipt ? "yes" : "no", DSA_EXEC: "" } });
+      env: { HOME: root, DSA_HOME: home, DSA_ORCHESTRATOR_ENTRY: fake, DSA_FAKE_RECEIPT: receipt ? "yes" : "no", DSA_EXEC: "" } });
     instances.push(pi); return pi;
   }
   t.after(async () => {
@@ -62,7 +62,7 @@ async function attention(home: string, fields: Partial<AttentionItem> = {}) {
 
 test("run publishes pinned call body through the durable outbox and returns created wid", { timeout: 30000 }, async t => {
   const { home, launch } = setup(t), pi = launch();
-  await prompt(pi, [{ tool: "subagents", args: { action: "run", agent: "worker", task: "Implement", model: "probe/scripted", timeoutMs: 1234 } }, { text: "done" }]);
+  await prompt(pi, [{ tool: "subagents", args: { agent: "worker", task: "Implement", model: "probe/scripted", timeoutMs: 1234 } }, { text: "done" }]);
   const [req] = await scanInbox(orchInbox(home));
   assert.ok(req); assert.equal(req.kind, "run"); assert.equal(req.from, sender); assert.equal(req.to, "orch"); assert.equal(req.sseq, 1);
   const { origin, ...body } = req.body as RunBody;
@@ -74,6 +74,31 @@ test("run publishes pinned call body through the durable outbox and returns crea
   assert.deepEqual(entries.find(e => e.type === "sent")?.request, req);
   assert.ok(entries.some(e => e.type === "resolved" && e.rid === req.rid));
   assert.equal(readFileSync(join(home, "spawn.log"), "utf8").trim().split("\n").length, 1);
+});
+
+test("v12 §2/§6 agents lists cwd-scoped definitions without publishing, and rejects unknown calls before creation", { timeout: 30000 }, async t => {
+  const { home, launch } = setup(t), pi = launch();
+  const dir = join(pi.dir, "work/.pi/agents"); mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "local.md"), "---\nname: local\ndescription: Project-only agent\nmodel: probe/scripted\n---\nLocal instructions\n");
+  await prompt(pi, [{ tool: "subagents", args: { action: "agents" } }, { text: "done" }]);
+  const agents = result(pi).result.details as { name: string; description: string; model?: string; source: string }[];
+  assert.ok(agents.some(a => a.name === "worker" && a.source === "builtin"));
+  assert.deepEqual(agents.find(a => a.name === "local"), { name: "local", description: "Project-only agent", model: "probe/scripted", source: "project" });
+  for (const args of [
+    { agent: "absent", task: "work" },
+    { tasks: [{ agent: "local", task: "ok" }, { agent: "absent", task: "bad" }] },
+    { chain: [{ agent: "absent", task: "bad" }, { agent: "missing", task: "bad" }] },
+  ]) {
+    await prompt(pi, [{ tool: "subagents", args }, { text: "done" }]);
+    assert.equal(result(pi).isError, true);
+    const text = JSON.stringify(result(pi).result);
+    assert.match(text, /absent/); assert.match(text, /Available agents:.*local/);
+    if ("chain" in args) assert.match(text, /missing/);
+  }
+  assert.deepEqual(await scanInbox(orchInbox(home)), []);
+  assert.deepEqual(readJournalSnapshot(orchLedger(home)), []);
+  assert.deepEqual(readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`)), []);
+  assert.equal(existsSync(join(home, "spawn.log")), false);
 });
 
 test("run returns submitted after 10 seconds, including an absolute workflow path", { timeout: 30000 }, async t => {
