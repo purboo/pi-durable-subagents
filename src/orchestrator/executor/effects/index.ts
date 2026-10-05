@@ -1,12 +1,13 @@
 import type { CallEffects, Ledgers } from "../../contract.ts";
-import { Containment } from "../../../platform/containment.ts";
+import { serialContainment } from "../sweep.ts";
+import type { Containment } from "../../../types.ts";
 import { cleanWorktree, prepareFork, prepareWorktree } from "./prepare.ts";
 import { recoverGates, runGate } from "./gate.ts";
 import { publishOutput } from "./output.ts";
 
 /** P19, P30, P32, P33, A5: Construct durable call effects under the orchestrator's single-writer authority. */
-export default function createEffects(ledgers: Ledgers): CallEffects {
-  const containment = new Containment(), queues = new Map<string, Promise<unknown>>();
+export default function createEffects(ledgers: Ledgers, containment: Containment = serialContainment()): CallEffects {
+  const queues = new Map<string, Promise<unknown>>();
   function serial<T>(key: string, operation: () => Promise<T>): Promise<T> {
     const result = (queues.get(key) ?? Promise.resolve()).then(operation);
     const tail = result.catch(() => {}); queues.set(key, tail);

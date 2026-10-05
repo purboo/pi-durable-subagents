@@ -2,18 +2,18 @@
 // stop-intent{call}; forward{rid,rid2,dest,hash,envelope:{to,kind,body,cond?}};
 // observation{exec,event}; selected{exec,model}; switch-observed{exec,rid,pool}.
 // P28 entries are documented in hibernate.ts; generation session publication in generation.ts.
-// The orchestrator ledger owns
-// hold/release{pool,slot,exec}. All transitions are serialized before publication.
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+// session-corrupt{call,line}: a malformed native session line was skipped (once per line, E4).
+// fence-failed{exec,error} is documented in sweep.ts. The orchestrator ledger owns hold/release{pool,slot,exec}
+// and mem{available,admitted,exec} (on decision change or every 30 s). All transitions are serialized before publication.
+import { mkdir, open, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CT, JT, type CallResult, type Entry, type JournalHandle, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
+import { CT, JT, type CallResult, type Containment, type Entry, type JournalHandle, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
 import { callDir, callInbox, callSession, outboxRoot } from "../../paths.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, forwardRid } from "../../kernel/ids.ts";
 import { capacity, seal } from "../../kernel/guards.ts";
-import { Containment } from "../../platform/containment.ts";
 import { buildPiArgs } from "../../compat/pi-args.ts";
 import { parseModel, resolveModel, type Model } from "../../compat/model.ts";
 import { buildCallResult } from "../../compat/result.ts";
@@ -21,15 +21,20 @@ import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts"
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
 import { hibernation, openQuestion } from "./hibernate.ts";
-import { evidence, readSession, receiptId, sessionModel, type SessionEntry } from "./session.ts";
+import { evidence, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
 import { observeExecution } from "./observe.ts";
 import { availableMemory } from "./memory.ts";
 import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
-import { skipLostCandidate, sweepExecutions } from "./sweep.ts";
+import { recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
+import { gateRetired } from "./effects/gate.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
-type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean };
+type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean;
+  parking?: string; onPark: Set<() => void>; mem?: { admitted: boolean; at: number } };
+const MEM_RECORD_MS = 30000;
+const ignoreMissing = (error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; };
+const callOf = (exec: string) => exec.slice(0, exec.lastIndexOf("#"));
 const shutdownError = () => Object.assign(new Error("executor shutdown; call resumes on recovery"), { name: "ExecutorShutdown" });
 const extension = fileURLToPath(new URL(`../../agent/extension.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url));
 const entriesFor = (journal: JournalHandle, call: string) => journal.entries().filter(e => e.call === call);
@@ -49,15 +54,19 @@ async function defaultModel(): Promise<string | undefined> {
 }
 
 /** P2, P9, P22: Construct the journal-owned execution authority under the engine's OS lock. */
-export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects } = {}): Executor {
+export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects; containment?: Containment } = {}): Executor {
   const { home, config, orch } = ledgers;
-  const containment = new Containment(), effects = options.effects ?? createEffects(ledgers);
+  const containment = options.containment ?? serialContainment(), effects = options.effects ?? createEffects(ledgers);
   const active = new Map<string, Active>(), completed = new Map<string, Promise<CallResult>>(), journals = new Map<string, JournalHandle>();
   let queue: Promise<unknown> = Promise.resolve(), closed = false;
   let suspending: Promise<void> | undefined;
-  let sweeping: Promise<void> | undefined, sweepFailure: unknown;
+  let sweeping: Promise<void> | undefined;
+  // F1: execs whose fence failed in this process; they are retried only by the sweep.
+  const failing = new Set<string>();
+  // F2: a sweep error is transient: report it and retry at the next K1; it never blocks dispatch.
   const sweepTimer = setInterval(() => {
-    if (!sweeping) sweeping = sweepExecutions(journals.values(), containment).catch(error => { sweepFailure = error; }).finally(() => { sweeping = undefined; });
+    if (!sweeping) sweeping = sweepExecutions(journals.values(), containment, { failing: exec => failing.has(exec), fenced: swept, failed: fenceFailed })
+      .catch(error => console.error(`durable-subagents: sweep failed, retrying in K1: ${String(error)}`)).finally(() => { sweeping = undefined; });
   }, options.sweepMs ?? 30000);
   sweepTimer.unref();
   const waiters = new Set<() => void>();
@@ -68,15 +77,21 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const next = queue.then(fn); queue = next.catch(() => {}); return next;
   };
   const wake = () => { for (const fn of waiters) fn(); waiters.clear(); };
-  const holdings = () => {
-    const held = new Map<string, Entry>();
-    for (const e of orch.entries()) {
-      const id = `${e.pool}:${e.slot}`;
-      if (e.type === "hold") held.set(id, e);
-      if (e.type === "release" && held.get(id)?.exec === e.exec) held.delete(id);
+  // F3: fold only orchestrator entries appended since the last fold (holdings, observed switches, K7 skips).
+  const ledger = { seen: 0, held: new Map<string, Entry>(), observed: new Set<string>(), skips: new Map<string, number>() };
+  const folded = () => {
+    const entries = orch.entries();
+    for (; ledger.seen < entries.length; ledger.seen++) {
+      const e = entries[ledger.seen]!, id = `${e.pool}:${e.slot}`;
+      if (e.type === "hold") ledger.held.set(id, e);
+      else if (e.type === "release" && ledger.held.get(id)?.exec === e.exec) ledger.held.delete(id);
+      else if (e.type === "switch-observed") ledger.observed.add(`${e.exec}\n${e.rid}`);
+      else if (e.type === "skip") ledger.skips.set(`${e.pool}\n${e.model}`, Math.max(Number(e.until), ledger.skips.get(`${e.pool}\n${e.model}`) ?? 0));
     }
-    return [...held.values()];
+    return ledger;
   };
+  const holdings = () => [...folded().held.values()];
+  const skipped = (pool: string, model: Model) => (folded().skips.get(`${pool}\n${model.provider}/${model.id}`) ?? 0) > Date.now();
   async function release(exec: string) {
     await serial(async () => { for (const h of holdings().filter(e => e.exec === exec)) await orch.append("release", { pool: h.pool, slot: h.slot, exec }); });
     wake();
@@ -95,15 +110,108 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     });
     return found;
   }
-  async function fence(journal: JournalHandle, exec: string, child?: Spawned) {
-    child?.stdin.end();
-    if (!has(journal, JT.fenced, exec)) {
-      await containment.fence(exec, tracked(journal, exec));
-      await serial(async () => { if (!has(journal, JT.fenced, exec)) await journal.append(JT.fenced, { exec }); });
+  /** P22, F1: Fence an execution; false when its processes did not provably exit. With `park` the call instead waits,
+   *  unsealed and without a new execution, until a sweep proves retirement (suspend/shutdown still interrupt it). */
+  async function fence(journal: JournalHandle, exec: string, opts: { child?: Spawned; park?: Active } = {}): Promise<boolean> {
+    opts.child?.stdin.end();
+    if (has(journal, JT.fenced, exec)) return true;
+    if (!failing.has(exec)) {
+      let retired = false;
+      try { await containment.fence(exec, tracked(journal, exec)); retired = true; }
+      catch (error) { await fenceFailed(journal, exec, callOf(exec), error); }
+      if (retired) { await fenceSucceeded(journal, exec); return true; }
+    }
+    if (!opts.park) return false;
+    await parked(opts.park, journal, exec);
+    return true;
+  }
+  async function fenceSucceeded(journal: JournalHandle, exec: string) {
+    failing.delete(exec);
+    await serial(async () => {
+      if (!has(journal, JT.fenced, exec)) await journal.append(JT.fenced, { exec });
+      await resolveFenceAttention(journal, exec);
+    });
+  }
+  /** F1: A fence timeout is recorded once with one unknown attention item for the origin; any failure parks the exec. */
+  async function fenceFailed(journal: JournalHandle, exec: string, call: string, error: unknown) {
+    if (!failing.has(exec)) console.error(`durable-subagents: fence of ${exec} failed: ${String(error)}`);
+    failing.add(exec);
+    if (/Fence timeout/.test(String(error))) await serial(() => recordFenceFailure(journal, exec, call, error));
+  }
+  async function parked(a: Active, journal: JournalHandle, exec: string) {
+    a.parking = exec;
+    for (const fn of a.onPark) fn();
+    try {
+      while (!has(journal, JT.fenced, exec)) {
+        if (closed || a.suspended) throw shutdownError();
+        await new Promise<void>(resolve => { const timer = setTimeout(resolve, config.k?.trackerMs ?? 1000); a.wake = () => { clearTimeout(timer); resolve(); }; });
+      }
+    } finally { a.parking = undefined; }
+  }
+  /** F1: Wait for a run to settle, or to park on an unfenced execution (a stop/retire never waits on a stuck fence). */
+  function settledOrParked(a: Active): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      if (a.parking) return resolve(undefined);
+      const now = () => resolve(undefined);
+      a.onPark.add(now);
+      void a.promise.then(resolve, reject).finally(() => a.onPark.delete(now));
+    });
+  }
+  /** P23, F1: A sweep proved an exec retired: commit the fence, free its slots and resume or settle its call. */
+  async function swept(journal: JournalHandle, exec: string, call: string, wasFenced: boolean) {
+    if (exec.startsWith("gate:")) { failing.delete(exec); await serial(() => gateRetired(journal, exec)); return; }
+    await fenceSucceeded(journal, exec);
+    if (wasFenced) return;
+    await release(exec);
+    const a = active.get(call);
+    if (a) { a.wake(); return; }
+    if (closed || sealed(journal, call) || current(journal, call) !== exec || !entriesFor(journal, call).some(e => e.type === "stop-intent")) return;
+    const { key, gen } = address(call);
+    await finish(journal, call, exec, buildCallResult({ key, gen, status: "stopped", output: "" }));
+  }
+  // E4: a malformed native session line is skipped exactly like pi does, and recorded once per line.
+  const corruptions = new Set<string>();
+  async function readCall(journal: JournalHandle, call: string): Promise<SessionEntry[]> {
+    const a = address(call), { entries, corrupt } = await readSessionState(callSession(home, a.wid, a.key, a.gen));
+    for (const line of corrupt) {
+      const id = `${call}\n${line}`;
+      if (corruptions.has(id)) continue;
+      corruptions.add(id);
+      if (journal.entries().some(e => e.type === "session-corrupt" && e.call === call && e.line === line)) continue;
+      console.error(`durable-subagents: skipped malformed line ${line} of the session of ${call}`);
+      await journal.append("session-corrupt", { call, line });
+    }
+    return entries;
+  }
+  // E2: inbox files are deleted once their resolution is durable: a child receipt (after an fsync of the session)
+  // or the call's seal. The child never re-applies a resolved request: its receipts are in the session it recovers.
+  const collected = new Map<string, Set<string>>();
+  async function collectReceipts(call: string, entries: SessionEntry[]) {
+    const done = collected.get(call) ?? new Set<string>(); collected.set(call, done);
+    const fresh = new Set<string>();
+    for (const e of entries) {
+      const rid = receiptId(e);
+      if (rid && !done.has(rid) && !/^\.|[/\\\0]/.test(rid) && !(e.customType === CT.rejected && e.data?.reason === "identity-conflict")) fresh.add(rid);
+    }
+    if (!fresh.size) return;
+    const a = address(call), file = await open(callSession(home, a.wid, a.key, a.gen), "r");
+    try { await file.sync(); } finally { await file.close(); }
+    const sender = await outbox, dir = inbox(call);
+    for (const rid of fresh) {
+      await sender.markResolved(rid);
+      await unlink(join(dir, `${rid}.json`)).catch(ignoreMissing);
+      done.add(rid);
+    }
+  }
+  async function collectSealed(call: string) {
+    const sender = await outbox, dir = inbox(call);
+    for (const name of await readdir(dir).catch(error => { ignoreMissing(error); return []; })) {
+      if (name.endsWith(".json") && !name.startsWith(".")) await sender.markResolved(name.slice(0, -5));
+      await rm(join(dir, name), { force: true });
     }
   }
   async function retireForwards(journal: JournalHandle, call: string) {
-    const a = address(call), entries = await readSession(callSession(home, a.wid, a.key, a.gen));
+    const entries = await readCall(journal, call);
     const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
     for (const e of journal.entries().filter(e => e.type === "forward" && e.dest === call)) {
       if (!receipts.has(String(e.rid2)) && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2))
@@ -113,7 +221,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   async function recordUsage(t: CallTicket, values: { id: string; usage: Usage }[]) {
     await serial(async () => {
-      for (const u of values) if (!t.journal.entries().some(e => e.type === "usage" && e.call === t.callId && e.id === u.id)) await t.journal.append("usage", { call: t.callId, ...u });
+      const recorded = new Set(t.journal.entries().filter(e => e.type === "usage" && e.call === t.callId).map(e => e.id));
+      for (const u of values) if (!recorded.has(u.id)) { await t.journal.append("usage", { call: t.callId, ...u }); recorded.add(u.id); }
       await workflowReached(t);
     });
   }
@@ -126,7 +235,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   async function retireAttention(journal: JournalHandle, call: string) {
     for (const e of journal.entries().filter(e => e.type === JT.attention)) {
       const item = e.item as { id: string; rev: number; call?: string; kind?: string };
-      if (item.kind === "finished" || item.id === `unknown:${call}`) continue;
+      if (item.kind === "finished" || item.id === `unknown:${call}` || item.id.startsWith("fence:")) continue;
       if (item.call === call && !journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev))
         await journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "retired" });
     }
@@ -174,6 +283,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await unknownAttention(journal, call);
       return result;
     });
+    await collectSealed(call).catch(error => console.error(`durable-subagents: inbox cleanup of ${call} failed: ${String(error)}`));
     await release(exec);
     if (a) await effects.afterSeal(a.ticket, value);
     return value;
@@ -186,16 +296,19 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const changed = new Promise<void>(resolve => { signal = resolve; waiters.add(resolve); });
       const chosen = await serial(async () => {
         if (interrupted(a) || await workflowReached(a.ticket)) return;
-        if (sweepFailure) throw sweepFailure;
         for (const model of models) {
-          if (!continuation && pool && orch.entries().some(e => e.type === "skip" && e.pool === pool && e.model === `${model.provider}/${model.id}` && Number(e.until) > Date.now())) continue;
+          if (!continuation && pool && skipped(pool, model)) continue;
           const provider = model.provider;
           const holders = holdings().filter(e => e.pool === provider);
           const limit = config.providers?.[provider ?? ""]?.slots ?? Infinity;
           if (!capacity({ kind: "provider", holders: holders.length, capacity: limit })) continue;
           const available = await (options.memory ?? availableMemory)();
-          await orch.append("mem", { available });
-          if (!capacity({ kind: "memory", available, reserve: config.memory?.reserveMb ?? 2048, perChild: config.memory?.perChildMb ?? 300 })) return;
+          const admitted = capacity({ kind: "memory", available, reserve: config.memory?.reserveMb ?? 2048, perChild: config.memory?.perChildMb ?? 300 });
+          // F3: record the observation only when the decision changes, or every 30 s while it holds.
+          if (a.mem?.admitted !== admitted || Date.now() - a.mem.at >= MEM_RECORD_MS) {
+            await orch.append("mem", { available, admitted, exec }); a.mem = { admitted, at: Date.now() };
+          }
+          if (!admitted) return;
           const memory = holdings().filter(e => e.pool === "memory");
           let memorySlot = 0; while (memory.some(e => e.slot === memorySlot)) memorySlot++;
           await orch.append("hold", { pool: "memory", slot: memorySlot, exec });
@@ -221,16 +334,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const pool = raw && config.pools?.[raw] ? raw : undefined;
     const candidates = raw ? resolveModel(raw, config.pools) : [{ id: "" }];
     const candidate = recorded && candidates.some(m => m.provider === recorded.provider && m.id === recorded.id);
-    const skipped = previous && ownSegment && pool && candidate && orch.entries().some(e => e.type === "skip" && e.pool === pool && e.model === `${recorded!.provider}/${recorded!.id}` && Number(e.until) > Date.now());
-    if (recorded && !freshFork && !skipped) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined };
+    const skip = previous && ownSegment && pool && candidate && skipped(pool, recorded!);
+    if (recorded && !freshFork && !skip) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined };
     return { candidates, continuation: false, pool };
   }
   async function questions(t: CallTicket, entries: SessionEntry[]) {
-    const sender = await outbox;
-    for (const entry of entries) {
-      const receipt = receiptId(entry);
-      if (typeof receipt === "string") await sender.markResolved(receipt);
-    }
+    await collectReceipts(t.callId, entries).catch(error => console.error(`durable-subagents: inbox cleanup of ${t.callId} failed: ${String(error)}`));
     await serial(async () => {
       for (const e of entries) {
         if (e.type !== "custom" || e.customType !== CT.question || !e.data) continue;
@@ -254,7 +363,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     await serial(async () => {
       const target = holdings().find(h => h.exec === exec && h.pool === provider && h.reserved);
       if (!target) return;
-      if (!orch.entries().some(e => e.type === "switch-observed" && e.exec === exec && e.rid === target.rid)) {
+      if (!folded().observed.has(`${exec}\n${target.rid}`)) {
         await orch.append("switch-observed", { exec, rid: target.rid, pool: provider });
         for (const h of holdings().filter(h => h.exec === exec && h.pool !== provider && h.pool !== "memory")) await orch.append("release", { pool: h.pool, slot: h.slot, exec });
       }
@@ -262,7 +371,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     wake();
   }
   function pendingSwitch(exec: string) {
-    return holdings().find(h => h.exec === exec && h.reserved && !orch.entries().some(e => e.type === "switch-observed" && e.exec === exec && e.rid === h.rid));
+    return holdings().find(h => h.exec === exec && h.reserved && !folded().observed.has(`${exec}\n${h.rid}`));
   }
   async function execute(a: Active): Promise<CallResult> {
     const t = a.ticket, journal = t.journal;
@@ -276,19 +385,19 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     } catch (error) {
       const exec = current(journal, t.callId) ?? `${t.callId}#1.1`;
       if (!current(journal, t.callId)) await serial(() => journal.append(JT.exec, { call: t.callId, exec }));
-      await fence(journal, exec);
+      await fence(journal, exec, { park: a });
       return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
     }
     for (;;) {
       const old = sealed(journal, t.callId); if (old) return old;
       if (closed || a.suspended || a.retired || journal.entries().some(e => e.type === "retired" && e.call === t.callId)) throw shutdownError();
       let exec = current(journal, t.callId);
-      let entries = await readSession(session);
+      let entries = await readCall(journal, t.callId);
       let dangling: string[] = [];
       let bound: Entry | undefined;
       const sleeping = hibernation(journal, t.callId);
       if (exec && sleeping?.exec === exec) {
-        await fence(journal, exec); await release(exec);
+        await fence(journal, exec, { park: a }); await release(exec);
         for (;;) {
           if (interrupted(a) || has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs) break;
           if (reached(totalUsage(journal.entries(), t.callId), t.spec.budget) || reached(totalUsage(journal.entries()), t.workflowBudget))
@@ -301,8 +410,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const pendingAnswer = journal.entries().findLast(e => e.type === "answer-bound" && e.call === t.callId);
       if (!bound && pendingAnswer && !entries.some(e => receiptId(e) === pendingAnswer.rid2)) bound = pendingAnswer;
       if (exec) {
-        await fence(journal, exec);
-        await questions(t, entries = await readSession(session));
+        await fence(journal, exec, { park: a });
+        await questions(t, entries = await readCall(journal, t.callId));
         await recordUsage(t, sessionUsage(entries, t.callId));
         const ev = evidence(entries, exec); dangling = ev.dangling;
         if (closed || a.suspended || a.retired) throw shutdownError();
@@ -329,17 +438,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const epoch = previous ? Number(previous.split(".").at(-1)) + 1 : 1;
       exec = `${t.callId}#1.${epoch}`;
       await serial(() => journal.append(JT.exec, { exec, call: t.callId }));
-      if (interrupted(a)) { await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("stopped")); }
-      if (await serial(() => workflowReached(t))) { await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("failed", "", "workflow budget reached")); }
+      if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
+      if (await serial(() => workflowReached(t))) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", "workflow budget reached")); }
       let decision: Awaited<ReturnType<typeof launchModel>>;
       try {
         decision = await launchModel(t, entries, previous);
       } catch (error) {
-        await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
+        await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
       }
       const model = await acquire(a, exec, decision.candidates, decision.pool, decision.continuation);
       if (!model || interrupted(a)) {
-        await fence(journal, exec);
+        await fence(journal, exec, { park: a });
         return finish(journal, t.callId, exec, !interrupted(a) ? makeResult("failed", "", "workflow budget reached") : makeResult("stopped"));
       }
       await mkdir(dir, { recursive: true });
@@ -359,19 +468,19 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (openingRid && !openingReceived) await sender.send(t.callId, "task", { message: t.opening!.message }, undefined, { rid: openingRid });
       else if (unresolved && !receipt) await sender.send(t.callId, "continue", { message: String(unresolved.message) }, { qid: String(unresolved.qid), rev: Number(unresolved.rev) }, { rid: String(unresolved.rid2) });
       else await sender.send(t.callId, previous ? "continue" : "task", { message: previous ? `Continue the task. Tool calls whose outcomes are unknown: ${dangling.join(", ") || "none"}.` : t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
-      if (interrupted(a)) { await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("stopped")); }
+      if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       let child: Spawned;
       try {
         child = await containment.spawn({ exec, command: "pi", args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
           env: { DSA_HOME: home, DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
       } catch (error) {
-        await fence(journal, exec); return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
+        await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
       }
       try {
         await track(journal, exec, [{ pid: child.pid, start: child.start, ppid: process.pid }]);
-        await observeExecution({ home, config, ticket: t, exec, child, serial,
+        await observeExecution({ home, config, ticket: t, exec, child, serial, read: () => readCall(journal, t.callId),
           setWake: fn => { a.wake = fn; }, interrupted: () => !!interrupted(a),
-          track: () => track(journal, exec!), fence: () => fence(journal, exec!, child),
+          track: () => track(journal, exec!), fence: async () => { await fence(journal, exec!, { child, park: a }); },
           questions: async entries => {
             await questions(t, entries);
             const q = openQuestion(entries);
@@ -386,7 +495,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           }, recordUsage: values => recordUsage(t, values),
           switched: event => switched(exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
-      } finally { await fence(journal, exec, child); }
+      } finally { await fence(journal, exec, { child, park: a }); }
     }
   }
   async function replayForward(e: Entry) {
@@ -398,7 +507,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const existing = completed.get(ticket.callId); if (existing) return existing;
       if (closed || suspending) return Promise.reject(shutdownError());
       journals.set(ticket.wid, ticket.journal);
-      const a: Active = { ticket, controller: new AbortController(), stopped: false, wake: () => {}, promise: undefined! };
+      const a: Active = { ticket, controller: new AbortController(), stopped: false, wake: () => {}, promise: undefined!, onPark: new Set() };
       active.set(ticket.callId, a);
       a.promise = execute(a).catch(error => {
         completed.delete(ticket.callId);
@@ -406,8 +515,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         throw error;
       }).finally(async () => {
         const exec = current(ticket.journal, ticket.callId);
-        try { if (exec) { await fence(ticket.journal, exec); await release(exec); } }
-        finally { active.delete(ticket.callId); wake(); }
+        try { if (exec && await fence(ticket.journal, exec)) await release(exec); }
+        finally {
+          active.delete(ticket.callId); collected.delete(ticket.callId); forgetSession(callSession(home, ticket.wid, ticket.key, ticket.gen)); wake();
+        }
       });
       // Shutdown rejection is still delivered to callers, without an unhandled rejection during teardown.
       void a.promise.catch(() => {});
@@ -496,10 +607,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       wake();
       for (const call of calls) {
         const a = active.get(call);
-        if (a) await a.promise;
+        if (a) await settledOrParked(a);
         else {
           const exec = current(journal, call); if (!exec || sealed(journal, call)) continue;
-          await fence(journal, exec);
+          // F1: a stuck fence leaves the call unsealed; the sweep seals it stopped once the exec is retired.
+          if (!await fence(journal, exec)) continue;
           const { key, gen } = address(call);
           await finish(journal, call, exec, buildCallResult({ key, gen, status: "stopped", output: "" }));
         }
@@ -509,19 +621,25 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       journals.set(wid, journal);
       await effects.recover(journal);
       for (const e of journal.entries().filter(e => e.type === JT.exec)) {
-        const exec = String(e.exec); await fence(journal, exec); await release(exec);
+        // F1: an exec whose fence fails stays unfenced and holding; its call parks until a sweep retires it.
+        const exec = String(e.exec); if (await fence(journal, exec)) await release(exec);
       }
-      for (const call of new Set(journal.entries().filter(e => e.type === JT.exec).map(e => String(e.call)))) {
-        const a = address(call), values = sessionUsage(await readSession(callSession(home, a.wid, a.key, a.gen)), call);
+      const calls = new Set(journal.entries().filter(e => e.type === JT.exec).map(e => String(e.call)));
+      for (const call of calls) {
+        const values = sessionUsage(await readCall(journal, call), call);
         await serial(async () => {
-          for (const u of values) if (!journal.entries().some(e => e.type === "usage" && e.call === call && e.id === u.id)) await journal.append("usage", { call, ...u });
+          const recorded = new Set(journal.entries().filter(e => e.type === "usage" && e.call === call).map(e => e.id));
+          for (const u of values) if (!recorded.has(u.id)) await journal.append("usage", { call, ...u });
           if (sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) {
             await retireForwards(journal, call); await retireAttention(journal, call); await unknownAttention(journal, call);
           }
         });
+        if (!active.has(call)) { const a = address(call); forgetSession(callSession(home, a.wid, a.key, a.gen)); }
       }
       for (const e of journal.entries().filter(e => e.type === "forward" && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2))) await replayForward(e);
       await (await outbox).republishPending();
+      // E2: republication may restore envelopes of sealed calls; those are resolved by the seal.
+      for (const call of calls) if (sealed(journal, call)) await collectSealed(call).catch(error => console.error(`durable-subagents: inbox cleanup of ${call} failed: ${String(error)}`));
     },
     async retire(widRev) {
       const journal = journals.get(widRev.slice(0, widRev.lastIndexOf("@"))); if (!journal) return;
@@ -531,8 +649,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       for (const call of calls) active.get(call)?.wake();
       wake();
       for (const call of calls) {
-        const a = active.get(call); if (a) await a.promise;
-        for (const e of journal.entries().filter(e => e.type === JT.exec && e.call === call)) { await fence(journal, String(e.exec)); await release(String(e.exec)); }
+        const a = active.get(call); if (a) await settledOrParked(a);
+        for (const e of journal.entries().filter(e => e.type === JT.exec && e.call === call)) if (await fence(journal, String(e.exec))) await release(String(e.exec));
         await serial(async () => { await retireForwards(journal, call); await retireAttention(journal, call); });
       }
     },

@@ -2,7 +2,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -12,12 +12,13 @@ import { callDir, callInbox, callSession, journalPath, orchLedger, outboxRoot } 
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { scanInbox } from "../../../src/kernel/mailbox.ts";
 import { contentHash, forwardRid, ulid } from "../../../src/kernel/ids.ts";
-import { CT, JT, type JournalHandle, type Request } from "../../../src/types.ts";
+import { CT, JT, type Containment, type JournalHandle, type Request } from "../../../src/types.ts";
 import type { CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
 import createExecutor from "../../../src/orchestrator/executor/index.ts";
 import { availableMemory } from "../../../src/orchestrator/executor/memory.ts";
 import { evidence } from "../../../src/orchestrator/executor/session.ts";
+import { serialContainment } from "../../../src/orchestrator/executor/sweep.ts";
 
 const recorder = fileURLToPath(new URL("recorder.ts", import.meta.url));
 const agent = { name: "test", description: "test", body: "Test agent", model: "probe/scripted", tools: ["bash"], systemPromptMode: "replace" as const, inheritProjectContext: false, inheritSkills: false, sourcePath: "/fixture/test.md", source: "project" as const };
@@ -58,6 +59,9 @@ async function nativeSession(t: TestContext, f: Awaited<ReturnType<typeof setup>
   await pi.waitFor(settled);
   return { pi, exec, ticket };
 }
+/** Every envelope the orchestrator sent, from its durable outbox (inbox files are deleted once resolved, E2). */
+const sent = (home: string) => readJournalSnapshot(join(outboxRoot(home), "outbox", "orch.jsonl")).filter(e => e.type === "sent").map(e => e.request as Request);
+const inboxFiles = async (f: { home: string; wid: string }, key = "a", gen = 1) => (await readdir(callInbox(f.home, f.wid, key, gen)).catch(() => [] as string[])).filter(n => !n.startsWith("."));
 function assertSealed(journal: JournalHandle, call: string, status: string) {
   const seals = journal.entries().filter(e => e.type === JT.sealed && e.call === call);
   assert.equal(seals.length, 1); assert.equal((seals[0]!.result as { status: string }).status, status);
@@ -419,7 +423,10 @@ test("C1 empty reply loses once, then continues in the same native session", { t
   assert.equal(entries.filter(e => e.type === "session").length, 1);
   assert.equal(entries.filter(e => e.customType === CT.exec).length, 2);
   assert.equal(entries.filter(e => e.type === "model_change").length, 1);
-  assert.ok((await scanInbox(callInbox(f.home, f.wid, "a", 1))).some(r => r.kind === "continue"));
+  const requests = sent(f.home).filter(r => r.to === ticket.callId);
+  assert.deepEqual(requests.map(r => r.kind), ["task", "continue"]);
+  for (const r of requests) assert.equal(entries.filter(e => e.type === "custom_message" && e.details?.rid === r.rid).length, 1, "each request is applied exactly once");
+  assert.deepEqual(await inboxFiles(f), [], "resolved inbox envelopes are deleted");
 });
 
 test("C1 K2 consecutive empty responses seal failed", { timeout: 30000 }, async t => {
@@ -468,7 +475,7 @@ test("C1 SIGKILL during a tool fences its detached orphan and continues", { time
   assert.equal((await pending).status, "ok");
   const state = await readFile(`/proc/${orphan}/stat`, "utf8").catch(() => "");
   assert.ok(!state || /\) Z /.test(state));
-  const continuation = (await scanInbox(callInbox(f.home, f.wid, "a", 1))).find(r => r.kind === "continue")!;
+  const continuation = sent(f.home).find(r => r.kind === "continue")!;
   assert.match((continuation.body as { message: string }).message, /unknown.*bash/);
 });
 
@@ -604,7 +611,8 @@ test("X1 seal retires forwards lacking child receipts and recovery never republi
   await f.executor.stop({ wid: f.wid });
   const retired = f.journal.entries().find(e => e.type === "forward-retired")!;
   assert.equal(retired.rid, req.rid); assert.equal(retired.reason, "retired-without-child-receipt");
-  const file = join(callInbox(f.home, f.wid, "a", 1), `${retired.rid2}.json`); await rm(file);
+  const file = join(callInbox(f.home, f.wid, "a", 1), `${retired.rid2}.json`);
+  assert.equal(existsSync(file), false, "the seal resolves and deletes the envelope");
   await f.executor.recover(f.wid, f.journal);
   assert.equal(existsSync(file), false);
 });
@@ -779,4 +787,77 @@ test("C5/C8 an execution fenced before pi persisted its session restarts with th
   const native = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
   const models = native.filter(e => e.type === "message" && e.message.role === "assistant").map(e => `${e.message.provider}/${e.message.model}`);
   assert.ok(models.length >= 1); assert.deepEqual([...new Set(models)], ["probe/scripted2"]);
+});
+
+test("E2 a receipted envelope is deleted while its call runs; the next execution never re-applies it", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 25 } }), ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 1.5" } }, { empty: true }, { text: "finished" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  const req: Request = { rid: "gc-steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "steered once" } };
+  await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: "a", gen: 1 });
+  const rid2 = f.journal.entries().find(e => e.type === "forward")!.rid2 as string, file = join(callInbox(f.home, f.wid, "a", 1), `${rid2}.json`);
+  assert.ok(existsSync(file));
+  await until(() => !existsSync(file) || f.journal.entries().some(e => e.type === JT.sealed));
+  assert.ok(!f.journal.entries().some(e => e.type === JT.sealed), "deleted on the child receipt, before the seal");
+  const result = await pending;
+  assert.equal(result.output, "finished"); assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 2);
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(rows.filter(e => e.type === "custom_message" && e.details?.rid === rid2).length, 1);
+  assert.ok(readJournalSnapshot(join(outboxRoot(f.home), "outbox", "orch.jsonl")).some(e => e.type === "resolved" && e.rid === rid2));
+  assert.ok(!f.journal.entries().some(e => e.type === "forward-retired"));
+  assert.deepEqual(await inboxFiles(f), []);
+});
+
+test("E4 a torn session line terminated by pi's next load is skipped once; entries after it stay visible", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 50 } }), ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 60" } }, { text: "after repair" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  const file = callSession(f.home, f.wid, "a", 1);
+  await appendFile(file, `{"type":"custom","customType":"${CT.report}","data":{"exe`);
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "ok"); assert.equal(result.output, "after repair");
+  const lines = (await readFile(file, "utf8")).split("\n");
+  const bad = lines.findIndex(l => { try { JSON.parse(l); return false; } catch { return l !== ""; } }) + 1;
+  assert.ok(bad > 0 && lines.slice(bad).filter(Boolean).length > 3, "pi terminated the torn line and appended after it");
+  assert.ok(lines.slice(bad).some(l => l.includes(`${ticket.callId}#1.2`)));
+  const corrupt = () => f.journal.entries().filter(e => e.type === "session-corrupt").map(e => [e.call, e.line]);
+  assert.deepEqual(corrupt(), [[ticket.callId, bad]]);
+  const fresh = createExecutor({ home: f.home, orch: f.orch, config: {} });
+  try { await fresh.recover(f.wid, f.journal); } finally { await fresh.shutdown(); }
+  assert.deepEqual(corrupt(), [[ticket.callId, bad]]);
+});
+
+test("F1 a stuck fence of a real child parks only its call with attention; a sibling completes; the sweep then seals it", { timeout: 45000 }, async t => {
+  const real = serialContainment();
+  let stuck: string | undefined;
+  const containment: Containment = { spawn: spec => real.spawn(spec), scan: known => real.scan(known),
+    fence: async (exec, tracked, opts) => { if (exec === stuck) throw new Error(`Fence timeout: ${exec}`); return real.fence(exec, tracked, opts); } };
+  const f = await setup(t, { k: { trackerMs: 25 } }, { containment, sweepMs: 100 });
+  // pi exits when its stdin ends (rpc-mode.js:642) and kills its bash tree (shell.js killProcessTree), so only a
+  // detached (setsid) descendant outlives the child: it plays the process the stuck fence cannot retire.
+  const a = f.ticket("a", script([{ tool: "bash", args: { command: "setsid sleep 60 >/dev/null 2>&1 & sleep 60" } }, { text: "never" }])), b = f.ticket("b", script([{ delayMs: 300, text: "sibling done" }]));
+  const ea = `${a.callId}#1.1`, tagged = async () => (await new ProcessTable().list()).filter(p => p.tag === ea);
+  t.mock.method(console, "error", () => {});
+  stuck = ea;
+  try {
+    const pa = f.executor.run(a);
+    await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+    const pb = f.executor.run(b);
+    await Promise.race([f.executor.stop({ wid: f.wid, callId: a.callId }), delay(10000).then(() => { throw new Error("stop waited on a stuck fence"); })]);
+    assert.equal(f.journal.entries().filter(e => e.type === "fence-failed" && e.exec === ea).length, 1);
+    assert.ok(f.journal.entries().some(e => e.type === JT.attention && (e.item as { id: string; kind: string }).id === `fence:${ea}` && (e.item as { kind: string }).kind === "unknown"));
+    assert.equal((await pb).output, "sibling done");
+    assert.ok((await tagged()).length > 0, "the detached descendant of the stuck execution is still alive");
+    await delay(400);
+    assert.equal(f.journal.entries().filter(e => e.type === "fence-failed" && e.exec === ea).length, 1);
+    assert.equal(f.journal.entries().filter(e => e.type === JT.exec && e.call === a.callId).length, 1);
+    assert.ok(!f.journal.entries().some(e => e.type === JT.sealed && e.call === a.callId));
+    stuck = undefined;
+    assert.equal((await pa).status, "stopped");
+    assertSealed(f.journal, a.callId, "stopped");
+    assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${ea}` && e.resolution === "fenced"));
+    assert.deepEqual(await tagged(), []);
+  } finally { stuck = undefined; await real.fence(ea, []).catch(() => {}); }
 });
