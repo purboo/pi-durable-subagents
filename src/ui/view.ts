@@ -7,7 +7,7 @@ export interface ViewState {
   folded: Set<string>; done: Map<string, number>; viewed: Set<string>; finished: boolean;
   observed?: Map<string, { working: number; failures: Set<string> }>;
 }
-export interface ListRow { id: string; kind: "workflow" | "call" | "done" | "more" | "finished"; text: string; workflow?: WorkflowSnapshot; call?: CallSnapshot; failed?: boolean }
+export interface ListRow { id: string; kind: "workflow" | "call" | "preview" | "done" | "more" | "finished"; text: string; workflow?: WorkflowSnapshot; call?: CallSnapshot; failed?: boolean }
 export type ModelName = (model: string | undefined) => string;
 
 /** UI §2: Render compact wall-clock durations; never present these as charged active time. */
@@ -32,8 +32,9 @@ export function modelLabel(model: string | undefined, find: (provider: string, i
 export const toolCount = (n: number | undefined) => n ? `${n} tool${n === 1 ? "" : "s"}` : "";
 /** UI §2: Stable workflow order — own session first, then start time (oldest first), never by activity. */
 export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt">>(workflows: readonly T[], own?: string): T[] {
+  // Newest first; start times never change, so the order is stable while you read.
   return [...workflows].sort((a, b) => Number(b.origin === own) - Number(a.origin === own) ||
-    (a.startedAt ?? Infinity) - (b.startedAt ?? Infinity) || (a.wid < b.wid ? -1 : a.wid > b.wid ? 1 : 0));
+    (b.startedAt ?? 0) - (a.startedAt ?? 0) || (a.wid < b.wid ? 1 : a.wid > b.wid ? -1 : 0));
 }
 /** UI §2: Done rows newest result first by immutable end time; ties keep snapshot order, so rows never reshuffle. */
 export function doneOrder(calls: readonly CallSnapshot[]): CallSnapshot[] {
@@ -45,11 +46,13 @@ export function keepSelection(rows: readonly { id: string }[], id: string | unde
   return Math.max(0, Math.min(found >= 0 ? found : fallback, rows.length - 1));
 }
 /** UI §2: Compose a call row within `width`: model column dropped first (<60), then tool/age tail, then the phrase is cut. */
-export function rowText(indent: string, key: string, model: string, phrase: string, tail: readonly string[], width: number): string {
-  const head = `${indent}${key}  ${width >= 60 ? `${model}  ` : ""}`, end = tail.filter(Boolean).join("  ");
+export function rowText(indent: string, key: string, model: string, phrase: string, tail: readonly string[], width: number, cols = { key: 0, model: 0 }): string {
+  const short = width < 70 ? model.replace(/\s*\([^)]*\)$/, "") : model; // narrow: drop the provider, keep the model
+  const pad = (text: string, n: number) => text + " ".repeat(Math.max(0, n - visibleWidth(text)));
+  const head = `${indent}${pad(key, cols.key)}  ${width >= 40 ? `${pad(short, width < 70 ? 0 : cols.model)}  ` : ""}`, end = tail.filter(Boolean).join(" · ");
   const room = width - visibleWidth(head) - (end ? visibleWidth(end) + 2 : 0);
   if (!end || room < 12) return truncateToWidth(head + phrase, Math.max(1, width));
-  return `${head}${truncateToWidth(phrase, room)}  ${end}`;
+  return `${head}${pad(truncateToWidth(phrase, room), room)}  ${end}`;
 }
 /** UI §2: Prefer report phrases while retaining truthful terminal status and failure reasons. */
 export function resultPhrase(call: CallSnapshot): string {
@@ -58,7 +61,9 @@ export function resultPhrase(call: CallSnapshot): string {
   const data = r.data as { summary?: unknown; phrase?: unknown } | undefined;
   const phrase = typeof data?.summary === "string" ? data.summary : typeof data?.phrase === "string" ? data.phrase : undefined;
   if (phrase) return phrase;
-  if (r.status === "ok") return "done";
+  // The overview shows what each finished agent concluded: its final line (legacy LEAF:/REVIEW: lines included).
+  const last = r.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
+  if (r.status === "ok") return last ? `done · ${last}` : "done";
   if (r.status === "skipped") return r.error ? `skipped (${r.error})` : "skipped";
   if (r.status === "parked") return r.error ? `parked: ${r.error}` : "parked";
   return `failed: ${r.error ?? r.status}`;
@@ -70,7 +75,9 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   if (question) return `asking main agent: ${question.text}`;
   if (workflow.attention.some(a => a.kind === "stall" && a.call === call.callId)) return `no activity for ${duration(now - Math.max(call.lastActivity ?? call.startedAt ?? now, facts?.lastActivity ?? 0))}`;
   if (call.phase === "queued") return "queued: waiting for capacity";
-  return facts?.activity ?? "thinking";
+  // Liveness (UI §2): the age of the newest evidence ticks, and resets whenever the agent does anything.
+  const since = duration(Math.max(0, now - Math.max(call.lastActivity ?? 0, facts?.lastActivity ?? 0, call.startedAt ?? 0)));
+  return facts?.activity ? `${facts.activity} · ${since}` : `thinking · ${since}`;
 }
 function failed(c: CallSnapshot) { return c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped"; }
 
@@ -78,10 +85,21 @@ function failed(c: CallSnapshot) { return c.phase === "sealed" && c.result && !c
 export const label = (c: { key: string; gen: number }) => c.gen > 1 ? `${c.key}@${c.gen}` : c.key;
 
 /** UI §1,4: One working sentence, or a completion sentence naming only exceptions. */
+export function summary(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; done: number; total: number } {
+  const running = workflows.filter(w => w.status === "running"), calls = running.flatMap(w => w.calls);
+  const asking = running.reduce((n, w) => n + w.calls.filter(c => c.phase !== "sealed" && w.attention.some(a => a.kind === "question" && a.call === c.callId)).length, 0);
+  return { working: calls.filter(c => c.phase !== "sealed").length - asking, asking, done: calls.filter(c => c.phase === "sealed").length, total: calls.length };
+}
+/** UI §1: What needs you first, then what is running, then progress — e.g. "1 asks you · 3 working · 12/40 done". */
+export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
+  const s = summary(workflows), finished = workflows.filter(w => w.status !== "running").length;
+  if (!s.total) return finished ? `${finished} finished` : "nothing running";
+  return [s.asking ? `${s.asking} asks you` : "", s.working ? `${s.working} working` : "", `${s.done}/${s.total} done`].filter(Boolean).join(" · ");
+}
 export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
-  const working = workflows.flatMap(w => w.calls).filter(c => c.phase !== "sealed").length;
-  if (working) return `${working} subagent${working === 1 ? "" : "s"} working  ↓`;
+  const s = summary(workflows);
+  if (s.working || s.asking) return `${summaryText(workflows)}  ↓`;
   const w = workflows.filter(w => w.status !== "running").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
   if (!w) return undefined;
   const latest = [...new Map(w.calls.map(c => [c.key, c])).values()]; // the newest generation of each key (P37)
@@ -108,27 +126,33 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
   }
   const unviewed = (w: WorkflowSnapshot) => w.calls.some(c => failed(c) && !state.viewed.has(c.callId));
   const finished = workflows.filter(w => w.status !== "running" && !unviewed(w));
-  const visible = workflows.filter(w => w.status === "running" || unviewed(w));
-  visible.sort((a, b) => Number(unviewed(b)) - Number(unviewed(a)) || Number(a.calls.length === 1) - Number(b.calls.length === 1));
+  const visible = workflows.filter(w => w.status === "running" || unviewed(w)); // caller order: newest first
   if (state.finished) visible.push(...finished);
-  const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string) => {
+  // Aligned columns across the whole list (UI §2): key and model start at the same column on every row.
+  const shownCalls = visible.flatMap(w => w.calls);
+  const cols = { key: Math.min(18, Math.max(0, ...shownCalls.map(c => visibleWidth(label(c))))),
+    model: Math.min(26, Math.max(0, ...shownCalls.map(c => visibleWidth(name(facts.get(c.callId)?.model ?? c.model))))) };
+  const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
-    const text = rowText(indent, label(c), name(f?.model ?? c.model), statusPhrase(c, w, f, now), [toolCount(f?.tools), age], width);
+    const text = rowText(indent, label(c), name(f?.model ?? c.model), statusPhrase(c, w, f, now), [toolCount(f?.tools), age], width, cols);
     rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), text });
+    // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.
+    if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)) });
   };
   for (const w of visible) {
-    if (w.calls.length === 1) { callRow(w, w.calls[0]!, "  "); continue; }
+    if (w.calls.length === 1) { callRow(w, w.calls[0]!, "  ", "    "); continue; }
     // Stable order (UI §2): active rows keep proposal (snapshot) order; done rows by immutable end time.
-    const done = doneOrder(w.calls), active = w.calls.filter(c => c.phase !== "sealed");
-    rows.push({ id: w.wid, kind: "workflow", workflow: w, text: `  ${w.name ?? w.wid} · ${done.length}/${w.calls.length} · ${duration((w.endedAt ?? now) - (w.startedAt ?? now))}` });
-    if (state.folded.has(w.wid)) continue;
-    for (const c of active) callRow(w, c, "    ");
+    const done = doneOrder(w.calls), active = w.calls.filter(c => c.phase !== "sealed"), folded = state.folded.has(w.wid);
+    rows.push({ id: w.wid, kind: "workflow", workflow: w, text: `${folded ? "▸" : "▾"} ${w.name ?? w.wid} · ${done.length}/${w.calls.length} · ${duration((w.endedAt ?? now) - (w.startedAt ?? now))}` });
+    if (folded) continue;
+    active.forEach((c, i) => { const last = i === active.length - 1 && !done.length; callRow(w, c, last ? "  └ " : "  ├ ", last ? "      " : "  │   "); });
     if (!done.length) continue;
-    const count = state.done.get(w.wid) ?? (!active.length || unviewed(w) ? 8 : 0);
-    rows.push({ id: `${w.wid}:done`, kind: "done", workflow: w, text: `    ${done.length} done` });
-    for (const c of done.slice(0, count)) callRow(w, c, "    ");
-    if (count && done.length > count) rows.push({ id: `${w.wid}:more`, kind: "more", workflow: w, text: `    ${done.length - count} more` });
+    const count = state.done.get(w.wid) ?? (!active.length || unviewed(w) ? 8 : 0), shown = done.slice(0, count);
+    rows.push({ id: `${w.wid}:done`, kind: "done", workflow: w, text: `  └ ${count ? "▾" : "▸"} ${done.length} done` });
+    const more = count && done.length > count;
+    shown.forEach((c, i) => callRow(w, c, i === shown.length - 1 && !more ? "      └ " : "      ├ "));
+    if (more) rows.push({ id: `${w.wid}:more`, kind: "more", workflow: w, text: `      └ … ${done.length - count} more` });
   }
-  if (finished.length) rows.push({ id: "finished", kind: "finished", text: `  ${finished.length} finished workflow${finished.length === 1 ? "" : "s"}` });
+  if (finished.length) rows.push({ id: "finished", kind: "finished", text: `${state.finished ? "▾" : "▸"} ${finished.length} finished workflow${finished.length === 1 ? "" : "s"}` });
   return rows;
 }

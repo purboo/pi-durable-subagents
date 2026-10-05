@@ -4,7 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { doneOrder, duration, keepSelection, label, listRows, modelLabel, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { doneOrder, duration, keepSelection, summaryText, label, listRows, modelLabel, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
 import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
@@ -147,7 +147,11 @@ export class SubagentScreen implements Component {
     } else if (!this.watching || this.doneTab) {
       if (this.doneTab && (matchesKey(key, "left") || matchesKey(key, "right"))) this.switchTab(matchesKey(key, "left") ? -1 : 1);
       else if (matchesKey(key, "up") || matchesKey(key, "down")) {
-        this.selected = Math.max(0, Math.min(this.rows.length - 1, this.selected + (matchesKey(key, "up") ? -1 : 1)));
+        // Preview lines belong to the agent row above them; the cursor skips them.
+        const step = matchesKey(key, "up") ? -1 : 1;
+        let next = this.selected + step;
+        while (this.rows[next]?.kind === "preview") next += step;
+        if (this.rows[next]) this.selected = next;
         this.selectedId = this.rows[this.selected]?.id;
       }
       else if (matchesKey(key, "enter")) this.selectRow(this.rows[this.selected]);
@@ -238,14 +242,17 @@ export class SubagentScreen implements Component {
         const f = this.data.facts.get(c.callId);
         return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", label(c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], size.width) };
       }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, size.width);
-      this.selected = keepSelection(this.rows, this.selectedId, this.selected); this.selectedId = this.rows[this.selected]?.id;
+      this.selected = keepSelection(this.rows, this.selectedId, this.selected);
+      while (this.rows[this.selected]?.kind === "preview" && this.selected > 0) this.selected--;
+      this.selectedId = this.rows[this.selected]?.id;
       const start = Math.max(0, this.selected - size.height + 1);
       const lines = this.rows.slice(start, start + size.height).map((row, i) => {
-        const text = row.failed ? this.theme.fg("error", fitWidth(row.text, size.width)) : fitWidth(row.text, size.width);
+        const fit = fitWidth(row.text, size.width);
+        const text = row.failed ? this.theme.fg("error", fit) : row.kind === "preview" ? this.theme.fg("dim", fit) : row.kind === "workflow" ? this.theme.bold(fit) : fit;
         return i + start === this.selected ? this.theme.bg("selectedBg", text) : text;
       });
       const keys = "↑ ↓ select · Enter open · Esc back";
-      return panel(this.rows.length ? lines : ["No subagents"], this.doneTab ? `${w?.name ?? w?.wid} › done` : "Subagents", this.doneTab ? `← → switch · ${keys}` : keys);
+      return panel(this.rows.length ? lines : ["No subagents"], this.doneTab ? `${w?.name ?? w?.wid} › done` : `Subagents · ${summaryText(this.data.workflows)}`, this.doneTab ? `← → switch · ${keys}` : keys);
     }
     const { c, w } = this.current();
     if (!c || !w) return panel(["Subagent is no longer in the current revision"], "Subagents", "Esc back");

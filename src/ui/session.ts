@@ -65,6 +65,9 @@ export function thoughtSummary(text: string): string {
 /** UI §2–3, P31: Derive model, thinking, tool activity and the call's own tool-call count solely from committed session entries. */
 export function sessionFacts(entries: readonly SessionEntry[], call: string) {
   let model: string | undefined, thinking = "off", activity: string | undefined, lastActivity = 0, task = "", count = 0, own = false;
+  let latest = ""; // the newest thing the agent said, thought or saw, for the overview (UI §2)
+  const firstLine = (text: string) => text.split("\n").map(l => l.trim()).find(Boolean) ?? "";
+  const lastLine = (text: string) => text.split("\n").map(l => l.trim()).filter(Boolean).at(-1) ?? "";
   const tools = new Map<string, { name: string; arguments: Record<string, unknown> }>();
   for (const e of entries) {
     // Only segments opened by this call's executions count; inherited fork/continuation context does not (P31).
@@ -84,8 +87,16 @@ export function sessionFacts(entries: readonly SessionEntry[], call: string) {
     const m = e.message;
     if (m.role === "assistant") {
       model = `${m.provider}/${m.model}`;
-      for (const b of m.content) if (b.type === "toolCall") { tools.set(b.id, b); if (own) count++; }
-    } else if (m.role === "toolResult") tools.delete(m.toolCallId);
+      for (const b of m.content) {
+        if (b.type === "toolCall") { tools.set(b.id, b); if (own) count++; }
+        else if (b.type === "text" && lastLine(b.text)) latest = lastLine(b.text);
+        else if (b.type === "thinking" && thoughtSummary(b.thinking ?? "")) latest = `thinking: ${thoughtSummary(b.thinking ?? "")}`;
+      }
+    } else if (m.role === "toolResult") {
+      tools.delete(m.toolCallId);
+      const out = firstLine(m.content.filter(b => b.type === "text").map(b => (b as { text: string }).text).join("\n"));
+      if (out) latest = `${m.toolName}: ${out}`;
+    }
   }
   const tool = [...tools.values()].at(-1);
   if (tool) {
@@ -93,5 +104,5 @@ export function sessionFacts(entries: readonly SessionEntry[], call: string) {
     activity = tool.name === "read" ? `reading ${path}` : ["edit", "write"].includes(tool.name) ? `editing ${path}` :
       tool.name === "bash" ? `running ${String(a.command ?? "")}` : `running ${tool.name}`;
   }
-  return { model, thinking, activity, lastActivity, task, tools: count };
+  return { model, thinking, activity, lastActivity, task, tools: count, latest };
 }
