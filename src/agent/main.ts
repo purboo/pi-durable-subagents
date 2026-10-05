@@ -169,6 +169,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       "stop target:<wid|call>. revise wid + workflow/source/args. resume [wid] (parked workflows or after drain; done/failed/stopped are final — start a new run). drain.",
       "Control actions reply {applied:true} or {applied:false, reason} once the orchestrator decides (else {submitted:{rid}} after 10 s).",
       ...(agents ? [`Agents (use one of these names): ${agents}.`] : []),
+      "The user can watch too: the line above the editor summarizes subagents; ↓ (on an empty editor) opens the Subagents list, Enter watches one live, typing there steers it, /stop and /model act on it, Esc goes back.",
     ].join("\n"), parameters,
     async execute(_id, args, signal, _update, context) {
       const value = await submit(args as Record<string, unknown>, context.cwd, signal);
