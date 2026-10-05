@@ -3,7 +3,7 @@ import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tu
 import type { UiDeps } from "../agent/main.ts";
 import { UiActions, UiData } from "./data.ts";
 import { SubagentScreen } from "./screen.ts";
-import { mainLine, type ViewState } from "./view.ts";
+import { mainLine, orderWorkflows, type ViewState } from "./view.ts";
 
 /** UI §1–3, P16, P21: Register journal-backed list/watch surfaces only in interactive pi. */
 export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
@@ -24,7 +24,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
       try {
         data.refresh(); actions.reconcile();
         const own = `main:${ctx.sessionManager.getSessionId()}`;
-        data.workflows.sort((a, b) => Number(b.origin === own) - Number(a.origin === own));
+        data.workflows = orderWorkflows(data.workflows, own);
         const line = mainLine(data.workflows);
         ctx.ui.setWidget("durable-subagents", line ? (_tui, theme) => ({
           invalidate() {},
@@ -42,7 +42,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
           closeScreen = () => done();
           screen = new SubagentScreen(data, actions, ctx, tui, theme, closeScreen, state);
           return screen;
-        }, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%" } }); })().catch(() => {}).finally(() => { screen?.dispose(); screen = undefined; closeScreen = undefined; opening = false; });
+        }, { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%" } }); })().catch(() => {}).finally(() => { screen?.dispose(); screen = undefined; closeScreen = undefined; opening = false; });
         return { consume: true };
       });
       timer = setInterval(refresh, 500); timer.unref(); cleanup = stop;

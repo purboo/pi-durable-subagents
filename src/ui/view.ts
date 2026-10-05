@@ -1,3 +1,4 @@
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import type { sessionFacts } from "./session.ts";
 
@@ -23,7 +24,32 @@ export function modelLabel(model: string | undefined, find: (provider: string, i
   const matched = /claude|gpt|gemini|deepseek|glm|opus|sonnet|haiku/i.exec(`${id} ${name}`)?.[0]?.toLowerCase();
   const family = matched && ["opus", "sonnet", "haiku"].includes(matched) ? "claude" : matched;
   const suffix = family && provider.toLowerCase().endsWith(`-${family}`) ? provider.slice(0, -family.length - 1) : provider;
-  return suffix.toLowerCase() === family ? name : `${name} (${suffix})`;
+  // A display name that already names its provider ("GLM-5.3 (zhipu)") is never suffixed again.
+  const named = (word: string) => Boolean(word) && new RegExp(`(^|[^a-z0-9])${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`, "i").test(name);
+  return suffix.toLowerCase() === family || named(provider) || named(suffix) ? name : `${name} (${suffix})`;
+}
+/** UI §2–3: Count committed tool calls compactly; zero is not shown. */
+export const toolCount = (n: number | undefined) => n ? `${n} tool${n === 1 ? "" : "s"}` : "";
+/** UI §2: Stable workflow order — own session first, then start time (oldest first), never by activity. */
+export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt">>(workflows: readonly T[], own?: string): T[] {
+  return [...workflows].sort((a, b) => Number(b.origin === own) - Number(a.origin === own) ||
+    (a.startedAt ?? Infinity) - (b.startedAt ?? Infinity) || (a.wid < b.wid ? -1 : a.wid > b.wid ? 1 : 0));
+}
+/** UI §2: Done rows newest result first by immutable end time; ties keep snapshot order, so rows never reshuffle. */
+export function doneOrder(calls: readonly CallSnapshot[]): CallSnapshot[] {
+  return calls.map((c, i) => ({ c, i })).filter(x => x.c.phase === "sealed").sort((a, b) => (b.c.endedAt ?? 0) - (a.c.endedAt ?? 0) || a.i - b.i).map(x => x.c);
+}
+/** UI §2: Keep the selection on the same row id across refreshes and insertions; fall back to the old position. */
+export function keepSelection(rows: readonly { id: string }[], id: string | undefined, fallback: number): number {
+  const found = id === undefined ? -1 : rows.findIndex(r => r.id === id);
+  return Math.max(0, Math.min(found >= 0 ? found : fallback, rows.length - 1));
+}
+/** UI §2: Compose a call row within `width`: model column dropped first (<60), then tool/age tail, then the phrase is cut. */
+export function rowText(indent: string, key: string, model: string, phrase: string, tail: readonly string[], width: number): string {
+  const head = `${indent}${key}  ${width >= 60 ? `${model}  ` : ""}`, end = tail.filter(Boolean).join("  ");
+  const room = width - visibleWidth(head) - (end ? visibleWidth(end) + 2 : 0);
+  if (!end || room < 12) return truncateToWidth(head + phrase, Math.max(1, width));
+  return `${head}${truncateToWidth(phrase, room)}  ${end}`;
 }
 /** UI §2: Prefer report phrases while retaining truthful terminal status and failure reasons. */
 export function resultPhrase(call: CallSnapshot): string {
@@ -87,12 +113,13 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
   if (state.finished) visible.push(...finished);
   const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
-    rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), text: `${indent}${label(c)}  ${width >= 60 ? `${name(f?.model ?? c.model)}  ` : ""}${statusPhrase(c, w, f, now)}${age ? `  ${age}` : ""}` });
+    const text = rowText(indent, label(c), name(f?.model ?? c.model), statusPhrase(c, w, f, now), [toolCount(f?.tools), age], width);
+    rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), text });
   };
   for (const w of visible) {
     if (w.calls.length === 1) { callRow(w, w.calls[0]!, "  "); continue; }
-    const done = w.calls.filter(c => c.phase === "sealed").sort((a, b) => Number(Boolean(failed(b) && !state.viewed.has(b.callId))) - Number(Boolean(failed(a) && !state.viewed.has(a.callId))) || (b.endedAt ?? 0) - (a.endedAt ?? 0));
-    const active = w.calls.filter(c => c.phase !== "sealed").sort((a, b) => Math.max(b.lastActivity ?? 0, facts.get(b.callId)?.lastActivity ?? 0) - Math.max(a.lastActivity ?? 0, facts.get(a.callId)?.lastActivity ?? 0));
+    // Stable order (UI §2): active rows keep proposal (snapshot) order; done rows by immutable end time.
+    const done = doneOrder(w.calls), active = w.calls.filter(c => c.phase !== "sealed");
     rows.push({ id: w.wid, kind: "workflow", workflow: w, text: `  ${w.name ?? w.wid} · ${done.length}/${w.calls.length} · ${duration((w.endedAt ?? now) - (w.startedAt ?? now))}` });
     if (state.folded.has(w.wid)) continue;
     for (const c of active) callRow(w, c, "    ");

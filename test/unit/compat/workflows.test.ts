@@ -49,7 +49,7 @@ test("P34 chain substitutes literal full output, stops proposals on failure and 
   assert.equal(calls.length, 2);
   assert.equal(calls[0]?.spec.task, "start");
   assert.equal(calls[1]?.spec.task, "before $&\nLEAF: success / $&\nLEAF: success");
-  assert.deepEqual(results.slice(2), ["chain:2", "chain:3"].map(key => ({ key, gen: 1, status: "skipped", ok: false, output: "" })));
+  assert.deepEqual(results.slice(2), ["chain:2", "chain:3"].map(key => ({ key, gen: 0, status: "skipped", ok: false, output: "" })));
   assert.deepEqual(JSON.parse(JSON.stringify(events)), [{ type: "skipped", keys: ["chain:2", "chain:3"] }]);
   calls.length = 0; events.length = 0;
   assert.deepEqual(JSON.parse(JSON.stringify(await execute())), results);
@@ -64,6 +64,25 @@ test("P34 empty and successful chains, inert source data and invalid fanout", as
   }
   assert.throws(() => compileFanout({ tasks: [], chain: [] } as never));
   assert.throws(() => compileFanout({ chain: [{ agent: "", task: "" }] }));
+});
+
+test("T11: user keys are honored in tasks and chain, defaults stay positional, and keys never reach the call spec", async () => {
+  const tasks = compileFanout({ tasks: [{ agent: "w", task: "a", key: "scout" }, { agent: "w", task: "b" }] });
+  assert.deepEqual(tasks.steps, [{ key: "scout", spec: { agent: "w", task: "a" } }, { key: "tasks:1", spec: { agent: "w", task: "b" } }]);
+  const proposed: unknown[] = [];
+  await runInNewContext(`(async () => {${tasks.source}})()`, { runs: { all: async (calls: unknown[]) => { proposed.push(...calls); return []; } } });
+  assert.deepEqual(JSON.parse(JSON.stringify(proposed)), [{ agent: "w", task: "a", key: "scout" }, { agent: "w", task: "b", key: "tasks:1" }]);
+  const chain = compileFanout({ chain: [{ agent: "w", task: "a" }, { agent: "w", task: "b", key: "review" }, { agent: "w", task: "c", key: "ship" }] });
+  const calls: [string, CallSpec][] = [];
+  const results = await runInNewContext(`(async () => {${chain.source}})()`, { emit: () => {}, runs: { run: async (key: string, spec: CallSpec) => {
+    calls.push([key, spec]); return key === "review" ? { ...ok(key, "x"), ok: false, status: "failed" } : ok(key, "x");
+  } } });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [["chain:0", { agent: "w", task: "a" }], ["review", { agent: "w", task: "b" }]]);
+  assert.deepEqual(JSON.parse(JSON.stringify(results.at(-1))), { key: "ship", gen: 0, status: "skipped", ok: false, output: "" });
+  assert.throws(() => compileFanout({ tasks: [{ agent: "w", task: "a", key: "x" }, { agent: "w", task: "b", key: "x" }] }), /Invalid tasks step 1: duplicate key "x"/);
+  assert.throws(() => compileFanout({ chain: [{ agent: "w", task: "a", key: "chain:1" }, { agent: "w", task: "b" }] }), /Invalid chain step 1: duplicate key "chain:1"/);
+  assert.throws(() => compileFanout({ tasks: [{ agent: "w", task: "a", key: " " }] }), /Invalid tasks step 0: key must be a non-empty string/);
+  assert.throws(() => compileFanout({ tasks: [{ agent: "w", task: "a", isolaton: "worktree" } as CallSpec] }), /Invalid tasks step 0: unknown field "isolaton"/);
 });
 
 test("P24/AC3 results retain large full output, report data, and legacy final-line parsing", () => {

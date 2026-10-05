@@ -1,5 +1,31 @@
 import { isDeepStrictEqual } from 'node:util';
 
+const keywords = new Set(['type', 'enum', 'items', 'properties', 'required', 'additionalProperties', 'description', 'title']);
+const types = new Set(['null', 'boolean', 'object', 'array', 'number', 'integer', 'string']);
+const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** P24, T4: List unsupported keywords and malformed shapes so a schema that would not constrain fails loudly. */
+export function schemaProblems(schema: unknown, path = '$'): string[] {
+  if (typeof schema === 'boolean') return [];
+  if (!isObject(schema)) return [`${path}: must be an object or boolean`];
+  const problems: string[] = [];
+  for (const [key, value] of Object.entries(schema)) {
+    const at = `${path}.${key}`;
+    if (!keywords.has(key)) problems.push(`${path}: unsupported keyword "${key}"`);
+    else if (key === 'type') {
+      const names = Array.isArray(value) ? value : [value];
+      if (!names.length || !names.every(n => typeof n === 'string' && types.has(n))) problems.push(`${at}: must be one of ${[...types].join(', ')} or a nonempty array of them`);
+    } else if (key === 'enum') { if (!Array.isArray(value)) problems.push(`${at}: must be an array`); }
+    else if (key === 'items' || key === 'additionalProperties') problems.push(...schemaProblems(value, at));
+    else if (key === 'properties') {
+      if (!isObject(value)) problems.push(`${at}: must be an object of schemas`);
+      else for (const [name, item] of Object.entries(value)) problems.push(...schemaProblems(item, `${at}.${name}`));
+    } else if (key === 'required') { if (!Array.isArray(value) || !value.every(n => typeof n === 'string')) problems.push(`${at}: must be an array of strings`); }
+    else if (typeof value !== 'string') problems.push(`${at}: must be a string`);
+  }
+  return problems;
+}
+
 /** P24: Validate the supported JSON schema vocabulary without coercion or dependencies. */
 export function validate(schema: unknown, value: unknown, path = '$'): string[] {
   if (schema === true) return [];

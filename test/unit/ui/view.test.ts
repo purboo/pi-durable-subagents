@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { appendFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { root, clean, now, call, workflow, state, session } from "./fixture.ts";
-const { listRows, duration, mainLine, modelLabel, statusPhrase } = await import("../../../src/ui/view.ts");
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+const { listRows, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount } = await import("../../../src/ui/view.ts");
+const { visibleWidth } = await import("@earendil-works/pi-tui");
 const { SessionTail, thoughtSummary, sessionFacts, sessionBranch } = await import("../../../src/ui/session.ts");
 after(clean);
 
@@ -14,13 +16,13 @@ test("durations and model names stay compact and truthful", () => {
   assert.equal(modelLabel(undefined, () => undefined), "—");
 });
 
-test("grouping, recent activity, done paging, and narrow columns", () => {
+test("grouping, proposal order, done paging, and narrow columns", () => {
   const calls = [call("E02"), call("E05", { lastActivity: now - 5_000 }), ...Array.from({ length: 10 }, (_, i) => call(`D${i}`, { phase: "sealed", endedAt: now - i * 1000, result: { key: `D${i}`, gen: 1, ok: true, status: "ok", output: "", data: { summary: `merged ${i}` } } }))];
   const w = workflow(calls), s = state();
   const solo = workflow([call("scout")], { wid: "solo" });
   let rows = listRows([solo, w], s, new Map(), () => "GPT-6 (openai)", 100, now);
   assert.equal(rows[0]!.kind, "workflow"); assert.match(rows[0]!.text, /10\/12 · 1h02m/);
-  assert.equal(rows[1]!.call!.key, "E05"); assert.equal(rows[3]!.text.trim(), "10 done");
+  assert.equal(rows[1]!.call!.key, "E02"); assert.equal(rows[2]!.call!.key, "E05"); assert.equal(rows[3]!.text.trim(), "10 done");
   assert(!rows.some(r => r.kind === "more"));
   s.done.set("w", 8); rows = listRows([w], s, new Map(), () => "GPT-6 (openai)", 100, now);
   assert.equal(rows.filter(r => r.call?.phase === "sealed").length, 8); assert.equal(rows.at(-1)!.text.trim(), "2 more");
@@ -31,7 +33,7 @@ test("grouping, recent activity, done paging, and narrow columns", () => {
 
 test("unviewed failures remain visible then collapse; all-ended workflows expand done rows", () => {
   const bad = call("bad", { phase: "sealed", endedAt: now, result: { key: "bad", gen: 1, status: "failed", ok: false, output: "", error: "merge conflict" } });
-  const good = call("good", { phase: "sealed", endedAt: now });
+  const good = call("good", { phase: "sealed", endedAt: now - 1_000 });
   const w = workflow([good, bad], { status: "failed" }), s = state();
   const rows = listRows([w], s, new Map(), () => "—", 100, now);
   assert.equal(rows.find(r => r.kind === "call")!.call!.key, "bad"); assert(rows.some(r => r.failed));
@@ -100,8 +102,82 @@ test("session tails tolerate split UTF-8 and partial lines, replacement and trun
 
 test("session facts follow the native branch and completed tools disappear", () => {
   const entries = session();
-  const facts = sessionFacts(entries); assert.equal(facts.model, "openai/gpt-6"); assert.equal(facts.thinking, "high"); assert.match(facts.task, /scheduler/); assert.equal(facts.activity, undefined);
-  assert.equal(sessionFacts(entries.slice(0, -1)).activity, "running npm test -- sched");
+  const facts = sessionFacts(entries, "w@1/E02@1"); assert.equal(facts.model, "openai/gpt-6"); assert.equal(facts.thinking, "high"); assert.match(facts.task, /scheduler/); assert.equal(facts.activity, undefined);
+  assert.equal(sessionFacts(entries.slice(0, -1), "w@1/E02@1").activity, "running npm test -- sched");
   const fork = { ...entries.at(-1)!, id: "fork", parentId: "0" };
   assert.deepEqual(sessionBranch([...entries, fork]).map(e => e.id), ["0", "fork"]);
+});
+
+test("model labels never repeat a provider the display name already contains", () => {
+  const named = (name: string) => () => ({ name });
+  assert.equal(modelLabel("zhipu/glm-5.3", named("GLM-5.3 (zhipu)")), "GLM-5.3 (zhipu)");
+  assert.equal(modelLabel("zhipu/glm-5.3-flash:high", named("GLM-5.3 Flash (ZhiPu)")), "GLM-5.3 Flash (ZhiPu)");
+  assert.equal(modelLabel("bedrock-claude/claude-opus", named("Opus 5.5 (bedrock)")), "Opus 5.5 (bedrock)");
+  assert.equal(modelLabel("zhipu/glm-5.3", () => undefined, { "zhipu/glm-5.3": "GLM (Zhipu)" }), "GLM (Zhipu)");
+  assert.equal(modelLabel("zhipu/glm-5.3", named("GLM-5.3")), "GLM-5.3 (zhipu)");
+  assert.equal(modelLabel("zhipu/glm-5.3", named("GLM zhipuplus")), "GLM zhipuplus (zhipu)"); // a word, not a substring
+  assert.equal(modelLabel("openai/gpt-6", named("GPT-6")), "GPT-6 (openai)");
+});
+
+test("row order is stable across refreshes while activity changes", () => {
+  const calls = [call("E02"), call("E05"), call("E07"), call("D1", { phase: "sealed", endedAt: now - 9_000 })];
+  const w = workflow(calls), facts = new Map(calls.map(c => [c.callId, { ...sessionFacts([], c.callId) }])), s = state();
+  const ids = () => listRows([w], s, facts, () => "GPT-6 (openai)", 100, now).map(r => r.id);
+  const first = ids();
+  for (const [i, c] of calls.entries()) {
+    c.lastActivity = now - (i % 2 ? 1_000 : 60_000) * (i + 1); facts.get(c.callId)!.lastActivity = now - i * 7_000;
+    assert.deepEqual(ids(), first);
+  }
+  calls[1]!.startedAt = undefined; calls[1]!.phase = "queued"; assert.deepEqual(ids(), first); // dispatch timing does not reorder
+  const a = { wid: "a", origin: "main:other", startedAt: 3 }, b = { wid: "b", origin: "main:me", startedAt: 5 }, c = { wid: "c", origin: "main:other", startedAt: 1 }, d = { wid: "d", origin: "main:me", startedAt: 2 };
+  assert.deepEqual(orderWorkflows([a, b, c, d], "main:me").map(x => x.wid), ["d", "b", "c", "a"]);
+  assert.deepEqual(orderWorkflows(orderWorkflows([a, b, c, d], "main:me"), "main:me").map(x => x.wid), ["d", "b", "c", "a"]);
+});
+
+test("done rows are newest first and never reshuffle when failures are viewed or results arrive", () => {
+  const fail = (key: string, endedAt: number) => call(key, { phase: "sealed", endedAt, result: { key, gen: 1, status: "failed", ok: false, output: "", error: "x" } });
+  const calls = [call("A"), call("D1", { phase: "sealed", endedAt: now - 30_000 }), fail("F1", now - 40_000), call("D2", { phase: "sealed", endedAt: now - 10_000 })];
+  const w = workflow(calls), s = state(); s.done.set("w", 8);
+  const done = () => listRows([w], s, new Map(), () => "—", 100, now).filter(r => r.call?.phase === "sealed").map(r => r.call!.key);
+  assert.deepEqual(done(), ["D2", "D1", "F1"]);
+  s.viewed.add(calls[2]!.callId); assert.deepEqual(done(), ["D2", "D1", "F1"]);
+  calls.push(call("D3", { phase: "sealed", endedAt: now - 1_000 })); assert.deepEqual(done(), ["D3", "D2", "D1", "F1"]);
+});
+
+test("selection follows the same row id across insertions and falls back by position", () => {
+  const rows = [{ id: "h" }, { id: "E02" }, { id: "E07" }];
+  assert.equal(keepSelection(rows, "E07", 2), 2);
+  assert.equal(keepSelection([{ id: "new" }, { id: "h2" }, ...rows], "E07", 2), 4);
+  assert.equal(keepSelection([{ id: "h" }, { id: "E02" }], "E07", 2), 1);
+  assert.equal(keepSelection([], "E07", 2), 0);
+});
+
+test("tool counts come only from this call's own committed execution segments", () => {
+  const call = "w@1/E02@2", tool = (id: string) => ({ type: "toolCall", id, name: "read", arguments: { path: "a" } });
+  const assistant = (...ids: string[]) => ({ type: "message", timestamp: new Date(now).toISOString(), message: { role: "assistant", provider: "openai", model: "gpt-6", content: ids.map(tool), timestamp: now } });
+  const exec = (id: string) => ({ type: "custom", customType: "dsa-exec", data: { exec: id } });
+  const entries = [
+    assistant("inherited"), // fork / continuation context before any segment
+    exec("w@1/E02@1#1.1"), assistant("g1a", "g1b"), // previous generation's segment
+    exec(`${call}#1.1`), assistant("a", "b"), { type: "message", timestamp: "", message: { role: "toolResult", toolCallId: "a", content: [] } },
+    exec("w@1/E020@2#1.1"), assistant("prefix-trap"), // a different key that merely shares a prefix
+    exec(`${call}#2.1`), assistant("c"),
+  ] as unknown as SessionEntry[];
+  assert.equal(sessionFacts(entries, call).tools, 3);
+  assert.equal(sessionFacts(entries, "w@1/E02@1").tools, 2);
+  assert.equal(sessionFacts(entries.slice(0, 1), call).tools, 0);
+  assert.equal(sessionFacts(session(), "w@1/E02@1").tools, 1);
+  assert.equal(toolCount(0), ""); assert.equal(toolCount(1), "1 tool"); assert.equal(toolCount(12), "12 tools");
+});
+
+test("call rows show tool counts within width and drop the model column first", () => {
+  const c = call("E02"), w = workflow([c, call("E05")]);
+  const facts = new Map([[c.callId, { ...sessionFacts([], c.callId), tools: 12, activity: "editing src/a/very/long/path/that/keeps/going/and/going.ts" }]]);
+  for (const width of [24, 40, 59, 60, 80, 100, 140]) {
+    const row = listRows([w], state(), facts, () => "GLM-5.3 (zhipu)", width, now).find(r => r.call === c)!;
+    assert(visibleWidth(row.text) <= width, `${width}: ${row.text}`);
+    assert.equal(row.text.includes("GLM"), width >= 60, `${width}: ${row.text}`);
+    if (width >= 40) assert.match(row.text, /12 tools {2}3m$/);
+  }
+  assert.equal(rowText("  ", "E02", "M", "short", ["", ""], 100), "  E02  M  short");
 });

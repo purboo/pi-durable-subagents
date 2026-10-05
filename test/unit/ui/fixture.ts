@@ -12,7 +12,7 @@ process.env.DSA_HOME = join(root, "dsa");
 mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 export const now = 1_800_000_000_000;
 export const clean = () => rmSync(root, { recursive: true, force: true });
-export const theme = { fg: (_c: string, s: string) => s, bg: (_c: string, s: string) => s } as Theme;
+export const theme = { fg: (_c: string, s: string) => s, bg: (_c: string, s: string) => s, bold: (s: string) => s } as Theme;
 export const tui = { terminal: { rows: 45, columns: 100 }, requestRender() {} } as TUI;
 export const models = [
   { provider: "openai", id: "gpt-6", name: "GPT-6" },
@@ -29,6 +29,7 @@ export function workflow(calls: CallSnapshot[], extra: Partial<WorkflowSnapshot>
 export function session(): SessionEntry[] {
   const stamp = new Date(now - 20_000).toISOString();
   const entries = [
+    { type: "custom", customType: "dsa-exec", data: { exec: "w@1/E02@1#1.1" } },
     { type: "model_change", provider: "openai", modelId: "gpt-6" },
     { type: "thinking_level_change", thinkingLevel: "high" },
     { type: "custom_message", customType: "dsa-msg", content: "Review the scheduler and fix the lease expiry test.", display: true, details: { kind: "task" } },

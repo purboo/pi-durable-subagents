@@ -1,21 +1,45 @@
-exec-0927: E02 · E07 · 1 done    ← → switch
-E02 · GPT-6 (openai) ▾ · high ▾
-────────────────────────────────────────────────────────────────────────────────────────────────────
-
-Review the scheduler and fix the lease expiry test.
-
-▸ Thinking 0s · Checking SDK import path
-
-
- bash
-
- {
-   "command": "npm test -- sched"
- }
- 3 failing: lease expires early
-
-Thinking 20s
-────────────────────────────────────────────────────────────────────────────────────────────────────
-Steer E02…   / for commands
-
-exec-0927 › E02 · 3m · Esc back
+╭─ exec-0927 › E02 ────────────────────────────────────────────────────────────────────────────────╮
+│ E02 · E07 · 1 done    ← → switch                                                                 │
+│ E02 · GPT-6 (openai) ▾ · high ▾ · 1 tool                                                         │
+│ ──────────────────────────────────────────────────────────────────────────────────────────────── │
+│                                                                                                  │
+│ Review the scheduler and fix the lease expiry test.                                              │
+│                                                                                                  │
+│ ▸ Thinking 0s · Checking SDK import path                                                         │
+│                                                                                                  │
+│                                                                                                  │
+│  bash                                                                                            │
+│                                                                                                  │
+│  {                                                                                               │
+│    "command": "npm test -- sched"                                                                │
+│  }                                                                                               │
+│  3 failing: lease expires early                                                                  │
+│                                                                                                  │
+│ Thinking 20s                                                                                     │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│ ──────────────────────────────────────────────────────────────────────────────────────────────── │
+│ Steer E02…   / for commands                                                                      │
+│                                                                                                  │
+╰─ 3m · Esc back ──────────────────────────────────────────────────────────────────────────────────╯
