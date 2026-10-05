@@ -48,7 +48,7 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
   }
   const parts = [...counts].map(([status, count]) => `${count} ${status}`);
   const heading = call ? `${label}/${calls[0]?.key ?? call}@${calls[0]?.gen ?? '?'} (follow-up) ${wakeStatus(calls[0]?.result?.status)}:` :
-    `${label} (${wid}) ${snap.status}: ${parts.join('; ')}`;
+    `${label} (${wid}) ${snap.status}${parts.length ? `: ${parts.join('; ')}` : ''}`;
   const footer = `${snap.error ? `\nError: ${tail(snap.error, 500)}` : ''}${charged(snap.usage) ? `\nUsage: ${charged(snap.usage)}` : ''}\nFull output: subagents status wid:${wid}`;
   const prefix = tail(heading, Math.max(1, 6000 - footer.length - 1));
   let remaining = Math.max(0, 6000 - prefix.length - footer.length);
