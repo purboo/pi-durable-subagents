@@ -641,3 +641,77 @@ test('P15: finished attention names exceptions by key and follow-up outcomes', a
   assert.equal(finishedText('w', entries as never), 'nightly (w) done: 1 ok; b timeout; c skipped. Details: subagents status.');
   assert.equal(finishedText('w', entries as never, 'w@1/a@1'), 'nightly/a@1 (follow-up) ok: DONE: a');
 });
+
+const decision = (ledgers: Ledgers, rid: string) => ledgers.orch.entries().find(e => (e.type === JT.applied || e.type === JT.rejected) && e.rid === rid);
+
+test('T6: resume of a final workflow and stop of a sealed call reject with reasons; drain and parked stay resumable', async t => {
+  const { engine, home, ledgers, run } = await fixture(t);
+  const wf = await run(`return await runs.run('a', {agent:'test',task:'a'});`);
+  await until(() => wf.journal.entries().some(e => e.type === JT.done));
+  let rid = await submit(engine, home, 'stop', { target: `${wf.wid}/a` }, 1);
+  assert.deepEqual([decision(ledgers, rid)?.type, decision(ledgers, rid)?.reason], [JT.rejected, 'already-sealed:ok']);
+  rid = await submit(engine, home, 'resume', { wid: wf.wid }, 2);
+  assert.deepEqual([decision(ledgers, rid)?.type, decision(ledgers, rid)?.reason], [JT.rejected, 'terminal:done \u2014 start a new run']);
+  rid = await submit(engine, home, 'resume', {}, 3);
+  assert.equal(decision(ledgers, rid)?.reason, 'nothing-to-resume');
+  assert.equal(wf.journal.entries().filter(e => e.type === 'resumed' || e.type === 'stop-requested').length, 0);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 1, 'nothing reran');
+  // A drained orchestrator is resumable even when the named workflow is final: the drain is released.
+  await submit(engine, home, 'drain', {}, 4);
+  rid = await submit(engine, home, 'resume', { wid: wf.wid }, 5);
+  assert.equal(decision(ledgers, rid)?.type, JT.applied);
+  assert.equal(ledgers.orch.entries().findLast(e => e.type === 'undrain')?.rid, rid);
+  assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
+  rid = await submit(engine, home, 'stop', { target: wf.wid }, 6);
+  assert.equal(decision(ledgers, rid)?.reason, 'terminal:done', 'stopping a finished workflow is rejected, not silently applied');
+});
+
+test('T4: stop of a running call applies once; a later stop of the stopped seal rejects; a replayed stop stays applied', async t => {
+  const evaluator = new ManualEvaluator(), { engine, home, ledgers, run } = await fixture(t, evaluator, 'held');
+  const wf = await run('unused');
+  propose(evaluator, 0, 'held'); idle(evaluator, 0); await engine.intake();
+  await until(() => wf.journal.entries().some(e => e.type === 'fake-run'));
+  const call = `${wf.wid}@1/held@1`;
+  let rid = await submit(engine, home, 'stop', { target: `${wf.wid}/held` }, 1);
+  assert.equal(decision(ledgers, rid)?.type, JT.applied);
+  assert.deepEqual(wf.journal.entries().filter(e => e.type === 'stop-requested').map(e => [e.rid, e.call]), [[rid, call]]);
+  assert.deepEqual(ledgers.orch.entries().findLast(e => e.type === 'fake-stop')?.target, { wid: wf.wid, callId: call });
+  // The executor seals the stop (simulated); a second stop now reports the seal instead of pretending to act.
+  await wf.journal.append(JT.sealed, { call, exec: `${call}#1.1`, result: { key: 'held', gen: 1, status: 'stopped', ok: false, output: '' } });
+  rid = await submit(engine, home, 'stop', { target: call }, 2);
+  assert.equal(decision(ledgers, rid)?.reason, 'already-sealed:stopped');
+  // Crash window: the stop took effect (marker + seal) but its decision was never committed -> replay applies it.
+  await wf.journal.append('stop-requested', { rid: 'control-3', call });
+  rid = await submit(engine, home, 'stop', { target: `${wf.wid}/held` }, 3);
+  assert.equal(decision(ledgers, rid)?.type, JT.applied);
+});
+
+test('P10/P11: script console lines are persisted per workflow, one line each with ev and level, and bounded', { timeout: 30_000 }, async t => {
+  const { engine, home, run } = await fixture(t);
+  const wf = await run(`console.log('hello', {a: 1}); console.warn('multi\\nline'); return 1;`);
+  await until(() => wf.journal.entries().some(e => e.type === JT.done));
+  const log = join(home, 'w', wf.wid, 'script.log');
+  const lines = (await until(async () => { const text = await readFile(log, 'utf8').catch(() => ''); return text.split('\n').length > 2 ? text : ''; })).trim().split('\n');
+  assert.match(lines[0]!, /^\S+Z ev=1 log: hello \{"a":1\}$/);
+  assert.match(lines[1]!, /^\S+Z ev=1 warn: multi\\nline$/);
+  const { statusDetail } = await import('../../../../src/orchestrator/snapshot.ts');
+  assert.equal(statusDetail(home, wf.wid).scriptLog, log);
+  const big = await run(`for (let i = 0; i < 1500; i++) console.log(String(i).padStart(1000, 'x')); return 2;`, {}, 2);
+  await until(() => big.journal.entries().some(e => e.type === JT.done), 20_000);
+  const bigLog = join(home, 'w', big.wid, 'script.log');
+  const text = await until(async () => { const s = await readFile(bigLog, 'utf8').catch(() => ''); return s.endsWith('dropped]\n') ? s : ''; }, 20_000);
+  assert.ok(Buffer.byteLength(text) <= 1 << 20, `bounded: ${Buffer.byteLength(text)}`);
+  assert.equal(text.split('\n').filter(l => l.includes('limit (1 MiB) reached')).length, 1);
+  assert.ok(text.split('\n').length > 900);
+});
+
+test('contracts: a script proposing an invalid spec gets a failed result naming the problems; nothing is dispatched', async t => {
+  const { home, run } = await fixture(t);
+  const wf = await run(`const r = await runs.run('a', {agent:'test', task:'a', isolaton:'worktree'}); return r;`);
+  await until(() => wf.journal.entries().some(e => e.type === JT.done));
+  const done = wf.journal.entries().find(e => e.type === JT.done)!;
+  const result = done.result as { status: string; error: string };
+  assert.equal(result.status, 'failed'); assert.match(result.error, /invalid spec: unknown field "isolaton"/);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 0);
+  assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
+});

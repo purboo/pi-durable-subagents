@@ -27,6 +27,8 @@ test('argument parsing rejects invalid commands, targets and flags', () => {
   assert.deepEqual(parseArgs(['status', '--json', 'w']), { command: 'status', target: 'w', json: true });
   assert.deepEqual(parseArgs(['stop', 'w@1/c@1']), { command: 'stop', target: 'w@1/c@1', json: false });
   assert.equal(parseArgs(['install-service', '--dry-run']).dryRun, true);
+  assert.deepEqual(parseArgs(['events', 'w', '--json']), { command: 'events', target: 'w', json: true });
+  for (const args of [['events'], ['events', 'a', 'b'], ['events', '..'], ['tail', '--json']]) assert.throws(() => parseArgs(args));
   for (const args of [['bad'], ['stop'], ['drain', 'w'], ['status', '../escape'], ['status', '--bad'], ['resume', '--json'], ['status', '--json', '--json'], ['drain', '--dry-run']]) assert.throws(() => parseArgs(args));
 });
 
@@ -49,6 +51,21 @@ test('status and tail follow real engine journals with fake executor', { timeout
   assert.equal(JSON.parse(json).status, 'done');
   assert.equal(JSON.parse(json).calls[0].result.ok, true);
   await assert.rejects(main(['status', 'missing'], { env: { DSA_HOME: home } }), /Unknown workflow/);
+  // T10: the list view is the compact projection; events are a timeline without observation noise.
+  const out: string[] = [], env = { DSA_HOME: home }, write = (s: string) => { out.push(s); };
+  assert.equal(await main(['status'], { env, write }), 0);
+  assert.match(out.join('\n'), new RegExp(`^${wid}@1: done · 1/1 sealed\n  a@1 ok "hello"\n  finished: ".* done: 1 ok\\. Details: subagents status\\."$`));
+  out.length = 0; assert.equal(await main(['status', '--json'], { env, write }), 0);
+  const view = JSON.parse(out[0]!);
+  assert.deepEqual(view.workflows[0].calls, [{ key: 'a', gen: 1, callId: `${wid}@1/a@1`, phase: 'sealed', status: 'ok', ok: true, lastLine: 'hello' }]);
+  assert.ok(!('entries' in view.workflows[0]) && !('result' in view.workflows[0].calls[0]));
+  out.length = 0; assert.equal(await main(['events', wid, '--json'], { env, write }), 0);
+  const events = out.map(line => JSON.parse(line));
+  assert.deepEqual(events.map(e => e.event), ['created', 'script-start', 'call', 'sealed', 'done', 'attention']);
+  assert.deepEqual([events[3].call, events[3].status, events[4].status], [`${wid}@1/a@1`, 'ok', 'done']);
+  out.length = 0; assert.equal(await main(['events', wid], { env, write }), 0);
+  assert.match(out[2]!, new RegExp(`^\\S+Z #\\d+ call\\s+key=a gen=1 agent=test$`));
+  await assert.rejects(main(['events', 'missing'], { env, write }), /Unknown workflow/);
 });
 
 test('CLI outbox recovers pending, retires receipts and serializes concurrent senders', { timeout: 15000 }, async t => {

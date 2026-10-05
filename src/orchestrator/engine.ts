@@ -5,6 +5,7 @@
 // generation{rid,key,gen,from,spec,revision,opening} is a send resolution outside the script;
 // its seal has a finished attention independent of workflow completion.
 // resumed {rid,n} supersedes a terminal park. emit {pos,value} records script outputs.
+// stop-requested {rid,call?} marks a call or workflow stop as taking effect, so its replay is applied, not already-sealed.
 import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readdir, unlink } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
@@ -18,22 +19,24 @@ import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
-import { snapshotFromEntries } from './snapshot.ts';
+import { formatUsage, snapshotFromEntries } from './snapshot.ts';
+import { validateCallSpec } from '../compat/spec.ts';
 
 const clip = (text: string, n = 300) => text.length > n ? `${text.slice(0, n)}…` : text;
-/** P15: A finished item tells the origin agent what happened without a status round trip: exceptions by key. */
+const charged = (u?: { input: number; output: number; costUsd: number }) => u && (u.input || u.output || u.costUsd) ? formatUsage(u) : undefined;
+/** P15, P31: A finished item tells the origin agent what happened without a status round trip: exceptions by key, usage total. */
 export function finishedText(wid: string, entries: readonly Entry[], call?: string): string {
   const snap = snapshotFromEntries(wid, entries), label = snap.name ?? wid;
   if (call) {
     const c = snap.calls.find(x => x.callId === call), r = c?.result;
-    return `${label}/${c?.key ?? call}@${c?.gen ?? '?'} (follow-up) ${r?.status ?? 'finished'}${r?.output ? `: ${clip(r.output.trim().split('\n').at(-1) ?? '')}` : r?.error ? `: ${clip(r.error)}` : ''}`;
+    return `${label}/${c?.key ?? call}@${c?.gen ?? '?'} (follow-up) ${r?.status ?? 'finished'}${r?.output ? `: ${clip(r.output.trim().split('\n').at(-1) ?? '')}` : r?.error ? `: ${clip(r.error)}` : ''}${charged(c?.usage) ? ` (usage: ${charged(c?.usage)})` : ''}`;
   }
   const latest = new Map(snap.calls.map(c => [c.key, c]));
   const calls = [...latest.values()], ok = calls.filter(c => c.result?.ok).length;
   const bad = calls.filter(c => c.result && !c.result.ok && c.result.status !== 'skipped').map(c => `${c.key} ${c.result!.status}`);
   const skipped = calls.filter(c => c.result?.status === 'skipped').map(c => c.key);
   const parts = [`${ok} ok`, bad.length ? `${bad.join(', ')}` : '', skipped.length ? `${skipped.join(', ')} skipped` : ''].filter(Boolean);
-  return `${label} (${wid}) ${snap.status}: ${parts.join('; ')}${snap.error ? `. Error: ${clip(snap.error)}` : ''}. Details: subagents status.`;
+  return `${label} (${wid}) ${snap.status}: ${parts.join('; ')}${snap.error ? `. Error: ${clip(snap.error)}` : ''}.${charged(snap.usage) ? ` Usage: ${charged(snap.usage)}.` : ''} Details: subagents status.`;
 }
 
 type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Set<number>; exposures: Entry[]; sent: number; replaying: boolean; ready: Map<number, CallResult>; running: Set<number>; outputs: Map<number, Entry>; values: Entry[]; needs: number };
@@ -224,11 +227,38 @@ export class Engine {
       const target = (req.body as { target: string })?.target;
       const call = this.findCall(target), wf = call?.wf ?? this.store.workflows.get(target);
       if (!wf) return { action: 'reject', reason: 'unknown-workflow' };
-      await this.executor.stop({ wid: wf.wid, ...(call ? { callId: `${wf.wid}@${wf.revision}/${call.entry.key}@${call.entry.gen}` } : {}) });
+      const callId = call ? `${wf.wid}@${wf.revision}/${call.entry.key}@${call.entry.gen}` : undefined;
+      if (callId) {
+        // A seal wins over a late stop (V2); say so instead of reporting a stop that cannot happen.
+        const log = wf.journal.entries(), seal = log.find(e => e.type === JT.sealed && e.call === callId);
+        if (!log.some(e => e.type === 'stop-requested' && e.rid === req.rid)) {
+          if (seal) return { action: 'reject', reason: `already-sealed:${(seal.result as CallResult).status}` };
+          await wf.journal.append('stop-requested', { rid: req.rid, call: callId });
+        }
+      }
+      if (!callId) {
+        // Stopping a finished workflow does nothing; say so (the replay of an applied stop stays applied).
+        const log = wf.journal.entries(), done = this.terminal(wf);
+        if (!log.some(e => e.type === 'stop-requested' && e.rid === req.rid)) {
+          if (done && done.status !== 'parked') return { action: 'reject', reason: `terminal:${String(done.status)}` };
+          await wf.journal.append('stop-requested', { rid: req.rid });
+        }
+      }
+      await this.executor.stop({ wid: wf.wid, ...(callId ? { callId } : {}) });
       if (!call) await this.finish(wf, 'stopped');
     } else if (req.kind === 'resume') {
       const wid = (req.body as { wid?: string })?.wid;
       if (wid && !this.store.workflows.has(wid)) return { action: 'reject', reason: 'unknown-workflow' };
+      // Only parked workflows and a drained orchestrator are resumable; running ones need nothing, final ones are final.
+      const took = (wf: Workflow) => wf.journal.entries().some(e => e.type === 'resumed' && e.rid === req.rid);
+      if (!this.draining && !this.ledgers.orch.entries().some(e => e.type === 'undrain' && e.rid === req.rid)) {
+        const targets = wid ? [this.store.workflows.get(wid)!] : [...this.store.workflows.values()];
+        const final = (wf: Workflow) => { const done = this.terminal(wf); return done && done.status !== 'parked' ? String(done.status) : undefined; };
+        const parked = (wf: Workflow) => this.terminal(wf)?.status === 'parked';
+        if (wid && final(targets[0]!) && !took(targets[0]!)) return { action: 'reject', reason: `terminal:${final(targets[0]!)} — start a new run` };
+        if (wid && !parked(targets[0]!) && !took(targets[0]!)) return { action: 'reject', reason: 'not-parked: already running' };
+        if (!wid && !targets.some(wf => parked(wf) || took(wf))) return { action: 'reject', reason: 'nothing-to-resume' };
+      }
       const wasDrained = this.draining;
       if (wasDrained) {
         await this.ledgers.orch.append('undrain', { rid: req.rid });
@@ -237,7 +267,7 @@ export class Engine {
       for (const wf of this.store.workflows.values()) {
         const done = this.terminal(wf);
         if ((wid && wf.wid !== wid && (!wasDrained || done)) || (done && done.status !== 'parked')) continue;
-        if (!wf.journal.entries().some(e => e.type === 'resumed' && e.rid === req.rid)) {
+        if (!took(wf)) {
           const n = (!wasDrained ? this.states.get(wf.wid)?.ev : undefined) ?? Math.max(0, ...wf.journal.entries().filter(e => e.type === 'ev').map(e => Number(e.n))) + 1;
           await wf.journal.append('resumed', { rid: req.rid, n });
           await this.resolveFinished(wf);
@@ -285,7 +315,7 @@ export class Engine {
       ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}) };
   }
   private sealed(st: State, entry: Entry): CallResult | undefined {
-    if (entry.type === 'refused') return { key: String(entry.key), gen: 0, status: 'failed', ok: false, error: 'spawn budget exceeded', output: '' };
+    if (entry.type === 'refused') return { key: String(entry.key), gen: 0, status: 'failed', ok: false, error: entry.reason === 'spawn-budget' ? 'spawn budget exceeded' : String(entry.reason), output: '' };
     const call = entry.type === 'reused' ? entry.from : `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`;
     return st.wf.journal.entries().find(e => e.type === JT.sealed && e.call === call)?.result as CallResult | undefined;
   }
@@ -343,7 +373,10 @@ export class Engine {
         }
         const reused = history.findLast(e => e.type === JT.sealed && matching.includes(String(e.call)));
         const fields = { pos: message.pos, key: message.key, spec: message.spec, fingerprint };
-        if (reused) entry = await st.wf.journal.append('reused', { ...fields, from: reused.call, gen: (reused.result as CallResult).gen });
+        const problems = validateCallSpec(message.spec);
+        // A malformed spec from a script never runs: the script gets a failed result naming every problem.
+        if (problems.length) entry = await st.wf.journal.append('refused', { ...fields, reason: `invalid spec: ${problems.join('; ')}` });
+        else if (reused) entry = await st.wf.journal.append('reused', { ...fields, from: reused.call, gen: (reused.result as CallResult).gen });
         else if (history.filter(e => e.type === 'call').length >= (st.wf.pins.maxCalls ?? 300)) {
           entry = await st.wf.journal.append('refused', { ...fields, reason: 'spawn-budget' });
         } else {

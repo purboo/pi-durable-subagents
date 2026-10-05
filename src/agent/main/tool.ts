@@ -26,7 +26,8 @@ function string(args: Args, name: string): string {
   return args[name];
 }
 function call(value: unknown, cwd: string, where: string): CallSpec {
-  const errors = validateCallSpec(value, { fanout: where !== "call" });
+  // A single call may name its key too (it compiles to tasks:[call], so the key addresses it as <wid>/<key>).
+  const errors = validateCallSpec(value, { fanout: true });
   if (errors.length) throw new Error(`Invalid ${where}: ${errors.join("; ")}`);
   const spec = { ...value as Args };
   if (typeof spec.cwd === "string") spec.cwd = resolve(cwd, spec.cwd);

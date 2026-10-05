@@ -10,13 +10,15 @@ import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type RunBody } from "../types.ts";
-import { attention, presented, resolved, unfinishedWorkflow, workflows } from "./main/snapshots.ts";
+import { attention, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
+import { statusDetail, statusView } from "../orchestrator/snapshot.ts";
 import { parameters, request } from "./main/tool.ts";
 
 /** Capabilities the UI (U1) receives from the main agent; every action goes through the same durable outbox. */
 export interface UiDeps {
   home: string;
-  /** Same semantics as the `subagents` tool (P25, P38); returns its reply value. Actions are journaled with by:"user". */
+  /** Same requests as the `subagents` tool (P25, P38), journaled with by:"user"; control actions return {submitted} at once and
+   *  the UI learns their resolution from the ledger. */
   submit(args: Record<string, unknown>): Promise<unknown>;
   presentNote(text: string): void;
 }
@@ -37,9 +39,11 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     const result = queue.then(fn); queue = result.catch(() => {}); return result;
   }
   function ledger() { return readJournalSnapshot(orchLedger(home)); }
+  function decisions() {
+    return reduceLifecycle(ledger().filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[]).resolved;
+  }
   async function reconcile() {
-    const records = ledger().filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[];
-    for (const rid of reduceLifecycle(records).resolved.keys()) await outbox?.markResolved(rid);
+    for (const rid of decisions().keys()) await outbox?.markResolved(rid);
     for (const entry of ledger()) if (entry.type === JT.created) await outbox?.markResolved(String(entry.rid));
   }
   function pendingOutbox() {
@@ -115,9 +119,9 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (!items) return msg;
     return { ...msg, content: items.map(item => resolved(home, item) ? `(resolved: ${item.text})` : item.text).join("\n") };
   }) }));
-  /** P25, P38: One durable submission path for the tool and the UI. */
-  async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal): Promise<unknown> {
-    if (args.action === "status") return workflows(home).sort((a, b) => Number(b.origin === sender) - Number(a.origin === sender));
+  /** P25, P38, T6, T10: One durable submission path for the tool and the UI; replies say what happened when known within 10 s. */
+  async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal, wait = true): Promise<unknown> {
+    if (args.action === "status") return typeof args.wid === "string" && args.wid ? statusDetail(home, args.wid) : statusView(home, { origin: sender });
     const normalized = request(args as Parameters<typeof request>[0], cwd);
     // P33: any call of the run may fork the origin context, so the origin branch is always offered for pinning.
     const sessionFile = ctx?.sessionManager.getSessionFile();
@@ -132,24 +136,31 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       }
       return outbox.send("orch", normalized.kind, normalized.body, normalized.cond);
     });
-    if (sent.kind === "run") {
-      const deadline = performance.now() + 10_000;
-      while (true) {
-        const receipt = ledger().find(e => e.type === JT.created && e.rid === sent.rid);
-        if (receipt) { await serial(async () => { await outbox?.markResolved(sent.rid); }); return { wid: receipt.wid }; }
-        if (performance.now() >= deadline || signal?.aborted) break;
-        await delay(Math.min(100, deadline - performance.now()));
+    // P25: run waits for `created`; control requests wait for their terminal lifecycle record (applied or rejected+reason).
+    const deadline = performance.now() + 10_000;
+    while (wait || sent.kind === "run") {
+      const receipt = sent.kind === "run" ? ledger().find(e => e.type === JT.created && e.rid === sent.rid) : undefined;
+      const decision = receipt ? undefined : decisions().get(sent.rid);
+      if (receipt || decision) {
+        await serial(async () => { await outbox?.markResolved(sent.rid); });
+        if (receipt) return { wid: receipt.wid };
+        if (decision!.type === "rejected") return { applied: false, reason: decision!.reason };
+        if (sent.kind !== "run") return { applied: true };
       }
+      if (performance.now() >= deadline || signal?.aborted) break;
+      await delay(Math.min(100, deadline - performance.now()));
     }
     return { submitted: { rid: sent.rid } };
   }
-  ui?.(pi, { home, presentNote, submit: args => submit({ ...args, by: "user" }, ctx?.cwd ?? process.cwd()) });
+  ui?.(pi, { home, presentNote, submit: args => submit({ ...args, by: "user" }, ctx?.cwd ?? process.cwd(), undefined, false) });
   pi.registerTool(defineTool({
     name: "subagents", label: "Subagents", description: [
       "Durable subagents: crash-safe, never run twice, survive pi restarts. Always asynchronous: run returns {wid}; you are woken once when it finishes or a subagent asks you something.",
       "run — exactly one of: agent+task (one subagent; optional model 'provider/id[:thinking]', cwd, timeoutMs, schema, gate, isolation:'worktree', context:'fork', budget); tasks:[...] (parallel); chain:[...] ({previous} = previous output); workflow:'./script.js' or source (a script using runs.run(key, spec), runs.all([...]), emit(value), args, runs.input(name); return value = result). Optional: args, name, usageBudget {tokens|costUsd}, maxCalls, inputs {name: path}.",
       "send — to: '<wid>/<key>' or a call id; kind: steer | follow-up | answer (with qid, rev from the question) | model (model:'provider/id[:thinking]'); replaces: [rid] supersedes your earlier send.",
-      "status — fresh snapshot of all workflows. stop target:<wid|call>. revise wid + workflow/source/args. resume [wid]. drain.",
+      "status — compact fresh snapshot (own workflows first; per call: status, usage, last output line); status wid:<wid> — one workflow in full detail incl. outputs and script.log path.",
+      "stop target:<wid|call>. revise wid + workflow/source/args. resume [wid] (parked workflows or after drain; done/failed/stopped are final — start a new run). drain.",
+      "Control actions reply {applied:true} or {applied:false, reason} once the orchestrator decides (else {submitted:{rid}} after 10 s).",
     ].join("\n"), parameters,
     async execute(_id, args, signal, _update, context) {
       const value = await submit(args as Record<string, unknown>, context.cwd, signal);
