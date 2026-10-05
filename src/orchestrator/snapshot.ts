@@ -37,6 +37,8 @@ export interface WorkflowSnapshot {
   counts: Record<CallPhase, number>;
   attention: AttentionItem[];
   startedAt?: number; endedAt?: number;
+  /** Drain: the orchestrator is drained (stop-all); queued calls start only after resume. */
+  paused?: boolean;
   /** P31: every call ever charged to this workflow, across revisions (always set by snapshotFromEntries). */
   usage?: Usage;
 }
@@ -164,9 +166,17 @@ function workflowIds(home: string): string[] {
   return wids.filter(wid => !pruned.has(wid));
 }
 
-/** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID). */
+/** Drain: the workflows a drain (stop-all) holds until resume: those created before the last drain, if no undrain followed. */
+export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean } {
+  const ledger = readJournalSnapshot(orchLedger(home)), last = ledger.findLast(e => e.type === "drain" || e.type === "undrain");
+  if (last?.type !== "drain") return { held: () => false };
+  return { since: last.ts, held: wid => (ledger.find(e => e.type === JT.created && e.wid === wid)?.seq ?? -1) < last.seq };
+}
+
+/** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
 export function allWorkflows(home: string): WorkflowSnapshot[] {
-  return workflowIds(home).sort().reverse().map(wid => workflowSnapshot(home, wid));
+  const { held } = heldWorkflows(home);
+  return workflowIds(home).sort().reverse().map(wid => { const wf = workflowSnapshot(home, wid); return wf.status === "running" && held(wid) ? { ...wf, paused: true } : wf; });
 }
 
 /** P10/P11: Per-workflow script console log written by the orchestrator (bounded, human-readable). */
@@ -196,6 +206,8 @@ export interface StatusView {
   /** Finished workflows older than the newest `keep` finished ones, collapsed (T10). */
   olderFinished?: number;
   hint?: string;
+  /** Drain: set while the orchestrator is drained by stop-all/drain; nothing new starts until resume. */
+  paused?: string;
 }
 export type StatusDetail = WorkflowSnapshot & { scriptLog?: string };
 
@@ -233,7 +245,9 @@ export function statusView(home: string, options: { origin?: string; keep?: numb
   let finished = 0;
   const shown = all.filter(w => !["done", "failed", "stopped"].includes(w.status) || ++finished <= keep);
   const hidden = all.length - shown.length;
-  return { workflows: shown.map(compactWorkflow), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}) };
+  const { since, held } = heldWorkflows(home), paused = all.filter(w => w.status === "running" && held(w.wid)).length;
+  return { workflows: shown.map(compactWorkflow), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
+    ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused by stop-all/drain since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}) };
 }
 
 /** P25, T10: One workflow in full detail (results, outputs, script log path) but without raw journal entries. */

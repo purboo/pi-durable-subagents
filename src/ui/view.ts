@@ -78,7 +78,7 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   const question = workflow.attention.find(a => a.kind === "question" && a.call === call.callId);
   if (question) return `asking main agent: ${question.text}`;
   if (workflow.attention.some(a => a.kind === "stall" && a.call === call.callId)) return `no activity for ${duration(now - Math.max(call.lastActivity ?? call.startedAt ?? now, facts?.lastActivity ?? 0))}`;
-  if (call.phase === "queued") return "queued: waiting for capacity";
+  if (call.phase === "queued") return workflow.paused ? "paused by stop-all · resume to start" : "queued: waiting for a free slot";
   // Liveness (UI §2): the age of the newest evidence ticks, and resets whenever the agent does anything.
   const since = duration(Math.max(0, now - Math.max(call.lastActivity ?? 0, facts?.lastActivity ?? 0, call.startedAt ?? 0)));
   return facts?.activity ? `${facts.activity} · ${since}` : `thinking · ${since}`;

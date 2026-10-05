@@ -59,6 +59,7 @@ export function renderView(view: StatusView): string {
   const lines = view.workflows.map(w => [`${w.wid}@${w.rev}${w.name ? ` ${w.name}` : ""}: ${w.status}${w.error ? ` (${clip(w.error, 200)})` : ""} · ${w.counts.sealed}/${w.calls.length} sealed${w.usage.input || w.usage.output || w.usage.costUsd ? ` · ${formatUsage(w.usage)}` : ""}`,
     ...w.calls.map(c => `  ${c.key}@${c.gen} ${c.status ?? c.phase}${c.model ? ` ${c.model}` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage ? ` ${formatUsage(c.usage)}` : ""}${c.lastLine ? ` ${JSON.stringify(c.lastLine)}` : c.error ? ` (${c.error})` : ""}`),
     ...w.attention.map(a => `  ${a.kind}: ${JSON.stringify(a.text)}`)].join("\n"));
+  if (view.paused) lines.unshift(`${view.paused} (pi-durable-subagents resume)`);
   if (view.olderFinished) lines.push(`(+${view.olderFinished} older finished workflows; status <wid> shows one in detail)`);
   return lines.join("\n") || "No workflows";
 }

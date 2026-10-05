@@ -13,6 +13,7 @@ import { CT, JT, type AttentionItem, type RunBody } from "../types.ts";
 import { attention, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
 import { statusDetail, statusView } from "../orchestrator/snapshot.ts";
 import { parameters, request } from "./main/tool.ts";
+import { discoverAgents } from "../compat/agents.ts";
 
 /** Capabilities the UI (U1) receives from the main agent; every action goes through the same durable outbox. */
 export interface UiDeps {
@@ -154,6 +155,11 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     return { submitted: { rid: sent.rid } };
   }
   ui?.(pi, { home, presentNote, submit: args => submit({ ...args, by: "user" }, ctx?.cwd ?? process.cwd(), undefined, false) });
+  // The model must name a real agent; list the ones this project can use (names are checked again per run).
+  let agents = "";
+  try {
+    agents = discoverAgents(process.cwd()).agents.map(a => `${a.name} (${a.description.split(/[.\n]/)[0]!.trim().slice(0, 80)})`).join("; ");
+  } catch { /* Discovery problems surface when a run is pinned. */ }
   pi.registerTool(defineTool({
     name: "subagents", label: "Subagents", description: [
       "Durable subagents: crash-safe, never run twice, survive pi restarts. Always asynchronous: run returns {wid}; you are woken once when it finishes or a subagent asks you something.",
@@ -162,6 +168,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       "status — compact fresh snapshot (own workflows first; per call: status, usage, last output line); status wid:<wid> — one workflow in full detail incl. outputs and script.log path.",
       "stop target:<wid|call>. revise wid + workflow/source/args. resume [wid] (parked workflows or after drain; done/failed/stopped are final — start a new run). drain.",
       "Control actions reply {applied:true} or {applied:false, reason} once the orchestrator decides (else {submitted:{rid}} after 10 s).",
+      ...(agents ? [`Agents (use one of these names): ${agents}.`] : []),
     ].join("\n"), parameters,
     async execute(_id, args, signal, _update, context) {
       const value = await submit(args as Record<string, unknown>, context.cwd, signal);

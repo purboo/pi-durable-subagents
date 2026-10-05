@@ -155,12 +155,13 @@ unchanged, with zero edited lines.
 pi-durable-subagents smoke              check this machine and this pi (offline, < 60 s)
 pi-durable-subagents chaos              run the fault suite (offline, about 2 minutes)
 pi-durable-subagents status [wid] [--json]
-pi-durable-subagents tail [wid]
+pi-durable-subagents tail [wid] [--json]
 pi-durable-subagents start              start the orchestrator if work is pending; sends nothing
 pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)
-pi-durable-subagents drain              start nothing new; running work finishes
+pi-durable-subagents drain              hold existing workflows: running calls finish, nothing new starts in them
 pi-durable-subagents stop <wid|call>
-pi-durable-subagents stop-all           pause everything; journals stay resumable
+pi-durable-subagents stop-all           pause every existing workflow now; journals stay resumable
+                                        (runs you start afterwards are not held)
 pi-durable-subagents prune [wid] [--older-than <days>]
                                         delete finished workflows (done, failed, stopped); prints count and bytes freed
 pi-durable-subagents doctor [--json]    read-only health check; exits 1 when something needs you

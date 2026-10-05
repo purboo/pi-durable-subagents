@@ -57,6 +57,8 @@ async function start(message: Start) {
       }
       if (event.t === 'log') { process.stderr.write(`${JSON.stringify(event)}\n`); return; }
       if (event.t === 'need') slot.need = event.n;
+      // P10: an idle script waits for exposures; CPU spent by the idle thread (GC, housekeeping) is not a segment.
+      if (event.t === 'idle') slot.baseline = undefined;
       if (event.t === 'done' || event.t === 'error') finish(message.wid, slot, event);
       else send(event);
     });

@@ -58,7 +58,7 @@ test('CLI prune and doctor against journals written by the real engine with the 
   };
   const one = await run('one', 1, "return await runs.run('a',{agent:'test',task:'hello'});");
   const two = await run('two', 2, "return await runs.run('b',{agent:'test',task:'world'});");
-  const parked = await run('three', 3, "return await runs.run('c',{agent:'nobody',task:'x'});");
+  const parked = await run('three', 3, "return await Promise.all([runs.run('c',{agent:'test',task:'x'}), runs.run('c',{agent:'test',task:'y'})]);");
 
   // Healthy: everything is reported, nothing is actionable.
   let r = await cli(['doctor', '--json'], env);
