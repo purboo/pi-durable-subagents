@@ -21,10 +21,11 @@
   },
   "pi": {
     "extensions": [
-      "dist/agent/extension.js"
+      "./index.js"
     ]
   },
   "files": [
+    "index.js",
     "dist",
     "agents",
     "README.md",
