@@ -715,3 +715,12 @@ test('contracts: a script proposing an invalid spec gets a failed result naming 
   assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 0);
   assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
 });
+
+test('contracts: status shows the real refusal reason, the same text the script received', async t => {
+  const { home, run } = await fixture(t);
+  const wf = await run(`return await runs.run('a', {agent:'test', task:'a', isolaton:'worktree'});`);
+  await until(() => wf.journal.entries().some(e => e.type === JT.done));
+  const shown = workflowSnapshot(home, wf.wid).calls[0]!.result!.error!;
+  assert.match(shown, /invalid spec: unknown field "isolaton"/);
+  assert.equal(shown, (wf.journal.entries().find(e => e.type === JT.done)!.result as { error: string }).error);
+});

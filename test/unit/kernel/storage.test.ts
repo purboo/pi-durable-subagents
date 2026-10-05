@@ -146,3 +146,15 @@ test('A1, C11: snapshots are shared, frozen and extended incrementally; a torn t
   await writeFile(path, '');
   assert.deepEqual(readJournalSnapshot(path), [], 'a shorter file is read from scratch');
 });
+
+test('A3, C11: requests with a long or unsafe rid are never admitted (no path can exceed limits downstream)', async () => {
+  const { mkdtemp, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { scanInbox } = await import('../../../src/kernel/mailbox.ts');
+  const dir = await mkdtemp(join(tmpdir(), 'dsa-rid-')), bad: string[] = [];
+  const base = { from: 's', to: 'orch', sseq: 1, kind: 'run', body: {} };
+  for (const rid of ['ok-01:a.b', 'x'.repeat(129), '任务'.repeat(40), '-leading']) await writeFile(join(dir, `${rid}.json`), JSON.stringify({ ...base, rid }));
+  const admitted = await scanInbox(dir, path => bad.push(path));
+  assert.deepEqual(admitted.map(r => r.rid), ['ok-01:a.b']); assert.equal(bad.length, 3);
+});

@@ -19,7 +19,7 @@ import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
-import { formatUsage, snapshotFromEntries } from './snapshot.ts';
+import { formatUsage, refusedResult, snapshotFromEntries } from './snapshot.ts';
 import { validateCallSpec } from '../compat/spec.ts';
 
 const clip = (text: string, n = 300) => text.length > n ? `${text.slice(0, n)}…` : text;
@@ -315,7 +315,7 @@ export class Engine {
       ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}) };
   }
   private sealed(st: State, entry: Entry): CallResult | undefined {
-    if (entry.type === 'refused') return { key: String(entry.key), gen: 0, status: 'failed', ok: false, error: entry.reason === 'spawn-budget' ? 'spawn budget exceeded' : String(entry.reason), output: '' };
+    if (entry.type === 'refused') return refusedResult(String(entry.key), entry.reason);
     const call = entry.type === 'reused' ? entry.from : `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`;
     return st.wf.journal.entries().find(e => e.type === JT.sealed && e.call === call)?.result as CallResult | undefined;
   }
