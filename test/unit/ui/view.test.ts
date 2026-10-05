@@ -6,7 +6,7 @@ import { root, clean, now, call, workflow, state, session } from "./fixture.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
 import type { CallStatus } from "../../../src/types.ts";
-const { listRows, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount, summaryText, summary, resultPhrase, resultWord } = await import("../../../src/ui/view.ts");
+const { listRows, toggleOpen, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount, summaryText, summary, resultPhrase, resultWord } = await import("../../../src/ui/view.ts");
 const { visibleWidth } = await import("@earendil-works/pi-tui");
 const { SessionTail, thoughtSummary, sessionFacts, sessionBranch } = await import("../../../src/ui/session.ts");
 after(clean);
@@ -46,7 +46,7 @@ test("unviewed failures remain visible; finished workflows stay listed with thei
   assert.ok(listed.some(r => r.kind === "workflow" && r.dim), "v12 §5: the finished workflow stays listed, dimmed");
   assert(listed.some(r => r.call === good), "its done rows stay readable after the failure is viewed");
   s.done.set("w", 0);
-  assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.kind), ["workflow", "done"], "collapse keeps the workflow row and its done node");
+  assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.kind), ["workflow"], "a closed finished workflow keeps its row");
 });
 
 test("done rows reopen on new failure and completion transitions, then respect fresh user collapse", () => {
@@ -277,15 +277,15 @@ test("v12 §5: finished workflows stay expandable with dimmed call rows; finishe
   const w = workflow([good, bad], { status: "failed" }), s = state();
   s.viewed.add(bad.callId); // no unviewed failure: the compact listing is the default
   let rows = listRows([w], s, new Map(), () => "—", 100, now);
-  assert.deepEqual(rows.map(r => r.kind), ["workflow", "done"], "the finished workflow stays listed with its done node");
-  assert.equal(rows[0]!.dim, true); assert.equal(rows[1]!.dim, true);
-  assert.match(rows[1]!.text, /▸ 2 done/);
-  s.done.set("w", 8);
+  assert.deepEqual(rows.map(r => r.kind), ["workflow"], "the finished workflow stays listed, closed");
+  assert.equal(rows[0]!.dim, true); assert.match(rows[0]!.text, /^▸ /);
+  toggleOpen(w, s); // Enter opens it: its agents are listed directly, without a nested "done" node
   rows = listRows([w], s, new Map(), () => "—", 100, now);
+  assert.deepEqual(rows.map(r => r.kind), ["workflow", "call", "call"]); assert.match(rows[0]!.text, /^▾ /);
   const goodRow = rows.find(r => r.call?.key === "good")!;
   assert.match(goodRow.text, /done · LEAF: ok/, "the finished agent keeps its final line");
   assert.equal(goodRow.dim, true);
-  s.folded.add("w");
+  toggleOpen(w, s);
   assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.kind), ["workflow"], "folding toggles, but the row never vanishes");
   const solo = listRows([workflow([good], { wid: "solo", status: "done" })], state(), new Map(), () => "—", 100, now);
   assert.equal(solo[0]!.kind, "call"); assert.equal(solo[0]!.dim, true); assert.match(solo[0]!.text, /LEAF: ok/);

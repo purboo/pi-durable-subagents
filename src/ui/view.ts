@@ -125,6 +125,15 @@ export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undef
 
 /** UI §2, v12 §5: Group workflows (finished ones stay listed, dimmed and expandable — never hidden behind a toggle),
  *  keep unviewed failures visible, and page newest done rows eight at a time. */
+/** v12 §5: Whether a workflow shows its agents: running ones unless folded; finished ones once opened (Enter, or on completion). */
+export function isOpen(w: WorkflowSnapshot, state: ViewState): boolean {
+  return !state.folded.has(w.wid) && (w.status === "running" || (state.done.get(w.wid) ?? 0) > 0);
+}
+/** v12 §5: Enter on a workflow row opens or closes it. */
+export function toggleOpen(w: WorkflowSnapshot, state: ViewState): void {
+  if (isOpen(w, state)) state.folded.add(w.wid);
+  else { state.folded.delete(w.wid); if (w.status !== "running") state.done.set(w.wid, Math.max(8, state.done.get(w.wid) ?? 0)); }
+}
 export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewState, facts: ReadonlyMap<string, Facts>, name: ModelName, width: number, now = Date.now()): ListRow[] {
   const rows: ListRow[] = [];
   state.observed ??= new Map();
@@ -160,10 +169,14 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     const dim = w.status !== "running"; // v12 §5: finished workflows are dimmed, not hidden
     if (w.calls.length === 1) { callRow(w, w.calls[0]!, "  ", "    ", dim); continue; }
     // Stable order (UI §2): active rows keep proposal (snapshot) order; done rows by immutable end time.
-    const done = doneOrder(w.calls), active = w.calls.filter(c => c.phase !== "sealed"), folded = state.folded.has(w.wid);
+    const done = doneOrder(w.calls), active = w.calls.filter(c => c.phase !== "sealed"), folded = !isOpen(w, state);
     const progress = progressOf(w); // v12 §4: done/planned, `n+` while a script workflow keeps proposing
     rows.push({ id: w.wid, kind: "workflow", workflow: w, dim, text: `${folded ? "▸" : "▾"} ${w.name ?? w.wid} · ${progress.done}/${progress.total}${progress.plus ? "+" : ""} · ${duration((w.endedAt ?? now) - (w.startedAt ?? now))}` });
     if (folded) continue;
+    if (dim) { // a finished workflow lists its agents directly (no nested "done" node)
+      done.forEach((c, i) => callRow(w, c, i === done.length - 1 ? "  └ " : "  ├ ", undefined, dim));
+      continue;
+    }
     active.forEach((c, i) => { const last = i === active.length - 1 && !done.length; callRow(w, c, last ? "  └ " : "  ├ ", last ? "      " : "  │   ", dim); });
     if (!done.length) continue;
     const count = state.done.get(w.wid) ?? (w.status === "running" && !active.length || unviewed(w) ? 8 : 0), shown = done.slice(0, count);
