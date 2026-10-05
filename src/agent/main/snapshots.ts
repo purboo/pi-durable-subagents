@@ -6,13 +6,15 @@ import { singlePresentation } from "../../kernel/guards.ts";
 import { journalPath, orchLedger } from "../../paths.ts";
 import { CT, JT, type AttentionItem, type Entry } from "../../types.ts";
 
-/** P15, P25: Read workflow snapshots without modifying another domain's history. */
+/** P15, P25: Read workflow snapshots without modifying another domain's history; a wid with an orchestrator.jsonl
+ *  `pruned{wid}` entry is gone (housekeeping), even while its directory is still being removed. */
 export function workflows(home: string): { wid: string; origin?: string; entries: Entry[] }[] {
   const ledger = readJournalSnapshot(orchLedger(home));
   let names: string[];
   try { names = readdirSync(join(home, "w")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
-  const ids = new Set([...ledger.filter(e => e.type === JT.created).map(e => String(e.wid)), ...names]);
+  const pruned = new Set(ledger.filter(e => e.type === "pruned").map(e => String(e.wid)));
+  const ids = new Set([...ledger.filter(e => e.type === JT.created).map(e => String(e.wid)), ...names].filter(wid => !pruned.has(wid)));
   return [...ids].sort().map(wid => {
     const entries = readJournalSnapshot(journalPath(home, wid));
     const created = ledger.find(e => e.type === JT.created && e.wid === wid) ?? entries.find(e => e.type === JT.created);

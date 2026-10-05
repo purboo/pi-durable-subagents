@@ -30,6 +30,10 @@ export function modelLabel(model: string | undefined, find: (provider: string, i
 }
 /** UI §2–3: Count committed tool calls compactly; zero is not shown. */
 export const toolCount = (n: number | undefined) => n ? `${n} tool${n === 1 ? "" : "s"}` : "";
+/** UI §3, P7: Messages sent to a call whose delivery the child has not confirmed yet; zero is not shown. */
+export const pendingText = (n: number | undefined) => n ? `${n} message${n === 1 ? "" : "s"} pending` : "";
+/** UI §2, P7: The list row's small pending marker (the watch header spells it out). */
+export const pendingMarker = (n: number | undefined) => n ? `${n} pending` : "";
 /** UI §2: Stable workflow order — own session first, then start time (oldest first), never by activity. */
 export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt">>(workflows: readonly T[], own?: string): T[] {
   // Newest first; start times never change, so the order is stable while you read.
@@ -134,7 +138,7 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     model: Math.min(26, Math.max(0, ...shownCalls.map(c => visibleWidth(name(facts.get(c.callId)?.model ?? c.model))))) };
   const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
-    const text = rowText(indent, label(c), name(f?.model ?? c.model), statusPhrase(c, w, f, now), [toolCount(f?.tools), age], width, cols);
+    const text = rowText(indent, label(c), name(f?.model ?? c.model), statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
     rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), text });
     // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.
     if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)) });

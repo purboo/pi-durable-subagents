@@ -6,31 +6,41 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { dsaHome } from "../paths.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
-import { journalPath } from "../paths.ts";
+import { journalPath, orchLedger } from "../paths.ts";
 import { allWorkflows, eventsFromEntries, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, compactWorkflow } from "../orchestrator/snapshot.ts";
-import { start, startOrchestrator, submit, type Control } from "./control.ts";
+import { resolution, start, startOrchestrator, submit, type Control } from "./control.ts";
+import { doctor, renderDoctor, size } from "./doctor.ts";
 import { smoke } from "./smoke.ts";
 import { serviceFiles, manageService, type ServiceRunner } from "./service.ts";
 
-const commands = ["smoke", "tail", "status", "events", "start", "resume", "drain", "stop", "stop-all", "install-service", "uninstall-service", "help"] as const;
+const commands = ["smoke", "tail", "status", "events", "start", "resume", "drain", "stop", "stop-all", "prune", "doctor", "install-service", "uninstall-service", "help"] as const;
 type Command = typeof commands[number];
-export interface Arguments { command: Command; target?: string; json: boolean; dryRun?: boolean }
+export interface Arguments { command: Command; target?: string; json: boolean; dryRun?: boolean; olderThanDays?: number }
 /** P25: Reject ambiguous CLI arguments before any durable action. */
 export function parseArgs(args: string[]): Arguments {
   if (!args.length || (args.length === 1 && ["-h", "--help"].includes(args[0]!))) return { command: "help", json: false };
   const command = args[0] as Command;
   if (!commands.includes(command)) throw new Error(`Unknown command: ${command}`);
-  const rest = args.slice(1), json = rest.includes("--json"), dryRun = rest.includes("--dry-run");
+  let rest = args.slice(1), olderThanDays: number | undefined;
+  const at = rest.indexOf("--older-than");
+  if (at >= 0) {
+    if (command !== "prune") throw new Error("--older-than is only supported by prune");
+    const value = rest[at + 1];
+    if (value === undefined || !/^\d+(\.\d+)?$/.test(value)) throw new Error("--older-than needs a number of days");
+    olderThanDays = Number(value); rest = [...rest.slice(0, at), ...rest.slice(at + 2)];
+  }
+  const json = rest.includes("--json"), dryRun = rest.includes("--dry-run");
   if (dryRun && !["install-service", "uninstall-service"].includes(command)) throw new Error("--dry-run requires a service command");
-  if (json && !["status", "events", "tail"].includes(command)) throw new Error("--json is only supported by status, events and tail");
+  if (json && !["status", "events", "tail", "doctor"].includes(command)) throw new Error("--json is only supported by status, events, tail and doctor");
   if (rest.filter(a => a === "--json").length > 1 || rest.filter(a => a === "--dry-run").length > 1 || rest.some(a => a.startsWith("-") && a !== "--json" && a !== "--dry-run")) throw new Error("Unknown or repeated option");
   const targets = rest.filter(a => a !== "--json" && a !== "--dry-run");
-  const optional = ["status", "tail", "resume"].includes(command);
+  const optional = ["status", "tail", "resume", "prune"].includes(command);
   const required = command === "stop" || command === "events";
   if (targets.length > (optional || required ? 1 : 0) || (required && targets.length !== 1)) throw new Error(`Invalid arguments for ${command}`);
   const target = targets[0];
   if (target && command !== "stop" && (!/^[^/\\\0]+$/.test(target) || target === "." || target === "..")) throw new Error("Invalid workflow id");
-  return { command, json, ...(dryRun ? { dryRun } : {}), ...(target ? { target } : {}) };
+  if (target && olderThanDays !== undefined) throw new Error("prune takes a workflow id or --older-than, not both");
+  return { command, json, ...(dryRun ? { dryRun } : {}), ...(target ? { target } : {}), ...(olderThanDays !== undefined ? { olderThanDays } : {}) };
 }
 const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
 /** P25, T10: Render journal-derived status (one line per call, last output line only) without live orchestrator memory. */
@@ -74,11 +84,11 @@ export function serviceEntryError(entry: string): string | undefined {
   if (/[/\\]_npx[/\\]/.test(entry)) return `install-service refuses to run from an npx cache (${entry}); the cache can be pruned and the service would break. Install the CLI with \`npm i -g pi-durable-subagents\` and run \`pi-durable-subagents install-service\` again.`;
   return undefined;
 }
-export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
+export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | prune [wid] [--older-than <days>] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
 /** P1, P21, P25, P38: Dispatch the public CLI using durable requests and read-only snapshots. */
-export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string } = {}): Promise<number> {
+export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string; waitMs?: number; now?: number } = {}): Promise<number> {
   if (args[0] === "chaos") return (await import("./chaos/index.ts")).chaos(args.slice(1), options.env ?? process.env, options.write);
-  const { command, target, json, dryRun } = parseArgs(args), env = options.env ?? process.env;
+  const { command, target, json, dryRun, olderThanDays } = parseArgs(args), env = options.env ?? process.env;
   const home = dsaHome(env), write = options.write ?? (line => console.log(line));
   if (command === "help") { write(HELP); return 0; }
   // Quiet when idle: the optional service runs this every K1 and must not fill the system log.
@@ -114,6 +124,21 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     const files = serviceFiles(env.HOME ?? homedir(), home, entry);
     await manageService(files, command === "install-service", { dryRun, runner: options.serviceRunner, write });
     files.forEach(f => write(`${command}: ${f.path}`));
+    return 0;
+  }
+  if (command === "doctor") {
+    const report = await doctor(home, env, options.now);
+    write(json ? JSON.stringify(report, null, 2) : renderDoctor(report));
+    return report.findings.length ? 1 : 0;
+  }
+  if (command === "prune") {
+    const [req] = await submit(home, "prune", target, env, { olderThanDays });
+    const waitMs = options.waitMs ?? 60_000, outcome = await resolution(home, req!.rid, waitMs);
+    if (!outcome) { write(`submitted prune ${req!.rid}; not resolved within ${Math.round(waitMs / 1000)} s (is the orchestrator running? see: pi-durable-subagents doctor)`); return 1; }
+    if (outcome.type === "rejected") { write(`prune rejected: ${outcome.reason}`); return 1; }
+    const pruned = readJournalSnapshot(orchLedger(home)).filter(e => e.type === "pruned" && e.rid === req!.rid);
+    write(`pruned ${pruned.length} workflow${pruned.length === 1 ? "" : "s"}, freed ${size(pruned.reduce((n, e) => n + (Number(e.bytes) || 0), 0))}`);
+    for (const e of pruned) write(`  ${String(e.wid)}`);
     return 0;
   }
   for (const req of await submit(home, command as Control, target, env)) write(`submitted ${req.kind} ${req.rid}`);

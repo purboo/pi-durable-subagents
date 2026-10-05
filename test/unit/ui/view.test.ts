@@ -199,3 +199,18 @@ test("overview: newest workflow first, agents as tree children, live preview lin
   assert.ok(rows.some(r => /^ {6}└ map .*done · LEAF: ok/.test(r)), "done rows nested under their done node, showing the final line");
   assert.equal(summaryText([older, newer]), "3 working · 1/4 done");
 });
+
+test("P7 list rows carry a small pending marker until the message is delivered, within width", async () => {
+  const { pendingMarker, pendingText } = await import("../../../src/ui/view.ts");
+  assert.equal(pendingText(1), "1 message pending"); assert.equal(pendingText(2), "2 messages pending"); assert.equal(pendingText(0), "");
+  assert.equal(pendingMarker(undefined), "");
+  const c = call("E02", { pending: 1, sends: [{ rid: "s", kind: "steer", state: "pending", at: now }] }), w = workflow([c, call("E05")]);
+  const facts = new Map([[c.callId, { ...sessionFacts([], c.callId), tools: 3 }]]);
+  const row = (width: number) => listRows([w], state(), facts, () => "GPT-6 (openai)", width, now).find(r => r.call?.key === "E02")!.text;
+  assert.match(row(100), /thinking · 20s\s+1 pending · 3 tools · 3m$/);
+  for (const width of [24, 40, 60, 100]) assert(visibleWidth(row(width)) <= width, `${width}: ${row(width)}`);
+  assert(!listRows([w], state(), facts, () => "GPT-6 (openai)", 100, now).find(r => r.call?.key === "E05")!.text.includes("pending"));
+  // Delivered: the snapshot no longer counts it, so the marker disappears.
+  delete c.pending; c.sends = [{ rid: "s", kind: "steer", state: "delivered", at: now }];
+  assert.doesNotMatch(row(100), /pending/); assert.match(row(100), /3 tools · 3m$/);
+});
