@@ -185,10 +185,19 @@ export class Engine {
   private findCall(to: string): { wf: Workflow; entry: Entry } | undefined {
     for (const wf of this.store.workflows.values()) {
       const calls = revisionEntries(wf).filter(e => e.type === 'call' || e.type === 'generation');
-      const named = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}`);
+      // A bare wid addresses its call when the workflow has exactly one key.
+      const keys = new Set(calls.map(e => String(e.key)));
+      const named = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}` || (to === wf.wid && keys.size === 1));
       const entry = named && calls.findLast(e => e.key === named.key);
       if (entry) return { wf, entry };
     }
+  }
+  /** P25: Explain an unknown send target with the addresses that would work. */
+  private unknownCall(to: unknown): string {
+    const wid = String(to ?? '').split(/[@/]/)[0]!, wf = this.store.workflows.get(wid);
+    if (!wf) return `unknown-call: no workflow ${JSON.stringify(wid)}; address a call as '<wid>/<key>'`;
+    const keys = [...new Set(revisionEntries(wf).filter(e => e.type === 'call' || e.type === 'generation').map(e => `${wf.wid}/${String(e.key)}`))];
+    return `unknown-call: use one of ${keys.join(', ') || '(no calls yet)'}`;
   }
   private context(wf: Workflow, entry: Entry) { return { journal: wf.journal, widRev: `${wf.wid}@${wf.revision}` as const, key: entry.key as string, gen: entry.gen as number }; }
   private async withdraw(req: Request) {
@@ -236,7 +245,7 @@ export class Engine {
       const existing = [...this.store.workflows.values()].flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && e.rid === req.rid).map(entry => ({ wf, entry })))[0];
       if (existing) { this.dispatchGeneration(existing.wf, existing.entry); return { action: 'apply' }; }
       const target = this.findCall((req.body as SendBody)?.to);
-      if (!target) return { action: 'reject', reason: 'unknown-call' };
+      if (!target) return { action: 'reject', reason: this.unknownCall((req.body as SendBody)?.to) };
       const { wf, entry } = target, send = req.body as SendBody;
       const from = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
       if (['steer', 'follow-up'].includes(send.kind) && wf.journal.entries().some(e => e.type === JT.sealed && e.call === from)) {
