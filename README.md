@@ -118,8 +118,8 @@ deterministic: use `now()`/`random()`, not `Date`/`Math.random`.
 
 While subagents work, one dim line appears above the editor
 (`1 asks you · 3 working · 12/40 done`). Press `↓` on an empty editor to open
-the list: this session's workflows (and other sessions' while they run),
-newest first, every subagent with its model, what it is
+the list: this session's workflows (sessions are independent), newest
+first, every subagent with its model, what it is
 doing and for how long, and its latest line. Finished ones stay there,
 dimmed, with their conclusion.
 

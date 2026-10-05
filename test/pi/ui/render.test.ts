@@ -232,11 +232,11 @@ test("P7 watch header and list show pending messages from the journal; delivery 
     assert.match(list, /├ E02  GPT-6 \(openai\)  thinking · 0s +1 pending · 0s\n/); assert.doesNotMatch(list.split("\n").find(l => l.includes("E05"))!, /pending/);
     screen.handleInput("\x1b[B"); screen.handleInput("\r");
     const header = () => plain(screen).split("\n")[2]!;
-    assert.match(header(), /^E02 · GPT-6 \(openai\) ▾ · high ▾ · 1 message pending$/);
+    assert.match(header(), /^E02 · GPT-6 \(openai\) ▾ · high ▾ · 1 message pending · ctx 110$/);
     for (const width of [40, 60, 100]) assert(screen.render(width).every(line => visibleWidth(line) <= width));
     j = await openJournal(path); await j.append("forward-delivered", { rid: "s1", rid2: "x1", call }); await j.close();
     data.refresh();
-    assert.doesNotMatch(header(), /pending/); assert.match(header(), /▾ · high ▾$/);
+    assert.doesNotMatch(header(), /pending/); assert.match(header(), /▾ · high ▾ · ctx 110$/);
     screen.handleInput("\x1b"); assert.doesNotMatch(plain(screen), /pending/);
   } finally { Date.now = original; }
 });
@@ -244,7 +244,7 @@ test("P7 watch header and list show pending messages from the journal; delivery 
 test("fullscreen model and thinking controls expose separate selectors", async () => {
   const { screen, open, requests } = setup(); open();
   // Row 2 of the panel is the model line; content starts at column 2 inside the border.
-  assert.match(plain(screen).split("\n")[2]!, /^E02 · GPT-6 \(openai\) ▾ · high ▾ · 1 tool$/);
+  assert.match(plain(screen).split("\n")[2]!, /^E02 · GPT-6 \(openai\) ▾ · high ▾ · 1 tool · ctx 110$/);
   assert.equal(screen.handleMouse({ type: "click", button: "left", x: 2 + 40, y: 2 } as TuiMouseEvent), undefined);
   screen.handleMouse({ type: "click", button: "left", x: 2 + 27, y: 2 } as TuiMouseEvent);
   assert.match(plain(screen), /Thinking for E02/); screen.handleInput("\r"); await tick();
@@ -268,7 +268,7 @@ test("list order and selection stay put across activity refreshes and inserted r
   screen.handleInput("\x1b"); screen.handleInput("\r"); assert.match(plain(screen), /E07 · GPT-6/); // Esc returns to the watched row
 });
 
-test("every view is a framed full-height panel at several widths and heights", async () => {
+test("every view is a framed floating panel: compact list and menus, a tall watch view, at several widths and heights", async () => {
   const original = Date.now; Date.now = () => now;
   try {
     for (const rows of [45, 12]) {
@@ -276,18 +276,21 @@ test("every view is a framed full-height panel at several widths and heights", a
       (screen as unknown as { tui: { terminal: { rows: number } } }).tui = { ...tui, terminal: { rows, columns: 100 } } as typeof tui;
       // The short panel also runs with styled output: selection background and border colours must not change widths.
       if (rows === 12) (screen as unknown as { theme: typeof theme }).theme = { fg: (_c: string, t: string) => `\x1b[36m${t}\x1b[39m`, bg: (_c: string, t: string) => `\x1b[44m${t}\x1b[49m`, bold: (t: string) => `\x1b[1m${t}\x1b[22m` } as typeof theme;
+      const compact = rows < 20 ? rows : Math.floor(rows * 0.6) - 2, tall = rows < 20 ? rows : Math.floor(rows * 0.85) - 2;
+      const fits = (lines: string[], cap: number, exact = false) => { assert.ok(exact ? lines.length === cap : lines.length <= cap, `${lines.length} rows within ${cap}`); return lines.length; };
       screen.render(100); screen.handleInput("\x1b[B");
-      for (const width of [20, 40, 60, 100]) assertFrame(screen.render(width), width, rows, /^╭─ Subagents /);
+      for (const width of [20, 40, 60, 100]) { const lines = screen.render(width); assertFrame(lines, width, fits(lines, compact), /^╭─ Subagents /); }
+      if (rows === 45) assert.equal(screen.render(100).length, 5 + 2, "the list grows with its content, not to the terminal height");
       if (rows === 12) assert(screen.render(100)[2]!.includes("\x1b[44m"), "selected row is highlighted across the panel");
       screen.handleInput("\r");
-      for (const width of [20, 40, 60, 100]) assertFrame(screen.render(width), width, rows, /^╭─ exec-0927 › E02 /);
+      for (const width of [20, 40, 60, 100]) { const lines = screen.render(width); assertFrame(lines, width, fits(lines, tall, true), /^╭─ exec-0927 › E02 /); }
       const watch = plain(screen).split("\n");
       assert.match(watch.at(-2)!, /^╰─ 3m · Esc back ─+╯$/); // key hints live in the bottom border
       assert.match(watch.at(-4)!, /^Steer E02…/); // the editor sits at the bottom of the panel
       screen.handleInput("\x0c");
-      for (const width of [20, 40, 60, 100]) assertFrame(screen.render(width), width, rows, /^╭─ Model for E02 /);
+      for (const width of [20, 40, 60, 100]) { const lines = screen.render(width); assertFrame(lines, width, fits(lines, compact), /^╭─ Model for E02 /); }
       screen.handleInput("\x1b"); screen.handleInput("\x1b[C"); screen.handleInput("\x1b[C");
-      for (const width of [20, 40, 60, 100]) assertFrame(screen.render(width), width, rows, /^╭─ exec-0927 › done /);
+      for (const width of [20, 40, 60, 100]) { const lines = screen.render(width); assertFrame(lines, width, fits(lines, compact), /^╭─ exec-0927 › done /); }
     }
     const { screen } = setup();
     (screen as unknown as { tui: { terminal: { rows: number } } }).tui = { ...tui, terminal: { rows: 2, columns: 6 } } as typeof tui;
@@ -298,4 +301,12 @@ test("every view is a framed full-height panel at several widths and heights", a
 test("submission failure retains input and records failure note", async () => {
   const { screen, open, notes } = setup(async () => { throw new Error("disk unavailable"); }); open(); screen.handleInput("preserve me"); screen.handleInput("\r"); await tick();
   assert.match(plain(screen), /preserve me/); assert.match(plain(screen), /disk unavailable/); assert.match(notes[0]!, /disk unavailable/);
+});
+
+test("UI §3: the watch header shows the subagent's own token spend and how full its context is", () => {
+  const { screen, open, data } = setup();
+  data.workflows[0]!.calls[0]!.usage = { input: 12_300, output: 1_200, cacheRead: 0, cacheWrite: 0, costUsd: 0.04 } as never;
+  open();
+  const head = plain(screen).split("\n").find(l => l.includes("▾"))!;
+  assert.match(head, /↑12\.3k ↓1\.2k \$0\.04/); assert.match(head, /ctx 110(\/\S+ \(\d+%\))?/);
 });
