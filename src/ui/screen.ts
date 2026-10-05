@@ -303,7 +303,7 @@ export class SubagentScreen implements Component {
       const start = Math.max(0, this.selected - size.height + 1);
       const lines = this.rows.slice(start, start + size.height).map((row, i) => {
         const fit = fitWidth(row.text, size.width);
-        const text = row.failed ? this.theme.fg("error", fit) : row.kind === "preview" ? this.theme.fg("dim", fit) : row.kind === "workflow" ? this.theme.bold(fit) : fit;
+        const text = row.failed ? this.theme.fg("error", fit) : row.kind === "preview" || row.dim ? this.theme.fg("dim", fit) : row.kind === "workflow" ? this.theme.bold(fit) : fit;
         return i + start === this.selected ? this.theme.bg("selectedBg", text) : text;
       });
       const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined;

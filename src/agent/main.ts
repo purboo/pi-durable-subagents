@@ -29,6 +29,15 @@ let noteSink: ((text: string) => void) | undefined;
 export function presentNote(text: string): void { noteSink?.(text); }
 
 /** P1, P15, P16, P25, P38: Register durable submission and serialized main-session presentation. */
+/** v12 §6: Agent discovery per cwd, reused for a few seconds (discovery may shell out to `npm root -g`). */
+const discovered = new Map<string, { at: number; agents: ReturnType<typeof discoverAgents>["agents"] }>();
+function agentsAt(cwd: string) {
+  const hit = discovered.get(cwd);
+  if (hit && Date.now() - hit.at < 10_000) return hit.agents;
+  const agents = discoverAgents(cwd).agents;
+  discovered.set(cwd, { at: Date.now(), agents });
+  return agents;
+}
 export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiDeps) => void): void {
   const home = dsaHome();
   let ctx: ExtensionContext | undefined, sender = "", outbox: Outbox | undefined;
@@ -123,7 +132,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   /** P25, P38, T6, T10: One durable submission path for the tool and the UI; replies say what happened when known within 10 s. */
   async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal, wait = true): Promise<unknown> {
     if (args.action === "status") return typeof args.wid === "string" && args.wid ? statusDetail(home, args.wid) : statusView(home, { origin: sender });
-    if (args.action === "agents") return discoverAgents(cwd).agents.map(({ name, description, model, source }) =>
+    if (args.action === "agents") return agentsAt(cwd).map(({ name, description, model, source }) =>
       ({ name, description, ...(model === undefined ? {} : { model }), source }));
     const normalized = request(args as Parameters<typeof request>[0], cwd);
     if (normalized.kind === "run") {
@@ -131,7 +140,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       // v12 §2: Reject unknown explicit call agents before starter or outbox publication; scripts remain call-local.
       const names = [...(body.call ? [body.call] : []), ...(body.tasks ?? []), ...(body.chain ?? [])].map(call => call.agent);
       if (names.length) {
-        const available = discoverAgents(cwd).agents.map(agent => agent.name);
+        const available = agentsAt(cwd).map(agent => agent.name);
         const unknown = [...new Set(names.filter(name => !available.includes(name)))];
         if (unknown.length) throw new Error(`Unknown agent${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. Available agents: ${available.join(", ") || "(none)"}`);
       }
@@ -178,7 +187,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       "run (action optional for exactly one launch form): agent+task; tasks:[call specs] parallel; chain:[call specs] sequential ({previous}); workflow:'./script.js' or source (runs.run(key,spec), runs.all([...]), emit(value), args, runs.input(name)). Optional name, model, cwd, timeoutMs, usageBudget, maxCalls, inputs. Explicit unknown agents are rejected BEFORE creation, with available names; unknown script agents fail only their call.",
       "agents: list names, descriptions, default models and source for this cwd; use these names for run.",
       "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn. answer needs open qid+rev (stale rejected). model switches at next provider request. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
-      "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); sealed → already-sealed:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. status [wid] gives a digest. revise wid + workflow/source/args starts a revision.",
+      "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); a sealed call → already-sealed:<status>, a finished workflow → terminal:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. status [wid] gives a digest. revise wid + workflow/source/args starts a revision.",
       "Control replies are {applied:true,rid} or {applied:false,reason,rid} when decided; otherwise {submitted:{rid}} after 10s.",
       ...(agents ? [`Available agents: ${agents}.`] : []),
       "User sees a summary line above the editor; ↓ on an empty editor opens the list, Enter watches live OR finished calls (finished transcripts remain on disk) and expands finished workflows. List keys: s steer (paste-capable input), x stop (confirm y), m model, a answer when asked, f follow-up on finished calls; action feedback appears in footer.",
