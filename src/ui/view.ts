@@ -35,11 +35,11 @@ export const toolCount = (n: number | undefined) => n ? `${n} tool${n === 1 ? ""
 export const pendingText = (n: number | undefined) => n ? `${n} message${n === 1 ? "" : "s"} pending` : "";
 /** UI §2, P7: The list row's small pending marker (the watch header spells it out). */
 export const pendingMarker = (n: number | undefined) => n ? `${n} pending` : "";
-/** UI §2: Stable workflow order — own session first, then start time (oldest first), never by activity. */
-export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt">>(workflows: readonly T[], own?: string): T[] {
-  // Newest first; start times never change, so the order is stable while you read.
-  return [...workflows].sort((a, b) => Number(b.origin === own) - Number(a.origin === own) ||
-    (b.startedAt ?? 0) - (a.startedAt ?? 0) || (a.wid < b.wid ? 1 : a.wid > b.wid ? -1 : 0));
+/** UI §2: This session's workflows (any state) plus other sessions' workflows while they run, newest first by start
+ *  time. Start times never change, so the order is stable while you read, also when a workflow finishes. */
+export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt" | "status">>(workflows: readonly T[], own?: string): T[] {
+  return workflows.filter(w => own === undefined || w.origin === own || w.status === "running")
+    .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0) || (a.wid < b.wid ? 1 : a.wid > b.wid ? -1 : 0));
 }
 /** UI §2: Done rows newest result first by immutable end time; ties keep snapshot order, so rows never reshuffle. */
 export function doneOrder(calls: readonly CallSnapshot[]): CallSnapshot[] {
@@ -151,9 +151,7 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     state.observed.set(w.wid, { working, failures });
   }
   const unviewed = (w: WorkflowSnapshot) => w.calls.some(c => failed(c) && !state.viewed.has(c.callId));
-  const live = workflows.filter(w => w.status === "running" || unviewed(w)); // caller order: newest first
-  const ended = workflows.filter(w => w.status !== "running" && !unviewed(w));
-  const visible = [...live, ...ended];
+  const visible = workflows; // caller order (newest first), unchanged when a workflow finishes
   // Aligned columns across the whole list (UI §2): key and model start at the same column on every row.
   const shownCalls = visible.flatMap(w => w.calls);
   const cols = { key: Math.min(18, Math.max(0, ...shownCalls.map(c => visibleWidth(label(c))))),

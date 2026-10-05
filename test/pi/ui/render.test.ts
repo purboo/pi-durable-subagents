@@ -176,7 +176,21 @@ test("thinking/tool expansion and follow pause use pi rendering", () => {
   const { screen, open } = setup(); open();
   assert(!plain(screen).includes("Checking the tests now")); screen.handleInput("\x14"); assert.match(plain(screen), /Checking the tests now/);
   screen.handleInput("\x0f"); assert.match(plain(screen), /3 failing/);
-  screen.handleInput("\x1b[5~"); assert.match(plain(screen), /Following paused/); screen.handleInput("\x1b[F"); assert(!plain(screen).includes("Following paused"));
+  screen.handleInput("\x1b[5~"); assert(!plain(screen).includes("Jump to latest message"), "nothing to jump to while everything fits");
+});
+
+test("pi's jump-to-latest badge: shown while following is paused, End or a click resumes, scrolling to the end resumes", () => {
+  const { screen, open, data } = setup(); open();
+  const id = [...data.sessions.keys()][0]!, base = data.sessions.get(id)!, last = base.at(-1)!;
+  const long = { type: "message", id: "long", parentId: last.id, timestamp: last.timestamp, message: { role: "user", content: Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n"), timestamp: now } };
+  data.sessions.set(id, [...base, long] as typeof base);
+  assert.match(plain(screen), /line 79/); assert(!plain(screen).includes("Jump to latest message"));
+  screen.handleInput("\x1b[5~"); assert.match(plain(screen), /↓ Jump to latest message · End/); assert(!plain(screen).includes("line 79"));
+  screen.handleInput("\x1b[F"); assert(!plain(screen).includes("Jump to latest message")); assert.match(plain(screen), /line 79/);
+  screen.handleInput("\x1b[5~"); screen.handleInput("\x1b[6~"); screen.handleInput("\x1b[6~");
+  assert(!plain(screen).includes("Jump to latest message"), "paging back to the end resumes following");
+  screen.handleInput("\x1b[5~"); const rows = screen.render(100), y = rows.findIndex(l => l.includes("Jump to latest message"));
+  assert.ok(y > 0); screen.handleMouse({ type: "click", button: "left", x: 90, y } as never); assert(!plain(screen).includes("Jump to latest message"));
 });
 
 test("late submit completion cannot clear a different call's editor", async () => {
