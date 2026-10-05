@@ -4,7 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { doneOrder, duration, keepSelection, summaryText, label, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { doneOrder, isOpen, toggleOpen, duration, keepSelection, summaryText, label, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
 import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
@@ -108,7 +108,7 @@ export class SubagentScreen implements Component {
   private selectRow(row: ListRow | undefined) {
     if (!row) return;
     if (row.kind === "call") this.open(row.workflow!, row.call!);
-    else if (row.kind === "workflow") { const key = row.workflow!.wid; this.state.folded.has(key) ? this.state.folded.delete(key) : this.state.folded.add(key); }
+    else if (row.kind === "workflow") toggleOpen(row.workflow!, this.state);
     else if (row.kind === "finished") this.state.finished = !this.state.finished;
     else if (row.workflow) {
       const w = row.workflow, count = this.state.done.get(w.wid) ?? (w.calls.every(c => c.phase === "sealed") || w.calls.some(c => c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped" && !this.state.viewed.has(c.callId)) ? 8 : 0);
@@ -309,7 +309,7 @@ export class SubagentScreen implements Component {
       const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined;
       const asking = c && row?.workflow?.attention.some(a => a.kind === "question" && a.call === c.callId);
       const narrow = size.width < 72;
-      const keys = [narrow ? "↑↓" : "↑ ↓ select", row && row.kind !== "preview" ? `Enter ${narrow ? "" : row.kind === "workflow" ? (this.state.folded.has(row.workflow!.wid) ? "expand" : "collapse") : row.kind === "call" ? "watch" : "open"}`.trim() : "",
+      const keys = [narrow ? "↑↓" : "↑ ↓ select", row && row.kind !== "preview" ? `Enter ${narrow ? "" : row.kind === "workflow" ? (isOpen(row.workflow!, this.state) ? "collapse" : "expand") : row.kind === "call" ? "watch" : "open"}`.trim() : "",
         c && c.phase !== "sealed" ? (narrow ? "s" : "s steer") : "", c?.phase === "sealed" ? (narrow ? "f" : "f follow-up") : "",
         c && c.phase !== "sealed" || row?.kind === "workflow" && row.workflow?.status === "running" ? (narrow ? "x" : "x stop") : "",
         c ? (narrow ? "m" : "m model") : "", asking ? (narrow ? "a" : "a answer") : "", "Esc back"].filter(Boolean).join(" · ");
