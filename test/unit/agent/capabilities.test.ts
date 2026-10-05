@@ -13,7 +13,7 @@ import { SURFACES, checkCapabilities } from "../../../src/agent/capabilities.ts"
 import { childRefusal } from "../../../src/agent/extension.ts";
 
 const fn = () => {};
-const api = { on: fn, registerTool: fn, appendEntry: fn, sendMessage: fn, setModel: fn, setThinkingLevel: fn };
+const api = { on: fn, registerTool: fn, appendEntry: fn, sendMessage: fn, setModel: fn, setThinkingLevel: fn, registerMessageRenderer: fn };
 const real = () => ({ "@earendil-works/pi-coding-agent": { ...coding }, "@earendil-works/pi-tui": { ...tui }, "@earendil-works/pi-ai": { ...ai } }) as Record<string, Record<string, unknown>>;
 
 test("the installed pi provides every surface", () => {
