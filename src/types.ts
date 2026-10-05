@@ -49,7 +49,7 @@ export interface JournalHandle {
 
 export type RequestKind =
   // to orchestrator from main/cli
-  | "run" | "send" | "stop" | "revise" | "resume" | "drain"
+  | "run" | "send" | "stop" | "revise" | "resume" | "drain" | "prune"
   // orchestrator to child (forwarded or own)
   | "task" | "steer" | "follow-up" | "answer" | "model" | "continue" | "withdraw"
   // evaluator to orchestrator
@@ -173,6 +173,9 @@ export interface StopBody { target: Wid | CallId }
 export interface ReviseBody { wid: Wid; workflow?: string; source?: string; args?: unknown }
 /** kind "resume": adopt/continue unfinished work (all when wid absent). */
 export interface ResumeBody { wid?: Wid }
+/** kind "prune": archive finished workflows (done/failed/stopped, no open generation): the named one, or all that ended
+ *  more than `olderThanDays` days ago. The workflow directory is removed; the orchestrator ledger keeps its identity. */
+export interface PruneBody { wid?: Wid; olderThanDays?: number }
 /** kind "drain": durable; no new dispatch and no continuation until `resume`. Running calls finish, unless
  *  `fence` (CLI stop-all): then every running execution is fenced WITHOUT sealing, so journals stay resumable. */
 export interface DrainBody { fence?: boolean }
