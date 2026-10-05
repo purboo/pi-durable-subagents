@@ -8,7 +8,7 @@ import { registerCards } from "./cards.ts";
 
 /** UI §1–3, P16, P21: Register journal-backed list/watch surfaces only in interactive pi. */
 export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
-  registerCards(pi, deps.home);
+  if (typeof pi.registerMessageRenderer === "function") registerCards(pi, deps.home); // P21: cards are optional
   let cleanup: (() => void) | undefined;
   const start = (_event: unknown, ctx: ExtensionContext) => {
     cleanup?.(); cleanup = undefined;
