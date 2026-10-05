@@ -35,10 +35,10 @@ export const toolCount = (n: number | undefined) => n ? `${n} tool${n === 1 ? ""
 export const pendingText = (n: number | undefined) => n ? `${n} message${n === 1 ? "" : "s"} pending` : "";
 /** UI §2, P7: The list row's small pending marker (the watch header spells it out). */
 export const pendingMarker = (n: number | undefined) => n ? `${n} pending` : "";
-/** UI §2: This session's workflows (any state) plus other sessions' workflows while they run, newest first by start
- *  time. Start times never change, so the order is stable while you read, also when a workflow finishes. */
+/** UI §2: Sessions are independent: only this session's workflows, newest first by start time. Start times never
+ *  change, so the order is stable while you read, also when a workflow finishes. */
 export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt" | "status">>(workflows: readonly T[], own?: string): T[] {
-  return workflows.filter(w => own === undefined || w.origin === own || w.status === "running")
+  return workflows.filter(w => own === undefined || w.origin === own)
     .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0) || (a.wid < b.wid ? 1 : a.wid > b.wid ? -1 : 0));
 }
 /** UI §2: Done rows newest result first by immutable end time; ties keep snapshot order, so rows never reshuffle. */

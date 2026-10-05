@@ -1,5 +1,5 @@
 import { AssistantMessageComponent, UserMessageComponent, ToolExecutionComponent, getMarkdownTheme, getSelectListTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { Input, SelectList, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Input, SelectList, matchesKey, truncateToWidth, visibleWidth, type Component, type OverlayOptions, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
@@ -289,17 +289,45 @@ export class SubagentScreen implements Component {
     }
     return { lines, thoughts };
   }
-  /** UI §2–3, P21: Every view is one full-height framed panel, so the main chat never shows through. */
+  /** UI §2–3: A floating panel over pi, like pi's own overlays: the list and menus are compact (they grow with their
+   *  content up to 60% of the terminal); watching a subagent takes most of the screen (85%). */
+  overlay(): OverlayOptions {
+    // One fixed frame (pi sizes an overlay when it opens): the panel's own height decides how much of it is used.
+    return this.termRows() < 20 ? { anchor: "center", width: "100%", maxHeight: "100%" } : { anchor: "center", width: "90%", minWidth: 40, maxHeight: "85%", margin: 1 };
+  }
+  private termRows() { return Math.max(3, Number(this.tui.terminal?.rows) || 24); }
+  /** UI §3: What this subagent costs and how full its context is, in pi's footer terms: "↑12.3k ↓1.2k $0.04 · 45k/200k (22%)". */
+  private spend(c: CallSnapshot, facts: { model?: string; context?: number } | undefined): string {
+    const k = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
+    const u = c.usage, parts: string[] = [];
+    if (u && (u.input || u.output)) parts.push(`↑${k(u.input)} ↓${k(u.output)}${u.costUsd > 0 ? ` $${u.costUsd.toFixed(u.costUsd < 0.01 ? 4 : 2)}` : ""}`);
+    if (facts?.context) {
+      const [p, ...rest] = (facts.model ?? c.model ?? "").split("/"), window = p && rest.length ? this.ctx.modelRegistry.find(p, rest.join("/"))?.contextWindow : undefined;
+      parts.push(window ? `ctx ${k(facts.context)}/${k(window)} (${Math.round(facts.context / window * 100)}%)` : `ctx ${k(facts.context)}`);
+    }
+    return parts.length ? ` · ${parts.join(" · ")}` : "";
+  }
+  /** The panel height for the current view: `content` rows plus the frame, within the overlay's height cap. */
+  private height(content?: number): number {
+    const rows = this.termRows(), small = rows < 20;
+    const cap = small ? rows : Math.floor(rows * (content === undefined ? 0.85 : 0.6)) - 2;
+    return content === undefined ? cap : Math.min(cap, Math.max(3, content + 2));
+  }
   render(width: number): string[] {
-    const height = Math.max(3, Number(this.tui.terminal?.rows) || 24), size = inner(width, height);
+    let height = this.height(), size = inner(width, height);
     const panel = (lines: string[], title: string, hints: string) => frame(lines, width, height, this.theme, title, hints);
-    if (this.menu) return panel([...this.search.render(size.width), ...this.menu.render(size.width)], this.menuTitle, "Applies from the next model call · Esc back");
+    if (this.menu) {
+      const lines = [...this.search.render(size.width), ...this.menu.render(size.width)];
+      height = this.height(lines.length); return panel(lines, this.menuTitle, "Applies from the next model call · Esc back");
+    }
     if (!this.watching || this.doneTab) {
       const w = this.current().w;
+      const footerRows = this.listInput ? 1 : this.stopTarget || (this.listNotice && this.listNotice.until > Date.now()) ? 1 : 0;
       this.rows = this.doneTab && w ? doneOrder(w.calls).map(c => {
         const f = this.data.facts.get(c.callId);
         return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", label(c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], size.width) };
       }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, size.width);
+      height = this.height(Math.max(1, this.rows.length) + footerRows); size = inner(width, height); // inner width does not depend on height
       this.selected = keepSelection(this.rows, this.selectedId, this.selected);
       while (this.rows[this.selected]?.kind === "preview" && this.selected > 0) this.selected--;
       this.selectedId = this.rows[this.selected]?.id;
@@ -327,7 +355,7 @@ export class SubagentScreen implements Component {
     const facts = this.data.facts.get(c.callId), active = w.calls.filter(c => c.phase !== "sealed"), done = w.calls.length - active.length;
     const tabs = size.width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
     const tools = toolCount(facts?.tools), pending = pendingText(c.pending), rule = this.theme.fg("borderMuted", "─".repeat(size.width));
-    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`, rule];
+    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}${this.spend(c, facts)}`, rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
     const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
     const empty = new Input({ prompt: "", placeholder, placeholderStyle: text => this.theme.fg("dim", text) });

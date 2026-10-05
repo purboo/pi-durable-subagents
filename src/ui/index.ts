@@ -51,7 +51,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
           closeScreen = () => done();
           screen = new SubagentScreen(data, actions, ctx, tui, theme, closeScreen, state);
           return screen;
-        }, { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%" } }); })().catch(() => {}).finally(() => { screen?.dispose(); screen = undefined; closeScreen = undefined; opening = false; });
+        }, { overlay: true, overlayOptions: () => screen?.overlay() ?? { anchor: "center", width: "85%", maxHeight: "60%", margin: 1 } }); })().catch(() => {}).finally(() => { screen?.dispose(); screen = undefined; closeScreen = undefined; opening = false; });
         return { consume: true };
       });
       timer = setInterval(refresh, 500); timer.unref(); cleanup = stop;

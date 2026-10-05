@@ -66,6 +66,7 @@ export function thoughtSummary(text: string): string {
 export function sessionFacts(entries: readonly SessionEntry[], call: string) {
   let model: string | undefined, thinking = "off", activity: string | undefined, lastActivity = 0, task = "", count = 0, own = false;
   let latest = ""; // the newest thing the agent said, thought or saw, for the overview (UI §2)
+  let context: number | undefined; // tokens in the agent's context at its latest response, as pi's footer counts them
   const firstLine = (text: string) => text.split("\n").map(l => l.trim()).find(Boolean) ?? "";
   const lastLine = (text: string) => text.split("\n").map(l => l.trim()).filter(Boolean).at(-1) ?? "";
   const tools = new Map<string, { name: string; arguments: Record<string, unknown> }>();
@@ -87,6 +88,9 @@ export function sessionFacts(entries: readonly SessionEntry[], call: string) {
     const m = e.message;
     if (m.role === "assistant") {
       model = `${m.provider}/${m.model}`;
+      const u = m.usage as { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number } | undefined;
+      const total = u ? u.totalTokens || (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) : 0;
+      if (total > 0) context = total;
       for (const b of m.content) {
         if (b.type === "toolCall") { tools.set(b.id, b); if (own) count++; }
         else if (b.type === "text" && lastLine(b.text)) latest = lastLine(b.text);
@@ -104,5 +108,5 @@ export function sessionFacts(entries: readonly SessionEntry[], call: string) {
     activity = tool.name === "read" ? `reading ${path}` : ["edit", "write"].includes(tool.name) ? `editing ${path}` :
       tool.name === "bash" ? `running ${String(a.command ?? "")}` : `running ${tool.name}`;
   }
-  return { model, thinking, activity, lastActivity, task, tools: count, latest };
+  return { model, thinking, activity, lastActivity, task, tools: count, latest, ...(context !== undefined ? { context } : {}) };
 }
