@@ -16,7 +16,7 @@ $ npx pi-durable-subagents chaos
   all 9 scenarios ....... pass
 ```
 
-You can run this yourself, offline, in about 1.5 minutes. It runs a three-step
+You can run this yourself, offline, in about 2 minutes. It runs a three-step
 writer → reviewer → integrator workflow through the real product (a real pi
 main session, the orchestrator, real subagent pi processes and a scripted
 model). It injects one fault per scenario, then checks the journals and
@@ -153,7 +153,7 @@ unchanged, with zero edited lines.
 
 ```text
 pi-durable-subagents smoke              check this machine and this pi (offline, < 60 s)
-pi-durable-subagents chaos              run the fault suite (offline, about 1.5 minutes)
+pi-durable-subagents chaos              run the fault suite (offline, about 2 minutes)
 pi-durable-subagents status [wid] [--json]
 pi-durable-subagents tail [wid]
 pi-durable-subagents start              start the orchestrator if work is pending; sends nothing

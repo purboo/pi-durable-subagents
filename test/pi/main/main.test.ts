@@ -192,9 +192,9 @@ test("T6/T10 real orchestrator: control actions report applied or the rejection 
   assert.ok(wid && wid !== "undefined", JSON.stringify(result(pi).result.details));
   await until(() => readJournalSnapshot(journalPath(home, wid)).some(e => e.type === JT.done), 20000);
   await prompt(pi, [{ tool: "subagents", args: { action: "resume", wid } }, { text: "done" }]);
-  assert.deepEqual(result(pi).result.details, { applied: false, reason: "terminal:done \u2014 start a new run" });
+  { const { rid, ...rest } = result(pi).result.details; assert.ok(rid); assert.deepEqual(rest, { applied: false, reason: "terminal:done \u2014 start a new run" }); }
   await prompt(pi, [{ tool: "subagents", args: { action: "stop", target: wid } }, { text: "done" }]);
-  assert.deepEqual(result(pi).result.details, { applied: false, reason: "terminal:done" });
+  { const { rid, ...rest } = result(pi).result.details; assert.ok(rid); assert.deepEqual(rest, { applied: false, reason: "terminal:done" }); }
   await prompt(pi, [{ tool: "subagents", args: { action: "status" } }, { text: "done" }]);
   const view = result(pi).result.details;
   assert.deepEqual(view.workflows.map((w: any) => [w.wid, w.name, w.status, w.origin]), [[wid, "probe", "done", sender]]);

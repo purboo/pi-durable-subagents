@@ -35,7 +35,8 @@ async function respond(context: any, options: any, _state?: any, model?: any) {
   }
   if (idx < 0) { log("respond", { step: -1, kind: ["none"], model: model?.id, disk: diskMarkers() }); return fauxAssistantMessage("no script"); }
   const script = JSON.parse((textOf(msgs[idx]).split("#script:")[1] ?? "[]").trim());
-  const n = msgs.slice(idx + 1).filter(m => m.role === "assistant").length;
+  // pi 1.0.2 sometimes answers a turn itself with "Unknown provider" (no request reaches us); count only our answers.
+  const n = msgs.slice(idx + 1).filter(m => m.role === "assistant" && (m.provider === undefined || m.provider === "probe")).length;
   const step = script[n] ?? { text: "end of script" };
   const lastUser = [...msgs].reverse().find(m => m.role === "user");
   const allText = msgs.map(textOf).join("\n");
