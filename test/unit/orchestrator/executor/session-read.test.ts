@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { forgetSession, readSession, readSessionState } from "../../../../src/orchestrator/executor/session.ts";
@@ -50,4 +50,18 @@ test("F3 a replaced or shortened session is read from scratch", async t => {
   assert.deepEqual((await readSession(file)).map(e => e.id), ["e5"]);
   await rm(file);
   assert.deepEqual(await readSessionState(file), { entries: [], corrupt: [] });
+});
+
+test("F3 an in-place rewrite that grows the session is detected by its first 4 KiB and read from scratch", async t => {
+  const root = await mkdtemp(join(tmpdir(), "dsa-session-read-")), file = join(root, "session.jsonl");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(file, line(1) + line(2));
+  assert.deepEqual((await readSession(file)).map(e => e.id), ["e1", "e2"]);
+  const { ino } = await stat(file);
+  // pi's _rewriteFile: same inode (truncate + write), different and longer content.
+  await writeFile(file, line(11) + line(12) + line(13));
+  assert.equal((await stat(file)).ino, ino);
+  assert.deepEqual(await readSessionState(file), { entries: [line(11), line(12), line(13)].map(l => JSON.parse(l)), corrupt: [] });
+  await writeFile(file, line(12) + line(11) + line(13));
+  assert.deepEqual((await readSessionState(file)).entries.map(e => e.id), ["e12", "e11", "e13"], "a same-size rewrite is also re-read");
 });

@@ -1,9 +1,10 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { PassThrough } from "node:stream";
 import { openJournal, readJournalSnapshot } from "../../../../src/kernel/journal.ts";
 import { contentHash, forwardRid, ulid } from "../../../../src/kernel/ids.ts";
 import { callDir, callInbox, callSession, journalPath, orchLedger, outboxRoot } from "../../../../src/paths.ts";
@@ -11,11 +12,17 @@ import { CT, JT, type Containment, type Entry, type ProcInfo, type Request } fro
 import type { CallTicket, OrchestratorConfig } from "../../../../src/orchestrator/contract.ts";
 import createExecutor from "../../../../src/orchestrator/executor/index.ts";
 import createEffects from "../../../../src/orchestrator/executor/effects/index.ts";
+import { serialContainment } from "../../../../src/orchestrator/executor/sweep.ts";
 
-// A containment without processes: spawning fails, fences of `stuck` execs time out, scans may fail transiently.
+// A containment without processes: spawning fails (or, with `exits`, yields a child that exits at once), fences of
+// `stuck` execs time out, scans may fail transiently.
 class FakeContainment implements Containment {
-  stuck = new Set<string>(); scanError?: Error; scans = 0;
-  async spawn(): Promise<never> { throw new Error("no processes in unit tests"); }
+  stuck = new Set<string>(); scanError?: Error; scans = 0; exits = false;
+  async spawn() {
+    if (!this.exits) throw new Error("no processes in unit tests");
+    const stdout = new PassThrough(), stderr = new PassThrough(); stdout.end(); stderr.end();
+    return { pid: 0, start: "", stdin: new PassThrough(), stdout, stderr, exited: Promise.resolve({ code: 0, signal: null }) };
+  }
   async scan(known: ReadonlyMap<string, readonly ProcInfo[]>) {
     this.scans++;
     if (this.scanError) throw this.scanError;
@@ -26,12 +33,12 @@ class FakeContainment implements Containment {
 const agent = { name: "test", description: "test", body: "test", model: "probe/scripted", sourcePath: "/fixture/test.md", source: "project" as const, systemPromptMode: "replace" as const, inheritProjectContext: false, inheritSkills: false };
 const effects = { prepare: async (t: CallTicket) => ({ cwd: t.cwd }), beforeSeal: async (_t: CallTicket, _e: string, r: never) => r, afterSeal: async () => {}, recover: async () => {} };
 
-async function fixture(t: TestContext, config: OrchestratorConfig = {}, options: { sweepMs?: number; memory?: () => Promise<number>; realEffects?: boolean } = {}) {
-  const home = await mkdtemp(join(tmpdir(), "dsa-robust-")), wid = ulid(), containment = new FakeContainment();
+async function fixture(t: TestContext, config: OrchestratorConfig = {}, options: { sweepMs?: number; memory?: () => Promise<number>; realEffects?: boolean; containment?: Containment } = {}) {
+  const home = await mkdtemp(join(tmpdir(), "dsa-robust-")), wid = ulid(), fake = new FakeContainment();
   const orch = await openJournal(orchLedger(home)), journal = await openJournal(journalPath(home, wid));
   const errors: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args.map(String).join(" ")); });
-  const ledgers = { home, orch, config: { k: { trackerMs: 20 }, ...config } }, { realEffects, ...rest } = options;
+  const ledgers = { home, orch, config: { k: { trackerMs: 20 }, ...config } }, { realEffects, containment = fake, ...rest } = options;
   const make = () => createExecutor(ledgers, { effects: realEffects ? createEffects(ledgers, containment) : effects, containment, memory: async () => 1e6, sweepMs: 40, ...rest });
   let executor = make();
   t.after(async () => { try { await executor.shutdown(); } finally { await journal.close(); await orch.close(); await rm(home, { recursive: true, force: true }); } });
@@ -40,7 +47,7 @@ async function fixture(t: TestContext, config: OrchestratorConfig = {}, options:
     await mkdir(callDir(home, wid, key, 1), { recursive: true });
     await writeFile(callSession(home, wid, key, 1), lines.map(l => typeof l === "string" ? l : JSON.stringify(l)).join("\n") + "\n");
   };
-  return { home, wid, orch, journal, containment, errors, ticket, session, get executor() { return executor; },
+  return { home, wid, orch, journal, containment: fake, errors, ticket, session, get executor() { return executor; },
     async restart() { await executor.shutdown(); executor = make(); return executor; } };
 }
 const execLine = (exec: string) => ({ type: "custom", customType: CT.exec, data: { exec } });
@@ -173,7 +180,7 @@ test("E2 receipted and sealed inbox envelopes are deleted and resolved; unreceip
   assert.deepEqual(await readdir(inbox), [], "recovery never republishes resolved envelopes");
 });
 
-test("F3 memory admission records mem only on a decision change", { timeout: 10000 }, async t => {
+test("F3 memory admission throttles repeated refusals and records every admission", { timeout: 10000 }, async t => {
   let available = 0;
   const f = await fixture(t, {}, { memory: async () => available });
   const pending = f.executor.run(f.ticket("a"));
@@ -183,6 +190,14 @@ test("F3 memory admission records mem only on a decision change", { timeout: 100
   available = 1e6;
   assert.equal((await pending).status, "failed");
   assert.deepEqual(f.orch.entries().filter(e => e.type === "mem").map(e => e.admitted), [false, true]);
+});
+
+test("F3 every admitted execution of one call records mem", { timeout: 10000 }, async t => {
+  const f = await fixture(t, { k: { trackerMs: 20, lossBound: 2 } });
+  f.containment.exits = true;
+  const a = f.ticket("a"), result = await f.executor.run(a);
+  assert.equal(result.status, "failed"); assert.equal(result.error, "lost ×2");
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "mem").map(e => [e.exec, e.admitted]), [[`${a.callId}#1.1`, true], [`${a.callId}#1.2`, true]]);
 });
 
 test("F3 incremental holdings observe holds and releases appended after an earlier fold", { timeout: 10000 }, async t => {
@@ -198,7 +213,7 @@ test("F3 incremental holdings observe holds and releases appended after an earli
   assert.ok(hold.seq > released.seq); assert.equal(hold.slot, 0);
 });
 
-test("F1 a gate whose recovery fence times out never fails recovery or re-runs; the sweep records its outcome later", { timeout: 10000 }, async t => {
+test("F1 A2 a gate whose recovery fence times out never fails recovery or re-runs; the call seals only after the sweep fenced it", { timeout: 10000 }, async t => {
   const f = await fixture(t, {}, { realEffects: true }), a = f.ticket("a"), ea = `${a.callId}#1.1`, gid = `gate:${a.callId}#1`;
   a.spec.gate = "echo must-not-run > ran";
   await f.journal.append(JT.exec, { call: a.callId, exec: ea }); await f.journal.append(JT.fenced, { exec: ea });
@@ -210,14 +225,58 @@ test("F1 a gate whose recovery fence times out never fails recovery or re-runs; 
   assert.equal(count(f.journal.entries(), e => e.type === "fence-failed" && e.exec === gid), 1);
   assert.equal(attention().length, 1); assert.equal(item(attention()[0]!).kind, "unknown"); assert.equal(item(attention()[0]!).call, a.callId);
   assert.equal(count(f.journal.entries(), e => e.type === "gate"), 0);
-  const result = await f.executor.run(a);
+  const pending = f.executor.run(a);
+  await until(() => f.containment.scans >= 4);
+  assert.equal(count(f.journal.entries(), e => e.type === JT.sealed), 0, "no seal while the gate's processes may live");
+  assert.equal(count(f.journal.entries(), e => e.type === "fence-failed" && e.exec === gid), 1);
+  f.containment.stuck.delete(gid);
+  const result = await pending;
   assert.equal(result.status, "unknown", "an unfenced gate is never re-run; its outcome is unknown");
   assert.equal(count(f.journal.entries(), e => e.type === "gate-intent"), 1);
   await assert.rejects(readdir(join(a.cwd, "ran")), { code: "ENOENT" });
-  f.containment.stuck.delete(gid);
-  await until(() => f.journal.entries().some(e => e.type === "gate" && e.id === gid));
-  assert.equal(f.journal.entries().find(e => e.type === "gate")!.unknown, true);
-  await until(() => f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${gid}` && e.resolution === "fenced"));
+  const gate = f.journal.entries().find(e => e.type === "gate")!, seal = f.journal.entries().find(e => e.type === JT.sealed)!;
+  assert.equal(gate.unknown, true); assert.ok(gate.seq < seal.seq);
+  assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${gid}` && e.resolution === "fenced"));
   await (await f.restart()).recover(f.wid, f.journal);
   assert.equal(count(f.journal.entries(), e => e.type === "gate"), 1);
+});
+
+test("F1 A2 stop ends the wait on a parked gate and seals stopped", { timeout: 10000 }, async t => {
+  const f = await fixture(t, {}, { realEffects: true }), a = f.ticket("a"), ea = `${a.callId}#1.1`, gid = `gate:${a.callId}#1`;
+  a.spec.gate = "true";
+  await f.journal.append(JT.exec, { call: a.callId, exec: ea }); await f.journal.append(JT.fenced, { exec: ea });
+  await f.journal.append("gate-intent", { call: a.callId, id: gid, exec: ea });
+  await f.session("a", [execLine(ea), report(ea)]);
+  f.containment.stuck.add(gid);
+  await f.executor.recover(f.wid, f.journal);
+  const pending = f.executor.run(a);
+  await delay(100);
+  await within(f.executor.stop({ wid: f.wid, callId: a.callId }));
+  assert.equal((await pending).status, "stopped");
+});
+
+test("F1 A2 a fence timeout at the end of a normal gate run is isolated; the call seals unknown after the sweep", { timeout: 15000 }, async t => {
+  const real = serialContainment(), stuck = new Set<string>();
+  const containment: Containment = { spawn: spec => real.spawn(spec), scan: known => real.scan(known),
+    fence: async (id, tracked, opts) => { if (stuck.has(id)) throw new Error(`Fence timeout: ${id}`); return real.fence(id, tracked, opts); } };
+  const f = await fixture(t, {}, { realEffects: true, containment }), a = f.ticket("a"), ea = `${a.callId}#1.1`, gid = `gate:${a.callId}#1`;
+  a.spec.gate = "echo ran >> gate-runs";
+  await f.journal.append(JT.exec, { call: a.callId, exec: ea }); await f.journal.append(JT.fenced, { exec: ea });
+  await f.session("a", [execLine(ea), report(ea)]);
+  stuck.add(gid);
+  try {
+    const pending = f.executor.run(a);
+    await until(() => f.journal.entries().some(e => e.type === "fence-failed" && e.exec === gid));
+    await delay(200);
+    assert.equal(count(f.journal.entries(), e => e.type === JT.sealed), 0, "a gate that may live never lets the call seal");
+    assert.equal(count(f.journal.entries(), e => e.type === "gate"), 0);
+    assert.equal(count(f.journal.entries(), e => e.type === JT.attention && item(e).id === `fence:${gid}` && item(e).kind === "unknown"), 1);
+    stuck.delete(gid);
+    const result = await pending;
+    assert.equal(result.status, "unknown");
+    assert.equal(f.journal.entries().find(e => e.type === "gate")!.unknown, true);
+    assert.equal(count(f.journal.entries(), e => e.type === "fence-failed"), 1);
+    assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${gid}`));
+    assert.equal((await readFile(join(a.cwd, "gate-runs"), "utf8")), "ran\n", "the gate ran exactly once");
+  } finally { stuck.clear(); await real.fence(gid, []).catch(() => {}); }
 });
