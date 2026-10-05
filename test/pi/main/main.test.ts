@@ -38,10 +38,10 @@ function setup(t: { after(fn: () => Promise<void>): void }, receipt = true) {
   });
   return { root, home, launch };
 }
-async function prompt(pi: PiInstance, steps: unknown[]) {
+async function prompt(pi: PiInstance, steps: unknown[], ms = 20000) {
   const from = pi.events.length;
   pi.send({ type: "prompt", message: script(steps) });
-  await pi.waitFor(e => pi.events.indexOf(e) >= from && e.type === "agent_settled", 20000);
+  await pi.waitFor(e => pi.events.indexOf(e) >= from && e.type === "agent_settled", ms);
 }
 function result(pi: PiInstance) {
   return pi.events.filter(e => e.type === "tool_execution_end" && e.toolName === "subagents").at(-1) as any;
@@ -87,7 +87,8 @@ test("run returns submitted after 10 seconds, including an absolute workflow pat
   assert.deepEqual(result(pi).result.details, { submitted: { rid: req.rid } });
 });
 
-test("send replaces publishes withdrawal first; all other actions use correct wire bodies", { timeout: 30000 }, async t => {
+// No orchestrator decides here (the test holds its lock), so every control action waits its full 10 s and replies {submitted}.
+test("send replaces publishes withdrawal first; all other actions use correct wire bodies", { timeout: 120000 }, async t => {
   const { home, launch } = setup(t), lock = await new OsLock().tryAcquire(orchLock(home)); assert.ok(lock);
   t.after(() => lock.release());
   const pi = launch();
@@ -96,8 +97,9 @@ test("send replaces publishes withdrawal first; all other actions use correct wi
     { action: "stop", target: "owned" }, { action: "revise", wid: "owned", workflow: "new.js", args: [1] },
     { action: "resume", wid: "owned" }, { action: "drain" },
   ];
-  await prompt(pi, [...actions.map(args => ({ tool: "subagents", args })), { text: "done" }]);
+  await prompt(pi, [...actions.map(args => ({ tool: "subagents", args })), { text: "done" }], 80000);
   const reqs = (await scanInbox(orchInbox(home))).sort((a, b) => a.sseq - b.sseq);
+  assert.deepEqual(result(pi).result.details, { submitted: { rid: reqs.at(-1)!.rid } });
   assert.deepEqual(reqs.map(r => r.kind), ["withdraw", "send", "stop", "revise", "resume", "drain"]);
   assert.deepEqual(reqs.map(r => r.sseq), [1, 2, 3, 4, 5, 6]);
   assert.deepEqual(reqs[0]!.body, { rids: ["old"] });
@@ -112,7 +114,7 @@ test("send replaces publishes withdrawal first; all other actions use correct wi
   await append(orchLedger(home), JT.rejected, { rid: reqs[1]!.rid, reason: "already-answered" });
   await append(orchLedger(home), JT.rejected, { rid: reqs[2]!.rid, reason: "identity-conflict" });
   const restarted = launch("restarted", ["--session", session]);
-  await prompt(restarted, [{ tool: "subagents", args: { action: "resume" } }, { text: "done" }]);
+  await prompt(restarted, [{ tool: "subagents", args: { action: "resume" } }, { text: "done" }], 30000);
   const entries = readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
   assert.deepEqual(entries.filter(e => e.type === "resolved").map(e => e.rid), [reqs[0]!.rid, reqs[1]!.rid]);
   const current = (await scanInbox(orchInbox(home))).sort((a, b) => a.sseq - b.sseq);
@@ -134,7 +136,9 @@ test("idle attention wakes once, survives restart, and status orders origin firs
   await prompt(resumed, [{ tool: "subagents", args: { action: "status" } }, { text: "done" }]);
   const entries = readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
   assert.equal(entries.filter(e => e.type === "custom_message" && e.customType === CT.attention).length, 1);
-  assert.deepEqual(result(resumed).result.details.map((w: { wid: string }) => w.wid), ["owned", "aaa-foreign"]);
+  const view = result(resumed).result.details;
+  assert.deepEqual(view.workflows.map((w: { wid: string }) => w.wid), ["owned", "aaa-foreign"]);
+  assert.ok(view.workflows.every((w: object) => !("entries" in w)));
   assert.equal(resumed.events.filter(e => e.type === "agent_start").length, 1);
 });
 
@@ -171,4 +175,36 @@ test("starter replays pending outbox at boot and notes never request continuatio
   assert.equal(note.length, 1); assert.equal(note[0].content, "UI action recorded");
   assert.equal(pi.events.filter(e => e.type === "message_start" && (e.message as any).role === "assistant").length, 1);
   assert.equal(readFileSync(join(home, "spawn.log"), "utf8").trim().split("\n").length, 1);
+});
+
+test("T6/T10 real orchestrator: control actions report applied or the rejection reason; status is compact", { timeout: 90000 }, async t => {
+  const root = tempRoot("dsa-main-real-"), home = join(root, "state");
+  mkdirSync(home); writeFileSync(join(home, "config.json"), JSON.stringify({ k: { idleExitMs: 500 } }));
+  // Real orchestrator (no DSA_ORCHESTRATOR_ENTRY); HOME is the temp root so agent discovery never reads the user's ~/.pi.
+  const pi = startPi({ root, name: "main", extensions: [extension], args: ["--session-id", sessionId], env: { DSA_HOME: home, HOME: root, DSA_EXEC: "" } });
+  t.after(async () => {
+    await pi.stop();
+    const lock = await until(() => new OsLock().tryAcquire(orchLock(home)), 20000); await lock.release();
+    console.log(`M1 evidence: ${root}`);
+  });
+  await prompt(pi, [{ tool: "subagents", args: { action: "run", name: "probe", source: "console.log('from script', 7); return 1;" } }, { text: "done" }]);
+  const wid = String(result(pi).result.details.wid);
+  assert.ok(wid && wid !== "undefined", JSON.stringify(result(pi).result.details));
+  await until(() => readJournalSnapshot(journalPath(home, wid)).some(e => e.type === JT.done), 20000);
+  await prompt(pi, [{ tool: "subagents", args: { action: "resume", wid } }, { text: "done" }]);
+  assert.deepEqual(result(pi).result.details, { applied: false, reason: "terminal:done \u2014 start a new run" });
+  await prompt(pi, [{ tool: "subagents", args: { action: "stop", target: wid } }, { text: "done" }]);
+  assert.deepEqual(result(pi).result.details, { applied: false, reason: "terminal:done" });
+  await prompt(pi, [{ tool: "subagents", args: { action: "status" } }, { text: "done" }]);
+  const view = result(pi).result.details;
+  assert.deepEqual(view.workflows.map((w: any) => [w.wid, w.name, w.status, w.origin]), [[wid, "probe", "done", sender]]);
+  assert.ok(!("entries" in view.workflows[0]) && view.workflows[0].usage);
+  await prompt(pi, [{ tool: "subagents", args: { action: "status", wid } }, { text: "done" }]);
+  const detail = result(pi).result.details;
+  assert.equal(detail.result, 1); assert.ok(!("entries" in detail));
+  assert.match(readFileSync(detail.scriptLog, "utf8"), /ev=1 log: from script 7\n/);
+  // Every resolved control request is retired from the session outbox.
+  const outbox = readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
+  const sent = outbox.filter(e => e.type === "sent").map(e => (e.request as { rid: string }).rid);
+  assert.deepEqual(outbox.filter(e => e.type === "resolved").map(e => e.rid).sort(), [...sent].sort());
 });
