@@ -744,3 +744,14 @@ test('contracts: an unknown agent name fails only that call, naming the availabl
   assert.equal(status, 'failed'); assert.match(error!, /unknown agent "coder"; available agents: .*\btest\b/); assert.equal(good, 'ok');
   assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
 });
+
+test('P25: a bare wid addresses a single-call workflow; an unknown target names the addresses that work', async t => {
+  const { engine, home, run, ledgers } = await fixture(t, undefined, 'a');
+  const wf = await run(`return await runs.run('a', {agent:'test',task:'a'});`);
+  await until(() => wf.journal.entries().some(e => e.type === 'call'));
+  await submit(engine, home, 'send', { to: `${wf.wid}/nope`, kind: 'steer', message: 'x' }, 1);
+  const rejected = await until(() => ledgers.orch.entries().find(e => e.type === JT.rejected && e.rid === 'control-1'));
+  assert.equal(rejected.reason, `unknown-call: use one of ${wf.wid}/a`);
+  await submit(engine, home, 'send', { to: wf.wid, kind: 'steer', message: 'use TOML' }, 2);
+  await until(() => ledgers.orch.entries().some(e => e.type === JT.applied && e.rid === 'control-2'));
+});

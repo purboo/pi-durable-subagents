@@ -164,7 +164,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     name: "subagents", label: "Subagents", description: [
       "Durable subagents: crash-safe, never run twice, survive pi restarts. Always asynchronous: run returns {wid}; you are woken once when it finishes or a subagent asks you something.",
       "run — exactly one of: agent+task (one subagent; optional model 'provider/id[:thinking]', cwd, timeoutMs, schema, gate, isolation:'worktree', context:'fork', budget); tasks:[...] (parallel); chain:[...] ({previous} = previous output); workflow:'./script.js' or source (a script using runs.run(key, spec), runs.all([...]), emit(value), args, runs.input(name); return value = result). Optional: args, name, usageBudget {tokens|costUsd}, maxCalls, inputs {name: path}.",
-      "send — to: '<wid>/<key>' or a call id; kind: steer | follow-up | answer (with qid, rev from the question) | model (model:'provider/id[:thinking]'); replaces: [rid] supersedes your earlier send.",
+      "send — to: '<wid>/<key>' (just '<wid>' when it has one call) or a call id; kind: steer | follow-up | answer (with qid, rev from the question) | model (model:'provider/id[:thinking]'); replaces: [rid] supersedes your earlier send.",
       "status — compact fresh snapshot (own workflows first; per call: status, usage, last output line); status wid:<wid> — one workflow in full detail incl. outputs and script.log path.",
       "stop target:<wid|call>. revise wid + workflow/source/args. resume [wid] (parked workflows or after drain; done/failed/stopped are final — start a new run). drain.",
       "Control actions reply {applied:true} or {applied:false, reason} once the orchestrator decides (else {submitted:{rid}} after 10 s).",
