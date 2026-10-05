@@ -118,7 +118,8 @@ deterministic: use `now()`/`random()`, not `Date`/`Math.random`.
 
 While subagents work, one dim line appears above the editor
 (`1 asks you · 3 working · 12/40 done`). Press `↓` on an empty editor to open
-the list: newest workflows first, every subagent with its model, what it is
+the list: this session's workflows (and other sessions' while they run),
+newest first, every subagent with its model, what it is
 doing and for how long, and its latest line. Finished ones stay there,
 dimmed, with their conclusion.
 
@@ -129,7 +130,8 @@ and the result shows right there: `✓ applied` or the reason it was not.
 
 `Enter` opens a subagent full screen: its task, thinking, tool calls and
 output, rendered with pi's own components. `←`/`→` switch between the
-subagents of one workflow.
+subagents of one workflow. Scrolling up pauses following; pi's
+`↓ Jump to latest message · End` badge (or `End`, or a click) brings you back.
 
 Typing steers the subagent you are watching (`Alt+Enter` queues a
 follow-up instead), or answers it if it is asking you something. `/model`

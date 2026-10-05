@@ -1,5 +1,5 @@
 import { AssistantMessageComponent, UserMessageComponent, ToolExecutionComponent, getMarkdownTheme, getSelectListTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { Input, SelectList, matchesKey, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Input, SelectList, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
@@ -44,6 +44,8 @@ export class SubagentScreen implements Component {
   private uses = 0;
   private thinkingRows = new Set<number>();
   private inputRow = 0;
+  /** Panel row of the "Jump to latest message" badge while following is paused (0 when not shown). */
+  private jumpRow = 0;
   private _focused = false;
   get focused() { return this._focused; }
   set focused(value: boolean) { this._focused = value; this.input.focused = value; this.search.focused = value; if (this.listInput) this.listInput.editor.focused = value; }
@@ -238,6 +240,7 @@ export class SubagentScreen implements Component {
       else return;
       return { handled: true, render: true };
     }
+    if (this.jumpRow && event.y === this.jumpRow) { this.following = true; return { handled: true, render: true }; }
     if (this.thinkingRows.has(event.y)) { this.expandedThinking = !this.expandedThinking; return { handled: true, render: true }; }
     if (event.y === this.inputRow) return this.input.handleMouse({ ...event, x: event.x - 2, y: 0 });
   }
@@ -330,13 +333,21 @@ export class SubagentScreen implements Component {
     const empty = new Input({ prompt: "", placeholder, placeholderStyle: text => this.theme.fg("dim", text) });
     empty.focused = this.focused;
     const editor = this.input.getValue() ? this.input.render(size.width) : empty.render(size.width);
-    const hint = this.input.getValue().startsWith("/") ? "/model · /stop" : this.notice || (this.following ? "" : "Following paused · End resumes");
+    const hint = this.input.getValue().startsWith("/") ? "/model · /stop" : this.notice;
     const transcript = this.transcript(c, w, size.width), available = Math.max(1, size.height - head.length - editor.length - 2);
-    if (this.following) this.scroll = Math.max(0, transcript.lines.length - available);
-    else this.scroll = Math.min(this.scroll, Math.max(0, transcript.lines.length - available));
+    const bottom = Math.max(0, transcript.lines.length - available);
+    // Scrolling back down to the end resumes following, as in pi's own transcript.
+    if (this.following || this.scroll >= bottom) { this.following = true; this.scroll = bottom; }
     this.thinkingRows = new Set(transcript.thoughts.filter(n => n >= this.scroll && n < this.scroll + available).map(n => n - this.scroll + head.length + 1));
     const body = transcript.lines.slice(this.scroll, this.scroll + available);
     while (body.length < available) body.push(""); // the editor stays at the bottom of the panel, as in the main session
+    // pi's own transcript affordance: while following is paused, a badge offers the way back (End or a click).
+    this.jumpRow = 0;
+    if (!this.following && available > 1) {
+      const badge = " ↓ Jump to latest message · End ", pad = Math.max(0, size.width - visibleWidth(badge));
+      body[available - 1] = " ".repeat(pad) + this.theme.bg("selectedBg", this.theme.fg("text", truncateToWidth(badge, size.width)));
+      this.jumpRow = 1 + head.length + available - 1;
+    }
     this.inputRow = 1 + head.length + available + 1;
     return panel([...head, ...body, rule, ...editor, hint], `${w.name ?? w.wid} › ${label(c)}`, `${duration(Date.now() - (c.startedAt ?? Date.now()))} · Esc back`);
   }

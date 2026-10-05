@@ -138,9 +138,10 @@ test("row order is stable across refreshes while activity changes", () => {
     assert.deepEqual(ids(), first);
   }
   calls[1]!.startedAt = undefined; calls[1]!.phase = "queued"; assert.deepEqual(ids(), first); // dispatch timing does not reorder
-  const a = { wid: "a", origin: "main:other", startedAt: 3 }, b = { wid: "b", origin: "main:me", startedAt: 5 }, c = { wid: "c", origin: "main:other", startedAt: 1 }, d = { wid: "d", origin: "main:me", startedAt: 2 };
-  assert.deepEqual(orderWorkflows([a, b, c, d], "main:me").map(x => x.wid), ["b", "d", "a", "c"], "own session first, newest first");
-  assert.deepEqual(orderWorkflows(orderWorkflows([a, b, c, d], "main:me"), "main:me").map(x => x.wid), ["b", "d", "a", "c"]);
+  const a = { wid: "a", origin: "main:other", startedAt: 3, status: "running" as const }, b = { wid: "b", origin: "main:me", startedAt: 5, status: "done" as const };
+  const c = { wid: "c", origin: "main:other", startedAt: 1, status: "done" as const }, d = { wid: "d", origin: "main:me", startedAt: 2, status: "running" as const };
+  assert.deepEqual(orderWorkflows([a, b, c, d], "main:me").map(x => x.wid), ["b", "a", "d"], "this session's workflows and other sessions' running ones, newest first; finishing never reorders");
+  assert.deepEqual(orderWorkflows(orderWorkflows([a, b, c, d], "main:me"), "main:me").map(x => x.wid), ["b", "a", "d"]);
 });
 
 test("done rows are newest first and never reshuffle when failures are viewed or results arrive", () => {
