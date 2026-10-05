@@ -10,6 +10,8 @@ export const SURFACES: readonly Surface[] = [
   { tier: 0, where: "@earendil-works/pi-ai", name: "Type" },
   ...["AssistantMessageComponent", "UserMessageComponent", "ToolExecutionComponent", "getMarkdownTheme", "getSelectListTheme"]
     .map(name => ({ tier: 2 as const, where: "@earendil-works/pi-coding-agent", name })),
+  { tier: 2, where: "ExtensionAPI", name: "registerMessageRenderer" },
+  { tier: 2, where: "@earendil-works/pi-tui", name: "wrapTextWithAnsi" },
   ...["Input", "SelectList", "matchesKey", "truncateToWidth", "visibleWidth"].map(name => ({ tier: 2 as const, where: "@earendil-works/pi-tui", name })),
 ];
 export interface CapabilityReport { version?: string; missing: Surface[]; execution: boolean; ui: boolean; messages: string[] }

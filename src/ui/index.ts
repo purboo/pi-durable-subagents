@@ -4,9 +4,11 @@ import type { UiDeps } from "../agent/main.ts";
 import { UiActions, UiData } from "./data.ts";
 import { SubagentScreen } from "./screen.ts";
 import { mainLine, orderWorkflows, type ViewState } from "./view.ts";
+import { registerCards } from "./cards.ts";
 
 /** UI §1–3, P16, P21: Register journal-backed list/watch surfaces only in interactive pi. */
 export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
+  registerCards(pi, deps.home);
   let cleanup: (() => void) | undefined;
   const start = (_event: unknown, ctx: ExtensionContext) => {
     cleanup?.(); cleanup = undefined;
