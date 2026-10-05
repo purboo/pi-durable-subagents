@@ -4,7 +4,10 @@
 
 Streams drop. Requests time out. Models return nothing. You quit pi. Your
 laptop reboots. Durable Subagents keeps going: it picks every subagent up
-where it stopped, in the same session, without running anything twice.
+where it stopped, in the same session. Every request is decided once and
+every step is finished at most once (what a tool did to the outside world
+before a crash is the one thing it cannot undo; see
+[What we do not promise](#what-we-do-not-promise)).
 
 ```text
 $ npx pi-durable-subagents chaos
@@ -57,16 +60,28 @@ The main agent gets one tool, `subagents`. You ask in plain language, and
 the agent calls it:
 
 ```text
-subagents({ action: "run", agent: "worker", task: "Fix the flaky lease test" })
-subagents({ action: "run", tasks: [{ agent: "scout", task: "…" }, { agent: "reviewer", task: "…" }] })
-subagents({ action: "run", chain: [{ agent: "worker", task: "…" }, { agent: "reviewer", task: "Review: {previous}" }] })
-subagents({ action: "run", workflow: "./batch.js", args: { … }, usageBudget: { costUsd: 20 } })
+subagents({ action: "agents" })
+subagents({ agent: "worker", task: "Fix the flaky lease test" })
+subagents({ tasks: [{ agent: "scout", task: "…" }, { agent: "reviewer", task: "…" }] })
+subagents({ chain: [{ agent: "worker", task: "…" }, { agent: "reviewer", task: "Review: {previous}" }] })
+subagents({ workflow: "./batch.js", args: { … }, usageBudget: { costUsd: 20 } })
 subagents({ action: "send", to: "<wid>/<key>", kind: "steer", message: "Don't touch the tests yet" })
 subagents({ action: "status" })
 ```
 
 Every run is asynchronous. The agent is woken once, when the workflow
-finishes or when a subagent asks it something.
+finishes (the notice carries each subagent's result) or when a subagent asks
+it something. Each verb means one thing, and a refusal says what would work:
+
+| Verb | Applies to | Effect |
+|---|---|---|
+| `run` | — | Start one subagent, `tasks` in parallel, a `chain`, or a workflow script. An unknown agent name is refused before anything starts, with the list of agents. |
+| `send steer` | a running subagent | Reaches it at its next safe point. To a finished one: refused, use `follow-up`. |
+| `send follow-up` | a finished subagent | Continues the same session as a new generation (`key@2`). |
+| `send answer` | an open question | Answers it once. |
+| `send model` | any subagent | Switches its model at the next request. |
+| `stop` | a subagent or a workflow | Final: `stopped`, usage kept, edits left as they are. |
+| `drain` / `resume` | existing workflows | A reversible hold; runs started later are not held. |
 
 ### Workflow scripts
 
@@ -101,10 +116,20 @@ deterministic: use `now()`/`random()`, not `Date`/`Math.random`.
 
 ### Watch any subagent like the main agent
 
-While subagents work, one dim line appears above the editor. Press `↓` on an
-empty editor to open the list, then `Enter` to watch a subagent. You see
-its task, thinking, tool calls and output, rendered with pi's own
-components. `←`/`→` switch between the subagents of one workflow.
+While subagents work, one dim line appears above the editor
+(`1 asks you · 3 working · 12/40 done`). Press `↓` on an empty editor to open
+the list: newest workflows first, every subagent with its model, what it is
+doing and for how long, and its latest line. Finished ones stay there,
+dimmed, with their conclusion.
+
+The list is also where you act. The footer shows the keys for the selected
+row: `Enter` watch, `s` steer, `f` follow-up, `x` stop (asks `y` first),
+`m` model, `a` answer. A one-line input opens at the bottom (paste works),
+and the result shows right there: `✓ applied` or the reason it was not.
+
+`Enter` opens a subagent full screen: its task, thinking, tool calls and
+output, rendered with pi's own components. `←`/`→` switch between the
+subagents of one workflow.
 
 Typing steers the subagent you are watching (`Alt+Enter` queues a
 follow-up instead), or answers it if it is asking you something. `/model`
