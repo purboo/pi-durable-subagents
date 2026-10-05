@@ -1,11 +1,17 @@
 import { resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { CallSpec, Conditions, RequestKind, RunBody } from "../../types.ts";
+import { validateCallSpec } from "../../compat/spec.ts";
+import { compileFanout } from "../../compat/fanout.ts";
+
+const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, schema?, gate?, isolation?, context?, budget?, once?, tools?, skills?, key?}; " +
+  "each call is addressed as '<wid>/<key>', where key is the step's own unique key or else 'tasks:<i>' / 'chain:<i>'.";
 
 export const parameters = Type.Object({
   action: Type.Union(["run", "send", "stop", "revise", "status", "resume", "drain"].map(v => Type.Literal(v))),
   workflow: Type.Optional(Type.String()), source: Type.Optional(Type.String()), args: Type.Optional(Type.Unknown()),
-  tasks: Type.Optional(Type.Array(Type.Any())), chain: Type.Optional(Type.Array(Type.Any())),
+  tasks: Type.Optional(Type.Array(Type.Any(), { description: `Parallel calls. ${stepsDoc}` })),
+  chain: Type.Optional(Type.Array(Type.Any(), { description: `Sequential calls ({previous} = previous output). ${stepsDoc}` })),
   agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
   to: Type.Optional(Type.String()), kind: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("follow-up"), Type.Literal("answer"), Type.Literal("model")])),
   message: Type.Optional(Type.String()), qid: Type.Optional(Type.String()), rev: Type.Optional(Type.Integer({ minimum: 1 })),
@@ -19,11 +25,11 @@ function string(args: Args, name: string): string {
   if (typeof args[name] !== "string" || !args[name]) throw new Error(`${name} is required`);
   return args[name];
 }
-function call(value: unknown, cwd: string): CallSpec {
-  if (!value || typeof value !== "object") throw new Error("Expected a call specification");
-  const spec = { ...value } as Args;
-  string(spec, "agent"); string(spec, "task");
-  if (spec.cwd !== undefined) spec.cwd = resolve(cwd, string(spec, "cwd"));
+function call(value: unknown, cwd: string, where: string): CallSpec {
+  const errors = validateCallSpec(value, { fanout: where !== "call" });
+  if (errors.length) throw new Error(`Invalid ${where}: ${errors.join("; ")}`);
+  const spec = { ...value as Args };
+  if (typeof spec.cwd === "string") spec.cwd = resolve(cwd, spec.cwd);
   return spec as unknown as CallSpec;
 }
 /** P25, P34: Normalize the public tool into the pinned orchestrator wire bodies. */
@@ -39,8 +45,10 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     else if (tasks !== undefined || chain !== undefined) {
       const list = tasks ?? chain;
       if (!Array.isArray(list) || !list.length) throw new Error("tasks/chain must be nonempty");
-      body[tasks !== undefined ? "tasks" : "chain"] = list.map(value => call(value, cwd));
-    } else body.call = call(spec, cwd);
+      const kind = tasks !== undefined ? "tasks" : "chain";
+      body[kind] = list.map((value, i) => call(value, cwd, `${kind}[${i}]`));
+      compileFanout(kind === "tasks" ? { tasks: body.tasks! } : { chain: body.chain! }); // duplicate keys fail here, not at admission
+    } else body.call = call(spec, cwd, "call");
     if (inputs !== undefined) body.args = inputs;
     if (name !== undefined) body.name = string(args, "name");
     // P31a, P36, P11: workflow-level limits and declared input files (absolute paths, pinned at admission).

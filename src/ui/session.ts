@@ -62,11 +62,13 @@ export function thoughtSummary(text: string): string {
   return text.match(/[^.!?。！？]+[.!?。！？](?=\s|$)/gu)?.at(-1)?.trim() ?? "";
 }
 
-/** UI §2–3: Derive model, thinking and tool activity solely from committed session entries. */
-export function sessionFacts(entries: readonly SessionEntry[]) {
-  let model: string | undefined, thinking = "off", activity: string | undefined, lastActivity = 0, task = "";
+/** UI §2–3, P31: Derive model, thinking, tool activity and the call's own tool-call count solely from committed session entries. */
+export function sessionFacts(entries: readonly SessionEntry[], call: string) {
+  let model: string | undefined, thinking = "off", activity: string | undefined, lastActivity = 0, task = "", count = 0, own = false;
   const tools = new Map<string, { name: string; arguments: Record<string, unknown> }>();
   for (const e of entries) {
+    // Only segments opened by this call's executions count; inherited fork/continuation context does not (P31).
+    if (e.type === "custom" && e.customType === CT.exec) own = String((e.data as { exec?: unknown } | undefined)?.exec ?? "").startsWith(`${call}#`);
     if (e.type === "model_change") model = `${e.provider}/${e.modelId}`;
     if (e.type === "thinking_level_change") thinking = e.thinkingLevel;
     if (e.type === "custom" && e.customType === CT.model) {
@@ -82,7 +84,7 @@ export function sessionFacts(entries: readonly SessionEntry[]) {
     const m = e.message;
     if (m.role === "assistant") {
       model = `${m.provider}/${m.model}`;
-      for (const b of m.content) if (b.type === "toolCall") tools.set(b.id, b);
+      for (const b of m.content) if (b.type === "toolCall") { tools.set(b.id, b); if (own) count++; }
     } else if (m.role === "toolResult") tools.delete(m.toolCallId);
   }
   const tool = [...tools.values()].at(-1);
@@ -91,5 +93,5 @@ export function sessionFacts(entries: readonly SessionEntry[]) {
     activity = tool.name === "read" ? `reading ${path}` : ["edit", "write"].includes(tool.name) ? `editing ${path}` :
       tool.name === "bash" ? `running ${String(a.command ?? "")}` : `running ${tool.name}`;
   }
-  return { model, thinking, activity, lastActivity, task };
+  return { model, thinking, activity, lastActivity, task, tools: count };
 }

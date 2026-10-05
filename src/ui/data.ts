@@ -26,7 +26,7 @@ export class UiData {
         let tail = this.tails.get(c.callId);
         if (!tail) { tail = new SessionTail(); this.tails.set(c.callId, tail); }
         const entries = sessionBranch(tail.read(callSession(this.home, w.wid, c.key, c.gen)));
-        const value = sessionFacts(entries);
+        const value = sessionFacts(entries, c.callId);
         const proposal = journal.findLast(e => e.type === "call" && e.key === c.key && e.gen === c.gen);
         value.task ||= String((proposal?.spec as { task?: string } | undefined)?.task ?? "");
         const loss = journal.findLastIndex(e => e.type === "loss" && e.exec === c.exec);

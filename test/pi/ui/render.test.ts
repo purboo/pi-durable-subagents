@@ -17,14 +17,29 @@ const { openJournal } = await import("../../../src/kernel/journal.ts");
 const { journalPath, callSession, orchLedger } = await import("../../../src/paths.ts");
 after(clean);
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
-const plain = (screen: InstanceType<typeof SubagentScreen>, width = 100) => screen.render(width).map(line => stripVTControlCharacters(line).trimEnd()).join("\n") + "\n";
+const framed = (screen: InstanceType<typeof SubagentScreen>, width = 100) => screen.render(width).map(line => stripVTControlCharacters(line)).join("\n") + "\n";
+// Panel content without its side borders, for content assertions.
+const plain = (screen: InstanceType<typeof SubagentScreen>, width = 100) => screen.render(width).map(line => {
+  const text = stripVTControlCharacters(line);
+  return (text.startsWith("│ ") && text.endsWith("│") ? text.slice(2, -1) : text).trimEnd();
+}).join("\n") + "\n";
+function assertFrame(lines: string[], width: number, height: number, title: RegExp) {
+  const text = lines.map(line => stripVTControlCharacters(line));
+  assert.equal(text.length, height, `panel fills ${height} rows at width ${width}`);
+  for (const [i, line] of text.entries()) {
+    assert.equal(visibleWidth(lines[i]!), width, `row ${i} spans the width ${width}: ${line}`);
+    const [left, right] = i === 0 ? ["╭", "╮"] : i === height - 1 ? ["╰", "╯"] : ["│", "│"];
+    assert(line.startsWith(left) && line.endsWith(right), `row ${i} at width ${width} has borders: ${line}`);
+  }
+  assert.match(text[0]!, width >= 40 ? title : /^╭─ \S/); if (width >= 60) assert.match(text.at(-1)!, /Esc back ─+╯$/);
+}
 function setup(submit?: UiDeps["submit"]) {
   const data = new UiData(join(root, "dsa")), requests: Record<string, unknown>[] = [], notes: string[] = [];
   const c = call("E02"), c2 = call("E07", { phase: "asking" });
   data.workflows = [workflow([c, c2, call("E01", { phase: "sealed", endedAt: now - 240_000, result: { key: "E01", gen: 1, status: "ok", ok: true, output: "", data: { summary: "merged 3f2a9c1" } } })], {
     attention: [{ kind: "question", id: "q", rev: 2, qid: "question-1", call: c2.callId, wid: "w", text: "docs/ in write set?" }],
   })];
-  data.sessions.set(c.callId, session()); data.facts.set(c.callId, sessionFacts(session()));
+  data.sessions.set(c.callId, session()); data.facts.set(c.callId, sessionFacts(session(), c.callId));
   const deps = { home: data.home, presentNote: (text: string) => { notes.push(text); }, submit: submit ?? (async (args: Record<string, unknown>) => { requests.push(args); return { submitted: { rid: String(requests.length) } }; }) };
   const actions = new UiActions(deps); let closed = false;
   const screen = new SubagentScreen(data, actions, ctx, tui, theme, () => { closed = true; }, state());
@@ -36,7 +51,7 @@ test("isolated pi components produce stable full-width list and watch captures",
   const original = Date.now; Date.now = () => now;
   try {
     const { screen, open } = setup();
-    const list = plain(screen); open(); const watch = plain(screen);
+    const list = framed(screen); open(); const watch = framed(screen);
     for (const [name, content] of [["list", list], ["watch", watch]]) {
       const path = new URL(`./${name}.txt`, import.meta.url);
       if (process.env.UPDATE_UI_CAPTURES === "1") writeFileSync(path, content!);
@@ -52,9 +67,9 @@ test("isolated pi components produce stable full-width list and watch captures",
 test("thinking duration renders for text and redacted blocks, with timestamp-free fallback", () => {
   for (const thinking of ["A complete thought.", ""]) {
     const { screen, data, open } = setup();
-    const entries = session().slice(0, 4);
-    entries[2]!.timestamp = new Date(now - 32_000).toISOString();
-    const assistant = entries[3]!;
+    const entries = session().slice(0, 5);
+    entries[3]!.timestamp = new Date(now - 32_000).toISOString();
+    const assistant = entries[4]!;
     assert(assistant.type === "message" && assistant.message.role === "assistant");
     assistant.message.content = [{ type: "thinking", thinking }];
     data.sessions.set("w@1/E02@1", entries); open();
@@ -100,8 +115,9 @@ test("tabs switch only on empty input, done tab opens ended context, Esc returns
   const { screen, open, closed } = setup(); open();
   screen.handleInput("draft"); screen.handleInput("\x1b[C"); assert.match(plain(screen), /Steer|draft/); assert.match(plain(screen), /E02 · GPT/);
   screen.handleInput("\x15"); screen.handleInput("\x1b[C"); screen.handleInput("\x1b[C");
-  assert.match(plain(screen), /done · ← →/); screen.handleInput("\r"); assert.match(plain(screen), /Continue E01/);
-  screen.handleInput("\x1b"); assert.match(plain(screen), /^Subagents/); screen.handleInput("\x1b"); assert(closed());
+  assert.match(plain(screen), /^╭─ exec-0927 › done /); assert.match(plain(screen), /← → switch · ↑ ↓ select/);
+  screen.handleInput("\r"); assert.match(plain(screen), /Continue E01/);
+  screen.handleInput("\x1b"); assert.match(plain(screen), /^╭─ Subagents /); screen.handleInput("\x1b"); assert(closed());
 });
 
 test("thinking/tool expansion and follow pause use pi rendering", () => {
@@ -115,7 +131,7 @@ test("late submit completion cannot clear a different call's editor", async () =
   let resolve!: (value: unknown) => void;
   const { screen, open } = setup(() => new Promise(r => { resolve = r; })); open();
   screen.handleInput("old"); screen.handleInput("\r"); screen.handleInput("\x1b");
-  screen.render(100); screen.handleInput("\x1b[B"); screen.handleInput("\x1b[B"); screen.handleInput("\r");
+  screen.render(100); screen.handleInput("\x1b[B"); screen.handleInput("\r"); assert.match(plain(screen), /E07 · GPT/);
   resolve({}); await tick(); screen.handleInput("new draft"); assert.match(plain(screen), /new draft/);
 });
 
@@ -135,17 +151,56 @@ test("actual journals and session growth feed fresh snapshots; rejection is a no
 
 test("fullscreen model and thinking controls expose separate selectors", async () => {
   const { screen, open, requests } = setup(); open();
-  screen.handleMouse({ type: "click", button: "left", x: 35, y: 1 } as TuiMouseEvent);
+  // Row 2 of the panel is the model line; content starts at column 2 inside the border.
+  assert.match(plain(screen).split("\n")[2]!, /^E02 · GPT-6 \(openai\) ▾ · high ▾ · 1 tool$/);
+  assert.equal(screen.handleMouse({ type: "click", button: "left", x: 2 + 40, y: 2 } as TuiMouseEvent), undefined);
+  screen.handleMouse({ type: "click", button: "left", x: 2 + 27, y: 2 } as TuiMouseEvent);
   assert.match(plain(screen), /Thinking for E02/); screen.handleInput("\r"); await tick();
   assert.equal(requests[0]!.model, "openai/gpt-6:off");
-  screen.handleMouse({ type: "click", button: "left", x: 8, y: 1 } as TuiMouseEvent);
-  assert.match(plain(screen), /Model for E02/); screen.handleInput("\x1b");
+  screen.handleMouse({ type: "click", button: "left", x: 2 + 8, y: 2 } as TuiMouseEvent);
+  assert.match(plain(screen), /^╭─ Model for E02 /); assert.match(plain(screen), /Applies from the next model call · Esc back/); screen.handleInput("\x1b");
 });
 
-test("list selection survives incoming activity reordering", () => {
-  const { screen, data } = setup(); screen.render(100); screen.handleInput("\x1b[B"); screen.render(100);
-  data.workflows[0]!.calls[1]!.lastActivity = now + 10_000;
-  screen.render(100); screen.handleInput("\r"); assert.match(plain(screen), /E02 · GPT-6/);
+test("list order and selection stay put across activity refreshes and inserted rows", () => {
+  const { screen, data } = setup(); screen.render(100); screen.handleInput("\x1b[B"); screen.handleInput("\x1b[B");
+  const order = () => plain(screen).split("\n").filter(line => /^ {4}E0\d/.test(line)).map(line => line.trim().slice(0, 3));
+  assert.deepEqual(order(), ["E02", "E07"]);
+  for (const t of [10_000, 20_000, 30_000]) {
+    data.workflows[0]!.calls[0]!.lastActivity = now + t; data.facts.set("w@1/E07@1", { ...sessionFacts([], "w@1/E07@1"), lastActivity: now + 2 * t });
+    assert.deepEqual(order(), ["E02", "E07"]);
+  }
+  // A new call and a new workflow inserted above the selection do not move it off E07.
+  data.workflows[0]!.calls.unshift(call("E00", { callId: "w@1/E00@1" }));
+  data.workflows.unshift(workflow([call("N1", { callId: "n@1/N1@1" }), call("N2", { callId: "n@1/N2@1" })], { wid: "n", name: "new-flow" }));
+  screen.render(100); screen.handleInput("\r"); assert.match(plain(screen), /E07 · GPT-6/);
+  screen.handleInput("\x1b"); screen.handleInput("\r"); assert.match(plain(screen), /E07 · GPT-6/); // Esc returns to the watched row
+});
+
+test("every view is a framed full-height panel at several widths and heights", async () => {
+  const original = Date.now; Date.now = () => now;
+  try {
+    for (const rows of [45, 12]) {
+      const { screen } = setup();
+      (screen as unknown as { tui: { terminal: { rows: number } } }).tui = { ...tui, terminal: { rows, columns: 100 } } as typeof tui;
+      // The short panel also runs with styled output: selection background and border colours must not change widths.
+      if (rows === 12) (screen as unknown as { theme: typeof theme }).theme = { fg: (_c: string, t: string) => `\x1b[36m${t}\x1b[39m`, bg: (_c: string, t: string) => `\x1b[44m${t}\x1b[49m`, bold: (t: string) => `\x1b[1m${t}\x1b[22m` } as typeof theme;
+      screen.render(100); screen.handleInput("\x1b[B");
+      for (const width of [20, 40, 60, 100]) assertFrame(screen.render(width), width, rows, /^╭─ Subagents /);
+      if (rows === 12) assert(screen.render(100)[2]!.includes("\x1b[44m"), "selected row is highlighted across the panel");
+      screen.handleInput("\r");
+      for (const width of [20, 40, 60, 100]) assertFrame(screen.render(width), width, rows, /^╭─ exec-0927 › E02 /);
+      const watch = plain(screen).split("\n");
+      assert.match(watch.at(-2)!, /^╰─ 3m · Esc back ─+╯$/); // key hints live in the bottom border
+      assert.match(watch.at(-4)!, /^Steer E02…/); // the editor sits at the bottom of the panel
+      screen.handleInput("\x0c");
+      for (const width of [20, 40, 60, 100]) assertFrame(screen.render(width), width, rows, /^╭─ Model for E02 /);
+      screen.handleInput("\x1b"); screen.handleInput("\x1b[C"); screen.handleInput("\x1b[C");
+      for (const width of [20, 40, 60, 100]) assertFrame(screen.render(width), width, rows, /^╭─ exec-0927 › done /);
+    }
+    const { screen } = setup();
+    (screen as unknown as { tui: { terminal: { rows: number } } }).tui = { ...tui, terminal: { rows: 2, columns: 6 } } as typeof tui;
+    for (const width of [1, 6]) assert(screen.render(width).every(line => visibleWidth(line) <= width)); // degrades unframed (P21)
+  } finally { Date.now = original; }
 });
 
 test("submission failure retains input and records failure note", async () => {

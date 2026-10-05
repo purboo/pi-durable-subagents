@@ -1,10 +1,11 @@
 import { AssistantMessageComponent, UserMessageComponent, ToolExecutionComponent, getMarkdownTheme, getSelectListTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { Input, SelectList, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Input, SelectList, matchesKey, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { duration, label, listRows, modelLabel, resultPhrase, type ListRow, type ViewState } from "./view.ts";
+import { doneOrder, duration, keepSelection, label, listRows, modelLabel, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
 
@@ -20,6 +21,7 @@ export class SubagentScreen implements Component {
   private theme: Theme;
   private close: () => void;
   private selected = 0;
+  private selectedId?: string;
   private rows: ListRow[] = [];
   private watching?: string;
   private workflow?: string;
@@ -65,7 +67,7 @@ export class SubagentScreen implements Component {
     const { w } = this.current(); if (!w) return;
     const tabs = this.tabs(w), index = tabs.indexOf(this.doneTab ? "done" : this.watching!);
     const next = tabs[(index + delta + tabs.length) % tabs.length];
-    if (next === "done") { this.doneTab = true; this.selected = 0; }
+    if (next === "done") { this.doneTab = true; this.selected = 0; this.selectedId = undefined; }
     else { const c = w.calls.find(c => c.callId === next); if (c) this.open(w, c); }
   }
   private selectRow(row: ListRow | undefined) {
@@ -139,12 +141,15 @@ export class SubagentScreen implements Component {
       if ((["up", "down", "enter", "escape"] as const).some(k => matchesKey(key, k))) this.menu.handleInput(key);
       else { this.search.handleInput(key); this.menu.setFilter(this.search.getValue()); }
     } else if (matchesKey(key, "escape")) {
-      if (this.watching) { this.watching = undefined; this.workflow = undefined; this.doneTab = false; this.selected = 0; }
+      // Back in the list, the selection lands on the call just watched (UI §2 stable selection).
+      if (this.watching) { this.selectedId = this.doneTab ? this.selectedId : this.watching; this.watching = undefined; this.workflow = undefined; this.doneTab = false; }
       else this.close();
     } else if (!this.watching || this.doneTab) {
       if (this.doneTab && (matchesKey(key, "left") || matchesKey(key, "right"))) this.switchTab(matchesKey(key, "left") ? -1 : 1);
-      else if (matchesKey(key, "up")) this.selected = Math.max(0, this.selected - 1);
-      else if (matchesKey(key, "down")) this.selected = Math.min(this.rows.length - 1, this.selected + 1);
+      else if (matchesKey(key, "up") || matchesKey(key, "down")) {
+        this.selected = Math.max(0, Math.min(this.rows.length - 1, this.selected + (matchesKey(key, "up") ? -1 : 1)));
+        this.selectedId = this.rows[this.selected]?.id;
+      }
       else if (matchesKey(key, "enter")) this.selectRow(this.rows[this.selected]);
     } else if (this.busy) {
       // Preserve the draft and target until its durable submission resolves.
@@ -164,14 +169,18 @@ export class SubagentScreen implements Component {
   handleMouse(event: TuiMouseEvent) {
     if (event.type === "wheel" && this.watching) { this.following = false; this.scroll = Math.max(0, this.scroll + (event.wheelDelta ?? 0)); return { handled: true, render: true }; }
     if (event.type !== "click" || event.button !== "left" || !this.watching || this.doneTab) return;
-    if (event.y === 1) {
-      const { c } = this.current();
-      const modelEnd = c ? visibleWidth(`${c.key} · ${this.name(this.data.facts.get(c.callId)?.model ?? c.model)} ▾ · `) : Infinity;
-      if (event.x >= modelEnd) this.thinkingMenu(); else this.modelMenu();
+    // Panel coordinates: row 0 is the top border, column 2 is the first content column.
+    if (event.y === 2) {
+      const { c } = this.current(); if (!c) return;
+      const facts = this.data.facts.get(c.callId), model = `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · `;
+      const x = event.x - 2;
+      if (x < visibleWidth(model)) this.modelMenu();
+      else if (x < visibleWidth(`${model}${facts?.thinking ?? "off"} ▾`)) this.thinkingMenu();
+      else return;
       return { handled: true, render: true };
     }
     if (this.thinkingRows.has(event.y)) { this.expandedThinking = !this.expandedThinking; return { handled: true, render: true }; }
-    if (event.y === this.inputRow) return this.input.handleMouse({ ...event, y: 0 });
+    if (event.y === this.inputRow) return this.input.handleMouse({ ...event, x: event.x - 2, y: 0 });
   }
   private transcript(c: CallSnapshot, w: WorkflowSnapshot, width: number): { lines: string[]; thoughts: number[] } {
     const entries = this.data.sessions.get(c.callId) ?? [], lines: string[] = [], thoughts: number[] = [];
@@ -218,39 +227,45 @@ export class SubagentScreen implements Component {
     }
     return { lines, thoughts };
   }
+  /** UI §2–3, P21: Every view is one full-height framed panel, so the main chat never shows through. */
   render(width: number): string[] {
-    const height = Math.max(8, this.tui.terminal.rows - 2);
-    const fit = (lines: string[]) => lines.map(line => truncateToWidth(line, Math.max(1, width)));
-    if (this.menu) return fit([this.menuTitle,...this.search.render(width), ...this.menu.render(width), "Applies from the next model call · Esc back"]);
+    const height = Math.max(3, Number(this.tui.terminal?.rows) || 24), size = inner(width, height);
+    const panel = (lines: string[], title: string, hints: string) => frame(lines, width, height, this.theme, title, hints);
+    if (this.menu) return panel([...this.search.render(size.width), ...this.menu.render(size.width)], this.menuTitle, "Applies from the next model call · Esc back");
     if (!this.watching || this.doneTab) {
       const w = this.current().w;
-      const selectedId = this.rows[this.selected]?.id;
-      this.rows = this.doneTab && w ? w.calls.filter(c => c.phase === "sealed").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).map(c => ({ id: c.callId, kind: "call" as const, workflow: w, call: c, text: `  ${label(c)}  ${resultPhrase(c)}`, failed: !c.result?.ok })) : listRows(this.data.workflows, this.state, this.data.facts, this.name, width);
-      const retained = this.rows.findIndex(row => row.id === selectedId);
-      this.selected = Math.max(0, Math.min(retained >= 0 ? retained : this.selected, this.rows.length - 1));
-      const start = Math.max(0, this.selected - height + 4);
-      return fit([this.doneTab ? `${w?.name ?? w?.wid}: done · ← → switch` : "Subagents", ...this.rows.slice(start, start + height - 3).map((row, i) => {
-        const text = row.failed ? this.theme.fg("error", row.text) : row.text;
+      this.rows = this.doneTab && w ? doneOrder(w.calls).map(c => {
+        const f = this.data.facts.get(c.callId);
+        return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", label(c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], size.width) };
+      }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, size.width);
+      this.selected = keepSelection(this.rows, this.selectedId, this.selected); this.selectedId = this.rows[this.selected]?.id;
+      const start = Math.max(0, this.selected - size.height + 1);
+      const lines = this.rows.slice(start, start + size.height).map((row, i) => {
+        const text = row.failed ? this.theme.fg("error", fitWidth(row.text, size.width)) : fitWidth(row.text, size.width);
         return i + start === this.selected ? this.theme.bg("selectedBg", text) : text;
-      }), ...(this.rows.length ? [] : ["No subagents"]), "↑ ↓ select · Enter open · Esc back"]);
+      });
+      const keys = "↑ ↓ select · Enter open · Esc back";
+      return panel(this.rows.length ? lines : ["No subagents"], this.doneTab ? `${w?.name ?? w?.wid} › done` : "Subagents", this.doneTab ? `← → switch · ${keys}` : keys);
     }
     const { c, w } = this.current();
-    if (!c || !w) return ["Subagent is no longer in the current revision · Esc back"];
+    if (!c || !w) return panel(["Subagent is no longer in the current revision"], "Subagents", "Esc back");
     const facts = this.data.facts.get(c.callId), active = w.calls.filter(c => c.phase !== "sealed"), done = w.calls.length - active.length;
-    const tabs = width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${w.name ?? w.wid}: ${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
-    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾`, "─".repeat(width)];
-    const transcript = this.transcript(c, w, width), available = Math.max(1, height - 8);
-    if (this.following) this.scroll = Math.max(0, transcript.lines.length - available);
-    else this.scroll = Math.min(this.scroll, Math.max(0, transcript.lines.length - available));
-    this.thinkingRows = new Set(transcript.thoughts.filter(n => n >= this.scroll && n < this.scroll + available).map(n => n - this.scroll + head.length));
-    const body = transcript.lines.slice(this.scroll, this.scroll + available);
+    const tabs = size.width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
+    const tools = toolCount(facts?.tools), rule = this.theme.fg("borderMuted", "─".repeat(size.width));
+    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}`, rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
     const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
-    this.inputRow = head.length + body.length + 1;
     const empty = new Input({ prompt: "", placeholder, placeholderStyle: text => this.theme.fg("dim", text) });
     empty.focused = this.focused;
-    const editor = this.input.getValue() ? this.input.render(width) : empty.render(width);
+    const editor = this.input.getValue() ? this.input.render(size.width) : empty.render(size.width);
     const hint = this.input.getValue().startsWith("/") ? "/model · /stop" : this.notice || (this.following ? "" : "Following paused · End resumes");
-    return fit([...head, ...body, "─".repeat(width), ...editor, hint, `${w.name ?? w.wid} › ${c.key} · ${duration(Date.now() - (c.startedAt ?? Date.now()))} · Esc back`]);
+    const transcript = this.transcript(c, w, size.width), available = Math.max(1, size.height - head.length - editor.length - 2);
+    if (this.following) this.scroll = Math.max(0, transcript.lines.length - available);
+    else this.scroll = Math.min(this.scroll, Math.max(0, transcript.lines.length - available));
+    this.thinkingRows = new Set(transcript.thoughts.filter(n => n >= this.scroll && n < this.scroll + available).map(n => n - this.scroll + head.length + 1));
+    const body = transcript.lines.slice(this.scroll, this.scroll + available);
+    while (body.length < available) body.push(""); // the editor stays at the bottom of the panel, as in the main session
+    this.inputRow = 1 + head.length + available + 1;
+    return panel([...head, ...body, rule, ...editor, hint], `${w.name ?? w.wid} › ${label(c)}`, `${duration(Date.now() - (c.startedAt ?? Date.now()))} · Esc back`);
   }
 }
