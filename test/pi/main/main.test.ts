@@ -233,3 +233,18 @@ test("T6/T10 real orchestrator: control actions report applied or the rejection 
   const sent = outbox.filter(e => e.type === "sent").map(e => (e.request as { rid: string }).rid);
   assert.deepEqual(outbox.filter(e => e.type === "resolved").map(e => e.rid).sort(), [...sent].sort());
 });
+
+test("v12 §2: an answer finds its open question from the qid, the call, or nothing; a send without a target names addresses", { timeout: 60000 }, async t => {
+  const { home, launch } = setup(t), lock = await new OsLock().tryAcquire(orchLock(home)); assert.ok(lock);
+  t.after(() => lock.release());
+  const pi = launch();
+  await append(orchLedger(home), JT.created, { rid: "r", wid: "owned", origin: sender });
+  await append(journalPath(home, "owned"), JT.created, { rid: "r", origin: sender });
+  await append(journalPath(home, "owned"), "call", { pos: 0, key: "work", gen: 1, spec: { agent: "worker", task: "t" } });
+  await append(journalPath(home, "owned"), JT.attention, { item: { id: "q:owned@1/work@1:x", rev: 3, kind: "question", wid: "owned", call: "owned@1/work@1", qid: "qx", text: "Which?", origin: sender } });
+  await prompt(pi, [{ tool: "subagents", args: { action: "send", kind: "answer", message: "the first" } }, { tool: "subagents", args: { action: "send", kind: "steer", message: "x" } }, { text: "done" }], 40000);
+  const [req] = await scanInbox(orchInbox(home));
+  assert.deepEqual(req!.body, { to: "owned@1/work@1", kind: "answer", message: "the first" }); assert.deepEqual(req!.cond, { qid: "qx", rev: 3 });
+  assert.equal(result(pi).isError, true);
+  assert.match(JSON.stringify(result(pi).result.content), /to is required: '<wid>\/<key>'; running: owned\/work/);
+});

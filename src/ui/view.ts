@@ -103,11 +103,11 @@ export function summary(workflows: readonly WorkflowSnapshot[]): { working: numb
   return { working: calls.filter(c => c.phase !== "sealed").length - asking, asking,
     done: progress.reduce((n, p) => n + p.done, 0), total: progress.reduce((n, p) => n + p.total, 0), plus: progress.some(p => p.plus) };
 }
-/** UI §1, v12 §4: What needs you first, then what is running, then progress — e.g. "1 asks you · 3 working · 12/40 done". */
+/** UI §1, v12 §4: What needs you first, then what is running, then progress — e.g. "1 asking · 3 working · 12/40 done". */
 export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
   const s = summary(workflows), finished = workflows.filter(w => w.status !== "running").length;
   if (!s.total) return finished ? `${finished} finished` : "nothing running";
-  return [s.asking ? `${s.asking} asks you` : "", s.working ? `${s.working} working` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
+  return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
 }
 export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
