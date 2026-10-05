@@ -26,7 +26,8 @@ type Snapshot = { hash: string; pins?: Pins; error?: string; warnings?: string[]
 
 // E3: errors of the machine rather than of the request; only these propagate, so the next intake retries the request.
 // Every other staging error (validation, missing input, ENAMETOOLONG, EACCES, ...) is deterministic: failure.json.
-const TRANSIENT = /^(EIO|ENOSPC|EMFILE|ENFILE|EAGAIN|EBUSY|EINTR)$/;
+// Conditions that clear without changing the request: retry at the next intake. Everything else is deterministic.
+const TRANSIENT = /^(EIO|ENOSPC|EDQUOT|EROFS|EMFILE|ENFILE|EAGAIN|EBUSY|EINTR)$/;
 /** E3: Whether a staging error is a transient machine error. */
 const transient = (error: unknown) => TRANSIENT.test(String((error as NodeJS.ErrnoException)?.code ?? ''));
 const MAX_INPUT_NAME = 200;

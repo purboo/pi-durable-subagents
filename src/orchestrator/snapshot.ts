@@ -36,6 +36,10 @@ const nonzero = (u?: Usage) => !!u && (u.input > 0 || u.output > 0 || u.costUsd 
 const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
 
 /** P25, P31: Build a workflow snapshot from its journal entries alone. */
+/** P36, contracts: The one place that turns a refusal reason into the failed result scripts and status both see. */
+export function refusedResult(key: string, reason: unknown): CallResult {
+  return { key, gen: 0, status: "failed", ok: false, error: reason === "spawn-budget" ? "spawn budget exceeded" : String(reason), output: "" };
+}
 export function snapshotFromEntries(wid: string, entries: readonly Entry[]): WorkflowSnapshot {
   const created = entries.find(e => e.type === "wf-created");
   const rev = Math.max(1, ...entries.filter(e => e.type === "wf-created" || e.type === "revised").map(e => Number(e.revision) || 1));
@@ -55,7 +59,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
       const key = String(e.key), gen = Number(e.gen) || (e.type === "refused" ? 0 : 1);
       const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;
-      const result = e.type === "refused" ? { key, gen, status: "failed" as const, ok: false, error: "spawn budget exceeded", output: "" } :
+      const result = e.type === "refused" ? refusedResult(key, e.reason) :
         e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
       calls.set(callId, { key, gen, callId, pos: Number(e.pos), agent: String((e.spec as { agent?: string } | undefined)?.agent ?? ""),
         phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),

@@ -37,7 +37,8 @@ export async function publishRequest(inboxDir: string, req: Request): Promise<Pu
 function isRequest(value: unknown): value is Request {
   if (!value || typeof value !== 'object') return false;
   const r = value as Request;
-  return typeof r.rid === 'string' && typeof r.from === 'string' && typeof r.to === 'string' && Number.isSafeInteger(r.sseq) && r.sseq > 0 &&
+  // A3, C11: request identities are short and path-safe, so every derived path (staging, receipts) is valid.
+  return typeof r.rid === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(r.rid) && typeof r.from === 'string' && typeof r.to === 'string' && Number.isSafeInteger(r.sseq) && r.sseq > 0 &&
     ['run','send','stop','revise','resume','drain','task','steer','follow-up','answer','model','continue','withdraw','call','emit'].includes(r.kind) && Object.hasOwn(r, 'body');
 }
 /** P3: Scan immutable requests, reporting invalid files without admitting them. */

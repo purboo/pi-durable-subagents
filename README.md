@@ -219,6 +219,15 @@ On load, it checks the pi exports and API methods it uses.
 
 ## What we do not promise
 
+- Call specs are checked strictly when a call is first proposed: an unknown or
+  misspelled field makes that call fail with a message naming it, instead of
+  being ignored. A `revise` of an older, looser script therefore fails those
+  calls loudly; calls already finished before the revision are kept as they
+  were.
+- A subagent whose processes cannot be killed (for example stuck in the
+  kernel) keeps its model slot and memory reservation until a later sweep
+  proves it gone, because it may still be calling the provider. You get one
+  "outcome unknown" notice; other work keeps running.
 - A tool that already ran inside a subagent may run again after a crash, if
   its result never reached the session. Make external side effects
   idempotent, or mark the step `once: true` (it then stops as `unknown`

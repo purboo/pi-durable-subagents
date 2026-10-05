@@ -28,7 +28,8 @@ test('argument parsing rejects invalid commands, targets and flags', () => {
   assert.deepEqual(parseArgs(['stop', 'w@1/c@1']), { command: 'stop', target: 'w@1/c@1', json: false });
   assert.equal(parseArgs(['install-service', '--dry-run']).dryRun, true);
   assert.deepEqual(parseArgs(['events', 'w', '--json']), { command: 'events', target: 'w', json: true });
-  for (const args of [['events'], ['events', 'a', 'b'], ['events', '..'], ['tail', '--json']]) assert.throws(() => parseArgs(args));
+  for (const args of [['events'], ['events', 'a', 'b'], ['events', '..']]) assert.throws(() => parseArgs(args));
+  assert.deepEqual(parseArgs(['tail', '--json']), { command: 'tail', json: true });
   for (const args of [['bad'], ['stop'], ['drain', 'w'], ['status', '../escape'], ['status', '--bad'], ['resume', '--json'], ['status', '--json', '--json'], ['drain', '--dry-run']]) assert.throws(() => parseArgs(args));
 });
 

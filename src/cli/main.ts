@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { dsaHome } from "../paths.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath } from "../paths.ts";
-import { allWorkflows, eventsFromEntries, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { allWorkflows, eventsFromEntries, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, compactWorkflow } from "../orchestrator/snapshot.ts";
 import { start, startOrchestrator, submit, type Control } from "./control.ts";
 import { smoke } from "./smoke.ts";
 import { serviceFiles, manageService, type ServiceRunner } from "./service.ts";
@@ -22,7 +22,7 @@ export function parseArgs(args: string[]): Arguments {
   if (!commands.includes(command)) throw new Error(`Unknown command: ${command}`);
   const rest = args.slice(1), json = rest.includes("--json"), dryRun = rest.includes("--dry-run");
   if (dryRun && !["install-service", "uninstall-service"].includes(command)) throw new Error("--dry-run requires a service command");
-  if (json && command !== "status" && command !== "events") throw new Error("--json is only supported by status and events");
+  if (json && !["status", "events", "tail"].includes(command)) throw new Error("--json is only supported by status, events and tail");
   if (rest.filter(a => a === "--json").length > 1 || rest.filter(a => a === "--dry-run").length > 1 || rest.some(a => a.startsWith("-") && a !== "--json" && a !== "--dry-run")) throw new Error("Unknown or repeated option");
   const targets = rest.filter(a => a !== "--json" && a !== "--dry-run");
   const optional = ["status", "tail", "resume"].includes(command);
@@ -59,12 +59,12 @@ function snapshots(home: string, wid?: string) {
   return [snapshot];
 }
 /** P25: Follow fresh snapshots, emitting only changed human-readable workflow lines. */
-export async function tail(home: string, wid: string | undefined, write: (line: string) => void, signal: AbortSignal, interval = 500): Promise<void> {
+export async function tail(home: string, wid: string | undefined, write: (line: string) => void, signal: AbortSignal, interval = 500, json = false): Promise<void> {
   const seen = new Map<string, string>();
   while (!signal.aborted) {
     for (const wf of snapshots(home, wid)) {
-      const text = renderStatus(wf), version = JSON.stringify(wf);
-      if (seen.get(wf.wid) !== version) { write(text); seen.set(wf.wid, version); }
+      const version = JSON.stringify(wf);
+      if (seen.get(wf.wid) !== version) { write(json ? JSON.stringify(compactWorkflow(wf)) : renderStatus(wf)); seen.set(wf.wid, version); }
     }
     try { await delay(interval, undefined, { signal }); } catch (error) { if (!signal.aborted) throw error; }
   }
@@ -74,7 +74,7 @@ export function serviceEntryError(entry: string): string | undefined {
   if (/[/\\]_npx[/\\]/.test(entry)) return `install-service refuses to run from an npx cache (${entry}); the cache can be pruned and the service would break. Install the CLI with \`npm i -g pi-durable-subagents\` and run \`pi-durable-subagents install-service\` again.`;
   return undefined;
 }
-export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] | start | resume [wid] | drain | stop <wid|callId> | stop-all | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
+export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
 /** P1, P21, P25, P38: Dispatch the public CLI using durable requests and read-only snapshots. */
 export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string } = {}): Promise<number> {
   if (args[0] === "chaos") return (await import("./chaos/index.ts")).chaos(args.slice(1), options.env ?? process.env, options.write);
@@ -104,7 +104,7 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
   if (command === "tail") {
     const controller = new AbortController(), stop = () => controller.abort();
     if (!options.signal) { process.once("SIGINT", stop); process.once("SIGTERM", stop); }
-    try { await tail(home, target, write, options.signal ?? controller.signal); }
+    try { await tail(home, target, write, options.signal ?? controller.signal, 500, json); }
     finally { process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); }
     return 0;
   }
