@@ -144,8 +144,9 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       if (receipt || decision) {
         await serial(async () => { await outbox?.markResolved(sent.rid); });
         if (receipt) return { wid: receipt.wid };
-        if (decision!.type === "rejected") return { applied: false, reason: decision!.reason };
-        if (sent.kind !== "run") return { applied: true };
+        // The rid is returned so a later send can supersede this one (replaces: [rid]).
+        if (decision!.type === "rejected") return { applied: false, reason: decision!.reason, rid: sent.rid };
+        if (sent.kind !== "run") return { applied: true, rid: sent.rid };
       }
       if (performance.now() >= deadline || signal?.aborted) break;
       await delay(Math.min(100, deadline - performance.now()));

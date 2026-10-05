@@ -12,7 +12,8 @@ export function workflow(n: number): string {
     n === 2 ? [{ tool: "bash", args: { command: "node -e 'for (;;) {}'" } }] : n === 3 ? [{ empty: true }] :
     n === 8 ? Array.from({ length: 8 }, () => ({ empty: true })) : n === 5 ? [
       { tool: "ask", args: { question: "CHAOS-QUESTION" } }, { tool: "ask", args: { question: "CHAOS-QUESTION" } }] :
-    [4, 6].includes(n) ? [{ tool: "bash", args: { command: "sleep 3" } }] : [];
+    // Scenario 6 keeps the writer busy while two sends each wait up to 10 s for the stopped orchestrator to resolve them.
+    n === 4 ? [{ tool: "bash", args: { command: "sleep 3" } }] : n === 6 ? [{ tool: "bash", args: { command: "sleep 28" } }] : [];
   writer.push({ text: "LEAF: writer-ok" });
   const reviewer = n === 9 ? [{ tool: "bash", args: { command: "sleep 45" } }, { text: "REVIEW: accept" }] : [{ text: `REVIEW: ${n === 7 ? "reject" : "accept"}` }];
   const specs = [ { agent: "writer", task: script(writer), ...(n === 2 ? { timeoutMs: 2200 } : {}) },
@@ -56,7 +57,8 @@ export async function scenario(n: number, root: string, env: NodeJS.ProcessEnv) 
     const send = async (args: Record<string, unknown>) => {
       await pi.prompt([{ tool: "subagents", args: { action: "send", to: `${wid}/writer`, ...args } }, { text: "Sent." }]);
       const result = main().filter(e => e.message?.toolName === "subagents").at(-1)?.message;
-      check(!result?.isError && result?.details?.submitted?.rid, "main send receipt"); return String(result.details.submitted.rid);
+      const rid = result?.details?.rid ?? result?.details?.submitted?.rid;
+      check(!result?.isError && rid && result.details.applied !== false, "main send receipt"); return String(rid);
     };
     if (n === 4) {
       await until(() => child().some(e => e.message?.role === "assistant"), "writer started");
