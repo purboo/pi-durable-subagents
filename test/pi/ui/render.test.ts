@@ -149,6 +149,32 @@ test("actual journals and session growth feed fresh snapshots; rejection is a no
   assert.match(actions.reconcile()!, /call-sealed/); actions.reconcile(); assert.equal(notes.length, 2);
 });
 
+test("P7 watch header and list show pending messages from the journal; delivery clears them", async () => {
+  const original = Date.now; Date.now = () => now;
+  try {
+    const home = join(root, "pending"), path = journalPath(home, "msg"), call = "msg@1/E02@1";
+    let j = await openJournal(path);
+    await j.append("wf-created", { origin: "main:test", cwd: root, revision: 1 });
+    for (const key of ["E02", "E05"]) await j.append("call", { key, gen: 1, spec: { agent: "worker" } });
+    await j.append("exec", { call, exec: `${call}#1.1` });
+    await j.append("forward", { rid: "s1", rid2: "x1", dest: call, hash: "h", envelope: { to: call, kind: "steer", body: { message: "also docs" } } });
+    await j.close();
+    writeSession(callSession(home, "msg", "E02", 1));
+    const data = new UiData(home); data.refresh();
+    const screen = new SubagentScreen(data, new UiActions({ home, submit: async () => ({}), presentNote() {} }), ctx, tui, theme, () => {}, state());
+    const list = plain(screen);
+    assert.match(list, /├ E02  GPT-6 \(openai\)  thinking · 0s +1 pending · 0s\n/); assert.doesNotMatch(list.split("\n").find(l => l.includes("E05"))!, /pending/);
+    screen.handleInput("\x1b[B"); screen.handleInput("\r");
+    const header = () => plain(screen).split("\n")[2]!;
+    assert.match(header(), /^E02 · GPT-6 \(openai\) ▾ · high ▾ · 1 message pending$/);
+    for (const width of [40, 60, 100]) assert(screen.render(width).every(line => visibleWidth(line) <= width));
+    j = await openJournal(path); await j.append("forward-delivered", { rid: "s1", rid2: "x1", call }); await j.close();
+    data.refresh();
+    assert.doesNotMatch(header(), /pending/); assert.match(header(), /▾ · high ▾$/);
+    screen.handleInput("\x1b"); assert.doesNotMatch(plain(screen), /pending/);
+  } finally { Date.now = original; }
+});
+
 test("fullscreen model and thinking controls expose separate selectors", async () => {
   const { screen, open, requests } = setup(); open();
   // Row 2 of the panel is the model line; content starts at column 2 inside the border.

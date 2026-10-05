@@ -3,7 +3,9 @@
 // The snapshot binds the request hash and pins (or error) before admission; never embed
 // input bytes in the ledger. Workflow wf-created {rid,origin,cwd,name?,revision} and
 // revised {rid,revision,snapshot} commit publications; old pins remain immutable.
-import { readFile, stat, rm } from 'node:fs/promises';
+// pruned {rid,wid,endedAt,bytes} (written by the engine) is decisive: the wid is gone, its create-intent and
+// created entries stay for identity (A1), and recovery finishes removing w/<wid> and its staging dirs.
+import { lstat, readdir, readFile, stat, rm } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { basename, extname, join, relative } from 'node:path';
 import { discoverAgents, type AgentDefinition, type DiscoveryOptions } from '../compat/agents.ts';
@@ -12,7 +14,7 @@ import { compileFanout } from '../compat/fanout.ts';
 import { contentHash, ulid } from '../kernel/ids.ts';
 import { openJournal, syncDirectory } from '../kernel/journal.ts';
 import { publishFile } from '../kernel/mailbox.ts';
-import { journalPath, pinnedDir } from '../paths.ts';
+import { journalPath, pinnedDir, workflowDir } from '../paths.ts';
 import { JT, type Entry, type JournalHandle, type Request, type RunBody, type ReviseBody } from '../types.ts';
 import type { Ledgers } from './contract.ts';
 
@@ -107,6 +109,17 @@ export function revisionEntries(wf: Workflow): readonly Entry[] {
 export function terminalEntry(entries: readonly Entry[]): Entry | undefined {
   const last = entries.findLast(e => e.type === JT.done || (e.type === 'resumed' && !e.call) || e.type === 'revised');
   return last?.type === JT.done ? last : undefined;
+}
+
+/** Housekeeping: bytes under a path (files counted once by lstat; a missing path is 0). */
+export async function diskUsage(path: string): Promise<number> {
+  let info;
+  try { info = await lstat(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0; throw error; }
+  if (!info.isDirectory()) return info.size;
+  let total = info.size;
+  const names = await readdir(path).catch(error => { if (error.code === 'ENOENT') return [] as string[]; throw error; });
+  for (const name of names) total += await diskUsage(join(path, name));
+  return total;
 }
 
 /** A1, P11: Own shared workflow handles and reconcile create intents after a crash. */
@@ -242,13 +255,44 @@ export class Store {
     const pins = await this.pinned(intent);
     return { ...wf, revision, ...await this.publishPins(wf.wid, revision, pins) };
   }
-  /** A1, A5: Restore committed revisions; the engine reconciles pending retirement intents. */
+  /** A1, housekeeping: Wids with a committed pruned entry; they are gone and never materialize again. */
+  pruned(): Set<string> { return new Set(this.ledgers.orch.entries().filter(e => e.type === 'pruned').map(e => String(e.wid))); }
+  /** Housekeeping: Bytes a prune of `wid` frees: its workflow directory and the staging dirs of its requests. */
+  async footprint(wid: string): Promise<number> {
+    let total = await diskUsage(workflowDir(this.ledgers.home, wid));
+    for (const rid of this.stagedRids(wid)) total += await diskUsage(this.stagePath(rid));
+    return total;
+  }
+  private stagedRids(wid: string): string[] {
+    return this.ledgers.orch.entries().filter(e => (e.type === 'create-intent' || e.type === 'revise-intent') && e.wid === wid).map(e => String(e.rid));
+  }
+  /** A1, A2: Retire a pruned workflow's handle after its pruned entry is committed; nothing appends to it again. */
+  async drop(wid: string): Promise<void> {
+    const wf = this.workflows.get(wid);
+    this.workflows.delete(wid);
+    await wf?.journal.close();
+  }
+  /** Housekeeping: Remove a pruned workflow's files; idempotent, so recovery can finish an interrupted removal. */
+  async remove(wid: string): Promise<void> {
+    await rm(workflowDir(this.ledgers.home, wid), { recursive: true, force: true });
+    await syncDirectory(join(this.ledgers.home, 'w')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    for (const rid of this.stagedRids(wid)) await rm(this.stagePath(rid), { recursive: true, force: true });
+    await syncDirectory(join(this.ledgers.home, 'staging')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  }
+  /** A1, A5: Restore committed revisions; the engine reconciles pending retirement intents. A pruned wid is never
+   *  materialized again; its interrupted removal is finished here (a failure is reported and retried next start). */
   async recover(): Promise<void> {
-    for (const intent of this.ledgers.orch.entries().filter(e => e.type === 'create-intent')) await this.materialize(intent);
+    const pruned = this.pruned();
+    for (const wid of pruned) {
+      try { await this.remove(wid); }
+      catch (error) { console.error(`durable-subagents: removal of pruned workflow ${wid} failed, retrying at next start: ${String(error)}`); }
+    }
+    for (const intent of this.ledgers.orch.entries().filter(e => e.type === 'create-intent')) if (!pruned.has(String(intent.wid))) await this.materialize(intent);
   }
   private async materialize(intent: Entry): Promise<Workflow> {
     const wid = intent.wid as string, existing = this.workflows.get(wid);
     if (existing) return existing;
+    if (this.pruned().has(wid)) throw new Error(`Workflow ${wid} was pruned`);
     const pins = await this.pinned(intent), files = await this.publishPins(wid, 1, pins);
     const journal = await openJournal(journalPath(this.ledgers.home, wid));
     const wf: Workflow = { wid, revision: 1, origin: intent.origin as string, cwd: intent.cwd as string, journal, ...files };

@@ -95,5 +95,6 @@ export async function openJournal(path: string): Promise<JournalHandle> {
       return operation;
     },
     async close() { if (closed) return; closed = true; await queue; await file.close(); },
+    get closed() { return closed; },
   };
 }

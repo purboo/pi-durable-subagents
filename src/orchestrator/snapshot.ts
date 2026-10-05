@@ -8,6 +8,14 @@ import { JT, type AttentionItem, type CallResult, type Entry } from "../types.ts
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
+/** P7, P27: A request forwarded to a call: pending until the child's receipt is observed, or retired by the seal. */
+export interface CallSend {
+  rid: string; kind: string; state: "pending" | "delivered" | "retired";
+  /** Wall-clock ms of the latest state change. */
+  at: number;
+  /** The child resolved it by rejecting it (e.g. `withdrawn`). */
+  reason?: string;
+}
 export interface CallSnapshot {
   key: string; gen: number; callId: string; agent: string; phase: CallPhase;
   result?: CallResult; model?: string; exec?: string;
@@ -18,6 +26,8 @@ export interface CallSnapshot {
   usage?: Usage;
   /** Tool executions observed across the call's executions. */
   tools?: number;
+  /** Forwarded requests in forward order; `pending` counts pending messages (steer, follow-up, answer). */
+  sends?: CallSend[]; pending?: number;
 }
 export interface WorkflowSnapshot {
   wid: string; rev: number; name?: string; origin?: string; cwd?: string;
@@ -34,6 +44,14 @@ export interface WorkflowSnapshot {
 const zero = (): Usage => ({ input: 0, output: 0, costUsd: 0 });
 const nonzero = (u?: Usage) => !!u && (u.input > 0 || u.output > 0 || u.costUsd > 0);
 const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
+const MESSAGES = new Set(["steer", "follow-up", "answer", "continue", "task"]);
+/** P7, P27: A pending send that carries a message to the agent (model switches and withdrawals are controls). */
+export const pendingMessage = (s: CallSend) => s.state === "pending" && MESSAGES.has(s.kind);
+/** P37: The display name of a call id `wid@r/key@g`: the key, with its generation when later than the first. */
+function callKey(call: unknown): string {
+  const text = String(call), match = /^.*\/(.*)@(\d+)$/.exec(text);
+  return match ? (Number(match[2]) > 1 ? `${match[1]}@${match[2]}` : match[1]!) : text;
+}
 
 /** P25, P31: Build a workflow snapshot from its journal entries alone. */
 /** P36, contracts: The one place that turns a refusal reason into the failed result scripts and status both see. */
@@ -54,6 +72,8 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
   // P31: usage per call id, deduplicated by message id; a seal carries the authoritative total.
   const live = new Map<string, Usage>(), sealedUsage = new Map<string, Usage>(), seen = new Set<string>();
   const tools = new Map<string, number>();
+  // P7, P27: forward / forward-delivered / forward-retired, by destination call; retirements carry only rid2.
+  const sends = new Map<string, CallSend[]>(), byRid2 = new Map<string, CallSend>();
   for (const e of entries) {
     if (["call", "generation", "refused", "reused"].includes(e.type)) {
       if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
@@ -88,6 +108,15 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
     } else if (e.type === JT.attention) {
       const item = e.item as AttentionItem;
       if (!resolved.has(`${item.id}@${item.rev}`)) attention.push(item);
+    } else if (e.type === "forward") {
+      const send: CallSend = { rid: String(e.rid), kind: String((e.envelope as { kind?: string } | undefined)?.kind ?? ""), state: "pending", at: e.ts };
+      const list = sends.get(String(e.dest)) ?? []; list.push(send); sends.set(String(e.dest), list);
+      byRid2.set(`${e.dest}\n${e.rid2}`, send); byRid2.set(String(e.rid2), send);
+    } else if (e.type === "forward-delivered" || e.type === "forward-retired") {
+      const send = byRid2.get(e.type === "forward-delivered" ? `${e.call}\n${e.rid2}` : String(e.rid2));
+      if (!send || send.state !== "pending") continue;
+      send.state = e.type === "forward-delivered" ? "delivered" : "retired"; send.at = e.ts;
+      if (e.type === "forward-delivered" && e.reason !== undefined) send.reason = String(e.reason);
     }
   }
   for (const item of attention) {
@@ -101,6 +130,8 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
     counts[c.phase]++;
     const usage = usageOf(c.callId); if (usage) c.usage = { ...usage };
     const n = tools.get(c.callId); if (n) c.tools = n;
+    const forwarded = sends.get(c.callId);
+    if (forwarded) { c.sends = forwarded; const pending = forwarded.filter(pendingMessage).length; if (pending) c.pending = pending; }
   }
   const usage = zero();
   for (const id of new Set([...live.keys(), ...sealedUsage.keys()])) {
@@ -121,10 +152,16 @@ export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
   return snapshotFromEntries(wid, readJournalSnapshot(journalPath(home, wid)));
 }
 
+/** Ops: wids archived by `prune` (orchestrator ledger `pruned{wid}`); they no longer exist for any reader. */
+function prunedIds(home: string): Set<string> {
+  return new Set(readJournalSnapshot(orchLedger(home)).filter(e => e.type === "pruned").map(e => String(e.wid)));
+}
+
 function workflowIds(home: string): string[] {
   let wids: string[] = [];
   try { wids = readdirSync(join(home, "w")).filter(n => !n.startsWith(".")); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  return wids;
+  const pruned = prunedIds(home);
+  return wids.filter(wid => !pruned.has(wid));
 }
 
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID). */
@@ -144,6 +181,8 @@ export function formatUsage(u: Usage): string {
 export interface StatusCall {
   key: string; gen: number; callId: string; phase: CallPhase;
   status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage;
+  /** Messages forwarded to the call whose child receipt has not been observed yet (P7). */
+  pending?: number;
   /** Last non-empty output line (clipped); the full output is in `status wid=<wid>`. */
   lastLine?: string; error?: string;
 }
@@ -169,7 +208,7 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
     calls: wf.calls.map(c => {
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
       return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...(r ? { status: r.status, ok: r.ok } : {}),
-        ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
+        ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
@@ -178,7 +217,8 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
 
 function origins(home: string): Map<string, string | undefined> {
   const ids = new Map<string, string | undefined>();
-  for (const e of readJournalSnapshot(orchLedger(home))) if (e.type === JT.created) ids.set(String(e.wid), e.origin as string | undefined);
+  const pruned = prunedIds(home);
+  for (const e of readJournalSnapshot(orchLedger(home))) if (e.type === JT.created && !pruned.has(String(e.wid))) ids.set(String(e.wid), e.origin as string | undefined);
   for (const wid of workflowIds(home)) if (!ids.has(wid)) ids.set(wid, undefined);
   return ids;
 }
@@ -199,7 +239,7 @@ export function statusView(home: string, options: { origin?: string; keep?: numb
 /** P25, T10: One workflow in full detail (results, outputs, script log path) but without raw journal entries. */
 export function statusDetail(home: string, wid: string): StatusDetail {
   const origin = origins(home);
-  if (!origin.has(wid)) throw new Error(`Unknown workflow: ${wid}`);
+  if (!origin.has(wid)) throw new Error(prunedIds(home).has(wid) ? `Workflow ${wid} was pruned` : `Unknown workflow: ${wid}`);
   const wf = workflowSnapshot(home, wid), log = scriptLogPath(home, wid);
   return { ...wf, ...(wf.origin === undefined && origin.get(wid) !== undefined ? { origin: origin.get(wid) } : {}), ...(existsSync(log) ? { scriptLog: log } : {}) };
 }
@@ -208,6 +248,7 @@ export interface TimelineEvent { seq: number; ts: number; event: string; [field:
 /** P25, T10: Project a workflow journal into meaningful events (no observations, time or tracking). */
 export function eventsFromEntries(entries: readonly Entry[]): TimelineEvent[] {
   const out: TimelineEvent[] = [];
+  const forwards = new Map<string, Entry>();
   const add = (e: Entry, event: string, fields: Record<string, unknown>) => {
     out.push({ seq: e.seq, ts: e.ts, event, ...Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined)) });
   };
@@ -227,7 +268,16 @@ export function eventsFromEntries(entries: readonly Entry[]): TimelineEvent[] {
       case "stop-intent": add(e, "stop", { call: e.call }); break;
       case "timeout-intent": add(e, "timeout", { call: e.call, exec: e.exec }); break;
       case "hibernated": add(e, "hibernated", { call: e.call, qid: e.qid }); break;
-      case "forward": add(e, "forward", { rid: e.rid, kind: (e.envelope as { body?: { kind?: string } } | undefined)?.body?.kind, dest: e.dest }); break;
+      case "forward": {
+        forwards.set(String(e.rid2), e);
+        add(e, "forward", { rid: e.rid, kind: (e.envelope as { kind?: string } | undefined)?.kind, dest: e.dest }); break;
+      }
+      case "forward-delivered": case "forward-retired": {
+        const f = forwards.get(String(e.rid2)), call = e.call ?? f?.dest;
+        add(e, e.type === "forward-delivered" ? "delivered" : "retired", { kind: (f?.envelope as { kind?: string } | undefined)?.kind ?? "request",
+          key: call === undefined ? undefined : callKey(call), rid: e.rid, reason: e.type === "forward-delivered" ? e.reason : undefined });
+        break;
+      }
       case JT.sealed: {
         const r = e.result as CallResult | undefined;
         add(e, "sealed", { call: e.call, status: r?.status, ok: r?.ok, usage: nonzero(r?.usage) ? r?.usage : undefined, error: r?.error ? clip(r.error, 300) : undefined });
@@ -244,8 +294,14 @@ export function eventsFromEntries(entries: readonly Entry[]): TimelineEvent[] {
 
 /** P25: One human-readable timeline line. */
 export function renderEvent(e: TimelineEvent): string {
-  const { seq, ts, event, usage, ...rest } = e;
-  const fields = Object.entries(rest).map(([k, v]) => `${k}=${typeof v === "string" ? (/\s/.test(v) ? JSON.stringify(v) : v) : JSON.stringify(v)}`);
+  const { seq, ts, event, usage, ...rest } = e, fields: string[] = [];
+  // P7, P27: delivery outcomes read as one sentence, e.g. "steer delivered to b" / "steer retired (call ended first)".
+  if (event === "delivered" || event === "retired") {
+    const { kind, key, reason } = rest; delete rest.kind; delete rest.reason;
+    if (event === "delivered") delete rest.key;
+    fields.push(event === "delivered" ? `${kind} delivered to ${key ?? "?"}${reason ? ` (rejected: ${reason})` : ""}` : `${kind} retired (call ended first)`);
+  }
+  fields.push(...Object.entries(rest).map(([k, v]) => `${k}=${typeof v === "string" ? (/\s/.test(v) ? JSON.stringify(v) : v) : JSON.stringify(v)}`));
   if (usage) fields.push(`usage=${JSON.stringify(formatUsage(usage as Usage))}`);
   return `${new Date(ts).toISOString()} #${seq} ${event.padEnd(10)} ${fields.join(" ")}`.trimEnd();
 }

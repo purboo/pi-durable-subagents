@@ -41,6 +41,8 @@ export interface JournalHandle {
   /** Append + fsync. Resolves only when durable. Single writer per file (caller holds authority). */
   append<T extends string>(type: T, fields: Record<string, unknown>): Promise<Entry<T>>;
   close(): Promise<void>;
+  /** True once close() was called; owners that outlive a workflow (the executor sweep) skip closed handles. */
+  readonly closed?: boolean;
 }
 
 // ---------------------------------------------------------------------------

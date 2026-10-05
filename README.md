@@ -161,6 +161,9 @@ pi-durable-subagents resume [wid]       continue unfinished or parked work (undo
 pi-durable-subagents drain              start nothing new; running work finishes
 pi-durable-subagents stop <wid|call>
 pi-durable-subagents stop-all           pause everything; journals stay resumable
+pi-durable-subagents prune [wid] [--older-than <days>]
+                                        delete finished workflows (done, failed, stopped); prints count and bytes freed
+pi-durable-subagents doctor [--json]    read-only health check; exits 1 when something needs you
 pi-durable-subagents install-service    optional: run `start` at login and every 30 s (systemd / launchd)
 pi-durable-subagents uninstall-service
 ```
@@ -168,6 +171,17 @@ pi-durable-subagents uninstall-service
 The service only runs `start`: it never resumes work you drained or
 stopped. Install the CLI globally (`npm i -g pi-durable-subagents`) before
 `install-service`.
+
+### Housekeeping
+
+Journals are never compacted, so state only grows. `prune` removes finished
+workflows: the named one, or all of them (only those that ended more than
+`--older-than` days ago, if given). Parked and running workflows, and
+workflows with a follow-up still open, are never pruned; naming one prints
+why. The ledger keeps a one-line record of each pruned workflow, and it
+never comes back. `doctor` shows disk use, workflows by status, the largest
+journals, parked work, old open questions, and leftovers; each finding
+comes with one command to fix it.
 
 ## Configuration
 

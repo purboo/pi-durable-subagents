@@ -1,5 +1,7 @@
 // Private journal entries (A1): tracked{exec,pid,start}; loss{exec}; settled{exec};
 // stop-intent{call}; forward{rid,rid2,dest,hash,envelope:{to,kind,body,cond?}};
+// forward-delivered{rid,rid2,call,reason?}: the first observed child receipt of a forward (once per forward; reason when
+// the child resolved it as rejected, e.g. withdrawn); forward-retired{rid,rid2,reason}: sealed/retired without a receipt (P27).
 // observation{exec,event}; selected{exec,model}; switch-observed{exec,rid,pool}.
 // P28 entries are documented in hibernate.ts; generation session publication in generation.ts.
 // session-corrupt{call,line}: a malformed native session line was skipped (once per line, E4).
@@ -65,7 +67,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   const failing = new Set<string>();
   // F2: a sweep error is transient: report it and retry at the next K1; it never blocks dispatch.
   const sweepTimer = setInterval(() => {
-    if (!sweeping) sweeping = sweepExecutions(journals.values(), containment, { failing: exec => failing.has(exec), fenced: swept, failed: fenceFailed })
+    if (!sweeping) sweeping = sweepExecutions([...journals.values()].filter(j => !j.closed), containment, { failing: exec => failing.has(exec), fenced: swept, failed: fenceFailed })
       .catch(error => console.error(`durable-subagents: sweep failed, retrying in K1: ${String(error)}`)).finally(() => { sweeping = undefined; });
   }, options.sweepMs ?? 30000);
   sweepTimer.unref();
@@ -210,8 +212,26 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await rm(join(dir, name), { force: true });
     }
   }
+  /** P7, P27: Record forward-delivered once when a forward's child receipt is first observed; serial sections only. */
+  async function forwardsDelivered(journal: JournalHandle, call: string, entries: SessionEntry[]) {
+    const all = journal.entries();
+    const open = all.filter(e => e.type === "forward" && e.dest === call &&
+      !all.some(r => r.rid2 === e.rid2 && (r.type === "forward-retired" || (r.type === "forward-delivered" && r.call === call))));
+    if (!open.length) return;
+    const receipts = new Map<string, SessionEntry>();
+    for (const e of entries) {
+      const rid = receiptId(e);
+      if (rid && !receipts.has(rid) && !(e.customType === CT.rejected && e.data?.reason === "identity-conflict")) receipts.set(rid, e);
+    }
+    for (const e of open) {
+      const receipt = receipts.get(String(e.rid2)); if (!receipt) continue;
+      const reason = receipt.customType === CT.rejected ? receipt.data?.reason : undefined;
+      await journal.append("forward-delivered", { rid: e.rid, rid2: e.rid2, call, ...(reason !== undefined ? { reason: String(reason) } : {}) });
+    }
+  }
   async function retireForwards(journal: JournalHandle, call: string) {
     const entries = await readCall(journal, call);
+    await forwardsDelivered(journal, call, entries);
     const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
     for (const e of journal.entries().filter(e => e.type === "forward" && e.dest === call)) {
       if (!receipts.has(String(e.rid2)) && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2))
@@ -341,6 +361,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   async function questions(t: CallTicket, entries: SessionEntry[]) {
     await collectReceipts(t.callId, entries).catch(error => console.error(`durable-subagents: inbox cleanup of ${t.callId} failed: ${String(error)}`));
     await serial(async () => {
+      await forwardsDelivered(t.journal, t.callId, entries);
       for (const e of entries) {
         if (e.type !== "custom" || e.customType !== CT.question || !e.data) continue;
         const { qid, rev, question } = e.data;
@@ -626,8 +647,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       }
       const calls = new Set(journal.entries().filter(e => e.type === JT.exec).map(e => String(e.call)));
       for (const call of calls) {
-        const values = sessionUsage(await readCall(journal, call), call);
+        const session = await readCall(journal, call), values = sessionUsage(session, call);
         await serial(async () => {
+          await forwardsDelivered(journal, call, session);
           const recorded = new Set(journal.entries().filter(e => e.type === "usage" && e.call === call).map(e => e.id));
           for (const u of values) if (!recorded.has(u.id)) await journal.append("usage", { call, ...u });
           if (sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) {

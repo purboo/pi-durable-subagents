@@ -6,6 +6,8 @@
 // its seal has a finished attention independent of workflow completion.
 // resumed {rid,n} supersedes a terminal park. emit {pos,value} records script outputs.
 // stop-requested {rid,call?} marks a call or workflow stop as taking effect, so its replay is applied, not already-sealed.
+// Orch entry pruned {rid,wid,endedAt,bytes} is the decisive record of a prune: appended before the journal handle is
+// closed and w/<wid> and its staging dirs are removed (bytes = footprint measured just before). Nothing is rewritten (A1).
 import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readdir, unlink } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
@@ -14,7 +16,7 @@ import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
-import { JT, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
+import { JT, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
@@ -54,6 +56,8 @@ export class Engine {
   private failure?: unknown;
   private closed = false;
   private generations = new Set<string>();
+  // wid -> executor runs whose follow-up has not run yet (prune never closes a journal they may still append to).
+  private running = new Map<string, number>();
   private draining = false;
   private watcher?: FSWatcher;
   private poll?: ReturnType<typeof setInterval>;
@@ -67,6 +71,11 @@ export class Engine {
     return result;
   }
   private background(fn: () => Promise<void>) { if (!this.closed) void this.serial(fn).catch(() => {}); }
+  private hold(wid: string) {
+    this.running.set(wid, (this.running.get(wid) ?? 0) + 1);
+    let released = false;
+    return () => { if (released) return; released = true; const n = this.running.get(wid)! - 1; if (n) this.running.set(wid, n); else this.running.delete(wid); };
+  }
   private terminal(wf: Workflow) { return terminalEntry(revisionEntries(wf)); }
   private lifecycle(): DecisionRecord[] { return this.ledgers.orch.entries().filter(e => ['admitted', 'applied', 'rejected', 'withdrawn'].includes(e.type)) as unknown as DecisionRecord[]; }
   /** A2, P10: Recover executor authority before replaying each unfinished workflow. */
@@ -196,6 +205,7 @@ export class Engine {
     }
     if (req.kind === 'run') {
       const created = this.ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid);
+      if (created && this.store.pruned().has(String(created.wid))) return { action: 'apply' }; // Never resurrect a pruned run.
       let wf = created ? this.store.workflows.get(created.wid as string) : undefined;
       if (!wf) {
         try { await this.store.staged(req as Request<RunBody>); }
@@ -288,8 +298,52 @@ export class Engine {
         await this.executor.suspend();
         for (const st of this.states.values()) st.running.clear();
       }
-    } else return { action: 'reject', reason: 'unsupported-kind' };
+    } else if (req.kind === 'prune') return this.prune(req as Request<PruneBody>);
+    else return { action: 'reject', reason: 'unsupported-kind' };
     return { action: 'apply' };
+  }
+  /** A1, housekeeping: Prune finished workflows (named, or all ended more than olderThanDays ago); a replay of a
+   *  committed prune is applied again and continues with the workflows still eligible. */
+  private async prune(req: Request<PruneBody>): Promise<Decision> {
+    const { wid, olderThanDays } = req.body ?? {};
+    if ((wid !== undefined && (typeof wid !== 'string' || !wid)) || (olderThanDays !== undefined && !(typeof olderThanDays === 'number' && Number.isFinite(olderThanDays) && olderThanDays >= 0)))
+      return { action: 'reject', reason: 'invalid-prune' };
+    const cutoff = olderThanDays === undefined ? undefined : Date.now() - olderThanDays * 86_400_000;
+    if (wid === undefined) {
+      for (const wf of [...this.store.workflows.values()].sort((a, b) => a.wid < b.wid ? -1 : 1))
+        if (!this.unprunable(wf, cutoff)) await this.pruneWorkflow(req.rid, wf);
+      return { action: 'apply' };
+    }
+    if (this.ledgers.orch.entries().some(e => e.type === 'pruned' && e.rid === req.rid && e.wid === wid)) return { action: 'apply' };
+    const wf = this.store.workflows.get(wid);
+    if (!wf) return { action: 'reject', reason: this.store.pruned().has(wid) ? 'already-pruned' : 'unknown-workflow' };
+    const reason = this.unprunable(wf, cutoff);
+    if (reason) return { action: 'reject', reason };
+    await this.pruneWorkflow(req.rid, wf);
+    return { action: 'apply' };
+  }
+  /** Housekeeping: Why a workflow cannot be pruned: not final (parked or running), open executor work, an unresolved
+   *  fence failure, or ended after the cutoff. */
+  private unprunable(wf: Workflow, cutoff?: number): string | undefined {
+    const done = this.terminal(wf), status = done ? String(done.status) : 'running';
+    if (!['done', 'failed', 'stopped'].includes(status)) return `not-finished:${status}`;
+    const log = wf.journal.entries(), has = (type: string, field: string, value: unknown) => log.some(e => e.type === type && e[field] === value);
+    const openGeneration = log.some(e => e.type === 'generation' && !has(JT.sealed, 'call', `${wf.wid}@${e.revision}/${e.key}@${e.gen}`) && !has('retired', 'call', `${wf.wid}@${e.revision}/${e.key}@${e.gen}`));
+    const liveExec = log.some(e => e.type === JT.exec && !has(JT.fenced, 'exec', e.exec) && !has(JT.sealed, 'call', e.call));
+    if (openGeneration || liveExec || this.running.has(wf.wid) || [...this.generations].some(id => id.startsWith(`${wf.wid}@`))) return 'open-generation';
+    if (log.some(e => e.type === 'fence-failed' && !log.some(r => r.seq > e.seq && ((r.type === JT.fenced && r.exec === e.exec) || (r.type === 'gate' && r.id === e.exec) ||
+      (r.type === JT.attentionResolved && r.id === `fence:${String(e.exec)}`))))) return 'fence-failed';
+    if (cutoff !== undefined && done!.ts > cutoff) return 'too-recent';
+    return undefined;
+  }
+  /** A1, housekeeping: The pruned entry commits first; then the handle closes and the files go (recovery finishes them). */
+  private async pruneWorkflow(rid: string, wf: Workflow) {
+    const bytes = await this.store.footprint(wf.wid);
+    await this.ledgers.orch.append('pruned', { rid, wid: wf.wid, endedAt: this.terminal(wf)!.ts, bytes });
+    this.states.delete(wf.wid);
+    await this.store.drop(wf.wid);
+    try { await this.store.remove(wf.wid); }
+    catch (error) { console.error(`durable-subagents: removal of pruned workflow ${wf.wid} failed, retrying at next start: ${String(error)}`); }
   }
   private dispatchGeneration(wf: Workflow, entry: Entry) {
     const ticket = this.ticket({ wf } as State, entry), id = ticket.callId;
@@ -326,14 +380,17 @@ export class Engine {
     if (sealed) { st.ready.set(pos, sealed); return; }
     if (this.draining) return;
     st.running.add(pos);
+    const release = this.hold(st.wf.wid);
     void this.executor.run(this.ticket(st, entry)).then(() => this.background(async () => {
-      if (this.states.get(st.wf.wid) !== st || this.terminal(st.wf)) return;
-      const result = this.sealed(st, entry);
-      if (!result) throw new Error(`Executor returned without seal: ${entry.key}`);
-      st.ready.set(pos, result); await this.flush(st);
+      try {
+        if (this.states.get(st.wf.wid) !== st || this.terminal(st.wf)) return;
+        const result = this.sealed(st, entry);
+        if (!result) throw new Error(`Executor returned without seal: ${entry.key}`);
+        st.ready.set(pos, result); await this.flush(st);
+      } finally { release(); }
     }), error => {
-      if (error instanceof Error && error.name === 'ExecutorShutdown') return;
-      this.background(async () => { if (this.states.get(st.wf.wid) === st) throw error; });
+      if (error instanceof Error && error.name === 'ExecutorShutdown') { release(); return; }
+      this.background(async () => { try { if (this.states.get(st.wf.wid) === st) throw error; } finally { release(); } });
     });
   }
   private async flush(st: State) {

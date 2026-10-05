@@ -10,9 +10,9 @@ import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
 import { orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { unfinishedWorkflow } from "../agent/main/snapshots.ts";
-import { JT, type DrainBody, type Request } from "../types.ts";
+import { JT, type DrainBody, type PruneBody, type Request } from "../types.ts";
 
-export type Control = "resume" | "drain" | "stop" | "stop-all";
+export type Control = "resume" | "drain" | "stop" | "stop-all" | "prune";
 /** P1: Start the detached orchestrator only after probing its OS lock. */
 export async function startOrchestrator(home: string, env: NodeJS.ProcessEnv): Promise<void> {
   const lock = await new OsLock().tryAcquire(orchLock(home));
@@ -53,8 +53,19 @@ export async function start(home: string, env: NodeJS.ProcessEnv, starter: (home
   await starter(home, env);
   return true;
 }
+/** P6, housekeeping: Wait (bounded) until the ledger resolves `rid`; undefined when it is still pending at the deadline. */
+export async function resolution(home: string, rid: string, timeoutMs: number, interval = 100): Promise<{ type: "applied" | "rejected"; reason?: string } | undefined> {
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    const records = readJournalSnapshot(orchLedger(home)).filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[];
+    const resolved = reduceLifecycle(records).resolved.get(rid);
+    if (resolved) return resolved.type === "rejected" ? { type: "rejected", reason: String(resolved.reason) } : { type: "applied" };
+    if (performance.now() >= deadline) return undefined;
+    await delay(interval);
+  }
+}
 /** P5, P38: Serialize the stable CLI sender across processes and recover its durable outbox. */
-export async function submit(home: string, command: Control, target?: string, env: NodeJS.ProcessEnv = process.env): Promise<Request[]> {
+export async function submit(home: string, command: Control, target?: string, env: NodeJS.ProcessEnv = process.env, options: { olderThanDays?: number } = {}): Promise<Request[]> {
   if (command === "stop" && !target) throw new Error("stop requires a workflow or call id");
   await mkdir(home, { recursive: true });
   const sender = `cli:${userInfo().username}@${hostname()}`;
@@ -72,6 +83,9 @@ export async function submit(home: string, command: Control, target?: string, en
       if (command === "stop-all") {
         const body: DrainBody = { fence: true };
         requests.push(await outbox.send("orch", "drain", body));
+      } else if (command === "prune") {
+        const body: PruneBody = { ...(target ? { wid: target } : {}), ...(options.olderThanDays !== undefined ? { olderThanDays: options.olderThanDays } : {}) };
+        requests.push(await outbox.send("orch", "prune", body));
       } else requests.push(await outbox.send("orch", command, command === "stop" ? { target } : command === "resume" && target ? { wid: target } : {}));
       // Publish first: even a starter failure leaves a recoverable request and no idle-exit race.
       await startOrchestrator(home, env);

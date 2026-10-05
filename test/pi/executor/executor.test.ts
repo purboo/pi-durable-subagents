@@ -491,6 +491,58 @@ test("C1 forwarded steer then withdraw is consumed with child receipts", { timeo
   const session = await readFile(callSession(f.home, f.wid, "a", 1), "utf8"); assert.match(session, new RegExp(CT.withdrawn));
 });
 
+test("P7 a live steer is recorded delivered exactly once on its child receipt; a restart never duplicates it", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 25 } }), ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 2" } }, { text: "done" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  const req: Request = { rid: "seen-steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "also check the docs" } };
+  await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: "a", gen: 1 });
+  const rid2 = f.journal.entries().find(e => e.type === "forward")!.rid2;
+  const delivered = () => f.journal.entries().filter(e => e.type === "forward-delivered");
+  assert.equal(delivered().length, 0, "the child applies a steer only at its next turn boundary");
+  await until(() => delivered().length > 0);
+  assert.ok(!f.journal.entries().some(e => e.type === JT.sealed), "delivery is visible while the call still runs");
+  assert.equal((await pending).status, "ok");
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(rows.filter(e => e.type === "custom_message" && e.details?.rid === rid2).length, 1);
+  assert.deepEqual(delivered().map(e => [e.rid, e.rid2, e.call, e.reason]), [[req.rid, rid2, ticket.callId, undefined]]);
+  assert.ok(!f.journal.entries().some(e => e.type === "forward-retired"));
+  await f.executor.shutdown();
+  const restarted = createExecutor({ home: f.home, orch: f.orch, config: {} });
+  try { await restarted.recover(f.wid, f.journal); await restarted.recover(f.wid, f.journal); } finally { await restarted.shutdown(); }
+  assert.equal(delivered().length, 1); assert.ok(!f.journal.entries().some(e => e.type === "forward-retired"));
+});
+
+test("P7 a receipt observed before a crash but not yet recorded is recorded once by the recovery scan", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 25 } });
+  // Fault injection: the first incarnation dies before any forward-delivered append becomes durable.
+  const real = f.journal, lossy: JournalHandle = { path: real.path, entries: () => real.entries(), close: () => real.close(),
+    append: (type, fields) => type === "forward-delivered" ? Promise.resolve({ seq: -1, ts: Date.now(), type, ...fields }) : real.append(type, fields) };
+  const ticket = { ...f.ticket("a", script([{ tool: "bash", args: { command: "sleep 1" } }, { tool: "bash", args: { command: "sleep 60" } }, { text: "resumed" }])), journal: lossy };
+  const pending = f.executor.run(ticket);
+  const started = () => real.entries().filter(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start").length;
+  await until(() => started() >= 1);
+  const req: Request = { rid: "crash-steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "keep going" } };
+  await f.executor.forward(req, { journal: lossy, widRev: ticket.widRev, key: "a", gen: 1 });
+  const rid2 = real.entries().find(e => e.type === "forward")!.rid2;
+  const receipts = async () => (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line)).filter(e => e.type === "custom_message" && e.details?.rid === rid2).length;
+  await until(async () => started() >= 2 && await receipts() === 1);
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.shutdown(); await rejected;
+  const delivered = () => real.entries().filter(e => e.type === "forward-delivered");
+  assert.equal(delivered().length, 0);
+  const restarted = createExecutor({ home: f.home, orch: f.orch, config: { k: { trackerMs: 25 } } });
+  t.after(() => restarted.shutdown());
+  const execs = real.entries().filter(e => e.type === JT.exec).length;
+  await restarted.recover(f.wid, real);
+  assert.deepEqual(delivered().map(e => [e.rid, e.rid2, e.call]), [[req.rid, rid2, ticket.callId]], "recorded by the recovery scan");
+  assert.equal(real.entries().filter(e => e.type === JT.exec).length, execs, "before any new execution");
+  const result = await restarted.run({ ...ticket, journal: real });
+  assert.equal(result.output, "resumed"); assert.equal(await receipts(), 1);
+  await restarted.recover(f.wid, real);
+  assert.equal(delivered().length, 1); assert.ok(!real.entries().some(e => e.type === "forward-retired"));
+});
+
 test("X1 shutdown fences without sealing; restart continues and retires unused forwards", { timeout: 45000 }, async t => {
   const f = await setup(t, { k: { trackerMs: 50 } });
   const ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 60" } }, { text: "resumed" }]));
@@ -611,6 +663,7 @@ test("X1 seal retires forwards lacking child receipts and recovery never republi
   await f.executor.stop({ wid: f.wid });
   const retired = f.journal.entries().find(e => e.type === "forward-retired")!;
   assert.equal(retired.rid, req.rid); assert.equal(retired.reason, "retired-without-child-receipt");
+  assert.ok(!f.journal.entries().some(e => e.type === "forward-delivered"), "a retired forward is never also delivered");
   const file = join(callInbox(f.home, f.wid, "a", 1), `${retired.rid2}.json`);
   assert.equal(existsSync(file), false, "the seal resolves and deletes the envelope");
   await f.executor.recover(f.wid, f.journal);
