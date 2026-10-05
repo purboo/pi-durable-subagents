@@ -182,12 +182,12 @@ export class Engine {
       }
     }
   }
-  private findCall(to: string): { wf: Workflow; entry: Entry } | undefined {
+  private findCall(to: string, bareWid = false): { wf: Workflow; entry: Entry } | undefined {
     for (const wf of this.store.workflows.values()) {
       const calls = revisionEntries(wf).filter(e => e.type === 'call' || e.type === 'generation');
-      // A bare wid addresses its call when the workflow has exactly one key.
+      // For sends, a bare wid addresses its call when the workflow has exactly one key (stop <wid> means the workflow).
       const keys = new Set(calls.map(e => String(e.key)));
-      const named = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}` || (to === wf.wid && keys.size === 1));
+      const named = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}` || (bareWid && to === wf.wid && keys.size === 1));
       const entry = named && calls.findLast(e => e.key === named.key);
       if (entry) return { wf, entry };
     }
@@ -207,7 +207,7 @@ export class Engine {
       const sent = requests.filter(r => r.kind === 'send' && rids.includes(r.rid));
       const visited = new Set<string>();
       for (const target of sent) {
-        const found = this.findCall((target.body as SendBody).to);
+        const found = this.findCall((target.body as SendBody).to, true);
         if (!found || found.wf !== wf || visited.has(found.entry.key as string)) continue;
         visited.add(found.entry.key as string);
         await this.executor.forward(req, this.context(wf, found.entry));
@@ -221,7 +221,7 @@ export class Engine {
       if (match && this.store.workflows.has(match[1]!) && this.store.workflows.get(match[1]!)!.revision !== Number(match[2])) return { action: 'reject', reason: 'stale-revision' };
     }
     if (req.cond?.epoch) {
-      const target = req.kind === 'send' ? this.findCall((req.body as SendBody).to) : undefined;
+      const target = req.kind === 'send' ? this.findCall((req.body as SendBody).to, true) : undefined;
       if (!target || req.cond.epoch !== `${target.wf.wid}@${target.wf.revision}`) return { action: 'reject', reason: 'stale-epoch' };
     }
     if (req.kind === 'run') {
@@ -244,7 +244,7 @@ export class Engine {
     } else if (req.kind === 'send') {
       const existing = [...this.store.workflows.values()].flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && e.rid === req.rid).map(entry => ({ wf, entry })))[0];
       if (existing) { this.dispatchGeneration(existing.wf, existing.entry); return { action: 'apply' }; }
-      const target = this.findCall((req.body as SendBody)?.to);
+      const target = this.findCall((req.body as SendBody)?.to, true);
       if (!target) return { action: 'reject', reason: this.unknownCall((req.body as SendBody)?.to) };
       const { wf, entry } = target, send = req.body as SendBody;
       const from = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
