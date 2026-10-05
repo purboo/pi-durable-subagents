@@ -4,7 +4,7 @@
 // P28 entries are documented in hibernate.ts; generation session publication in generation.ts.
 // session-corrupt{call,line}: a malformed native session line was skipped (once per line, E4).
 // fence-failed{exec,error} is documented in sweep.ts. The orchestrator ledger owns hold/release{pool,slot,exec}
-// and mem{available,admitted,exec} (on decision change or every 30 s). All transitions are serialized before publication.
+// and mem{available,admitted,exec} (every admission; a repeated refusal at most every 30 s per call). All transitions are serialized before publication.
 import { mkdir, open, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -31,7 +31,7 @@ import { gateRetired } from "./effects/gate.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
 type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean;
-  parking?: string; onPark: Set<() => void>; mem?: { admitted: boolean; at: number } };
+  parking?: string; onPark: Set<() => void>; refusedAt?: number };
 const MEM_RECORD_MS = 30000;
 const ignoreMissing = (error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; };
 const callOf = (exec: string) => exec.slice(0, exec.lastIndexOf("#"));
@@ -304,9 +304,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           if (!capacity({ kind: "provider", holders: holders.length, capacity: limit })) continue;
           const available = await (options.memory ?? availableMemory)();
           const admitted = capacity({ kind: "memory", available, reserve: config.memory?.reserveMb ?? 2048, perChild: config.memory?.perChildMb ?? 300 });
-          // F3: record the observation only when the decision changes, or every 30 s while it holds.
-          if (a.mem?.admitted !== admitted || Date.now() - a.mem.at >= MEM_RECORD_MS) {
-            await orch.append("mem", { available, admitted, exec }); a.mem = { admitted, at: Date.now() };
+          // F3: every admitted dispatch is recorded; repeated refusals at most once per 30 s per call.
+          if (admitted || a.refusedAt === undefined || Date.now() - a.refusedAt >= MEM_RECORD_MS) {
+            await orch.append("mem", { available, admitted, exec }); a.refusedAt = admitted ? undefined : Date.now();
           }
           if (!admitted) return;
           const memory = holdings().filter(e => e.pool === "memory");

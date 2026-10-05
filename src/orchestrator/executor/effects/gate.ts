@@ -11,10 +11,29 @@ import type { CallTicket } from "../../contract.ts";
 
 const tracked = (journal: JournalHandle, id: string) => journal.entries().filter(e => e.type === "gate-tracked" && e.id === id).map(e => e.process as ProcInfo);
 
+// Calls parked on an unfenced gate, woken when the sweep records the gate's outcome.
+const parked = new Map<string, Set<() => void>>();
 /** P30, F1: A gate proven retired after a failed fence gets its unknown outcome once and its attention resolved. */
 export async function gateRetired(journal: JournalHandle, id: string): Promise<void> {
   if (!journal.entries().some(e => e.type === "gate" && e.id === id)) await journal.append("gate", { id, unknown: true });
   await resolveFenceAttention(journal, id);
+  for (const wake of parked.get(id) ?? []) wake();
+}
+/** A2, F1: Wait until the sweep has fenced a gate and recorded its outcome; a settlement abort (stop, timeout,
+ *  budget, suspend) ends the wait without an outcome. */
+async function gateParked(journal: JournalHandle, id: string, signal: AbortSignal): Promise<Entry | undefined> {
+  const waiters = parked.get(id) ?? new Set<() => void>(); parked.set(id, waiters);
+  try {
+    for (;;) {
+      const record = journal.entries().find(e => e.type === "gate" && e.id === id);
+      if (record || signal.aborted) return record;
+      await new Promise<void>(resolve => {
+        const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); waiters.delete(done); resolve(); };
+        const timer = setTimeout(done, 1000);
+        signal.addEventListener("abort", done, { once: true }); waiters.add(done);
+      });
+    }
+  } finally { if (!waiters.size) parked.delete(id); }
 }
 /** F1: Fence a gate identity; a failure is recorded once (timeouts raise an unknown attention) and left to the sweep. */
 async function fenceGate(journal: JournalHandle, intent: Entry, containment: Pick<Containment, "fence">): Promise<boolean> {
@@ -52,17 +71,18 @@ export async function runGate(t: CallTicket, home: string, cwd: string, exec: st
     const intent = prior.at(-1)!;
     let record = t.journal.entries().find(e => e.type === "gate" && e.id === intent.id);
     if (!record) {
-      // A gate that cannot be fenced is never re-run: its outcome is unknown now and recorded once the sweep retires it.
-      if (!await fenceGate(t.journal, intent, containment)) return apply(result, { unknown: true } as unknown as Entry);
-      await gateRetired(t.journal, String(intent.id));
-      record = t.journal.entries().find(e => e.type === "gate" && e.id === intent.id)!;
+      // A gate that cannot be fenced is never re-run and the call never seals while it may live (A2): park until
+      // the sweep retires it and records its unknown outcome.
+      if (await fenceGate(t.journal, intent, containment)) await gateRetired(t.journal, String(intent.id));
+      record = await gateParked(t.journal, String(intent.id), signal);
+      if (!record) return result;
     }
     return apply(result, record);
   }
   const gate = typeof t.spec.gate === "string" ? { command: t.spec.gate } : t.spec.gate;
   if (gate.timeoutMs !== undefined && (!Number.isFinite(gate.timeoutMs) || gate.timeoutMs < 0)) throw new Error("Invalid gate timeout");
   const id = `gate:${t.callId}#${prior.length + 1}`, dir = join(callDir(home, t.wid, t.key, t.gen), "gate-1");
-  await t.journal.append("gate-intent", { call: t.callId, id, exec });
+  const intent = await t.journal.append("gate-intent", { call: t.callId, id, exec });
   for (const [name, bytes] of [["result.json", JSON.stringify(result)], ["output.txt", result.output]]) {
     if (await publishFile(dir, name!, bytes!) === "conflict") throw new Error(`Gate input conflict: ${dir}/${name}`);
   }
@@ -72,7 +92,7 @@ export async function runGate(t: CallTicket, home: string, cwd: string, exec: st
   let scanQueue = Promise.resolve(), stdout = "", outputError: string | undefined;
   let abort = () => {};
   let fields: Record<string, unknown> = { id, exit: null };
-  let finishRead: Promise<void> = Promise.resolve();
+  let finishRead: Promise<void> = Promise.resolve(), retired = false;
   try {
     const child = await containment.spawn({ command: "sh", args: ["-c", gate.command], cwd, exec: id,
       env: { DSA_RESULT: join(dir, "result.json"), DSA_OUTPUT: join(dir, "output.txt"), DSA_CALL: t.callId } });
@@ -103,7 +123,12 @@ export async function runGate(t: CallTicket, home: string, cwd: string, exec: st
   finally {
     clearTimeout(timer); clearInterval(scanTimer); signal.removeEventListener("abort", abort);
     await scanQueue.catch(() => {});
-    await containment.fence(id, known);
+    retired = await fenceGate(t.journal, intent, containment);
+  }
+  if (!retired) {
+    // F1, A2: descendants may still live; the outcome is left to the sweep (unknown) and the call waits for it.
+    const record = await gateParked(t.journal, id, signal);
+    return record ? apply(result, record) : result;
   }
   await finishRead.catch(error => { outputError = String(error); });
   if (signal.aborted) fields = { id, exit: fields.exit, aborted: true };

@@ -24,24 +24,32 @@ export interface Workflow { wid: string; revision: number; origin: string; cwd: 
 type SnapshotRef = { path: string; hash: string };
 type Snapshot = { hash: string; pins?: Pins; error?: string; warnings?: string[] };
 
-// E3: errors of the machine rather than of the request; they propagate so the next intake retries the request.
-const TRANSIENT = /\b(EIO|ENOSPC|EDQUOT|EMFILE|ENFILE|ENOMEM|EAGAIN|EBUSY|EINTR|ETIMEDOUT|EROFS)\b/;
-/** E3: Reading the request's own inputs: a missing or unreadable input is deterministic; resource errors are not. */
-const transientInput = (error: unknown) => TRANSIENT.test(String((error as NodeJS.ErrnoException)?.code ?? ''));
-/** E3: Publishing staging files (temp file, link, fsync): every system error is transient. */
-const transientWrite = (error: unknown) => typeof (error as NodeJS.ErrnoException)?.code === 'string';
+// E3: errors of the machine rather than of the request; only these propagate, so the next intake retries the request.
+// Every other staging error (validation, missing input, ENAMETOOLONG, EACCES, ...) is deterministic: failure.json.
+const TRANSIENT = /^(EIO|ENOSPC|EMFILE|ENFILE|EAGAIN|EBUSY|EINTR)$/;
+/** E3: Whether a staging error is a transient machine error. */
+const transient = (error: unknown) => TRANSIENT.test(String((error as NodeJS.ErrnoException)?.code ?? ''));
+const MAX_INPUT_NAME = 200;
 
-/** E3: Names an agent file with a diagnostic may define: its frontmatter name (with a package prefix) and file name. */
+/** E3: The agent name a file with a diagnostic defines: its frontmatter name (and package-qualified name), or, when the
+ *  frontmatter names nothing (unparseable or unreadable), its file name without the extension. */
 function diagnosticNames(sourcePath: string): string[] {
-  const names = [basename(sourcePath, extname(sourcePath))];
   try {
     const { frontmatter: f } = parseFrontmatter(readFileSync(sourcePath, 'utf8'));
-    if (f.name) names.push(f.name, ...(f.package ? [`${f.package.trim().toLowerCase()}.${f.name}`] : []));
+    if (f.name) return [f.name, ...(f.package ? [`${f.package.trim().toLowerCase()}.${f.name}`] : [])];
   } catch { /* An unreadable file is named by its file name only. */ }
-  return names;
+  return [basename(sourcePath, extname(sourcePath))];
 }
-/** E3, P11: A run references an agent when its pinned source names it as a string literal (fan-out specs compile to JSON). */
-const references = (source: string, name: string) => ['"', "'", '`'].some(q => source.includes(`${q}${name}${q}`));
+/** E3, P11: Every string a run could use as an agent name: pinned agents, quoted source literals, strings in args. */
+function usableNames(source: string, args: unknown, agents: AgentDefinition[]): (name: string) => boolean {
+  const strings = new Set(agents.map(a => a.name));
+  const walk = (value: unknown): void => {
+    if (typeof value === 'string') strings.add(value);
+    else if (value && typeof value === 'object') for (const v of Object.values(value)) walk(v);
+  };
+  walk(args);
+  return name => strings.has(name) || ['"', "'", '`'].some(q => source.includes(`${q}${name}${q}`));
+}
 
 /** P33: Capture the selected branch before admission and exclude extension receipts. */
 async function pinOrigin(origin: NonNullable<RunBody['origin']>): Promise<string> {
@@ -61,19 +69,25 @@ async function pinOrigin(origin: NonNullable<RunBody['origin']>): Promise<string
 }
 
 /** P11, A5, E3: Capture immutable admission inputs before publishing any workflow files. Agent diagnostics reject the
- *  run only for agents its source references; the others are appended to `warnings`. */
+ *  run only for names the run could use (see usableNames); the others are appended to `warnings`. */
 export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, warnings: string[] = []): Promise<Pins> {
   if (!body || typeof body.cwd !== 'string' || [body.workflow, body.source, body.tasks, body.chain, body.call].filter(x => x !== undefined).length !== 1) throw new Error('invalid-run');
   if (body.maxCalls !== undefined && (!Number.isSafeInteger(body.maxCalls) || body.maxCalls < 0)) throw new Error('invalid-maxCalls');
   if (body.usageBudget && Object.values(body.usageBudget).some(n => !Number.isFinite(n) || n < 0)) throw new Error('invalid-usageBudget');
   const source = body.source ?? (body.workflow ? await readFile(body.workflow, 'utf8') : compileFanout(body.tasks ? { tasks: body.tasks } : body.chain ? { chain: body.chain } : { tasks: [body.call!] }).source);
   const inputs: Record<string, string> = Object.create(null);
-  for (const [name, file] of Object.entries(body.inputs ?? {})) inputs[name] = (await readFile(file)).toString('base64');
+  for (const [name, file] of Object.entries(body.inputs ?? {})) {
+    const encoded = encodeURIComponent(name);
+    if (!encoded || encoded === '.' || encoded === '..' || encoded.length > MAX_INPUT_NAME) throw new Error(`invalid-input-name: ${name.slice(0, 40)}`);
+    inputs[name] = (await readFile(file)).toString('base64');
+  }
   const found = discoverAgents(body.cwd, discovery), blocking: string[] = [];
+  const usable = usableNames(source, body.args, found.agents);
   for (const d of found.diagnostics) {
     const text = `${d.sourcePath}: ${d.error}`;
-    if (!diagnosticNames(d.sourcePath).some(name => references(source, name))) { warnings.push(text); continue; }
-    if (TRANSIENT.test(d.error)) throw Object.assign(new Error(text), { code: TRANSIENT.exec(d.error)![1] });
+    if (!diagnosticNames(d.sourcePath).some(usable)) { warnings.push(text); continue; }
+    const code = /\b(EIO|ENOSPC|EMFILE|ENFILE|EAGAIN|EBUSY|EINTR)\b/.exec(d.error)?.[1];
+    if (code) throw Object.assign(new Error(text), { code });
     blocking.push(text);
   }
   if (blocking.length) throw new Error(blocking.join('\n'));
@@ -107,7 +121,12 @@ export class Store {
   async stage(req: Request<RunBody | ReviseBody>, discovery?: DiscoveryOptions): Promise<void> {
     const dir = this.stagePath(req.rid);
     let exists = true;
-    try { await stat(join(dir, 'snapshot.json')); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; exists = false; }
+    try { await stat(join(dir, 'snapshot.json')); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') exists = false;
+      else if (transient(error)) throw error;
+      else return; // Unstageable request (e.g. ENAMETOOLONG): staged() rejects it.
+    }
     if (!exists) {
       let snapshot: Snapshot;
       const warnings: string[] = [];
@@ -125,11 +144,11 @@ export class Store {
           ...(warnings.length ? { warnings } : {}) };
         if (req.kind === 'revise') snapshot.pins!.origin = this.workflows.get((req.body as ReviseBody).wid)?.pins.origin;
       } catch (error) {
-        if (transientInput(error)) throw error;
+        if (transient(error)) throw error;
         snapshot = { hash: contentHash(req), error: String(error) };
       }
-      await publishFile(dir, 'snapshot.json', JSON.stringify(snapshot));
-      await syncDirectory(join(this.ledgers.home, 'staging'));
+      try { await publishFile(dir, 'snapshot.json', JSON.stringify(snapshot)); await syncDirectory(join(this.ledgers.home, 'staging')); }
+      catch (error) { if (transient(error)) throw error; return; } // Unstageable request: staged() rejects it.
     }
     try {
       const pins = await this.staged(req);
@@ -138,12 +157,12 @@ export class Store {
       }
       for (const [name, bytes] of Object.entries(pins.inputs)) {
         const file = encodeURIComponent(name);
-        if (!file || file === '.' || file === '..') throw new Error('Invalid input name');
+        if (!file || file === '.' || file === '..' || file.length > MAX_INPUT_NAME) throw new Error('Invalid input name');
         if (await publishFile(join(dir, 'inputs'), file, Buffer.from(bytes, 'base64')) === 'conflict') throw new Error(`Staging input conflict: ${name}`);
       }
       await syncDirectory(dir);
     } catch (error) {
-      if (transientWrite(error)) throw error;
+      if (transient(error)) throw error;
       await publishFile(dir, 'failure.json', JSON.stringify({ error: String(error) }));
     }
   }
