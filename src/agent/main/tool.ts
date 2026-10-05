@@ -8,7 +8,7 @@ const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, sc
   "each call is addressed as '<wid>/<key>', where key is the step's own unique key or else 'tasks:<i>' / 'chain:<i>'.";
 
 export const parameters = Type.Object({
-  action: Type.Union(["run", "send", "stop", "revise", "status", "resume", "drain"].map(v => Type.Literal(v))),
+  action: Type.Optional(Type.Union(["run", "agents", "send", "stop", "revise", "status", "resume", "drain"].map(v => Type.Literal(v)))),
   workflow: Type.Optional(Type.String()), source: Type.Optional(Type.String()), args: Type.Optional(Type.Unknown()),
   tasks: Type.Optional(Type.Array(Type.Any(), { description: `Parallel calls. ${stepsDoc}` })),
   chain: Type.Optional(Type.Array(Type.Any(), { description: `Sequential calls ({previous} = previous output). ${stepsDoc}` })),
@@ -33,9 +33,13 @@ function call(value: unknown, cwd: string, where: string): CallSpec {
   if (typeof spec.cwd === "string") spec.cwd = resolve(cwd, spec.cwd);
   return spec as unknown as CallSpec;
 }
-/** P25, P34: Normalize the public tool into the pinned orchestrator wire bodies. */
+/** v12 §2: Infer unambiguous runs and normalize controls into unchanged wire bodies. */
 export function request(args: Args, cwd: string): { kind: RequestKind; body: unknown; cond?: Conditions; replaces?: string[] } {
-  const action = string(args, "action");
+  // v12 §2: Infer run only when one launch form is present; never guess a control verb.
+  const launchForms = [args.agent !== undefined || args.task !== undefined, args.tasks !== undefined,
+    args.chain !== undefined, args.workflow !== undefined, args.source !== undefined];
+  const action = args.action === undefined && launchForms.filter(Boolean).length === 1 ? "run" : args.action;
+  if (typeof action !== "string" || !action) throw new Error("action is required: run, agents, send, stop, revise, status, resume, drain");
   if (action === "run") {
     const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, by: _by, ...spec } = args;
     const choices = [workflow, source, tasks, chain, spec.agent === undefined && spec.task === undefined ? undefined : spec];
@@ -84,5 +88,5 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     ...(args.source === undefined ? {} : { source: string(args, "source") }), ...(args.args === undefined ? {} : { args: args.args }) } };
   if (action === "resume") return { kind: "resume", body: args.wid === undefined ? {} : { wid: string(args, "wid") } };
   if (action === "drain") return { kind: "drain", body: {} };
-  throw new Error(`Unsupported action: ${action}`);
+  throw new Error(`Unsupported action: ${action}; use run, agents, send, stop, revise, status, resume, or drain`);
 }

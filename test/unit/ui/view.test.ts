@@ -4,7 +4,9 @@ import { appendFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { root, clean, now, call, workflow, state, session } from "./fixture.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-const { listRows, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount, summaryText } = await import("../../../src/ui/view.ts");
+import type { WorkflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
+import type { CallStatus } from "../../../src/types.ts";
+const { listRows, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount, summaryText, summary, resultPhrase, resultWord } = await import("../../../src/ui/view.ts");
 const { visibleWidth } = await import("@earendil-works/pi-tui");
 const { SessionTail, thoughtSummary, sessionFacts, sessionBranch } = await import("../../../src/ui/session.ts");
 after(clean);
@@ -21,7 +23,7 @@ test("grouping, proposal order, done paging, and narrow columns", () => {
   const w = workflow(calls), s = state();
   const solo = workflow([call("scout")], { wid: "solo" });
   let rows = listRows([w, solo], s, new Map(), () => "GPT-6 (openai)", 100, now);
-  assert.equal(rows[0]!.kind, "workflow"); assert.match(rows[0]!.text, /10\/12 · 1h02m/);
+  assert.equal(rows[0]!.kind, "workflow"); assert.match(rows[0]!.text, /10\/12\+ · 1h02m/, "no planned total: proposed so far reads as n+ (v12 §4)");
   assert.equal(rows[1]!.call!.key, "E02"); assert.equal(rows[2]!.call!.key, "E05"); assert.equal(rows[3]!.text.trim(), "└ ▸ 10 done");
   assert.match(rows[1]!.text, /^ {2}├ E02/, "agents are tree children of their workflow");
   assert(!rows.some(r => r.kind === "more"));
@@ -33,15 +35,18 @@ test("grouping, proposal order, done paging, and narrow columns", () => {
   s.folded.add("w"); assert.equal(listRows([w], s, new Map(), () => "", 100, now).length, 1);
 });
 
-test("unviewed failures remain visible then collapse; all-ended workflows expand done rows", () => {
+test("unviewed failures remain visible; finished workflows stay listed with their done rows", () => {
   const bad = call("bad", { phase: "sealed", endedAt: now, result: { key: "bad", gen: 1, status: "failed", ok: false, output: "", error: "merge conflict" } });
   const good = call("good", { phase: "sealed", endedAt: now - 1_000 });
   const w = workflow([good, bad], { status: "failed" }), s = state();
   const rows = listRows([w], s, new Map(), () => "—", 100, now);
   assert.equal(rows.find(r => r.kind === "call")!.call!.key, "bad"); assert(rows.some(r => r.failed));
   s.viewed.add(bad.callId);
-  assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.text), ["▸ 1 finished workflow"]);
-  s.finished = true; assert(listRows([w], s, new Map(), () => "—", 100, now).some(r => r.call === good));
+  const listed = listRows([w], s, new Map(), () => "—", 100, now);
+  assert.ok(listed.some(r => r.kind === "workflow" && r.dim), "v12 §5: the finished workflow stays listed, dimmed");
+  assert(listed.some(r => r.call === good), "its done rows stay readable after the failure is viewed");
+  s.done.set("w", 0);
+  assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.kind), ["workflow", "done"], "collapse keeps the workflow row and its done node");
 });
 
 test("done rows reopen on new failure and completion transitions, then respect fresh user collapse", () => {
@@ -70,7 +75,7 @@ test("successful last call also reopens collapsed done rows without a new failur
 
 test("ordinary status phrases, main line, questions and stalls", () => {
   const c = call("E07"), w = workflow([c]);
-  assert.equal(mainLine([]), undefined); assert.equal(mainLine([w]), "1 working · 0/1 done  ↓");
+  assert.equal(mainLine([]), undefined); assert.equal(mainLine([w]), "1 working · 0/1+ done  ↓");
   w.attention = [{ id: "q", rev: 1, kind: "question", call: c.callId, text: "docs/ in write set?", wid: "w" }];
   assert.equal(statusPhrase(c, w, undefined, now), "asking main agent: docs/ in write set?");
   w.attention = [{ id: "s", rev: 1, kind: "stall", call: c.callId, text: "", wid: "w" }]; c.lastActivity = now - 840_000;
@@ -80,8 +85,8 @@ test("ordinary status phrases, main line, questions and stalls", () => {
   assert.equal(statusPhrase(c, w, { ...sessionFacts([], c.callId), activity: "reading src/a.ts" }, now), "reading src/a.ts · 1s");
   c.phase = "queued"; assert.match(statusPhrase(c, w, undefined, now), /^queued:/);
   c.phase = "sealed"; c.result = { key: c.key, gen: 1, status: "failed", ok: false, output: "", error: "blocked" };
-  w.status = "failed";
-  assert.match(mainLine([w])!, /E07 failed/);
+  w.status = "failed"; w.endedAt = now;
+  assert.match(mainLine([w])!, /exec-0927 finished: 1 failed\./);
 });
 
 test("thinking summaries never display partial prose or expose empty expansion", () => {
@@ -197,7 +202,7 @@ test("overview: newest workflow first, agents as tree children, live preview lin
   assert.match(rows[0]!, /^▾ newer/); assert.ok(rows.findIndex(r => /^▾ older/.test(r)) > 0, "newest first");
   assert.match(rows[1]!, /^ {2}├ plan/); assert.match(rows[2]!, /^ {2}│ {3}thinking: Checking the lease logic/);
   assert.ok(rows.some(r => /^ {6}└ map .*done · LEAF: ok/.test(r)), "done rows nested under their done node, showing the final line");
-  assert.equal(summaryText([older, newer]), "3 working · 1/4 done");
+  assert.equal(summaryText([older, newer]), "3 working · 1/4+ done");
 });
 
 test("P7 list rows carry a small pending marker until the message is delivered, within width", async () => {
@@ -219,4 +224,69 @@ test("drain: a queued call in a drained orchestrator says it waits for resume, n
   const c = call("q", { phase: "queued" });
   assert.equal(statusPhrase(c, workflow([c], { paused: true }), undefined, now), "paused by stop-all · resume to start");
   assert.equal(statusPhrase(c, workflow([c]), undefined, now), "queued: waiting for a free slot");
+});
+
+test("v12 §4: totals use planned counts; scripts show n+ while running", () => {
+  const ok = (key: string) => ({ key, gen: 1, status: "ok" as const, ok: true, output: "" });
+  const header = (w: WorkflowSnapshot) => listRows([w], state(), new Map(), () => "—", 100, now).find(r => r.kind === "workflow")!.text;
+  const chain = workflow([call("c1"), call("c2")], { planned: 2 });
+  assert.equal(summaryText([chain]), "2 working · 0/2 done", "a chain of two is never 0/1");
+  assert.match(header(chain), /0\/2 · /);
+  const tasks = workflow([call("a", { phase: "sealed", endedAt: now, result: ok("a") }), call("b"), call("c"), call("d")], { planned: 4 });
+  assert.equal(summaryText([tasks]), "3 working · 1/4 done");
+  assert.match(header(tasks), /1\/4 · /);
+  const script = workflow([call("s1"), call("s2")]);
+  assert.equal(summaryText([script]), "2 working · 0/2+ done");
+  assert.match(header(script), /0\/2\+ · /);
+  const ended = workflow([call("s1", { phase: "sealed", endedAt: now, result: ok("s1") }), call("s2", { phase: "sealed", endedAt: now, result: ok("s2") })], { status: "done", endedAt: now });
+  assert.equal(summaryText([ended]), "1 finished", "a finished script drops the +");
+  assert.match(header(ended), /2\/2 · /);
+});
+
+test("v12 §4: follow-up generations never change the denominator", () => {
+  const ok = (key: string) => ({ key, gen: 1, status: "ok" as const, ok: true, output: "" });
+  const rev1 = call("rev", { phase: "sealed", endedAt: now - 10_000, result: ok("rev") });
+  const rev2 = call("rev", { gen: 2, callId: "w@1/rev@2", phase: "running", startedAt: now - 1_000 });
+  const other = call("other", { phase: "sealed", endedAt: now - 5_000, result: ok("other") });
+  const planned = summary([workflow([rev1, rev2, other, call("wait")], { planned: 3 })]);
+  assert.equal(planned.done, 1); assert.equal(planned.total, 3); assert.equal(planned.plus, false);
+  assert.equal(summaryText([workflow([rev1, rev2, other, call("wait")], { planned: 3 })]), "2 working · 1/3 done");
+  const script = summary([workflow([rev1, rev2, call("x")])]);
+  assert.equal(script.total, 2); assert.equal(script.done, 0); assert.equal(script.plus, true, "a follow-up adds a generation, not a key");
+});
+
+test("v12 §4: completion words — stopped is never failed; timeout/budget/unknown named as such", () => {
+  const seal = (key: string, status: CallStatus = "ok", extra: Record<string, unknown> = {}) =>
+    call(key, { phase: "sealed", endedAt: now, result: { key, gen: 1, status, ok: status === "ok", output: "", ...extra } });
+  assert.equal(resultWord("stopped"), "stopped"); assert.equal(resultWord("gate-failed"), "failed");
+  const w = workflow([seal("a"), seal("b"), seal("c"), seal("d", "stopped"), seal("e", "failed", { error: "merge conflict" })], { status: "stopped", endedAt: now });
+  assert.equal(mainLine([w]), "exec-0927 finished: 3 done · 1 stopped · 1 failed.  ↓");
+  for (const status of ["timeout", "budget", "unknown", "skipped", "parked"] as const)
+    assert.equal(mainLine([workflow([seal("k", status)], { status: "failed", endedAt: now })]), `exec-0927 finished: 1 ${resultWord(status)}.  ↓`);
+  assert.equal(resultPhrase(seal("s", "stopped")), "stopped");
+  assert.equal(resultPhrase(seal("s", "stopped", { error: "by user" })), "stopped: by user");
+  assert.equal(resultPhrase(seal("s", "timeout")), "timeout");
+  assert.equal(resultPhrase(seal("s", "budget")), "budget");
+  assert.equal(resultPhrase(seal("s", "unknown")), "unknown");
+  assert.equal(resultPhrase(seal("s", "gate-failed", { error: "exit 1" })), "failed: exit 1");
+});
+
+test("v12 §5: finished workflows stay expandable with dimmed call rows; finished agents keep their final line", () => {
+  const good = call("good", { phase: "sealed", endedAt: now - 1_000, result: { key: "good", gen: 1, status: "ok", ok: true, output: "work\nLEAF: ok" } });
+  const bad = call("bad", { phase: "sealed", endedAt: now, result: { key: "bad", gen: 1, status: "failed", ok: false, output: "", error: "x" } });
+  const w = workflow([good, bad], { status: "failed" }), s = state();
+  s.viewed.add(bad.callId); // no unviewed failure: the compact listing is the default
+  let rows = listRows([w], s, new Map(), () => "—", 100, now);
+  assert.deepEqual(rows.map(r => r.kind), ["workflow", "done"], "the finished workflow stays listed with its done node");
+  assert.equal(rows[0]!.dim, true); assert.equal(rows[1]!.dim, true);
+  assert.match(rows[1]!.text, /▸ 2 done/);
+  s.done.set("w", 8);
+  rows = listRows([w], s, new Map(), () => "—", 100, now);
+  const goodRow = rows.find(r => r.call?.key === "good")!;
+  assert.match(goodRow.text, /done · LEAF: ok/, "the finished agent keeps its final line");
+  assert.equal(goodRow.dim, true);
+  s.folded.add("w");
+  assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.kind), ["workflow"], "folding toggles, but the row never vanishes");
+  const solo = listRows([workflow([good], { wid: "solo", status: "done" })], state(), new Map(), () => "—", 100, now);
+  assert.equal(solo[0]!.kind, "call"); assert.equal(solo[0]!.dim, true); assert.match(solo[0]!.text, /LEAF: ok/);
 });

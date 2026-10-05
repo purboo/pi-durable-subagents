@@ -123,7 +123,19 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   /** P25, P38, T6, T10: One durable submission path for the tool and the UI; replies say what happened when known within 10 s. */
   async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal, wait = true): Promise<unknown> {
     if (args.action === "status") return typeof args.wid === "string" && args.wid ? statusDetail(home, args.wid) : statusView(home, { origin: sender });
+    if (args.action === "agents") return discoverAgents(cwd).agents.map(({ name, description, model, source }) =>
+      ({ name, description, ...(model === undefined ? {} : { model }), source }));
     const normalized = request(args as Parameters<typeof request>[0], cwd);
+    if (normalized.kind === "run") {
+      const body = normalized.body as RunBody;
+      // v12 §2: Reject unknown explicit call agents before starter or outbox publication; scripts remain call-local.
+      const names = [...(body.call ? [body.call] : []), ...(body.tasks ?? []), ...(body.chain ?? [])].map(call => call.agent);
+      if (names.length) {
+        const available = discoverAgents(cwd).agents.map(agent => agent.name);
+        const unknown = [...new Set(names.filter(name => !available.includes(name)))];
+        if (unknown.length) throw new Error(`Unknown agent${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. Available agents: ${available.join(", ") || "(none)"}`);
+      }
+    }
     // P33: any call of the run may fork the origin context, so the origin branch is always offered for pinning.
     const sessionFile = ctx?.sessionManager.getSessionFile();
     if (normalized.kind === "run" && sessionFile) (normalized.body as RunBody).origin = { sessionFile, leafId: ctx!.sessionManager.getLeafId() };
@@ -162,14 +174,14 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   } catch { /* Discovery problems surface when a run is pinned. */ }
   pi.registerTool(defineTool({
     name: "subagents", label: "Subagents", description: [
-      "Durable subagents: crash-safe, never run twice, survive pi restarts. Always asynchronous: run returns {wid}; you are woken once when it finishes or a subagent asks you something.",
-      "run — exactly one of: agent+task (one subagent; optional model 'provider/id[:thinking]', cwd, timeoutMs, schema, gate, isolation:'worktree', context:'fork', budget); tasks:[...] (parallel); chain:[...] ({previous} = previous output); workflow:'./script.js' or source (a script using runs.run(key, spec), runs.all([...]), emit(value), args, runs.input(name); return value = result). Optional: args, name, usageBudget {tokens|costUsd}, maxCalls, inputs {name: path}.",
-      "send — to: '<wid>/<key>' (just '<wid>' when it has one call) or a call id; kind: steer | follow-up | answer (with qid, rev from the question) | model (model:'provider/id[:thinking]'); replaces: [rid] supersedes your earlier send.",
-      "status — compact fresh snapshot (own workflows first; per call: status, usage, last output line); status wid:<wid> — one workflow in full detail incl. outputs and script.log path.",
-      "stop target:<wid|call>. revise wid + workflow/source/args. resume [wid] (parked workflows or after drain; done/failed/stopped are final — start a new run). drain.",
-      "Control actions reply {applied:true} or {applied:false, reason} once the orchestrator decides (else {submitted:{rid}} after 10 s).",
-      ...(agents ? [`Agents (use one of these names): ${agents}.`] : []),
-      "The user can watch too: the line above the editor summarizes subagents; ↓ (on an empty editor) opens the Subagents list, Enter watches one live, typing there steers it, /stop and /model act on it, Esc goes back.",
+      "Durable asynchronous subagents; run returns {wid} when created (or {submitted:{rid}} while pending). A finished workflow or question wakes you; crash recovery resumes its session, not external side effects.",
+      "run (action optional for exactly one launch form): agent+task; tasks:[call specs] parallel; chain:[call specs] sequential ({previous}); workflow:'./script.js' or source (runs.run(key,spec), runs.all([...]), emit(value), args, runs.input(name)). Optional name, model, cwd, timeoutMs, usageBudget, maxCalls, inputs. Explicit unknown agents are rejected BEFORE creation, with available names; unknown script agents fail only their call.",
+      "agents: list names, descriptions, default models and source for this cwd; use these names for run.",
+      "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn. answer needs open qid+rev (stale rejected). model switches at next provider request. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
+      "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); sealed → already-sealed:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. status [wid] gives a digest. revise wid + workflow/source/args starts a revision.",
+      "Control replies are {applied:true,rid} or {applied:false,reason,rid} when decided; otherwise {submitted:{rid}} after 10s.",
+      ...(agents ? [`Available agents: ${agents}.`] : []),
+      "User sees a summary line above the editor; ↓ on an empty editor opens the list, Enter watches live OR finished calls (finished transcripts remain on disk) and expands finished workflows. List keys: s steer (paste-capable input), x stop (confirm y), m model, a answer when asked, f follow-up on finished calls; action feedback appears in footer.",
     ].join("\n"), parameters,
     async execute(_id, args, signal, _update, context) {
       const value = await submit(args as Record<string, unknown>, context.cwd, signal);

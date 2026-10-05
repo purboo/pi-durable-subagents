@@ -25,25 +25,48 @@ import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts
 import { formatUsage, refusedResult, snapshotFromEntries } from './snapshot.ts';
 import { validateCallSpec } from '../compat/spec.ts';
 
-const clip = (text: string, n = 300) => text.length > n ? `${text.slice(0, n)}…` : text;
+const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
 const charged = (u?: { input: number; output: number; costUsd: number }) => u && (u.input || u.output || u.costUsd) ? formatUsage(u) : undefined;
-/** P15, P31: A finished item tells the origin agent what happened without a status round trip: exceptions by key, usage total. */
-/** contracts: The refusal text for an agent name the run cannot use: it names the agents that exist. */
+const wakeStatus = (status?: string) => {
+  if (status === 'gate-failed') return 'failed';
+  if (status === 'parked' || status === undefined) return 'unknown';
+  return status;
+};
+/** v12 §6: Name available agents in the refusal instead of making the caller guess. */
 export function unknownAgent(name: unknown, agents: readonly { name: string }[]): string {
   return `unknown agent ${JSON.stringify(name)}; available agents: ${agents.map(a => a.name).sort().join(", ") || "none"}`;
 }
+/** v12 §3: Wake with bounded latest-per-key results, preferring structured reports and preserving clipped tails. */
 export function finishedText(wid: string, entries: readonly Entry[], call?: string): string {
   const snap = snapshotFromEntries(wid, entries), label = snap.name ?? wid;
-  if (call) {
-    const c = snap.calls.find(x => x.callId === call), r = c?.result;
-    return `${label}/${c?.key ?? call}@${c?.gen ?? '?'} (follow-up) ${r?.status ?? 'finished'}${r?.output ? `: ${clip(r.output.trim().split('\n').at(-1) ?? '')}` : r?.error ? `: ${clip(r.error)}` : ''}${charged(c?.usage) ? ` (usage: ${charged(c?.usage)})` : ''}`;
-  }
   const latest = new Map(snap.calls.map(c => [c.key, c]));
-  const calls = [...latest.values()], ok = calls.filter(c => c.result?.ok).length;
-  const bad = calls.filter(c => c.result && !c.result.ok && c.result.status !== 'skipped').map(c => `${c.key} ${c.result!.status}`);
-  const skipped = calls.filter(c => c.result?.status === 'skipped').map(c => c.key);
-  const parts = [`${ok} ok`, bad.length ? `${bad.join(', ')}` : '', skipped.length ? `${skipped.join(', ')} skipped` : ''].filter(Boolean);
-  return `${label} (${wid}) ${snap.status}: ${parts.join('; ')}${snap.error ? `. Error: ${clip(snap.error)}` : ''}.${charged(snap.usage) ? ` Usage: ${charged(snap.usage)}.` : ''} Details: subagents status.`;
+  const calls = call ? snap.calls.filter(c => c.callId === call) : [...latest.values()];
+  const counts = new Map<string, number>();
+  for (const c of calls) {
+    const status = wakeStatus(c.result?.status);
+    counts.set(status, (counts.get(status) ?? 0) + 1);
+  }
+  const parts = [...counts].map(([status, count]) => `${count} ${status}`);
+  const heading = call ? `${label}/${calls[0]?.key ?? call}@${calls[0]?.gen ?? '?'} (follow-up) ${wakeStatus(calls[0]?.result?.status)}:` :
+    `${label} (${wid}) ${snap.status}: ${parts.join('; ')}`;
+  const footer = `${snap.error ? `\nError: ${tail(snap.error, 500)}` : ''}${charged(snap.usage) ? `\nUsage: ${charged(snap.usage)}` : ''}\nFull output: subagents status wid:${wid}`;
+  const prefix = tail(heading, Math.max(1, 6000 - footer.length - 1));
+  let remaining = Math.max(0, 6000 - prefix.length - footer.length);
+  const lines: string[] = [];
+  for (const [i, c] of calls.entries()) {
+    // Reserve a slice for every remaining agent; never lose the usage and full-output hint.
+    const allowance = Math.min(1500, Math.floor(remaining / (calls.length - i)));
+    if (allowance < 2) break;
+    const result = c.result;
+    const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${wakeStatus(result?.status)}`;
+    const title = `\n${tail(name, allowance - 1)}`;
+    const error = result?.error && allowance - title.length > 10 ? `\n  Error: ${tail(result.error, Math.min(300, allowance - title.length - 9))}` : '';
+    const space = allowance - title.length - error.length;
+    const message = result && Object.hasOwn(result, 'data') ? JSON.stringify(result.data) : result?.output;
+    const line = title + (message && space > 4 ? `\n  ${tail(message.trimEnd(), space - 3)}` : '') + error;
+    lines.push(line); remaining -= line.length;
+  }
+  return `${prefix}${lines.join('')}${footer}`;
 }
 
 type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Set<number>; exposures: Entry[]; sent: number; replaying: boolean; ready: Map<number, CallResult>; running: Set<number>; outputs: Map<number, Entry>; values: Entry[]; needs: number };
@@ -248,7 +271,9 @@ export class Engine {
       if (!target) return { action: 'reject', reason: this.unknownCall((req.body as SendBody)?.to) };
       const { wf, entry } = target, send = req.body as SendBody;
       const from = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
-      if (['steer', 'follow-up'].includes(send.kind) && wf.journal.entries().some(e => e.type === JT.sealed && e.call === from)) {
+      const seal = wf.journal.entries().find(e => e.type === JT.sealed && e.call === from);
+      if (seal && send.kind === 'steer') return { action: 'reject', reason: `finished:${(seal.result as CallResult).status} — use kind "follow-up" to continue it` };
+      if (seal && send.kind === 'follow-up') {
         const gen = Math.max(0, ...wf.journal.entries().filter(e => ['call', 'generation'].includes(e.type) && e.key === entry.key).map(e => Number(e.gen))) + 1;
         const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec: entry.spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message: send.message ?? '' } });
         this.dispatchGeneration(wf, opened); return { action: 'apply' };

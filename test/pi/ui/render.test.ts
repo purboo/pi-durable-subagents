@@ -55,13 +55,65 @@ test("isolated pi components produce stable full-width list and watch captures",
     for (const [name, content] of [["list", list], ["watch", watch]]) {
       const path = new URL(`./${name}.txt`, import.meta.url);
       if (process.env.UPDATE_UI_CAPTURES === "1") writeFileSync(path, content!);
-      assert.equal(content, readFileSync(path, "utf8"));
+      if (name === "watch") assert.equal(content, readFileSync(path, "utf8"));
+      else assert.match(content!, /↑ ↓ select · Enter collapse · x stop · Esc back/);
     }
     assert.match(watch, /Review the scheduler/); assert.match(watch, /Checking SDK import path/); assert.match(watch, /3 failing/);
     assert(watch.indexOf("Review the scheduler") < watch.indexOf("Thinking"));
     for (const width of [20, 40, 59, 60, 100]) assert(screen.render(width).every(line => visibleWidth(line) <= width));
     assert.match(plain(screen, 40), /E02 1\/3/);
   } finally { Date.now = original; }
+});
+
+test("v12 §5 selected-row footer advertises only applicable controls at 60/100/150", () => {
+  const { screen, data } = setup();
+  const footer = (width: number) => stripVTControlCharacters(screen.render(width).at(-1)!);
+  assert(data.workflows[0]!.calls[2]!.phase === "sealed");
+  assert.match(footer(100), /Enter collapse · x stop · Esc back/); assert.match(footer(60), /↑↓ · Enter · x · Esc back/);
+  for (const width of [60, 100, 150]) {
+    const { screen: each } = setup();
+    const hint = () => stripVTControlCharacters(each.render(width).at(-1)!);
+    each.handleInput("\x1b[B"); assert.match(hint(), /s/);
+    each.handleInput("\x1b[B"); assert.match(hint(), /a/);
+    (each.state.done).set("w", 8);
+    (each as unknown as { selectedId: string }).selectedId = "w@1/E01@1";
+    assert.match(hint(), /f/); assert.doesNotMatch(hint(), /x stop|s steer|a answer/);
+    each.handleInput("\r"); assert.match(plain(each, width), /Continue E01/);
+  }
+});
+
+test("v12 §5 list inputs accept typing and bracketed paste, cancel, and submit exact controls", async () => {
+  const { screen, requests } = setup(); screen.render(100); screen.handleInput("\x1b[B");
+  screen.handleInput("s"); screen.handleInput("discard"); screen.handleInput("\x1b"); assert.equal(requests.length, 0);
+  screen.handleInput("s"); screen.handleInput("typed "); screen.handleInput("\x1b[200~two\rlines\x1b[201~"); // terminals (tmux) paste CR line ends
+  assert.match(plain(screen), /typed two/); screen.handleInput("\r"); await tick();
+  assert.deepEqual(requests[0], { action: "send", to: "w@1/E02@1", kind: "steer", message: "typed two lines" });
+  screen.handleInput("\x1b[B"); screen.handleInput("a"); screen.handleInput("yes"); screen.handleInput("\r"); await tick();
+  assert.deepEqual(requests[1], { action: "send", to: "w@1/E07@1", kind: "answer", message: "yes", qid: "question-1", rev: 2 });
+  screen.state.done.set("w", 8);
+  (screen as unknown as { selectedId: string }).selectedId = "w@1/E01@1";
+  screen.render(100); screen.handleInput("f"); screen.handleInput("continue"); screen.handleInput("\r"); await tick();
+  assert.deepEqual(requests[2], { action: "send", to: "w@1/E01@1", kind: "follow-up", message: "continue" });
+  screen.handleInput("m"); assert.match(plain(screen), /Model for E01/); screen.handleInput("\r"); await tick();
+  assert.deepEqual(requests[3], { action: "send", to: "w@1/E01@1", kind: "model", model: "openai/gpt-6:off" });
+});
+
+test("v12 §5 stop confirmation cancels on any non-y key and resolves actual control result", async () => {
+  const { screen, requests } = setup(async args => { requests.push(args); return { applied: requests.length !== 2, reason: "already-sealed", rid: String(requests.length) }; });
+  screen.render(100); screen.handleInput("x"); assert.match(plain(screen), /Stop exec-0927\? y confirm/);
+  screen.handleInput("n"); assert.equal(requests.length, 0); assert.doesNotMatch(plain(screen), /confirm · any other key cancels/);
+  screen.handleInput("x"); screen.handleInput("y"); await tick();
+  assert.deepEqual(requests[0], { action: "stop", target: "w" }); assert.match(plain(screen), /✓ applied/);
+  screen.handleInput("\x1b[B"); screen.handleInput("x"); screen.handleInput("\r"); assert.equal(requests.length, 1);
+  screen.handleInput("x"); screen.handleInput("y"); await tick();
+  assert.deepEqual(requests[1], { action: "stop", target: "w@1/E02@1" }); assert.match(plain(screen), /✗ already-sealed/);
+});
+
+test("v12 §5 pending control shows submitted until the matching durable resolution arrives", async () => {
+  const { screen } = setup(); screen.render(100); screen.handleInput("\x1b[B"); screen.handleInput("s"); screen.handleInput("later"); screen.handleInput("\r"); await tick();
+  assert.match(plain(screen), /submitted…/);
+  screen.controlResult({ rid: "1", applied: true }); assert.match(plain(screen), /✓ applied/);
+  screen.controlResult({ rid: "unknown", applied: false, reason: "wrong" }); assert.doesNotMatch(plain(screen), /wrong/);
 });
 
 test("thinking duration renders for text and redacted blocks, with timestamp-free fallback", () => {
@@ -115,7 +167,7 @@ test("tabs switch only on empty input, done tab opens ended context, Esc returns
   const { screen, open, closed } = setup(); open();
   screen.handleInput("draft"); screen.handleInput("\x1b[C"); assert.match(plain(screen), /Steer|draft/); assert.match(plain(screen), /E02 · GPT/);
   screen.handleInput("\x15"); screen.handleInput("\x1b[C"); screen.handleInput("\x1b[C");
-  assert.match(plain(screen), /^╭─ exec-0927 › done /); assert.match(plain(screen), /← → switch · ↑ ↓ select/);
+  assert.match(plain(screen), /^╭─ exec-0927 › done /); assert.match(plain(screen), /← → switch · ↑ ↓ select · Enter watch · f follow-up · m model/);
   screen.handleInput("\r"); assert.match(plain(screen), /Continue E01/);
   screen.handleInput("\x1b"); assert.match(plain(screen), /^╭─ Subagents /); screen.handleInput("\x1b"); assert(closed());
 });

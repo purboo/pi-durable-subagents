@@ -49,19 +49,28 @@ export class UiData {
 export class UiActions {
   private deps: UiDeps;
   private pending = new Map<string, string>();
+  readonly resolutions: { rid: string; applied: boolean; reason?: string }[] = [];
   constructor(deps: UiDeps) { this.deps = deps; }
-  async send(args: Record<string, unknown>, note: string): Promise<string | undefined> {
+  /** v12 §5: Expose the actual control receipt, not a successful submission as an application. */
+  async send(args: Record<string, unknown>, note: string): Promise<{ state: "applied" | "submitted" | "rejected"; reason?: string; rid?: string }> {
     try {
-      const result = await this.deps.submit(args) as { submitted?: { rid?: string }; error?: string } | undefined;
+      const result = await this.deps.submit(args) as { submitted?: { rid?: string }; applied?: boolean; reason?: string; rid?: string; error?: string } | undefined;
       if (result?.error) throw new Error(result.error);
       if (result?.submitted?.rid) this.pending.set(result.submitted.rid, note);
+      if (result?.applied === false) {
+        const reason = result.reason ?? "rejected";
+        this.deps.presentNote(`[user] ${note}: ${reason}`);
+        return { state: "rejected", reason, rid: result.rid };
+      }
       this.deps.presentNote(`[user] ${note}`);
-      return undefined;
+      return { state: result?.applied ? "applied" : "submitted", rid: result?.rid ?? result?.submitted?.rid };
     } catch (error) {
-      const text = `${note}: ${error instanceof Error ? error.message : String(error)}`;
-      this.deps.presentNote(`[user] ${text}`); return text;
+      const reason = error instanceof Error ? error.message : String(error);
+      this.deps.presentNote(`[user] ${note}: ${reason}`);
+      return { state: "rejected", reason };
     }
   }
+  /** v12 §5: Resolve deferred controls from the durable ledger without confusing submission with application. */
   reconcile(): string | undefined {
     let latest: string | undefined;
     if (!this.pending.size) return;
@@ -69,7 +78,10 @@ export class UiActions {
       const note = this.pending.get(String(e.rid));
       if (!note) continue;
       if (e.type === JT.rejected) { latest = `${note}: ${String(e.reason)}`; this.deps.presentNote(`[user] ${latest}`); }
-      if (e.type === JT.applied || e.type === JT.rejected) this.pending.delete(String(e.rid));
+      if (e.type === JT.applied || e.type === JT.rejected) {
+        this.resolutions.push({ rid: String(e.rid), applied: e.type === JT.applied, ...(e.type === JT.rejected ? { reason: String(e.reason) } : {}) });
+        this.pending.delete(String(e.rid));
+      }
     }
     return latest;
   }

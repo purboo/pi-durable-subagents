@@ -460,7 +460,11 @@ test('revision re-pins inputs, reuses matching seals, allocates changed generati
   assert.equal(snapshot.calls.find(c => c.key === 'changed')!.callId, `${wf.wid}@2/changed@2`);
   const stale = await submit(engine, home, 'send', { to: `${wf.wid}@1/changed@1`, kind: 'steer', message: 'stale' }, 2);
   assert.equal(ledgers.orch.entries().find(e => e.type === JT.rejected && e.rid === stale)!.reason, 'stale-revision');
-  await submit(engine, home, 'send', { to: `${wf.wid}/changed`, kind: 'steer', message: 'current' }, 3);
+  const sealedSteer = await submit(engine, home, 'send', { to: `${wf.wid}/changed`, kind: 'steer', message: 'current' }, 3);
+  assert.equal(decision(ledgers, sealedSteer)?.reason, 'finished:ok — use kind "follow-up" to continue it');
+  assert.equal(wf.journal.entries().filter(e => e.type === 'generation').length, 0);
+  const followUp = await submit(engine, home, 'send', { to: `${wf.wid}/changed`, kind: 'follow-up', message: 'continue' }, 4);
+  assert.equal(decision(ledgers, followUp)?.type, JT.applied);
   assert.equal(wf.journal.entries().filter(e => e.type === 'generation').length, 1);
   await until(() => wf.journal.entries().filter(e => e.type === 'fake-run').length === 4);
   evaluator.death(); await until(() => evaluator.current().ev === 3);
@@ -639,18 +643,70 @@ test('drain with fence survives restart without dispatch, then resume continues 
   assert.equal(workflowSnapshot(home, String(created.wid)).status, 'done');
 });
 
-test('P15: finished attention names exceptions by key and follow-up outcomes', async () => {
+test('v12 §2: sealed steer rejects without opening a generation, stopped guidance and old resolution replay remain stable', async t => {
+  const evaluator = new ManualEvaluator(), { engine, home, ledgers, run } = await fixture(t, evaluator);
+  const wf = await run('unused'); propose(evaluator, 0, 'a'); idle(evaluator, 0);
+  await until(() => wf.journal.entries().some(e => e.type === JT.sealed && e.call === `${wf.wid}@1/a@1`));
+  const old: Request = { rid: 'old-steer', from: 'cli:old', to: 'orch', sseq: 1, kind: 'send', body: { to: `${wf.wid}/a`, kind: 'steer', message: 'historical' } };
+  await ledgers.orch.append('request', { request: old });
+  await ledgers.orch.append(JT.admitted, { rid: old.rid, from: old.from, sseq: old.sseq, hash: contentHash(old), kind: old.kind });
+  await ledgers.orch.append(JT.applied, { rid: old.rid });
+  await wf.journal.append('generation', { rid: old.rid, key: 'a', gen: 2, from: `${wf.wid}@1/a@1`, spec: spec('a'), revision: 1, opening: { rid: old.rid, kind: 'steer', message: 'historical' } });
+  await wf.journal.append(JT.sealed, { call: `${wf.wid}@1/a@2`, result: { key: 'a', gen: 2, status: 'stopped', ok: false, output: '' } });
+  await engine.intake();
+  assert.equal(decision(ledgers, old.rid)?.type, JT.applied);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'generation' && e.rid === old.rid).length, 1);
+  const rid = await submit(engine, home, 'send', { to: wf.wid, kind: 'steer', message: 'too late' });
+  assert.equal(decision(ledgers, rid)?.reason, 'finished:stopped — use kind "follow-up" to continue it');
+  assert.equal(wf.journal.entries().filter(e => e.type === 'generation').length, 1);
+  const second = await submit(engine, home, 'send', { to: `${wf.wid}/a`, kind: 'steer', message: 'too late again' }, 2);
+  assert.equal(decision(ledgers, second)?.reason, 'finished:stopped — use kind "follow-up" to continue it');
+  assert.equal(wf.journal.entries().filter(e => e.type === 'generation').length, 1);
+});
+
+test('v12 §3: finished attention digests latest calls, report, errors and stopped without calling it failed', async () => {
   const { finishedText } = await import('../../../../src/orchestrator/engine.ts');
   const e = (seq: number, type: string, f: Record<string, unknown>) => ({ seq, ts: seq, type, ...f });
   const res = (key: string, status: string, output = '') => ({ key, gen: 1, status, ok: status === 'ok', output });
   const entries = [
     e(1, 'wf-created', { name: 'nightly', origin: 'o', cwd: '/', revision: 1 }),
     e(2, 'call', { key: 'a', gen: 1, spec: { agent: 'x' } }), e(3, 'call', { key: 'b', gen: 1, spec: { agent: 'x' } }), e(4, 'call', { key: 'c', gen: 1, spec: { agent: 'x' } }),
-    e(5, 'sealed', { call: 'w@1/a@1', result: res('a', 'ok', 'line1\nDONE: a') }), e(6, 'sealed', { call: 'w@1/b@1', result: res('b', 'timeout') }),
-    e(7, 'sealed', { call: 'w@1/c@1', result: res('c', 'skipped') }), e(8, 'workflow-done', { status: 'done' }),
+    e(5, 'sealed', { call: 'w@1/a@1', result: res('a', 'ok', 'line1\nDONE: a') }),
+    e(6, 'sealed', { call: 'w@1/b@1', result: { ...res('b', 'stopped', 'partially complete'), error: 'user stopped' } }),
+    e(7, 'sealed', { call: 'w@1/c@1', result: { ...res('c', 'skipped', 'ignored text'), data: { verdict: 'skip' } } }),
+    e(8, 'workflow-done', { status: 'stopped', error: 'workflow stopped' }),
   ];
-  assert.equal(finishedText('w', entries as never), 'nightly (w) done: 1 ok; b timeout; c skipped. Details: subagents status.');
-  assert.equal(finishedText('w', entries as never, 'w@1/a@1'), 'nightly/a@1 (follow-up) ok: DONE: a');
+  assert.equal(finishedText('w', entries as never), 'nightly (w) stopped: 1 ok; 1 stopped; 1 skipped\na: ok\n  line1\nDONE: a\nb: stopped\n  partially complete\n  Error: user stopped\nc: skipped\n  {"verdict":"skip"}\nError: workflow stopped\nFull output: subagents status wid:w');
+  assert.equal(finishedText('w', entries as never, 'w@1/b@1'), 'nightly/b@1 (follow-up) stopped:\nb: stopped\n  partially complete\n  Error: user stopped\nError: workflow stopped\nFull output: subagents status wid:w');
+  assert.doesNotMatch(finishedText('w', entries as never), /failed/);
+  entries.push(e(9, 'generation', { key: 'a', gen: 2, from: 'w@1/a@1', spec: { agent: 'x' } }));
+  entries.push(e(10, 'sealed', { call: 'w@1/a@2', result: { key: 'a', gen: 2, status: 'timeout', ok: false, output: 'retry timed out' } }));
+  const current = finishedText('w', entries as never);
+  assert.match(current, /^nightly \(w\) stopped: 1 timeout; 1 stopped; 1 skipped/);
+  assert.match(current, /a@2: timeout\n  retry timed out/);
+  assert.doesNotMatch(current, /DONE: a/);
+});
+
+test('v12 §3: digest bounds each agent and whole notice, preserving output and report tails', async () => {
+  const { finishedText } = await import('../../../../src/orchestrator/engine.ts');
+  const e = (seq: number, type: string, fields: Record<string, unknown>) => ({ seq, ts: seq, type, ...fields });
+  const entries = [e(1, 'wf-created', { name: 'bulk', revision: 1 })];
+  for (let i = 0; i < 8; i++) {
+    const key = `k${i}`;
+    entries.push(e(entries.length + 1, 'call', { key, gen: 1, spec: { agent: 'x' } }));
+    entries.push(e(entries.length + 1, 'sealed', { call: `w@1/${key}@1`, result: { key, gen: 1, status: 'ok', ok: true, output: 'X'.repeat(3000) + `tail-${i}`, ...(i === 0 ? { data: { detail: 'Y'.repeat(3000), ending: 'report-tail' } } : {}) } }));
+  }
+  entries.push(e(entries.length + 1, 'workflow-done', { status: 'done', error: 'workflow error' }));
+  const digest = finishedText('w', entries as never);
+  assert.ok(digest.length <= 6000, `notice is ${digest.length} characters`);
+  assert.match(digest, /^bulk \(w\) done: 8 ok/);
+  assert.match(digest, /k0: ok\n  ….*report-tail"\}/s);
+  assert.doesNotMatch(digest, /k0: ok\n  .*tail-0/);
+  for (let i = 1; i < 8; i++) assert.match(digest, new RegExp(`k${i}: ok\\n  …X+tail-${i}`));
+  assert.match(digest, /\nError: workflow error\nFull output: subagents status wid:w$/);
+  const single = finishedText('w', entries as never, 'w@1/k0@1');
+  assert.ok(single.length <= 6000);
+  assert.ok(single.split('\nFull output')[0]!.length < 1600, 'the single report also respects the per-agent bound');
 });
 
 const decision = (ledgers: Ledgers, rid: string) => ledgers.orch.entries().find(e => (e.type === JT.applied || e.type === JT.rejected) && e.rid === rid);

@@ -1,5 +1,5 @@
-╭─ Subagents · 1 asks you · 1 working · 1/3 done ──────────────────────────────────────────────────╮
-│ ▾ exec-0927 · 1/3 · 1h02m                                                                        │
+╭─ Subagents · 1 asks you · 1 working · 1/3+ done ─────────────────────────────────────────────────╮
+│ ▾ exec-0927 · 1/3+ · 1h02m                                                                       │
 │   ├ E02  GPT-6 (openai)  thinking · 20s                                              1 tool · 3m │
 │   │   bash: 3 failing: lease expires early                                                       │
 │   ├ E07  GPT-6 (openai)  asking main agent: docs/ in write set?                               3m │
@@ -42,4 +42,4 @@
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-╰─ ↑ ↓ select · Enter open · Esc back ─────────────────────────────────────────────────────────────╯
+╰─ ↑ ↓ select · Enter collapse · x stop · Esc back ────────────────────────────────────────────────╯
