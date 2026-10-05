@@ -5,10 +5,16 @@ import { UiActions, UiData } from "./data.ts";
 import { SubagentScreen } from "./screen.ts";
 import { mainLine, orderWorkflows, type ViewState } from "./view.ts";
 import { registerCards } from "./cards.ts";
+import { toolRenderers } from "./tool.ts";
 
 /** UI §1–3, P16, P21: Register journal-backed list/watch surfaces only in interactive pi. */
 export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
   if (typeof pi.registerMessageRenderer === "function") registerCards(pi, deps.home); // P21: cards are optional
+  // UI §5: compact tool calls and results (optional surface; without it pi shows the raw JSON).
+  if (typeof pi.registerToolRenderer === "function") pi.registerToolRenderer((name, next) => {
+    const n = next();
+    return name !== "subagents" ? n : { ...n, renderCall: n?.renderCall ?? toolRenderers.renderCall as never, renderResult: n?.renderResult ?? toolRenderers.renderResult as never };
+  });
   let cleanup: (() => void) | undefined;
   const start = (_event: unknown, ctx: ExtensionContext) => {
     cleanup?.(); cleanup = undefined;

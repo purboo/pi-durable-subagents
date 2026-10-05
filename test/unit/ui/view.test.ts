@@ -214,3 +214,9 @@ test("P7 list rows carry a small pending marker until the message is delivered, 
   delete c.pending; c.sends = [{ rid: "s", kind: "steer", state: "delivered", at: now }];
   assert.doesNotMatch(row(100), /pending/); assert.match(row(100), /3 tools · 3m$/);
 });
+
+test("drain: a queued call in a drained orchestrator says it waits for resume, not for capacity", () => {
+  const c = call("q", { phase: "queued" });
+  assert.equal(statusPhrase(c, workflow([c], { paused: true }), undefined, now), "paused by stop-all · resume to start");
+  assert.equal(statusPhrase(c, workflow([c]), undefined, now), "queued: waiting for a free slot");
+});

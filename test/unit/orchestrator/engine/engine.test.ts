@@ -225,18 +225,29 @@ test('idle exits after K6 and held OS lock prevents opening a ledger', async t =
   finally { await lock.release(); }
 });
 
-test('unfinished work prevents idle exit; drain commits proposals without dispatching', async t => {
+test('unfinished work prevents idle exit; drain commits proposals without dispatching and held work lets the orchestrator exit', async t => {
   const evaluator = new ManualEvaluator(); const { engine, home, run } = await fixture(t, evaluator);
   const wf = await run('unused');
+  const busy = new AbortController(), t0 = performance.now(), busyTimer = setTimeout(() => busy.abort(), 100);
+  try { await engine.loop(busy.signal); } finally { clearTimeout(busyTimer); }
+  assert.ok(performance.now() - t0 >= 90, 'unfinished work keeps the orchestrator alive');
   await publishRequest(orchInbox(home), { rid: 'drain', from: 'cli:test', to: 'orch', sseq: 1, kind: 'drain', body: {} });
   await engine.intake();
   propose(evaluator, 0, 'new'); idle(evaluator, 0); await engine.intake();
   assert.equal(wf.journal.entries().filter(e => e.type === 'call').length, 1);
   assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 0);
-  const controller = new AbortController(), began = performance.now();
-  const timer = setTimeout(() => controller.abort(), 100);
+  // Drain: work the drain holds cannot progress until a resume request (which starts an orchestrator), so it does not keep one alive.
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 2000);
   try { await engine.loop(controller.signal); } finally { clearTimeout(timer); }
-  assert.ok(performance.now() - began >= 90);
+  assert.equal(controller.signal.aborted, false, 'idle exit while only held work remains');
+});
+
+test('drain holds only the workflows that exist when it is recorded; a later run dispatches normally', async t => {
+  const { engine, home, run } = await fixture(t);
+  await submit(engine, home, 'drain', { fence: true });
+  const wf = await run(`return await runs.run('a', {agent:'test',task:'a'});`);
+  await until(() => wf.journal.entries().some(e => e.type === JT.done));
+  assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
 });
 
 test('run fanout, send, withdraw, stop and drain use committed lifecycle', async t => {
@@ -586,13 +597,13 @@ test('durable drain lets an in-flight call finish, blocks the next dispatch and 
   assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
 });
 
-test('drain without workflows continues serving the inbox beyond idle exit', async t => {
-  const { engine, home } = await fixture(t, new ManualEvaluator());
+test('drain without workflows idle-exits; the drain stays durable for the next orchestrator', async t => {
+  const { engine, home, ledgers } = await fixture(t, new ManualEvaluator());
   await submit(engine, home, 'drain', { fence: true });
-  const controller = new AbortController(), began = performance.now();
-  const timer = setTimeout(() => controller.abort(), 120);
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 2000);
   try { await engine.loop(controller.signal); } finally { clearTimeout(timer); }
-  assert.ok(performance.now() - began >= 100);
+  assert.equal(controller.signal.aborted, false);
+  assert.equal(ledgers.orch.entries().findLast(e => e.type === 'drain' || e.type === 'undrain')!.type, 'drain');
 });
 
 test('drain with fence survives restart without dispatch, then resume continues unsealed calls', { timeout: 30_000 }, async t => {
@@ -616,13 +627,13 @@ test('drain with fence survives restart without dispatch, then resume continues 
   first.proc.kill('SIGKILL'); await first.ended;
   const second = child(home); children.push(second);
   await until(() => readJournalSnapshot(file).some(e => e.type === 'ev' && e.n === 2));
-  await delay(250);
-  assert.equal(second.proc.exitCode, null);
+  // Held work cannot progress, so the restarted orchestrator idle-exits without dispatching; the drain stays durable.
+  assert.equal((await second.ended).code, 0, second.stderr());
   assert.equal(readJournalSnapshot(file).filter(e => e.type === 'fake-run').length, 1);
   assert.equal(readJournalSnapshot(file).filter(e => e.type === JT.sealed || e.type === JT.done).length, 0);
   await publishRequest(orchInbox(home), { rid: 'resume', from: 'main:test', to: 'orch', sseq: 3, kind: 'resume', body: {} });
-  await until(() => second.proc.exitCode !== null || second.proc.signalCode !== null);
-  assert.equal((await second.ended).code, 0, second.stderr());
+  const third = child(home); children.push(third); // the starter runs an orchestrator for the pending resume request
+  assert.equal((await third.ended).code, 0, third.stderr());
   assert.equal(readJournalSnapshot(file).filter(e => e.type === 'fake-run').length, 2);
   assert.equal(readJournalSnapshot(file).filter(e => e.type === JT.sealed).length, 1);
   assert.equal(workflowSnapshot(home, String(created.wid)).status, 'done');
@@ -723,4 +734,13 @@ test('contracts: status shows the real refusal reason, the same text the script 
   const shown = workflowSnapshot(home, wf.wid).calls[0]!.result!.error!;
   assert.match(shown, /invalid spec: unknown field "isolaton"/);
   assert.equal(shown, (wf.journal.entries().find(e => e.type === JT.done)!.result as { error: string }).error);
+});
+
+test('contracts: an unknown agent name fails only that call, naming the available agents; the workflow continues', async t => {
+  const { home, run } = await fixture(t);
+  const wf = await run(`const bad = await runs.run('a', {agent:'coder', task:'a'}); const good = await runs.run('b', {agent:'test', task:'b'}); return [bad.status, bad.error, good.status];`);
+  await until(() => wf.journal.entries().some(e => e.type === JT.done));
+  const [status, error, good] = wf.journal.entries().find(e => e.type === JT.done)!.result as string[];
+  assert.equal(status, 'failed'); assert.match(error!, /unknown agent "coder"; available agents: .*\btest\b/); assert.equal(good, 'ok');
+  assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
 });

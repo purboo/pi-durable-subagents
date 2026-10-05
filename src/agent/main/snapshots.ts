@@ -26,9 +26,12 @@ export function workflows(home: string): { wid: string; origin?: string; entries
 export function openGeneration(entries: readonly { type: string; [k: string]: unknown }[]): boolean {
   return entries.some(g => g.type === "generation" && !entries.some(s => s.type === JT.sealed && String(s.call).endsWith(`/${String(g.key)}@${String(g.gen)}`)));
 }
-/** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation. */
+/** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation,
+ *  unless a drain (stop-all) holds it: held work waits for an explicit resume, which starts the orchestrator itself. */
 export function unfinishedWorkflow(home: string): boolean {
-  return workflows(home).some(w => !w.entries.some(e => e.type === JT.done) || openGeneration(w.entries));
+  const ledger = readJournalSnapshot(orchLedger(home)), last = ledger.findLast(e => e.type === "drain" || e.type === "undrain");
+  const held = (wid: string) => last?.type === "drain" && (ledger.find(e => e.type === JT.created && e.wid === wid)?.seq ?? -1) < last.seq;
+  return workflows(home).some(w => (!w.entries.some(e => e.type === JT.done) || openGeneration(w.entries)) && !held(w.wid));
 }
 
 /** P15, V7: Rebuild session-wide receipts, including entries hidden by compaction. */

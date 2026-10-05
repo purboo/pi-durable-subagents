@@ -1,5 +1,6 @@
 // Private orch entries: request {request} retains immutable admitted envelopes;
-// drain {rid,fence} and undrain {rid} record durable dispatch admission.
+// drain {rid,fence} and undrain {rid} record durable dispatch admission: a drain holds the workflows that exist when it is
+// recorded (until resume); workflows created after it run normally.
 // Workflow entries: ev {n}; call {pos,key,gen,spec,fingerprint}; refused {pos,key,spec,fingerprint,reason};
 // reused {pos,key,gen,spec,fingerprint,from}; exposed {pos}; value {n,kind,value};
 // generation{rid,key,gen,from,spec,revision,opening} is a send resolution outside the script;
@@ -27,6 +28,10 @@ import { validateCallSpec } from '../compat/spec.ts';
 const clip = (text: string, n = 300) => text.length > n ? `${text.slice(0, n)}…` : text;
 const charged = (u?: { input: number; output: number; costUsd: number }) => u && (u.input || u.output || u.costUsd) ? formatUsage(u) : undefined;
 /** P15, P31: A finished item tells the origin agent what happened without a status round trip: exceptions by key, usage total. */
+/** contracts: The refusal text for an agent name the run cannot use: it names the agents that exist. */
+export function unknownAgent(name: unknown, agents: readonly { name: string }[]): string {
+  return `unknown agent ${JSON.stringify(name)}; available agents: ${agents.map(a => a.name).sort().join(", ") || "none"}`;
+}
 export function finishedText(wid: string, entries: readonly Entry[], call?: string): string {
   const snap = snapshotFromEntries(wid, entries), label = snap.name ?? wid;
   if (call) {
@@ -59,6 +64,13 @@ export class Engine {
   // wid -> executor runs whose follow-up has not run yet (prune never closes a journal they may still append to).
   private running = new Map<string, number>();
   private draining = false;
+  /** Drain: true when the workflow existed at the last drain (its `created` precedes it) and no resume followed. */
+  private held(wid: string): boolean {
+    if (!this.draining) return false;
+    const entries = this.ledgers.orch.entries(), drain = entries.findLast(e => e.type === 'drain');
+    const created = entries.find(e => e.type === JT.created && e.wid === wid);
+    return !!drain && (!created || created.seq < drain.seq);
+  }
   private watcher?: FSWatcher;
   private poll?: ReturnType<typeof setInterval>;
   constructor(ledgers: Ledgers, executor: Executor, options: EngineOptions = {}) {
@@ -347,7 +359,7 @@ export class Engine {
   }
   private dispatchGeneration(wf: Workflow, entry: Entry) {
     const ticket = this.ticket({ wf } as State, entry), id = ticket.callId;
-    if (this.generations.has(id) || this.draining || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
+    if (this.generations.has(id) || this.held(wf.wid) || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
     this.generations.add(id);
     void this.executor.run(ticket).then(() => this.background(async () => {
       if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);
@@ -378,7 +390,7 @@ export class Engine {
     if (st.running.has(pos)) return;
     const sealed = this.sealed(st, entry);
     if (sealed) { st.ready.set(pos, sealed); return; }
-    if (this.draining) return;
+    if (this.held(st.wf.wid)) return;
     st.running.add(pos);
     const release = this.hold(st.wf.wid);
     void this.executor.run(this.ticket(st, entry)).then(() => this.background(async () => {
@@ -414,8 +426,8 @@ export class Engine {
     if (!st || st.ev !== message.ev || this.terminal(st.wf)) return;
     const park = (error: string) => this.finish(st.wf, 'parked', undefined, error);
     if (message.t === 'call') {
-      const agent = st.wf.pins.agents.find(a => a.name === message.spec.agent);
-      if (!agent) return park(`Unknown pinned agent: ${message.spec.agent}`);
+      // An unknown agent name refuses that call (the script gets a failed result naming the available agents), like an invalid spec.
+      const agent = st.wf.pins.agents.find(a => a.name === message.spec.agent) ?? null;
       const fingerprint = contentHash({ spec: message.spec, agent }), old = st.outputs.get(message.pos);
       if (st.proposed.has(message.pos) || (old && (!['call', 'refused', 'reused'].includes(old.type) || old.key !== message.key || old.fingerprint !== fingerprint))) return park(`Replay mismatch at ${message.pos}`);
       if (!old && [...st.calls.values()].some(e => e.key === message.key)) return park(`Duplicate call key: ${message.key}`);
@@ -431,6 +443,7 @@ export class Engine {
         const reused = history.findLast(e => e.type === JT.sealed && matching.includes(String(e.call)));
         const fields = { pos: message.pos, key: message.key, spec: message.spec, fingerprint };
         const problems = validateCallSpec(message.spec);
+        if (!problems.length && !agent) problems.push(unknownAgent(message.spec.agent, st.wf.pins.agents));
         // A malformed spec from a script never runs: the script gets a failed result naming every problem.
         if (problems.length) entry = await st.wf.journal.append('refused', { ...fields, reason: `invalid spec: ${problems.join('; ')}` });
         else if (reused) entry = await st.wf.journal.append('reused', { ...fields, from: reused.call, gen: (reused.result as CallResult).gen });
@@ -510,7 +523,8 @@ export class Engine {
         await this.queue;
         if (this.failure) throw this.failure;
         const files = await readdir(inbox);
-        if (this.draining || this.generations.size || [...this.store.workflows.values()].some(w => !this.terminal(w)) || this.executor.busy() || files.length) idleSince = performance.now();
+        // Held (drained) workflows cannot progress until a resume request, which restarts the orchestrator: they do not keep it alive.
+        if (this.generations.size || [...this.store.workflows.values()].some(w => !this.terminal(w) && !this.held(w.wid)) || this.executor.busy() || files.length) idleSince = performance.now();
         else if (performance.now() - idleSince >= (this.ledgers.config.k?.idleExitMs ?? 60_000)) return;
         await delay(Math.min(100, this.ledgers.config.k?.idleExitMs ?? 100));
       }

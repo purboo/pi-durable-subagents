@@ -133,3 +133,30 @@ test('ops: a pruned workflow is gone for status, even while its directory remova
   assert.throws(() => statusDetail(home, 'W1'), /Workflow W1 was pruned/);
   assert.throws(() => statusDetail(home, 'W9'), /Unknown workflow: W9/);
 });
+
+test('drain: status and snapshots mark the workflows a drain holds; later runs are not held', async t => {
+  const { allWorkflows } = await import('../../../../src/orchestrator/snapshot.ts');
+  const home = await mkdtemp(join(tmpdir(), 'dsa-drained-')); t.after(() => rm(home, { recursive: true, force: true }));
+  const orch = await openJournal(orchLedger(home)); await orch.append(JT.created, { rid: 'r1', wid: 'W1' });
+  const j = await openJournal(journalPath(home, 'W1')); await j.append('wf-created', { rid: 'r1' }); await j.close();
+  assert.equal(statusView(home).paused, undefined); assert.equal(allWorkflows(home)[0]!.paused, undefined);
+  await orch.append('drain', { rid: 'd', fence: true });
+  await orch.append(JT.created, { rid: 'r2', wid: 'W2' });
+  const j2 = await openJournal(journalPath(home, 'W2')); await j2.append('wf-created', { rid: 'r2' }); await j2.close();
+  assert.match(statusView(home).paused!, /^1 workflow paused by stop-all\/drain since .*; resume continues them \(new runs are not affected\)$/);
+  assert.deepEqual(allWorkflows(home).map(w => [w.wid, w.paused]), [['W2', undefined], ['W1', true]]);
+  await orch.append('undrain', { rid: 'u' }); await orch.close();
+  assert.equal(statusView(home).paused, undefined);
+});
+
+test('drain: work a drain holds is not pending for the starters (no start/idle-exit loop); later work is', async t => {
+  const { unfinishedWorkflow } = await import('../../../../src/agent/main/snapshots.ts');
+  const home = await mkdtemp(join(tmpdir(), 'dsa-held-')); t.after(() => rm(home, { recursive: true, force: true }));
+  const orch = await openJournal(orchLedger(home)); await orch.append(JT.created, { rid: 'r1', wid: 'W1' });
+  const j = await openJournal(journalPath(home, 'W1')); await j.append('wf-created', { rid: 'r1' }); await j.close();
+  assert.equal(unfinishedWorkflow(home), true);
+  await orch.append('drain', { rid: 'd', fence: true }); assert.equal(unfinishedWorkflow(home), false);
+  await orch.append(JT.created, { rid: 'r2', wid: 'W2' });
+  const j2 = await openJournal(journalPath(home, 'W2')); await j2.append('wf-created', { rid: 'r2' }); await j2.close();
+  assert.equal(unfinishedWorkflow(home), true); await orch.close();
+});
