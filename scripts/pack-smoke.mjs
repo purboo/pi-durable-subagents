@@ -17,7 +17,7 @@ try {
   run("tar", ["-xzf", join(root, tgz), "-C", pkg, "--strip-components=1"]);
   const files = run("tar", ["-tzf", join(root, tgz)]).trim().split("\n");
   for (const bad of files.filter(f => /\/(src|test|design)\/|\.ts$/.test(f) && !f.endsWith(".d.ts"))) throw new Error(`unexpected file in package: ${bad}`);
-  for (const need of ["package/dist/agent/extension.js", "package/dist/orchestrator/main.js", "package/dist/evaluator/worker.js", "package/dist/cli/main.js", "package/agents/worker.md", "package/LICENSE", "package/README.md"])
+  for (const need of ["package/index.js", "package/dist/agent/extension.js", "package/dist/orchestrator/main.js", "package/dist/evaluator/worker.js", "package/dist/cli/main.js", "package/agents/worker.md", "package/LICENSE", "package/README.md"])
     if (!files.includes(need)) throw new Error(`missing from package: ${need}`);
   console.log(`package: ${tgz} (${files.length} files)`);
 
