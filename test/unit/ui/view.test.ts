@@ -4,7 +4,7 @@ import { appendFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { root, clean, now, call, workflow, state, session } from "./fixture.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-const { listRows, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount } = await import("../../../src/ui/view.ts");
+const { listRows, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount, summaryText } = await import("../../../src/ui/view.ts");
 const { visibleWidth } = await import("@earendil-works/pi-tui");
 const { SessionTail, thoughtSummary, sessionFacts, sessionBranch } = await import("../../../src/ui/session.ts");
 after(clean);
@@ -20,14 +20,16 @@ test("grouping, proposal order, done paging, and narrow columns", () => {
   const calls = [call("E02"), call("E05", { lastActivity: now - 5_000 }), ...Array.from({ length: 10 }, (_, i) => call(`D${i}`, { phase: "sealed", endedAt: now - i * 1000, result: { key: `D${i}`, gen: 1, ok: true, status: "ok", output: "", data: { summary: `merged ${i}` } } }))];
   const w = workflow(calls), s = state();
   const solo = workflow([call("scout")], { wid: "solo" });
-  let rows = listRows([solo, w], s, new Map(), () => "GPT-6 (openai)", 100, now);
+  let rows = listRows([w, solo], s, new Map(), () => "GPT-6 (openai)", 100, now);
   assert.equal(rows[0]!.kind, "workflow"); assert.match(rows[0]!.text, /10\/12 · 1h02m/);
-  assert.equal(rows[1]!.call!.key, "E02"); assert.equal(rows[2]!.call!.key, "E05"); assert.equal(rows[3]!.text.trim(), "10 done");
+  assert.equal(rows[1]!.call!.key, "E02"); assert.equal(rows[2]!.call!.key, "E05"); assert.equal(rows[3]!.text.trim(), "└ ▸ 10 done");
+  assert.match(rows[1]!.text, /^ {2}├ E02/, "agents are tree children of their workflow");
   assert(!rows.some(r => r.kind === "more"));
   s.done.set("w", 8); rows = listRows([w], s, new Map(), () => "GPT-6 (openai)", 100, now);
-  assert.equal(rows.filter(r => r.call?.phase === "sealed").length, 8); assert.equal(rows.at(-1)!.text.trim(), "2 more");
+  assert.equal(rows.filter(r => r.call?.phase === "sealed").length, 8); assert.equal(rows.at(-1)!.text.trim(), "└ … 2 more");
+  assert.match(rows.find(r => r.call?.key === "D0")!.text, /^ {6}├ D0/, "done rows are nested under their done node");
   assert.match(rows.find(r => r.call?.key === "D0")!.text, /merged 0/);
-  assert(!listRows([w], s, new Map(), () => "GPT-6 (openai)", 40, now).some(r => r.text.includes("GPT")));
+  assert(listRows([w], s, new Map(), () => "GPT-6 (openai)", 50, now).some(r => r.text.includes("GPT-6") && !r.text.includes("(openai)")), "narrow: model kept, provider dropped");
   s.folded.add("w"); assert.equal(listRows([w], s, new Map(), () => "", 100, now).length, 1);
 });
 
@@ -38,7 +40,7 @@ test("unviewed failures remain visible then collapse; all-ended workflows expand
   const rows = listRows([w], s, new Map(), () => "—", 100, now);
   assert.equal(rows.find(r => r.kind === "call")!.call!.key, "bad"); assert(rows.some(r => r.failed));
   s.viewed.add(bad.callId);
-  assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.text), ["  1 finished workflow"]);
+  assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.text), ["▸ 1 finished workflow"]);
   s.finished = true; assert(listRows([w], s, new Map(), () => "—", 100, now).some(r => r.call === good));
 });
 
@@ -68,12 +70,14 @@ test("successful last call also reopens collapsed done rows without a new failur
 
 test("ordinary status phrases, main line, questions and stalls", () => {
   const c = call("E07"), w = workflow([c]);
-  assert.equal(mainLine([]), undefined); assert.equal(mainLine([w]), "1 subagent working  ↓");
+  assert.equal(mainLine([]), undefined); assert.equal(mainLine([w]), "1 working · 0/1 done  ↓");
   w.attention = [{ id: "q", rev: 1, kind: "question", call: c.callId, text: "docs/ in write set?", wid: "w" }];
   assert.equal(statusPhrase(c, w, undefined, now), "asking main agent: docs/ in write set?");
   w.attention = [{ id: "s", rev: 1, kind: "stall", call: c.callId, text: "", wid: "w" }]; c.lastActivity = now - 840_000;
   assert.equal(statusPhrase(c, w, undefined, now), "no activity for 14m");
-  w.attention = []; assert.equal(statusPhrase(c, w, undefined, now), "thinking");
+  w.attention = []; c.lastActivity = now - 8_000; assert.equal(statusPhrase(c, w, undefined, now), "thinking · 8s", "the age of the newest evidence ticks");
+  c.lastActivity = now - 1_000; assert.equal(statusPhrase(c, w, undefined, now), "thinking · 1s", "and resets on new activity");
+  assert.equal(statusPhrase(c, w, { ...sessionFacts([], c.callId), activity: "reading src/a.ts" }, now), "reading src/a.ts · 1s");
   c.phase = "queued"; assert.match(statusPhrase(c, w, undefined, now), /^queued:/);
   c.phase = "sealed"; c.result = { key: c.key, gen: 1, status: "failed", ok: false, output: "", error: "blocked" };
   w.status = "failed";
@@ -130,8 +134,8 @@ test("row order is stable across refreshes while activity changes", () => {
   }
   calls[1]!.startedAt = undefined; calls[1]!.phase = "queued"; assert.deepEqual(ids(), first); // dispatch timing does not reorder
   const a = { wid: "a", origin: "main:other", startedAt: 3 }, b = { wid: "b", origin: "main:me", startedAt: 5 }, c = { wid: "c", origin: "main:other", startedAt: 1 }, d = { wid: "d", origin: "main:me", startedAt: 2 };
-  assert.deepEqual(orderWorkflows([a, b, c, d], "main:me").map(x => x.wid), ["d", "b", "c", "a"]);
-  assert.deepEqual(orderWorkflows(orderWorkflows([a, b, c, d], "main:me"), "main:me").map(x => x.wid), ["d", "b", "c", "a"]);
+  assert.deepEqual(orderWorkflows([a, b, c, d], "main:me").map(x => x.wid), ["b", "d", "a", "c"], "own session first, newest first");
+  assert.deepEqual(orderWorkflows(orderWorkflows([a, b, c, d], "main:me"), "main:me").map(x => x.wid), ["b", "d", "a", "c"]);
 });
 
 test("done rows are newest first and never reshuffle when failures are viewed or results arrive", () => {
@@ -170,14 +174,28 @@ test("tool counts come only from this call's own committed execution segments", 
   assert.equal(toolCount(0), ""); assert.equal(toolCount(1), "1 tool"); assert.equal(toolCount(12), "12 tools");
 });
 
-test("call rows show tool counts within width and drop the model column first", () => {
+test("call rows show tool counts within width and keep the model (provider dropped when narrow)", () => {
   const c = call("E02"), w = workflow([c, call("E05")]);
   const facts = new Map([[c.callId, { ...sessionFacts([], c.callId), tools: 12, activity: "editing src/a/very/long/path/that/keeps/going/and/going.ts" }]]);
   for (const width of [24, 40, 59, 60, 80, 100, 140]) {
     const row = listRows([w], state(), facts, () => "GLM-5.3 (zhipu)", width, now).find(r => r.call === c)!;
     assert(visibleWidth(row.text) <= width, `${width}: ${row.text}`);
-    assert.equal(row.text.includes("GLM"), width >= 60, `${width}: ${row.text}`);
-    if (width >= 40) assert.match(row.text, /12 tools {2}3m$/);
+    assert.equal(row.text.includes("GLM"), width >= 40, `${width}: ${row.text}`);
+    assert.equal(row.text.includes("(zhipu)"), width >= 70, `${width}: ${row.text}`);
+    if (width >= 60) assert.match(row.text, /12 tools · 3m$/);
   }
   assert.equal(rowText("  ", "E02", "M", "short", ["", ""], 100), "  E02  M  short");
+  assert.equal(rowText("", "a", "M", "x", ["2 tools"], 50, { key: 3, model: 0 }).indexOf("M"), 5, "key column padded for alignment");
+});
+
+test("overview: newest workflow first, agents as tree children, live preview line, done rows show the conclusion", () => {
+  const older = workflow([call("map", { phase: "sealed", endedAt: now - 5_000, result: { key: "map", gen: 1, status: "ok", ok: true, output: "work\nLEAF: ok" } }), call("scan")], { wid: "old", name: "older", startedAt: now - 60_000 });
+  const newer = workflow([call("plan", { callId: "new@1/plan@1" }), call("test", { callId: "new@1/test@1" })], { wid: "new", name: "newer", startedAt: now - 10_000 });
+  const facts = new Map([["new@1/plan@1", { ...sessionFacts([], "new@1/plan@1"), latest: "thinking: Checking the lease logic" }]]);
+  const s = state(); s.done.set("old", 8);
+  const rows = listRows(orderWorkflows([older, newer]), s, facts, () => "GLM-5.3 (zhipu)", 100, now).map(r => r.text);
+  assert.match(rows[0]!, /^▾ newer/); assert.ok(rows.findIndex(r => /^▾ older/.test(r)) > 0, "newest first");
+  assert.match(rows[1]!, /^ {2}├ plan/); assert.match(rows[2]!, /^ {2}│ {3}thinking: Checking the lease logic/);
+  assert.ok(rows.some(r => /^ {6}└ map .*done · LEAF: ok/.test(r)), "done rows nested under their done node, showing the final line");
+  assert.equal(summaryText([older, newer]), "3 working · 1/4 done");
 });

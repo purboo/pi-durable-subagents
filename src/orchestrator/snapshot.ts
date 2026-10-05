@@ -66,7 +66,8 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
     } else if (e.type === "selected") {
       const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
       if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
-    } else if (e.type === "observation" || e.type === "tracked" || e.type === "time") {
+    } else if (e.type === "observation") {
+      // Only what the agent did counts as activity; tracker scans and time checkpoints are bookkeeping.
       const call = byExec.get(String(e.exec)); if (call) call.lastActivity = e.ts;
       if (call && e.type === "observation" && (e.event as { type?: string } | undefined)?.type === "tool_execution_start") tools.set(call.callId, (tools.get(call.callId) ?? 0) + 1);
     } else if (e.type === "usage") {

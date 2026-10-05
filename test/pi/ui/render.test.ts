@@ -163,7 +163,7 @@ test("fullscreen model and thinking controls expose separate selectors", async (
 
 test("list order and selection stay put across activity refreshes and inserted rows", () => {
   const { screen, data } = setup(); screen.render(100); screen.handleInput("\x1b[B"); screen.handleInput("\x1b[B");
-  const order = () => plain(screen).split("\n").filter(line => /^ {4}E0\d/.test(line)).map(line => line.trim().slice(0, 3));
+  const order = () => plain(screen).split("\n").filter(line => /^ {2}[├└] E0\d/.test(line)).map(line => line.trim().slice(2, 5));
   assert.deepEqual(order(), ["E02", "E07"]);
   for (const t of [10_000, 20_000, 30_000]) {
     data.workflows[0]!.calls[0]!.lastActivity = now + t; data.facts.set("w@1/E07@1", { ...sessionFacts([], "w@1/E07@1"), lastActivity: now + 2 * t });
