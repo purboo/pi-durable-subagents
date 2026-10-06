@@ -65,5 +65,13 @@
     "@earendil-works/pi-tui": "1.0.2",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/purboo/pi-durable-subagents.git"
+  },
+  "homepage": "https://github.com/purboo/pi-durable-subagents#readme",
+  "bugs": {
+    "url": "https://github.com/purboo/pi-durable-subagents/issues"
   }
 }
