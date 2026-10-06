@@ -19,7 +19,11 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint:imports
-      - run: npm run test:unit
-      - run: npm run test:pi
+      - run: npm run test:unit 2>&1 | tee unit.log; exit ${PIPESTATUS[0]}
+        shell: bash
+      - run: npm run test:pi 2>&1 | tee pi.log; exit ${PIPESTATUS[0]}
+        shell: bash
         if: matrix.node == '24'
+      - run: node scripts/ci-annotate.mjs unit.log pi.log
+        if: failure()
       - run: npm run pack:smoke
