@@ -60,7 +60,7 @@ export async function scenario(n: number, root: string, env: NodeJS.ProcessEnv) 
       await pi.prompt([{ tool: "subagents", args: { action: "send", to: `${wid}/writer`, ...args } }, { text: "Sent." }]);
       const result = main().filter(e => e.message?.toolName === "subagents").at(-1)?.message;
       const rid = result?.details?.rid ?? result?.details?.submitted?.rid;
-      check(!result?.isError && rid && result.details.applied !== false, "main send receipt"); return String(rid);
+      check(!result?.isError && rid && result.details.applied !== false, `main send receipt: ${JSON.stringify({ isError: result?.isError, details: result?.details, content: JSON.stringify(result?.content ?? "").slice(0, 400) })}`); return String(rid);
     };
     if (n === 4) {
       await until(() => child().some(e => e.message?.role === "assistant"), "writer started");

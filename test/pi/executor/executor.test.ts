@@ -910,13 +910,16 @@ test("F1 a stuck fence of a real child parks only its call with attention; a sib
   const f = await setup(t, { k: { trackerMs: 25 } }, { containment, sweepMs: 100 });
   // pi exits when its stdin ends (rpc-mode.js:642) and kills its bash tree (shell.js killProcessTree), so only a
   // detached (setsid) descendant outlives the child: it plays the process the stuck fence cannot retire.
-  const a = f.ticket("a", script([{ tool: "bash", args: { command: `${detachedSleep(60)} >/dev/null; sleep 60` } }, { text: "never" }])), b = f.ticket("b", script([{ delayMs: 300, text: "sibling done" }]));
+  const pidfile = join(f.cwd, "detached.pid");
+  const a = f.ticket("a", script([{ tool: "bash", args: { command: `${detachedSleep(60)} > '${pidfile}'; sleep 60` } }, { text: "never" }])), b = f.ticket("b", script([{ delayMs: 300, text: "sibling done" }]));
   const ea = `${a.callId}#1.1`, tagged = async () => (await new ProcessTable().list(new Set([ea]))).filter(p => p.tag === ea); // macOS reads tags only for known ids
   t.mock.method(console, "error", () => {});
   stuck = ea;
   try {
     const pa = f.executor.run(a);
     await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+    // Stop only once the detached descendant exists (starting it takes a moment on a loaded runner).
+    await until(() => existsSync(pidfile) && /\d\n/.test(readFileSync(pidfile, "utf8")));
     const pb = f.executor.run(b);
     await Promise.race([f.executor.stop({ wid: f.wid, callId: a.callId }), delay(10000).then(() => { throw new Error("stop waited on a stuck fence"); })]);
     assert.equal(f.journal.entries().filter(e => e.type === "fence-failed" && e.exec === ea).length, 1);
