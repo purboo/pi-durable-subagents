@@ -422,6 +422,26 @@ test("C1 spawn and plain-text settle preserve the complete final text", { timeou
   assert.ok(f.journal.entries().some(e => e.type === "tracked"));
 });
 
+test("P9 a restart while the first execution waits for a slot delivers the task, never a bare continue", { timeout: 45000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 0 } } }), ticket = f.ticket();
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === JT.exec));
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.shutdown(); await rejected;
+  assert.equal(f.journal.entries().filter(e => e.type === "tracked").length, 0, "the first execution never launched");
+  const restarted = createExecutor({ home: f.home, orch: f.orch, config: {} });
+  t.after(() => restarted.shutdown());
+  await restarted.recover(f.wid, f.journal);
+  const result = await restarted.run(ticket);
+  assert.equal(result.status, "ok", JSON.stringify(result)); assert.equal(result.output, "full\nLEAF: final");
+  assert.ok(f.journal.entries().filter(e => e.type === JT.exec).length >= 2, "a second execution ran");
+  const requests = sent(f.home).filter(r => r.to === ticket.callId);
+  assert.deepEqual(requests.map(r => r.kind), ["task"]);
+  assert.equal((requests[0]!.body as { message: string }).message, ticket.spec.task);
+  const entries = readFileSync(callSession(f.home, f.wid, "a", 1), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(entries.filter(e => e.type === "custom_message" && e.details?.rid === requests[0]!.rid).length, 1, "the session holds the task once");
+});
+
 test("C1 empty reply loses once, then continues in the same native session", { timeout: 30000 }, async t => {
   const f = await setup(t), ticket = f.ticket("a", script([{ empty: true }, { text: "continued" }]));
   const result = await f.executor.run(ticket); assert.equal(result.output, "continued");

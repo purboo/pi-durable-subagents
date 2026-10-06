@@ -492,9 +492,16 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const receipt = unresolved && entries.some(e => receiptId(e) === unresolved.rid2);
       const openingRid = t.opening && contentHash([t.opening.rid, "dispatch"]);
       const openingReceived = openingRid && entries.some(e => receiptId(e) === openingRid);
+      // The task has one identity: the dispatch of the call's first execution. A later execution continues only once
+      // the session holds that task; an execution interrupted before its child received it (still waiting for a
+      // provider slot, say) leaves a session without a task, and "continue" would ask a fresh model to guess.
+      const taskRid = contentHash([`${t.callId}#1.1`, "dispatch"]);
+      const taskReceived = !openingRid && entries.some(e => receiptId(e) === taskRid);
       if (openingRid && !openingReceived) await sender.send(t.callId, "task", { message: t.opening!.message }, undefined, { rid: openingRid });
+      else if (!openingRid && !taskReceived) await sender.send(t.callId, "task", { message: t.spec.task }, undefined, { rid: taskRid });
       else if (unresolved && !receipt) await sender.send(t.callId, "continue", { message: String(unresolved.message) }, { qid: String(unresolved.qid), rev: Number(unresolved.rev) }, { rid: String(unresolved.rid2) });
-      else await sender.send(t.callId, previous ? "continue" : "task", { message: previous ? `Continue the task. Tool calls whose outcomes are unknown: ${dangling.join(", ") || "none"}.` : t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
+      else if (previous) await sender.send(t.callId, "continue", { message: `Continue the task. Tool calls whose outcomes are unknown: ${dangling.join(", ") || "none"}.` }, undefined, { rid: contentHash([exec, "dispatch"]) });
+      else await sender.send(t.callId, "task", { message: t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       let child: Spawned;
       try {
