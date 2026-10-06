@@ -5,10 +5,13 @@
 //   node scripts/ci-test.mjs <log> [node --test args...]
 import { spawnSync } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
+import { delimiter, join } from "node:path";
 
 const [log, ...args] = process.argv.slice(2);
 const run = (testArgs) => {
-  const result = spawnSync(process.execPath, ["--test", ...testArgs], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  // Like `npm run`: the repository's node_modules/.bin (the `pi` the real-process tests launch) comes first on PATH.
+  const env = { ...process.env, PATH: `${join(process.cwd(), "node_modules", ".bin")}${delimiter}${process.env.PATH ?? ""}` };
+  const result = spawnSync(process.execPath, ["--test", ...testArgs], { encoding: "utf8", env, maxBuffer: 256 * 1024 * 1024 });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   process.stdout.write(output);
   return { code: result.status ?? 1, output };
