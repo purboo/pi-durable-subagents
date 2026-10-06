@@ -34,6 +34,8 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     const state: ViewState = { folded: new Set(), done: new Map(), viewed: new Set(), finished: false };
     let screen: SubagentScreen | undefined, opening = false, stopped = false, closeScreen: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined, timer: ReturnType<typeof setInterval> | undefined;
+    let dockRows: (width: number) => string[] = () => [], dockAt: "above" | "below" | undefined, dockTui: { requestRender(): void } | undefined, lastDock = "";
+    const right = (text: string, width: number) => { const t = truncateToWidth(text, width); return " ".repeat(Math.max(0, width - visibleWidth(t))) + t; };
     const stop = () => {
       stopped = true; clearInterval(timer); unsubscribe?.(); screen?.dispose(); closeScreen?.(); openList = undefined;
       try { ctx.ui.setWidget("durable-subagents", undefined); } catch { /* P21: disappearing UI surface. */ }
@@ -49,16 +51,30 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
         const name = (model: string | undefined) => modelLabel(model, (p, id) => ctx.modelRegistry.find(p, id), data.aliases);
         const now = Date.now(), dock = data.dock;
         const lines = (width: number) => dock === "off" ? [] : dock === "line" ? [mainLine(data.workflows) ?? ""].filter(Boolean) : dockLines(data.workflows, data.facts, name, width, now);
-        const right = (text: string, width: number) => { const t = truncateToWidth(text, width); return " ".repeat(Math.max(0, width - visibleWidth(t))) + t; };
-        ctx.ui.setWidget("durable-subagents", lines(200).length ? (_tui, theme) => ({
-          invalidate() {},
-          render(width) {
-            const rows = lines(width).map(row => truncateToWidth(oneLine(row), width));
-            // Agent rows read left to right and stay quiet; a question is the one thing that stands out. The last line
-            // (the summary or the completion sentence) sits on the right, where the old single line was.
-            return rows.map((row, i) => i === rows.length - 1 ? theme.fg("dim", right(row, width)) : row.startsWith("? ") ? theme.fg("warning", row) : theme.fg("muted", row));
-          },
-        }) : undefined, { placement: "aboveEditor" });
+        dockRows = lines;
+        // The widget is installed once (and again only when its placement changes). pi orders widgets by when they
+        // were last set, so re-setting it on every refresh pushed it under other extensions' editor headers (a
+        // powerline bar) and rebuilt the whole widget area twice a second. Between installs only its content changes.
+        const at = dock === "off" ? undefined : data.dockAt;
+        if (at !== dockAt) {
+          dockAt = at; dockTui = undefined;
+          ctx.ui.setWidget("durable-subagents", at ? (tui, theme) => {
+            dockTui = tui;
+            return {
+              invalidate() {},
+              render(width) {
+                // One column of margin on each side, like pi's own text and status lines.
+                const inner = Math.max(1, width - 2);
+                const rows = dockRows(inner).map(row => truncateToWidth(oneLine(row), inner));
+                // Agent rows read left to right and stay quiet; a question is the one thing that stands out. The last
+                // line (the summary or the completion sentence) sits on the right.
+                return rows.map((row, i) => ` ${i === rows.length - 1 ? theme.fg("dim", right(row, inner)) : row.startsWith("? ") ? theme.fg("warning", row) : theme.fg("muted", row)}`);
+              },
+            };
+          } : undefined, { placement: at === "above" ? "aboveEditor" : "belowEditor" });
+        }
+        const shown = dockRows(200).join("\n");
+        if (shown !== lastDock) { lastDock = shown; dockTui?.requestRender(); }
         screen?.refresh();
       } catch { /* P21: journal or UI unavailability must not interrupt the main agent. */ }
     };
