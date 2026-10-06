@@ -31,7 +31,7 @@ scratch.
 ```bash
 pi install npm:pi-durable-subagents
 # or straight from GitHub (no build step; runs the TypeScript sources)
-pi install git:github.com/purboo/pi-durable-subagents@v1.0.0
+pi install git:github.com/purboo/pi-durable-subagents
 ```
 
 This needs pi 1.0.x and Node.js 22.19 or later. It has been tested with
