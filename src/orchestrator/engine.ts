@@ -17,12 +17,12 @@ import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
-import { JT, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
+import { JT, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
-import { formatUsage, refusedResult, snapshotFromEntries } from './snapshot.ts';
+import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
 import { validateCallSpec } from '../compat/spec.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
@@ -87,13 +87,9 @@ export class Engine {
   private generations = new Set<string>();
   // wid -> executor runs whose follow-up has not run yet (prune never closes a journal they may still append to).
   private running = new Map<string, number>();
-  private draining = false;
-  /** Drain: true when the workflow existed at the last drain (its `created` precedes it) and no resume followed. */
+  /** Drain: held by a drain that applies to it (all, its session's origin, or itself) and recorded after its creation. */
   private held(wid: string): boolean {
-    if (!this.draining) return false;
-    const entries = this.ledgers.orch.entries(), drain = entries.findLast(e => e.type === 'drain');
-    const created = entries.find(e => e.type === JT.created && e.wid === wid);
-    return !!drain && (!created || created.seq < drain.seq);
+    return holdOf(this.ledgers.orch.entries(), wid, this.store.workflows.get(wid)?.origin) !== undefined;
   }
   private watcher?: FSWatcher;
   private poll?: ReturnType<typeof setInterval>;
@@ -116,7 +112,6 @@ export class Engine {
   private lifecycle(): DecisionRecord[] { return this.ledgers.orch.entries().filter(e => ['admitted', 'applied', 'rejected', 'withdrawn'].includes(e.type)) as unknown as DecisionRecord[]; }
   /** A2, P10: Recover executor authority before replaying each unfinished workflow. */
   async recover(): Promise<void> {
-    this.draining = this.ledgers.orch.entries().findLast(e => e.type === 'drain' || e.type === 'undrain')?.type === 'drain';
     await this.store.recover();
     for (const wf of this.store.workflows.values()) {
       await this.executor.recover(wf.wid, wf.journal);
@@ -304,32 +299,33 @@ export class Engine {
       await this.executor.stop({ wid: wf.wid, ...(callId ? { callId } : {}) });
       if (!call) await this.finish(wf, 'stopped');
     } else if (req.kind === 'resume') {
-      const wid = (req.body as { wid?: string })?.wid;
+      const { wid, origin } = (req.body as ResumeBody) ?? {};
       if (wid && !this.store.workflows.has(wid)) return { action: 'reject', reason: 'unknown-workflow' };
-      // Only parked workflows and a drained orchestrator are resumable; running ones need nothing, final ones are final.
+      // A resume releases held work in its scope (one workflow, one session's, or all) and continues parked workflows;
+      // running ones need nothing and final ones are final.
+      const inScope = (wf: Workflow) => wid ? wf.wid === wid : origin ? wf.origin === origin : true;
       const took = (wf: Workflow) => wf.journal.entries().some(e => e.type === 'resumed' && e.rid === req.rid);
-      if (!this.draining && !this.ledgers.orch.entries().some(e => e.type === 'undrain' && e.rid === req.rid)) {
-        const targets = wid ? [this.store.workflows.get(wid)!] : [...this.store.workflows.values()];
-        const final = (wf: Workflow) => { const done = this.terminal(wf); return done && done.status !== 'parked' ? String(done.status) : undefined; };
-        const parked = (wf: Workflow) => this.terminal(wf)?.status === 'parked';
-        if (wid && final(targets[0]!) && !took(targets[0]!)) return { action: 'reject', reason: `terminal:${final(targets[0]!)} — start a new run` };
-        if (wid && !parked(targets[0]!) && !took(targets[0]!)) return { action: 'reject', reason: 'not-parked: already running' };
-        if (!wid && !targets.some(wf => parked(wf) || took(wf))) return { action: 'reject', reason: 'nothing-to-resume' };
+      const replayed = this.ledgers.orch.entries().some(e => e.type === 'undrain' && e.rid === req.rid);
+      const holding = [...this.store.workflows.values()].filter(wf => inScope(wf) && this.held(wf.wid) && !this.terminal(wf));
+      const releasing = replayed || holding.length > 0;
+      const final = (wf: Workflow) => { const done = this.terminal(wf); return done && done.status !== 'parked' ? String(done.status) : undefined; };
+      const parked = (wf: Workflow) => this.terminal(wf)?.status === 'parked';
+      if (!releasing) {
+        const target = wid ? this.store.workflows.get(wid)! : undefined;
+        if (target && final(target) && !took(target)) return { action: 'reject', reason: `terminal:${final(target)} — start a new run` };
+        if (target && !parked(target) && !took(target)) return { action: 'reject', reason: 'not-parked: already running' };
+        if (!target && ![...this.store.workflows.values()].some(wf => inScope(wf) && (parked(wf) || took(wf)))) return { action: 'reject', reason: 'nothing-to-resume' };
       }
-      const wasDrained = this.draining;
-      if (wasDrained) {
-        await this.ledgers.orch.append('undrain', { rid: req.rid });
-        this.draining = false;
-      }
+      if (releasing && !replayed) await this.ledgers.orch.append('undrain', { rid: req.rid, ...(wid ? { wid } : origin ? { origin } : {}) });
       for (const wf of this.store.workflows.values()) {
-        const done = this.terminal(wf);
-        if ((wid && wf.wid !== wid && (!wasDrained || done)) || (done && done.status !== 'parked')) continue;
+        const done = this.terminal(wf), released = releasing && inScope(wf) && !done && (replayed || holding.includes(wf));
+        if (!released && !(inScope(wf) && done?.status === 'parked')) continue;
         if (!took(wf)) {
-          const n = (!wasDrained ? this.states.get(wf.wid)?.ev : undefined) ?? Math.max(0, ...wf.journal.entries().filter(e => e.type === 'ev').map(e => Number(e.n))) + 1;
+          const n = (!released ? this.states.get(wf.wid)?.ev : undefined) ?? Math.max(0, ...wf.journal.entries().filter(e => e.type === 'ev').map(e => Number(e.n))) + 1;
           await wf.journal.append('resumed', { rid: req.rid, n });
           await this.resolveFinished(wf);
         }
-        if (wasDrained) {
+        if (released) {
           const st = this.states.get(wf.wid);
           if (st) this.evaluator.send({ t: 'stop', wid: wf.wid, ev: st.ev });
           this.states.delete(wf.wid);
@@ -338,12 +334,13 @@ export class Engine {
       }
       for (const wf of this.store.workflows.values()) for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     } else if (req.kind === 'drain') {
-      const fence = (req.body as DrainBody)?.fence === true;
-      if (!this.ledgers.orch.entries().some(e => e.type === 'drain' && e.rid === req.rid)) await this.ledgers.orch.append('drain', { rid: req.rid, fence });
-      this.draining = true;
-      if (fence) {
-        await this.executor.suspend();
-        for (const st of this.states.values()) st.running.clear();
+      const { fence, origin, wid } = (req.body as DrainBody) ?? {}, scoped = Boolean(origin || wid);
+      if (!this.ledgers.orch.entries().some(e => e.type === 'drain' && e.rid === req.rid)) {
+        await this.ledgers.orch.append('drain', { rid: req.rid, fence: fence === true, ...(wid ? { wid } : origin ? { origin } : {}) });
+      }
+      if (fence === true) {
+        await this.executor.suspend(scoped ? w => this.held(w) : undefined);
+        for (const st of this.states.values()) if (!scoped || this.held(st.wf.wid)) st.running.clear();
       }
     } else if (req.kind === 'prune') return this.prune(req as Request<PruneBody>);
     else return { action: 'reject', reason: 'unsupported-kind' };

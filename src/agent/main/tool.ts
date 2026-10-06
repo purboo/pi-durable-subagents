@@ -86,7 +86,7 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   if (action === "revise") return { kind: "revise", body: { wid: string(args, "wid"),
     ...(args.workflow === undefined ? {} : { workflow: resolve(cwd, string(args, "workflow")) }),
     ...(args.source === undefined ? {} : { source: string(args, "source") }), ...(args.args === undefined ? {} : { args: args.args }) } };
-  if (action === "resume") return { kind: "resume", body: args.wid === undefined ? {} : { wid: string(args, "wid") } };
+  if (action === "resume") return { kind: "resume", body: args.wid !== undefined ? { wid: string(args, "wid") } : typeof args.origin === "string" ? { origin: args.origin } : {} };
   if (action === "drain") return { kind: "drain", body: {} };
   throw new Error(`Unsupported action: ${action}; use run, agents, send, stop, revise, status, resume, or drain`);
 }

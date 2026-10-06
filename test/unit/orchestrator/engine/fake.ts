@@ -52,11 +52,11 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
       await Promise.allSettled(runs);
     },
     busy: () => active.size > 0,
-    async suspend() {
-      await ledgers.orch.append('fake-suspend', {});
-      const runs = [...pending.values()];
-      for (const [call, a] of active) {
-        await a.ticket.journal.append('fake-fenced', { call }); a.end('suspend');
+    async suspend(only?: (wid: string) => boolean) {
+      await ledgers.orch.append('fake-suspend', only ? { scoped: true } : {});
+      const runs: Promise<CallResult>[] = [];
+      for (const [call, a] of active) if (!only || only(a.ticket.wid)) {
+        runs.push(pending.get(call)!); await a.ticket.journal.append('fake-fenced', { call }); a.end('suspend');
       }
       await Promise.allSettled(runs);
     },

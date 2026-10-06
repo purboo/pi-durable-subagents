@@ -47,7 +47,8 @@ the npx cache, so `install-service` refuses to run from there.
 |---|---|
 | The stream drops, or the model returns nothing | Continues the **same** session. Finished tool results are kept. |
 | A step runs past its `timeoutMs` (even inside a silent tool) | Stops it cleanly as `timeout`. Only time spent working counts; waiting for you does not. |
-| You quit pi, or pi crashes, while subagents run | The work keeps running. When you come back, the session that started the work is told what needs you. |
+| You quit pi (Ctrl+D, `/quit`, closing the terminal) while subagents run | That session's workflows pause: nothing more is spent, nothing is lost. When you come back, pi says so; `resume` (or `r` in the list) continues them in the same sessions. Set `"onQuit": "continue"` to let them run on instead. |
+| pi crashes or is killed (`kill -9`) while subagents run | The work keeps running. When you come back, the session that started the work is told what needs you. |
 | The machine or the orchestrator dies mid-run | The next pi you open resumes the work. Finished results are kept and nothing runs twice. |
 | You steer a subagent while it is asking you a question | Your message reaches it, in order. Nothing is rejected or lost. |
 | Two steers arrive out of order and the second replaces the first | Only the second one applies. |
@@ -226,6 +227,7 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
 ```json
 {
   "defaultModel": "provider/id",
+  "onQuit": "pause",
   "pools": { "fast": ["anthropic/claude-haiku-4-5", "openai/gpt-5-mini"] },
   "providers": { "anthropic": { "slots": 4 } },
   "memory": { "reserveMb": 2048, "perChildMb": 300 }
@@ -238,6 +240,8 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   progress.
 - **Memory:** new subagents wait while memory is short. Running ones are
   never stopped for memory.
+- **onQuit:** `"pause"` (default) pauses a session's running workflows when
+  you quit that pi; `"continue"` lets them run on in the background.
 
 ## Switching back
 

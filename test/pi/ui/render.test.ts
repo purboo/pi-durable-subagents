@@ -322,3 +322,12 @@ test("UI §3 be pi: the watch view shows the response in flight — waiting for 
   assert(!plain(screen).includes("The timer starts before the lock."));
   screen.handleInput("\x14"); assert.match(plain(screen), /The timer starts before the lock\./);
 });
+
+test("be pi: a click anywhere on an expanded thinking block collapses it, a click on the title expands it", () => {
+  const { screen, open } = setup(); open();
+  const row = (needle: string) => screen.render(100).findIndex(l => stripVTControlCharacters(l).includes(needle));
+  const click = (y: number) => screen.handleMouse({ type: "click", button: "left", x: 10, y } as never);
+  assert(!plain(screen).includes("Checking the tests now"));
+  click(row("Thinking")); assert.match(plain(screen), /Checking the tests now/, "the title expands it");
+  click(row("Checking the tests now")); assert(!plain(screen).includes("Checking the tests now"), "a click inside the block collapses it");
+});

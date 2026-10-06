@@ -683,7 +683,18 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       }
     },
     busy: () => active.size > 0,
-    suspend() {
+    suspend(only?: (wid: string) => boolean) {
+      if (only) { // scoped (one session's quit, one workflow): other workflows keep running and dispatching
+        const targets = [...active.values()].filter(a => only(a.ticket.wid));
+        for (const a of targets) { a.suspended = true; a.controller.abort(); a.wake(); }
+        wake();
+        return (async () => {
+          const results = await Promise.allSettled(targets.map(a => a.promise));
+          await queue;
+          const failed = results.find(r => r.status === "rejected" && r.reason?.name !== "ExecutorShutdown");
+          if (failed?.status === "rejected") throw failed.reason;
+        })();
+      }
       if (suspending) return suspending;
       for (const a of active.values()) { a.suspended = true; a.controller.abort(); a.wake(); }
       wake();

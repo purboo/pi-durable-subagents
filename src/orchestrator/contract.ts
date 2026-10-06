@@ -74,9 +74,10 @@ export interface Executor {
   recover(wid: Wid, journal: JournalHandle): Promise<void>;
   /** True while any call is running or pending (used for idle exit, K6). */
   busy(): boolean;
-  /** Drain with fence (stop-all): fence every running execution WITHOUT sealing; their run() promises reject with an
-   *  Error named "ExecutorShutdown"; the executor stays open and a later run() continues the call. */
-  suspend(): Promise<void>;
+  /** Drain with fence (stop-all, quit): fence every running execution (or only those of workflows `only` selects)
+   *  WITHOUT sealing; their run() promises reject with an Error named "ExecutorShutdown"; the executor stays open and a
+   *  later run() continues the call. */
+  suspend(only?: (wid: string) => boolean): Promise<void>;
   /** Orchestrator exit: suspend(), then close the outbox. */
   shutdown(): Promise<void>;
 }

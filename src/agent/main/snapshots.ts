@@ -5,6 +5,7 @@ import { readJournalSnapshot } from "../../kernel/journal.ts";
 import { singlePresentation } from "../../kernel/guards.ts";
 import { journalPath, orchLedger } from "../../paths.ts";
 import { CT, JT, type AttentionItem, type Entry } from "../../types.ts";
+import { holdOf } from "../../orchestrator/snapshot.ts";
 
 /** P15, P25: Read workflow snapshots without modifying another domain's history; a wid with an orchestrator.jsonl
  *  `pruned{wid}` entry is gone (housekeeping), even while its directory is still being removed. */
@@ -29,9 +30,8 @@ export function openGeneration(entries: readonly { type: string; [k: string]: un
 /** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation,
  *  unless a drain (stop-all) holds it: held work waits for an explicit resume, which starts the orchestrator itself. */
 export function unfinishedWorkflow(home: string): boolean {
-  const ledger = readJournalSnapshot(orchLedger(home)), last = ledger.findLast(e => e.type === "drain" || e.type === "undrain");
-  const held = (wid: string) => last?.type === "drain" && (ledger.find(e => e.type === JT.created && e.wid === wid)?.seq ?? -1) < last.seq;
-  return workflows(home).some(w => (!w.entries.some(e => e.type === JT.done) || openGeneration(w.entries)) && !held(w.wid));
+  const ledger = readJournalSnapshot(orchLedger(home));
+  return workflows(home).some(w => (!w.entries.some(e => e.type === JT.done) || openGeneration(w.entries)) && !holdOf(ledger, w.wid, w.origin));
 }
 
 /** P15, V7: Rebuild session-wide receipts, including entries hidden by compaction. */
