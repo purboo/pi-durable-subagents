@@ -32,7 +32,9 @@ export class SessionTail {
         let end;
         while ((end = this.pending.indexOf("\n")) >= 0) {
           const line = this.pending.slice(0, end); this.pending = this.pending.slice(end + 1);
-          if (line.trim()) this.entries.push(JSON.parse(line) as SessionEntry);
+          if (!line.trim()) continue;
+          // E4, like pi and the orchestrator: a malformed interior line is skipped, never a reason to stop following.
+          try { this.entries.push(JSON.parse(line) as SessionEntry); } catch { /* skipped */ }
         }
       }
     } catch (error) { this.failure = error as Error; throw error; }

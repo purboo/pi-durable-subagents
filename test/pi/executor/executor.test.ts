@@ -623,6 +623,16 @@ test("X1 memory refusal holds nothing and rechecks headroom before spawn", { tim
   assert.ok(await availableMemory() > 0);
 });
 
+test("P29 a burst of dispatches cannot over-commit memory: children admitted in the last 30 s are reserved", { timeout: 60000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 30 }, memory: { reserveMb: 1000, perChildMb: 300 } }, { memory: async () => 1000 + 600 + 1 });
+  const runs = ["a", "b", "c"].map(key => f.executor.run(f.ticket(key, script([{ delayMs: 1500, text: key }]))));
+  let peak = 0;
+  const watch = setInterval(() => { const held = new Map<string, string>(); for (const e of f.orch.entries()) if (e.pool === "memory") { if (e.type === "hold") held.set(String(e.slot), String(e.exec)); else if (e.type === "release") held.delete(String(e.slot)); } peak = Math.max(peak, held.size); }, 20);
+  try { assert.deepEqual((await Promise.all(runs)).map(r => r.status), ["ok", "ok", "ok"]); } finally { clearInterval(watch); }
+  assert.equal(peak, 2, "the measured headroom fits two children; the third waits for a release instead of over-committing");
+  assert.ok(f.orch.entries().some(e => e.type === "mem" && e.admitted === false && Number(e.warming) === 2));
+});
+
 test("X1 retire fences without seals, retires question attention and rejects stale forwards", { timeout: 30000 }, async t => {
   const f = await setup(t), ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Retire me?" } }]));
   const pending = f.executor.run(ticket);

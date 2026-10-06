@@ -87,6 +87,8 @@ export class Containment implements Contract {
       if (performance.now() >= deadline) throw new Error(`Fence timeout: ${exec}`);
       for (const p of targets) {
         known.set(identity(p), p);
+        // C3: the pid may have exited and been reused since the scan; kill only if it still has the scanned start.
+        if (p.start !== "" && await captureStart(p.pid) !== p.start) continue;
         try { process.kill(p.pid, "SIGKILL"); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       }

@@ -6,7 +6,7 @@ import { root, clean, now, call, workflow, state, session } from "./fixture.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
 import type { CallStatus } from "../../../src/types.ts";
-const { listRows, toggleOpen, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount, summaryText, summary, resultPhrase, resultWord } = await import("../../../src/ui/view.ts");
+const { listRows, toggleOpen, dockLines, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount, summaryText, summary, resultPhrase, resultWord } = await import("../../../src/ui/view.ts");
 const { visibleWidth } = await import("@earendil-works/pi-tui");
 const { SessionTail, thoughtSummary, sessionFacts, sessionBranch } = await import("../../../src/ui/session.ts");
 after(clean);
@@ -95,7 +95,7 @@ test("thinking summaries never display partial prose or expose empty expansion",
   assert.equal(thoughtSummary("partial"), ""); assert.equal(thoughtSummary(""), "");
 });
 
-test("session tails tolerate split UTF-8 and partial lines, replacement and truncation", () => {
+test("session tails tolerate split UTF-8, partial and corrupt lines, replacement and truncation", () => {
   const path = join(root, "tail.jsonl"), tail = new SessionTail();
   assert.deepEqual(tail.read(path), []);
   const bytes = Buffer.from(JSON.stringify({ type: "custom", id: "a", data: "你好" }) + "\n");
@@ -106,7 +106,9 @@ test("session tails tolerate split UTF-8 and partial lines, replacement and trun
   writeFileSync(path, ""); assert.equal(tail.read(path).length, 0);
   writeFileSync(path + ".new", '{"type":"custom","id":"b"}\n'); renameSync(path + ".new", path);
   assert.equal(tail.read(path)[0]!.id, "b");
-  appendFileSync(path, "bad\n"); assert.throws(() => tail.read(path)); assert.throws(() => tail.read(path));
+  // E4: a corrupt interior line is skipped (as pi and the orchestrator do) and the tail keeps following.
+  appendFileSync(path, 'bad\n{"type":"custom","id":"c"}\n'); assert.deepEqual(tail.read(path).map(e => e.id), ["b", "c"]);
+  appendFileSync(path, '{"type":"custom","id":"d"}\n'); assert.deepEqual(tail.read(path).map(e => e.id), ["b", "c", "d"]);
 });
 
 test("session facts follow the native branch and completed tools disappear", () => {
@@ -299,4 +301,21 @@ test("one row per key: a follow-up generation replaces its key's earlier row, so
   const rows = listRows([w], s, new Map(), () => "—", 100, now);
   assert.match(rows[0]!.text, /· 3\/3 ·/); assert.equal(rows.filter(r => r.kind === "call").length, 3);
   assert.ok(rows.some(r => r.call?.callId === "w@1/a@2") && !rows.some(r => r.call?.callId === "w@1/a@1"));
+});
+
+test("UI §1 dock: a row per active agent (questions first, at most three), a summary line; finished for ten minutes; then nothing", () => {
+  const busy = (key: string, extra = {}) => call(key, { phase: "running", startedAt: now - 60_000, lastActivity: now - 2_000, ...extra });
+  const a = busy("a"), b = busy("b", { startedAt: now - 300_000, lastActivity: now - 120_000 }), c = busy("c"), d = busy("d"), q = busy("q");
+  const w = workflow([a, b, c, d, q], { attention: [{ kind: "question", id: "x", rev: 1, qid: "x", call: q.callId, wid: "w", text: "Which file?" }] });
+  const lines = dockLines([w], new Map(), () => "GLM", 80, now);
+  assert.equal(lines.length, 4);
+  assert.match(lines[0]!, /^\? q .*asks: Which file\?/, "the question comes first");
+  assert.match(lines[1]!, /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] a /, "fresh activity spins");
+  assert.match(lines[2]!, /^… b /, "a quiet agent stops spinning");
+  assert.match(lines[3]!, /^\+2 more · 1 asking · 4 working · 0\/5\+ done · ↓ subagents$/);
+  assert(lines.every(l => visibleWidth(l) <= 80));
+  const done = workflow([call("a", { phase: "sealed", endedAt: now - 1_000, result: { key: "a", gen: 1, status: "ok", ok: true, output: "x" } })], { status: "done", endedAt: now - 1_000 });
+  assert.deepEqual(dockLines([done], new Map(), () => "GLM", 80, now), ["exec-0927 finished: 1 done · ↓ subagents"]);
+  assert.deepEqual(dockLines([done], new Map(), () => "GLM", 80, now + 11 * 60_000), [], "the completion sentence leaves after ten minutes");
+  assert.deepEqual(dockLines([], new Map(), () => "GLM", 80, now), []);
 });

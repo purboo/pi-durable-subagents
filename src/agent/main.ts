@@ -155,6 +155,8 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (args.action === "status") return typeof args.wid === "string" && args.wid ? statusDetail(home, args.wid) : statusView(home, { origin: sender });
     if (args.action === "agents") return agentsAt(cwd).map(({ name, description, model, source }) =>
       ({ name, description, ...(model === undefined ? {} : { model }), source }));
+    // A send addressed like a stop (target:) means the same call; the field name is not worth a failed round trip.
+    if (args.action === "send" && args.to === undefined && typeof args.target === "string") { const { target, ...rest } = args; args = { ...rest, to: target }; }
     if (args.action === "send") args = completeSend(args);
     const normalized = request(args as Parameters<typeof request>[0], cwd);
     if (normalized.kind === "run") {
