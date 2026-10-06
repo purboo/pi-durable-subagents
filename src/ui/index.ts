@@ -3,6 +3,7 @@ import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tu
 import type { UiDeps } from "../agent/main.ts";
 import { UiActions, UiData } from "./data.ts";
 import { SubagentScreen } from "./screen.ts";
+import { oneLine } from "./frame.ts";
 import { dockLines, mainLine, modelLabel, orderWorkflows, type ViewState } from "./view.ts";
 import { registerCards } from "./cards.ts";
 import { toolRenderers } from "./tool.ts";
@@ -52,7 +53,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
         ctx.ui.setWidget("durable-subagents", lines(200).length ? (_tui, theme) => ({
           invalidate() {},
           render(width) {
-            const rows = lines(width);
+            const rows = lines(width).map(row => truncateToWidth(oneLine(row), width));
             // Agent rows read left to right and stay quiet; a question is the one thing that stands out. The last line
             // (the summary or the completion sentence) sits on the right, where the old single line was.
             return rows.map((row, i) => i === rows.length - 1 ? theme.fg("dim", right(row, width)) : row.startsWith("? ") ? theme.fg("warning", row) : theme.fg("muted", row));
