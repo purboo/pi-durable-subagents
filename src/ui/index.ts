@@ -52,9 +52,10 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
         const now = Date.now(), dock = data.dock;
         const lines = (width: number) => dock === "off" ? [] : dock === "line" ? [mainLine(data.workflows) ?? ""].filter(Boolean) : dockLines(data.workflows, data.facts, name, width, now);
         dockRows = lines;
-        // The widget is installed once (and again only when its placement changes). pi orders widgets by when they
-        // were last set, so re-setting it on every refresh pushed it under other extensions' editor headers (a
-        // powerline bar) and rebuilt the whole widget area twice a second. Between installs only its content changes.
+        // The widget is installed once, at session start (and again only when its placement changes). pi stacks
+        // widgets in the order they were set, so installing once keeps the dock where the extension load order puts
+        // it: listed before another extension's editor bar (a powerline bar), the dock sits above that bar. Re-setting
+        // it on every refresh pushed it under such bars and rebuilt the whole widget area twice a second.
         const at = dock === "off" ? undefined : data.dockAt;
         if (at !== dockAt) {
           dockAt = at; dockTui = undefined;

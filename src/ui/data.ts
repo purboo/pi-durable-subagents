@@ -26,7 +26,7 @@ export class UiData {
   /** UI §1: the dock above the editor — "auto" (live rows), "line" (one summary line) or "off". */
   dock: "auto" | "line" | "off" = "auto";
   /** Where the dock sits: below the editor (default; never splits an editor header such as a powerline bar) or above. */
-  dockAt: "below" | "above" = "below";
+  dockAt: "below" | "above" = "above";
   private tails = new Map<string, SessionTail>();
   home: string;
   constructor(home: string) { this.home = home; }
@@ -55,8 +55,8 @@ export class UiData {
       const config = JSON.parse(readFileSync(join(this.home, "config.json"), "utf8"));
       this.aliases = Object.fromEntries(Object.entries(config.ui?.modelAliases ?? {}).filter(([, v]) => typeof v === "string")) as Record<string, string>;
       this.dock = ["auto", "line", "off"].includes(config.ui?.dock) ? config.ui.dock : "auto";
-      this.dockAt = config.ui?.dockAt === "above" ? "above" : "below";
-    } catch { this.aliases = {}; this.dock = "auto"; this.dockAt = "below"; }
+      this.dockAt = config.ui?.dockAt === "below" ? "below" : "above";
+    } catch { this.aliases = {}; this.dock = "auto"; this.dockAt = "above"; }
   }
 }
 
