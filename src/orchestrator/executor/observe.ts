@@ -62,6 +62,7 @@ export async function observeExecution(d: Dependencies) {
   let logged = 0; const log = join(callDir(home, t.wid, t.key, t.gen), "stderr.log");
   child.stderr.on("data", (chunk: Buffer) => { if (logged < 262144) { logged += chunk.length; try { appendFileSync(log, chunk.subarray(0, Math.max(0, 262144 - logged + chunk.length))); } catch { /* best effort */ } } });
   const lines = createInterface({ input: child.stdout });
+  const drained = new Promise<void>(resolve => lines.once("close", () => resolve()));
   lines.on("line", line => {
     let event: Record<string, unknown>;
     try { event = JSON.parse(line); } catch { return; }
@@ -103,7 +104,14 @@ export async function observeExecution(d: Dependencies) {
   watcher.on("error", () => {});
   try {
     if (d.interrupted()) signal();
-    await Promise.race([boundary, child.exited]);
+    // `exit` can fire before the child's last stdout lines are read (seen on loaded CI): an agent_settled still in the
+    // pipe would be dropped and a finished run counted as a loss and run again. Read to the end of its output first,
+    // bounded, since a grandchild may still hold the pipe open.
+    if (await Promise.race([boundary.then(() => false), child.exited.then(() => true)])) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([drained, new Promise<void>(resolve => { timer = setTimeout(resolve, 2000); })]);
+      clearTimeout(timer);
+    }
   } finally {
     watcher.close(); clearInterval(timer); d.setWake(() => {}); ending = true; await pending;
     await d.fence(); await saveTime();

@@ -3,6 +3,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { publishFile } from "../../../kernel/mailbox.ts";
@@ -19,6 +20,18 @@ export async function attention(t: CallTicket, kind: string, text: string): Prom
   const id = `${kind}:${t.callId}`;
   if (!t.journal.entries().some(e => e.type === JT.attention && (e.item as { id?: string })?.id === id))
     await t.journal.append(JT.attention, { item: { id, rev: 1, kind: "unknown", text, wid: t.wid, call: t.callId } });
+}
+/** Git lists worktrees by real path (macOS: /var is /private/var); compare paths in that form. */
+function canonical(path: string): string {
+  let dir = path, rest = "";
+  for (;;) {
+    try { return join(realpathSync(dir), rest); }
+    catch { const up = dirname(dir); if (up === dir) return path; rest = join(basename(dir), rest); dir = up; }
+  }
+}
+async function worktree(cwd: string, path: string) {
+  const want = canonical(path);
+  return (await worktrees(cwd)).find(w => w.worktree && canonical(w.worktree) === want);
 }
 async function worktrees(cwd: string) {
   const text = await git(cwd, "worktree", "list", "--porcelain", "-z");
@@ -45,7 +58,7 @@ export async function prepareWorktree(t: CallTicket): Promise<string> {
   }
   const { path, branch, base } = intent as Entry & { path: string; branch: string; base: string };
   if (records(t, "wt-removed").length) return path;
-  const tree = (await worktrees(t.cwd)).find(w => w.worktree === path), head = await branchHead(t.cwd, branch);
+  const tree = (await worktree(t.cwd, path)), head = await branchHead(t.cwd, branch);
   if (tree) {
     if (tree.branch !== `refs/heads/${branch}` || tree.HEAD !== head) throw new Error(`Worktree identity conflict: ${path}`);
   } else {
@@ -62,7 +75,7 @@ export async function prepareWorktree(t: CallTicket): Promise<string> {
 export async function cleanWorktree(t: CallTicket): Promise<void> {
   const intent = records(t, "wt-intent")[0];
   if (!intent || records(t, "wt-removed").length || records(t, "wt-kept").length) return;
-  const path = String(intent.path), tree = (await worktrees(t.cwd)).find(w => w.worktree === path);
+  const path = String(intent.path), tree = (await worktree(t.cwd, path));
   if (!tree) {
     if (records(t, "wt-remove-intent").length) await t.journal.append("wt-removed", { call: t.callId });
     return;
