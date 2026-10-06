@@ -207,7 +207,7 @@ test("starter replays pending outbox at boot and notes never request continuatio
   assert.equal(readFileSync(join(home, "spawn.log"), "utf8").trim().split("\n").length, 1);
 });
 
-test("T6/T10 real orchestrator: control actions report applied or the rejection reason; status is compact", { timeout: 90000 }, async t => {
+test("T6/T10 real orchestrator: control actions report applied or the rejection reason; status is compact", { timeout: 150000 }, async t => {
   const root = tempRoot("dsa-main-real-"), home = join(root, "state");
   mkdirSync(home); writeFileSync(join(home, "config.json"), JSON.stringify({ k: { idleExitMs: 500 } }));
   // Real orchestrator (no DSA_ORCHESTRATOR_ENTRY); HOME is the temp root so agent discovery never reads the user's ~/.pi.
@@ -247,10 +247,16 @@ test("T6/T10 real orchestrator: control actions report applied or the rejection 
   const detail = result(pi).result.details;
   assert.equal(detail.result, 1); assert.ok(!("entries" in detail));
   assert.match(readFileSync(detail.scriptLog, "utf8"), /ev=1 log: from script 7\n/);
-  // Every resolved control request is retired from the session outbox.
-  const outbox = readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
-  const sent = outbox.filter(e => e.type === "sent").map(e => (e.request as { rid: string }).rid);
-  assert.deepEqual(outbox.filter(e => e.type === "resolved").map(e => e.rid).sort(), [...sent].sort());
+  // Every resolved control request is retired from the session outbox (a reply that came back as submitted is
+  // retired by the session's next reconcile, so wait for it).
+  const outbox = () => readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
+  const retired = () => {
+    const entries = outbox(), sent = entries.filter(e => e.type === "sent").map(e => (e.request as { rid: string }).rid).sort();
+    return JSON.stringify(entries.filter(e => e.type === "resolved").map(e => e.rid).sort()) === JSON.stringify(sent);
+  };
+  await until(retired, 45000).catch(() => {}); // the session reconciles at least every 30 s
+  const entries = outbox(), sent = entries.filter(e => e.type === "sent").map(e => (e.request as { rid: string }).rid);
+  assert.deepEqual(entries.filter(e => e.type === "resolved").map(e => e.rid).sort(), [...sent].sort());
 });
 
 test("v12 §2: an answer finds its open question from the qid, the call, or nothing; a send without a target names addresses", { timeout: 60000 }, async t => {
