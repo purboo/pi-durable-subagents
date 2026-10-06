@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -37,6 +38,11 @@ function agentsAt(cwd: string) {
   const agents = discoverAgents(cwd).agents;
   discovered.set(cwd, { at: Date.now(), agents });
   return agents;
+}
+/** Quit pause: "pause" (default) holds this session's running workflows when pi quits; "continue" lets them run on. */
+function quitPolicy(home: string): "pause" | "continue" {
+  try { return (JSON.parse(readFileSync(join(home, "config.json"), "utf8")) as { onQuit?: string }).onQuit === "continue" ? "continue" : "pause"; }
+  catch { return "pause"; }
 }
 export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiDeps) => void): void {
   const home = dsaHome();
@@ -120,8 +126,25 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     }, 200);
     timer.unref();
   }
-  pi.on("session_start", async (_event, context) => start(context));
-  pi.on("session_shutdown", close);
+  pi.on("session_start", async (_event, context) => {
+    await start(context);
+    // Quit pause: say once, at the session's start, which of its workflows wait for a resume.
+    const paused = statusView(home, { origin: sender }).workflows.filter(w => w.origin === sender && w.status === "running" && w.paused);
+    if (paused.length) pi.sendMessage({ customType: CT.note, display: true, content: `${paused.length} subagent workflow${paused.length > 1 ? "s were" : " was"} paused when pi quit (${paused.map(w => w.name ?? w.wid).join(", ")}). Ask to resume, or press ↓ then r.` });
+  });
+  // Quitting pi is a stop-burning-tokens moment: on a quit (Ctrl+D, /quit, a closed terminal, SIGTERM) this session's
+  // running workflows are held — fenced without sealing, so nothing is lost and `resume` continues them in the same
+  // sessions. A crash or SIGKILL runs no handler: then the work keeps running, as durability promises.
+  // Switching sessions (/new, /resume, fork) or reloading does not pause. config.json "onQuit": "continue" opts out.
+  pi.on("session_shutdown", async event => {
+    if (event.reason === "quit" && quitPolicy(home) === "pause" && outbox && !stopped) {
+      try {
+        const running = statusView(home, { origin: sender }).workflows.some(w => w.origin === sender && w.status === "running" && !w.paused);
+        if (running) await serial(async () => { await outbox?.send("orch", "drain", { fence: true, origin: sender }); });
+      } catch (error) { console.error("durable-subagents: could not pause on quit:", error); }
+    }
+    await close();
+  });
   pi.on("turn_end", boundary); pi.on("agent_before_settle", boundary);
   pi.on("context", async event => ({ messages: event.messages.map(msg => {
     if (msg.role !== "custom" || msg.customType !== CT.attention) return msg;
@@ -158,6 +181,8 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     // A send addressed like a stop (target:) means the same call; the field name is not worth a failed round trip.
     if (args.action === "send" && args.to === undefined && typeof args.target === "string") { const { target, ...rest } = args; args = { ...rest, to: target }; }
     if (args.action === "send") args = completeSend(args);
+    // A session resumes its own held work (what its quit paused); the CLI `resume` remains the global one.
+    if (args.action === "resume" && args.wid === undefined) args = { ...args, origin: sender };
     const normalized = request(args as Parameters<typeof request>[0], cwd);
     if (normalized.kind === "run") {
       const body = normalized.body as RunBody;
@@ -207,7 +232,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   } catch { /* Discovery problems surface when a run is pinned. */ }
   pi.registerTool(defineTool({
     name: "subagents", label: "Subagents", description: [
-      "Durable asynchronous subagents; run returns {wid} when created (or {submitted:{rid}} while pending). A finished workflow (its notice carries every agent's result) or a question wakes you, so after starting work end your turn: never poll with sleep or repeated status. Crash recovery resumes sessions, not external side effects. Background helper processes (orchestrator, evaluator) exit by themselves about 10 s after all work ends: never kill processes or delete files to 'clean up'.",
+      "Durable asynchronous subagents; run returns {wid} when created (or {submitted:{rid}} while pending). A finished workflow (its notice carries every agent's result) or a question wakes you, so after starting work end your turn: never poll with sleep or repeated status. Crash recovery resumes sessions, not external side effects. Background helper processes (orchestrator, evaluator) exit by themselves about 10 s after all work ends: never kill processes or delete files to 'clean up'. When the user quits pi, this session's running workflows pause (nothing is spent); resume continues them.",
       "run (action optional for exactly one launch form): agent+task; tasks:[call specs] parallel; chain:[call specs] sequential ({previous}); workflow:'./script.js' or source (runs.run(key,spec), runs.all([...]), emit(value), args, runs.input(name)). Optional name, model, cwd, timeoutMs, usageBudget, maxCalls, inputs. Explicit unknown agents are rejected BEFORE creation, with available names; unknown script agents fail only their call.",
       "agents: list names, descriptions, default models and source for this cwd; use these names for run.",
       "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn. answer: give the qid (or just the call, or nothing when one question is open); to and rev are filled in. A question that needs the user's decision goes to the user; if you answer one yourself, tell the user what you chose. model switches at next provider request. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",

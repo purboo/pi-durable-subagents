@@ -173,14 +173,15 @@ export interface WithdrawBody { rids: Rid[] }
 export interface StopBody { target: Wid | CallId }
 /** kind "revise" (P14). */
 export interface ReviseBody { wid: Wid; workflow?: string; source?: string; args?: unknown }
-/** kind "resume": adopt/continue unfinished work (all when wid absent). */
-export interface ResumeBody { wid?: Wid }
+/** kind "resume": continue held or parked work — one workflow (`wid`), one session's (`origin`), or all. */
+export interface ResumeBody { wid?: Wid; origin?: string }
 /** kind "prune": archive finished workflows (done/failed/stopped, no open generation): the named one, or all that ended
  *  more than `olderThanDays` days ago. The workflow directory is removed; the orchestrator ledger keeps its identity. */
 export interface PruneBody { wid?: Wid; olderThanDays?: number }
-/** kind "drain": durable; no new dispatch and no continuation until `resume`. Running calls finish, unless
- *  `fence` (CLI stop-all): then every running execution is fenced WITHOUT sealing, so journals stay resumable. */
-export interface DrainBody { fence?: boolean }
+/** kind "drain": durable hold of the workflows that exist now — all of them, or only one session's (`origin`, e.g. when
+ *  that pi quits) or one workflow (`wid`): no new dispatch and no continuation until `resume`. Running calls finish,
+ *  unless `fence` (stop-all, quit): then their executions are fenced WITHOUT sealing, so journals stay resumable. */
+export interface DrainBody { fence?: boolean; origin?: string; wid?: Wid }
 
 // Request bodies addressed to a child (to: CallId), written by the orchestrator (own requests or P7 forwards).
 /** kinds "task" | "steer" | "follow-up" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */

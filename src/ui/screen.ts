@@ -209,6 +209,7 @@ export class SubagentScreen implements Component {
         else if (key === "f" && c?.phase === "sealed") this.beginListInput("follow-up", row!);
         else if (key === "a" && c && asking) this.beginListInput("answer", row!);
         else if (key === "m" && c) this.modelMenu(c);
+        else if (key === "r" && w?.paused) this.listAction({ action: "resume", wid: w.wid }, `resume ${w.name ?? w.wid}`);
         else if (key === "x" && (c && c.phase !== "sealed" || row?.kind === "workflow" && w?.status === "running")) {
           this.stopTarget = c ? { id: c.callId, name: label(c) } : { id: w!.wid, name: w!.name ?? w!.wid };
         }
@@ -248,7 +249,10 @@ export class SubagentScreen implements Component {
   private transcript(c: CallSnapshot, w: WorkflowSnapshot, width: number): { lines: string[]; thoughts: number[] } {
     const entries = this.data.sessions.get(c.callId) ?? [], lines: string[] = [], thoughts: number[] = [];
     const tools = new Map<string, ToolExecutionComponent>();
-    const components: (Component | string)[] = [];
+    // A `{ thought }` part is an expanded thinking block: like pi, a click anywhere on it collapses it again.
+    const components: (Component | string | { thought: Component })[] = [];
+    const assistant = (content: AssistantMessage["content"], m?: AssistantMessage) =>
+      new AssistantMessageComponent({ ...(m ?? { role: "assistant", api: "", provider: "", model: "", usage: undefined, stopReason: "stop", timestamp: Date.now() }), content } as unknown as AssistantMessage, false, markdown, undefined, 0);
     const markdown = getMarkdownTheme();
     const task = this.data.facts.get(c.callId)?.task;
     if (task) components.push(new UserMessageComponent(task, markdown, 0));
@@ -266,8 +270,9 @@ export class SubagentScreen implements Component {
         const elapsed = thinkingElapsed(entries, index);
         const clock = elapsed === undefined ? "" : ` ${Math.floor(elapsed / 1000)}s`;
         if (hasThinking) components.push(`${thinking.trim() ? (this.expandedThinking ? "▾ " : "▸ ") : ""}Thinking${clock}${thoughtSummary(thinking) ? ` · ${thoughtSummary(thinking)}` : ""}`);
-        const content = m.content.filter(b => b.type !== "toolCall" && (this.expandedThinking || b.type !== "thinking"));
-        if (content.length) components.push(new AssistantMessageComponent({ ...m, content } as AssistantMessage, false, markdown, undefined, 0));
+        const thoughtBlocks = m.content.filter(b => b.type === "thinking"), rest = m.content.filter(b => b.type !== "toolCall" && b.type !== "thinking");
+        if (this.expandedThinking && thoughtBlocks.some(b => b.thinking?.trim())) components.push({ thought: assistant(thoughtBlocks, m) });
+        if (rest.length) components.push(assistant(rest, m));
         for (const b of m.content) if (b.type === "toolCall") {
           const component = new ToolExecutionComponent(b.name, b.id, b.arguments, { showImages: false }, undefined, this.tui, w.cwd ?? this.ctx.cwd);
           component.markExecutionStarted(); component.setArgsComplete(); component.setExpanded(this.expandedTools);
@@ -286,8 +291,8 @@ export class SubagentScreen implements Component {
     else if (live?.phase === "streaming") {
       const age = ` ${Math.floor((Date.now() - live.since) / 1000)}s`;
       if (live.thinking) components.push(`${this.expandedThinking ? "▾ " : "▸ "}Thinking${age}${thoughtSummary(live.thinking) ? ` · ${thoughtSummary(live.thinking)}` : ""}`);
-      const content = [...(this.expandedThinking && live.thinking ? [{ type: "thinking" as const, thinking: live.thinking }] : []), ...(live.text ? [{ type: "text" as const, text: live.text }] : [])];
-      if (content.length) components.push(new AssistantMessageComponent({ role: "assistant", content, api: "", provider: "", model: "", usage: undefined, stopReason: "stop", timestamp: Date.now() } as unknown as AssistantMessage, false, markdown, undefined, 0));
+      if (this.expandedThinking && live.thinking) components.push({ thought: assistant([{ type: "thinking", thinking: live.thinking }] as AssistantMessage["content"]) });
+      if (live.text) components.push(assistant([{ type: "text", text: live.text }] as AssistantMessage["content"]));
       if (live.tool) components.push(`${SPIN[Math.floor(Date.now() / 500) % SPIN.length]} Writing a ${live.tool} call`);
       if (!live.thinking && !live.text && !live.tool) components.push(`${SPIN[Math.floor(Date.now() / 500) % SPIN.length]} Responding · ${duration(Date.now() - live.since)}`);
     } else if (pending) {
@@ -297,6 +302,7 @@ export class SubagentScreen implements Component {
     if (!components.length) components.push(c.phase === "queued" ? "Waiting for dispatch" : "Waiting for session output");
     for (const component of components) {
       if (typeof component === "string") { if (/^[▸▾]/u.test(component)) thoughts.push(lines.length); lines.push(component); }
+      else if ("thought" in component) { const rows = component.thought.render(width); for (let i = 0; i < rows.length; i++) thoughts.push(lines.length + i); lines.push(...rows); }
       else lines.push(...component.render(width));
     }
     return { lines, thoughts };
@@ -355,7 +361,7 @@ export class SubagentScreen implements Component {
       const keys = [narrow ? "↑↓" : "↑ ↓ select", row && row.kind !== "preview" ? `Enter ${narrow ? "" : row.kind === "workflow" ? (isOpen(row.workflow!, this.state) ? "collapse" : "expand") : row.kind === "call" ? "watch" : "open"}`.trim() : "",
         c && c.phase !== "sealed" ? (narrow ? "s" : "s steer") : "", c?.phase === "sealed" ? (narrow ? "f" : "f follow-up") : "",
         c && c.phase !== "sealed" || row?.kind === "workflow" && row.workflow?.status === "running" ? (narrow ? "x" : "x stop") : "",
-        c ? (narrow ? "m" : "m model") : "", asking ? (narrow ? "a" : "a answer") : "", "Esc back"].filter(Boolean).join(" · ");
+        c ? (narrow ? "m" : "m model") : "", asking ? (narrow ? "a" : "a answer") : "", row?.workflow?.paused ? (narrow ? "r" : "r resume") : "", "Esc back"].filter(Boolean).join(" · ");
       const notice = this.listNotice && this.listNotice.until > Date.now() ? this.listNotice.text : "";
       const footer = this.listInput ? this.listInput.editor.render(size.width) : this.stopTarget ? [`Stop ${this.stopTarget.name}? y confirm · any other key cancels`] : notice ? [notice] : [];
       const body = this.rows.length ? lines.slice(0, Math.max(0, size.height - footer.length)) : ["No subagents"];

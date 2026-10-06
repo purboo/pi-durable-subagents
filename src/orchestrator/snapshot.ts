@@ -122,6 +122,9 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
     } else if (e.type === JT.exec) {
       const call = calls.get(String(e.call)); if (!call) continue;
       call.exec = String(e.exec); call.phase = "running"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
+    } else if (e.type === JT.fenced) {
+      // A fenced execution without a seal (stop-all, a quit pi, a loss before its continuation) waits to run again.
+      const call = byExec.get(String(e.exec)); if (call && call.phase === "running") call.phase = "queued";
     } else if (e.type === "selected") {
       const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
       if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
@@ -201,11 +204,22 @@ function workflowIds(home: string): string[] {
   return wids.filter(wid => !pruned.has(wid));
 }
 
-/** Drain: the workflows a drain (stop-all) holds until resume: those created before the last drain, if no undrain followed. */
+/** Drain: the one hold rule. drain/undrain entries apply to every workflow (no scope), one session's (`origin`) or one
+ *  workflow (`wid`). A workflow is held when the newest entry that applies to it is a drain recorded after it was created. */
+export function holdOf(ledger: readonly Entry[], wid: string, origin?: string): Entry | undefined {
+  const applies = (e: Entry) => (e.wid === undefined && e.origin === undefined) || e.wid === wid || (origin !== undefined && e.origin === origin);
+  const last = ledger.findLast(e => (e.type === "drain" || e.type === "undrain") && applies(e));
+  if (last?.type !== "drain") return undefined;
+  const created = ledger.find(e => e.type === JT.created && e.wid === wid);
+  return !created || created.seq < last.seq ? last : undefined;
+}
+/** Drain: the workflows a drain (stop-all, a quit pi) holds until resume, and since when. */
 export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean } {
-  const ledger = readJournalSnapshot(orchLedger(home)), last = ledger.findLast(e => e.type === "drain" || e.type === "undrain");
-  if (last?.type !== "drain") return { held: () => false };
-  return { since: last.ts, held: wid => (ledger.find(e => e.type === JT.created && e.wid === wid)?.seq ?? -1) < last.seq };
+  const ledger = readJournalSnapshot(orchLedger(home));
+  const origin = (wid: string) => ledger.find(e => e.type === JT.created && e.wid === wid)?.origin as string | undefined;
+  const hold = (wid: string) => holdOf(ledger, wid, origin(wid));
+  const since = ledger.filter(e => e.type === "drain").at(-1)?.ts;
+  return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined };
 }
 
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
@@ -239,6 +253,8 @@ export interface StatusWorkflow {
   /** v12 §4: keys of the current revision whose latest generation is sealed (the `done` of done/total). */
   done: number;
   calls: StatusCall[]; attention: Pick<AttentionItem, "id" | "rev" | "kind" | "text" | "call" | "qid">[];
+  /** Drain: held by stop-all/drain or a quit pi; `resume` continues it. */
+  paused?: boolean;
 }
 export interface StatusView {
   workflows: StatusWorkflow[];
@@ -265,6 +281,7 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
+    ...(wf.paused ? { paused: true } : {}),
   };
 }
 
@@ -279,16 +296,17 @@ function origins(home: string): Map<string, string | undefined> {
 /** P25, T10: Compact status of all workflows: own session first, then newest first; finished ones beyond the first `keep` collapse into a count. */
 export function statusView(home: string, options: { origin?: string; keep?: number } = {}): StatusView {
   const keep = options.keep ?? 10, own = (w: WorkflowSnapshot) => Number(!!options.origin && w.origin === options.origin);
+  const { since, held } = heldWorkflows(home);
   const all = [...origins(home)].sort(([a], [b]) => a < b ? 1 : a > b ? -1 : 0).map(([wid, origin]) => {
-    const wf = workflowSnapshot(home, wid);
-    return wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
+    const wf = workflowSnapshot(home, wid), withOrigin = wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
+    return withOrigin.status === "running" && held(wid) ? { ...withOrigin, paused: true } : withOrigin;
   }).sort((a, b) => own(b) - own(a));
   let finished = 0;
   const shown = all.filter(w => !["done", "failed", "stopped"].includes(w.status) || ++finished <= keep);
   const hidden = all.length - shown.length;
-  const { since, held } = heldWorkflows(home), paused = all.filter(w => w.status === "running" && held(w.wid)).length;
+  const paused = all.filter(w => w.paused).length;
   return { workflows: shown.map(compactWorkflow), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
-    ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused by stop-all/drain since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}) };
+    ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused (stop-all, drain or a quit pi) since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}) };
 }
 
 /** P25, T10: One workflow in full detail (results, outputs, script log path) but without raw journal entries. */

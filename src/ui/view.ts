@@ -100,7 +100,7 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   const question = workflow.attention.find(a => a.kind === "question" && a.call === call.callId);
   if (question) return `asking main agent: ${question.text}`;
   if (workflow.attention.some(a => a.kind === "stall" && a.call === call.callId)) return `no activity for ${duration(now - Math.max(call.lastActivity ?? call.startedAt ?? now, facts?.lastActivity ?? 0))}`;
-  if (call.phase === "queued") return workflow.paused ? "paused by stop-all · resume to start" : "queued: waiting for a free slot";
+  if (call.phase === "queued") return workflow.paused ? "paused · r resumes" : "queued: waiting for a free slot";
   // Liveness (UI §2): the age of the newest evidence ticks, and resets whenever the agent does anything.
   const since = duration(Math.max(0, now - Math.max(call.lastActivity ?? 0, facts?.lastActivity ?? 0, call.startedAt ?? 0)));
   if (facts?.activity) return `${facts.activity} · ${since}`;
@@ -121,24 +121,25 @@ export const resultWord = (status: CallStatus): string => WORDS[status] ?? "fail
 const WORD_ORDER = ["done", "stopped", "failed", "timeout", "budget", "unknown", "skipped", "parked"];
 
 /** UI §1,4, v12 §4: One working sentence; done/total uses planned totals, `n+` while a script workflow keeps proposing. */
-export function summary(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; done: number; total: number; plus: boolean } {
-  const running = workflows.filter(w => w.status === "running"), calls = running.flatMap(w => w.calls);
+export function summary(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; paused: number; done: number; total: number; plus: boolean } {
+  const running = workflows.filter(w => w.status === "running"), open = (w: WorkflowSnapshot) => w.calls.filter(c => c.phase !== "sealed").length;
   const asking = running.reduce((n, w) => n + w.calls.filter(c => c.phase !== "sealed" && w.attention.some(a => a.kind === "question" && a.call === c.callId)).length, 0);
+  const paused = running.filter(w => w.paused).reduce((n, w) => n + open(w), 0); // held work is not working: it burns nothing
   const progress = running.map(progressOf);
-  return { working: calls.filter(c => c.phase !== "sealed").length - asking, asking,
+  return { working: running.reduce((n, w) => n + open(w), 0) - asking - paused, asking, paused,
     done: progress.reduce((n, p) => n + p.done, 0), total: progress.reduce((n, p) => n + p.total, 0), plus: progress.some(p => p.plus) };
 }
 /** UI §1, v12 §4: What needs you first, then what is running, then progress — e.g. "1 asking · 3 working · 12/40 done". */
 export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
   const s = summary(workflows), finished = workflows.filter(w => w.status !== "running").length;
   if (!s.total) return finished ? `${finished} finished` : "nothing running";
-  return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
+  return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", s.paused ? `${s.paused} paused` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
 }
 export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
   const s = summary(workflows);
   // The key that opens the list is spelled out: a bare arrow is easy to miss.
-  if (s.working || s.asking) return `${summaryText(workflows)} · ↓ subagents`;
+  if (s.working || s.asking || s.paused) return `${summaryText(workflows)} · ↓ subagents`;
   const w = workflows.filter(w => w.status !== "running").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
   if (!w) return undefined;
   const latest = [...new Map(w.calls.map(c => [c.key, c])).values()]; // the newest generation of each key (P37)

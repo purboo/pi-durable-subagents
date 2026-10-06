@@ -143,7 +143,7 @@ test("send replaces publishes withdrawal first; all other actions use correct wi
   const entries = readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
   assert.deepEqual(entries.filter(e => e.type === "resolved").map(e => e.rid), [reqs[0]!.rid, reqs[1]!.rid]);
   const current = (await scanInbox(orchInbox(home))).sort((a, b) => a.sseq - b.sseq);
-  assert.equal(current.at(-1)!.sseq, 7); assert.deepEqual(current.at(-1)!.body, {});
+  assert.equal(current.at(-1)!.sseq, 7); assert.deepEqual(current.at(-1)!.body, { origin: sender }); // a session resumes its own held work
   assert.equal(existsSync(join(home, "spawn.log")), false);
 });
 

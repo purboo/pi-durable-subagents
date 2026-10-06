@@ -11,7 +11,7 @@ import { publishRequest } from '../../../../src/kernel/mailbox.ts';
 import { orchInbox, orchLedger, orchLock, pinnedDir, journalPath } from '../../../../src/paths.ts';
 import { OsLock } from '../../../../src/platform/lock.ts';
 import { Engine } from '../../../../src/orchestrator/engine.ts';
-import { workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
+import { statusView, workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
 import { contentHash } from '../../../../src/kernel/ids.ts';
 import { main } from '../../../../src/orchestrator/main.ts';
 import { EvaluatorClient, type EvaluatorTransport } from '../../../../src/orchestrator/evaluator-client.ts';
@@ -723,11 +723,10 @@ test('T6: resume of a final workflow and stop of a sealed call reject with reaso
   assert.equal(decision(ledgers, rid)?.reason, 'nothing-to-resume');
   assert.equal(wf.journal.entries().filter(e => e.type === 'resumed' || e.type === 'stop-requested').length, 0);
   assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 1, 'nothing reran');
-  // A drained orchestrator is resumable even when the named workflow is final: the drain is released.
+  // A drain holds only unfinished workflows: a final one stays final under a drain, and the reply says so.
   await submit(engine, home, 'drain', {}, 4);
   rid = await submit(engine, home, 'resume', { wid: wf.wid }, 5);
-  assert.equal(decision(ledgers, rid)?.type, JT.applied);
-  assert.equal(ledgers.orch.entries().findLast(e => e.type === 'undrain')?.rid, rid);
+  assert.deepEqual([decision(ledgers, rid)?.type, decision(ledgers, rid)?.reason], [JT.rejected, 'terminal:done \u2014 start a new run']);
   assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
   rid = await submit(engine, home, 'stop', { target: wf.wid }, 6);
   assert.equal(decision(ledgers, rid)?.reason, 'terminal:done', 'stopping a finished workflow is rejected, not silently applied');
@@ -810,4 +809,28 @@ test('P25: a bare wid addresses a single-call workflow; an unknown target names 
   assert.equal(rejected.reason, `unknown-call: use one of ${wf.wid}/a`);
   await submit(engine, home, 'send', { to: wf.wid, kind: 'steer', message: 'use TOML' }, 2);
   await until(() => ledgers.orch.entries().some(e => e.type === JT.applied && e.rid === 'control-2'));
+});
+
+test('quit pause: a drain scoped to one session holds only its workflows; another session keeps running; resume of that origin continues them', async t => {
+  const { engine, home, ledgers, run } = await fixture(t, undefined, 'held');
+  const mine = await run(`return await runs.run('held', {agent:'test',task:'mine'});`, {}, 1);
+  const req: Request<RunBody> = { rid: 'run-other', from: 'main:other', to: 'orch', sseq: 1, kind: 'run', body: { cwd: join(home, 'project'), source: `return await runs.run('b', {agent:'test',task:'other'});` } };
+  await publishRequest(orchInbox(home), req); await engine.intake();
+  const other = engine.store.workflows.get(ledgers.orch.entries().find(e => e.type === JT.created && e.rid === 'run-other')!.wid as string)!;
+  await until(() => mine.journal.entries().some(e => e.type === 'fake-run'));
+  const origin = mine.origin;
+  await submit(engine, home, 'drain', { fence: true, origin }, 1);
+  await until(() => mine.journal.entries().some(e => e.type === 'fake-fenced'));
+  await until(() => other.journal.entries().some(e => e.type === JT.done));
+  assert.equal(workflowSnapshot(home, other.wid).status, 'done', 'the other session was not paused');
+  assert.equal(workflowSnapshot(home, mine.wid).status, 'running');
+  assert.equal(statusView(home).workflows.find(w => w.wid === mine.wid)!.paused, true);
+  assert.equal(statusView(home).workflows.find(w => w.wid === mine.wid)!.calls[0]!.phase, 'queued', 'a fenced, unsealed call waits; it is not shown as running');
+  const fakeRuns = () => mine.journal.entries().filter(e => e.type === 'fake-run').length;
+  await delay(100); assert.equal(fakeRuns(), 1, 'nothing is dispatched while held');
+  const rid = await submit(engine, home, 'resume', { origin }, 2);
+  assert.equal(decision(ledgers, rid)?.type, JT.applied);
+  assert.deepEqual(ledgers.orch.entries().findLast(e => e.type === 'undrain'), { ...ledgers.orch.entries().findLast(e => e.type === 'undrain'), rid, origin });
+  await until(() => fakeRuns() === 2);
+  assert.equal(statusView(home).workflows.find(w => w.wid === mine.wid)!.paused, undefined);
 });

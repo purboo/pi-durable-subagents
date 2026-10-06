@@ -212,7 +212,7 @@ test('drain: status and snapshots mark the workflows a drain holds; later runs a
   await orch.append('drain', { rid: 'd', fence: true });
   await orch.append(JT.created, { rid: 'r2', wid: 'W2' });
   const j2 = await openJournal(journalPath(home, 'W2')); await j2.append('wf-created', { rid: 'r2' }); await j2.close();
-  assert.match(statusView(home).paused!, /^1 workflow paused by stop-all\/drain since .*; resume continues them \(new runs are not affected\)$/);
+  assert.match(statusView(home).paused!, /^1 workflow paused \(stop-all, drain or a quit pi\) since .*; resume continues them \(new runs are not affected\)$/);
   assert.deepEqual(allWorkflows(home).map(w => [w.wid, w.paused]), [['W2', undefined], ['W1', true]]);
   await orch.append('undrain', { rid: 'u' }); await orch.close();
   assert.equal(statusView(home).paused, undefined);
