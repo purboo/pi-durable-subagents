@@ -21,7 +21,10 @@ jobs:
       - run: npm ci
       - name: Tag matches package version
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
-      - run: npm publish --provenance --access public
+      - name: Publish to npm (a re-run skips a version that is already published)
+        run: |
+          if npm view "pi-durable-subagents@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "already published"; exit 0; fi
+          npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: GitHub Release from the CHANGELOG
@@ -29,6 +32,6 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           awk -v v="## $version" '$0 == v { on = 1; next } /^## / && on { exit } on' CHANGELOG.md > notes.md
           test -s notes.md
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
