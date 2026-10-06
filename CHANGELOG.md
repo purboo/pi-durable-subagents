@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2
+
+- The dock is back above the editor by default (1.0.1 moved it below). It is
+  set once per session, so listed before another extension's editor bar (such
+  as a powerline bar) in `packages`, it sits above that bar.
+  `"ui": { "dockAt": "below" }` puts it below the editor.
+
 ## 1.0.1
 
 - Model and thinking menus search fuzzily, by id or display name (`bedrock opus`
