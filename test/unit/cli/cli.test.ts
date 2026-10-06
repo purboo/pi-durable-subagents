@@ -9,7 +9,7 @@ import { serviceFiles, manageService } from '../../../src/cli/service.ts';
 import { OsLock } from '../../../src/platform/lock.ts';
 import { openJournal, readJournalSnapshot } from '../../../src/kernel/journal.ts';
 import { scanInbox, publishRequest } from '../../../src/kernel/mailbox.ts';
-import { orchInbox, orchLock, orchLedger } from '../../../src/paths.ts';
+import { journalPath, orchInbox, orchLock, orchLedger } from '../../../src/paths.ts';
 import { Engine } from '../../../src/orchestrator/engine.ts';
 import { fakeExecutor } from '../orchestrator/engine/fake.ts';
 import { JT } from '../../../src/types.ts';
@@ -54,6 +54,8 @@ test('status and tail follow real engine journals with fake executor', { timeout
   await assert.rejects(main(['status', 'missing'], { env: { DSA_HOME: home } }), /Unknown workflow/);
   // T10: the list view is the compact projection; events are a timeline without observation noise.
   const out: string[] = [], env = { DSA_HOME: home }, write = (s: string) => { out.push(s); };
+  // The finished notice is appended just after the workflow's done record; wait for it rather than race it.
+  await until(() => readJournalSnapshot(journalPath(home, wid)).some(e => e.type === JT.attention));
   assert.equal(await main(['status'], { env, write }), 0);
   assert.match(out.join('\n'), new RegExp(`^${wid}@1: done · 1/1 done\n  a@1 ok "hello"\n  finished: ".* done: 1 ok"$`));
   out.length = 0; assert.equal(await main(['status', '--json'], { env, write }), 0);

@@ -83,12 +83,16 @@ export async function observeExecution(d: Dependencies) {
       }
     });
   });
-  let scanning = false;
+  let scanning = false, scanFailures = 0;
   const scan = () => {
     if (scanning) return;
     scanning = true;
     enqueue(async () => { try {
-      clock.scan(await d.track());
+      // One failed process-table scan is no evidence, not a reason to fence a live child: on macOS `ps` can miss its
+      // 2 s deadline right after the orchestrator was stopped or the machine slept (seen on CI as a spurious loss and
+      // a rerun). Only a scan that keeps failing for a minute ends the observation.
+      try { clock.scan(await d.track()); scanFailures = 0; }
+      catch (error) { if (++scanFailures * (config.k?.trackerMs ?? 1000) >= 60_000) throw error; }
       const nextSize = (await fileStat(session).catch(() => ({ size: 0 }))).size;
       if (nextSize > size) { clock.evidence(); size = nextSize; }
       const entries = await (d.read ? d.read() : readSession(session));
