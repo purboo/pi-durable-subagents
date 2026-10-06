@@ -35,6 +35,8 @@ type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
 type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean;
   parking?: string; onPark: Set<() => void>; refusedAt?: number };
 const MEM_RECORD_MS = 30000;
+/** A4, P29: A child admitted within this window may not show in MemAvailable yet; its share is reserved explicitly. */
+const MEM_WARMUP_MS = 30000;
 const ignoreMissing = (error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; };
 const callOf = (exec: string) => exec.slice(0, exec.lastIndexOf("#"));
 const shutdownError = () => Object.assign(new Error("executor shutdown; call resumes on recovery"), { name: "ExecutorShutdown" });
@@ -322,11 +324,15 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           const holders = holdings().filter(e => e.pool === provider);
           const limit = config.providers?.[provider ?? ""]?.slots ?? Infinity;
           if (!capacity({ kind: "provider", holders: holders.length, capacity: limit })) continue;
-          const available = await (options.memory ?? availableMemory)();
-          const admitted = capacity({ kind: "memory", available, reserve: config.memory?.reserveMb ?? 2048, perChild: config.memory?.perChildMb ?? 300 });
+          // A burst of dispatches all read the same MemAvailable before any child has grown: subtract the children
+          // admitted in the last 30 s (their memory is not visible yet), so a burst cannot over-commit the headroom.
+          const perChild = config.memory?.perChildMb ?? 300;
+          const warming = holdings().filter(e => e.pool === "memory" && Date.now() - e.ts < MEM_WARMUP_MS).length;
+          const measured = await (options.memory ?? availableMemory)(), available = measured - warming * perChild;
+          const admitted = capacity({ kind: "memory", available, reserve: config.memory?.reserveMb ?? 2048, perChild });
           // F3: every admitted dispatch is recorded; repeated refusals at most once per 30 s per call.
           if (admitted || a.refusedAt === undefined || Date.now() - a.refusedAt >= MEM_RECORD_MS) {
-            await orch.append("mem", { available, admitted, exec }); a.refusedAt = admitted ? undefined : Date.now();
+            await orch.append("mem", { available, admitted, exec, ...(warming ? { measured, warming } : {}) }); a.refusedAt = admitted ? undefined : Date.now();
           }
           if (!admitted) return;
           const memory = holdings().filter(e => e.pool === "memory");

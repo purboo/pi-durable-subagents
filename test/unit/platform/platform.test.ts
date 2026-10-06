@@ -129,3 +129,17 @@ test("OS lock releases on holder SIGKILL and exactly one concurrent acquirer suc
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("C3 fence never kills a pid whose start differs from the scanned identity (pid reuse)", { skip: process.platform !== "linux", timeout: 10000 }, async () => {
+  const { spawn: spawnChild } = await import("node:child_process");
+  const bystander = spawnChild("sleep", ["30"], { stdio: "ignore" });
+  await new Promise(resolve => bystander.once("spawn", resolve));
+  try {
+    // A scan result that names the bystander's pid with another start token: a reused pid, not our process.
+    const stale = { pid: bystander.pid!, ppid: 1, start: "1", tag: "exec-reused" };
+    let calls = 0;
+    const table = { list: async () => (calls++ ? [] : [stale]) };
+    await new Containment(table as never).fence("exec-reused", [], { timeoutMs: 2000 });
+    assert.equal(bystander.exitCode, null); assert.equal(bystander.signalCode, null);
+  } finally { bystander.kill("SIGKILL"); }
+});

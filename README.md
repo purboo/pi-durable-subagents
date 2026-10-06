@@ -116,11 +116,17 @@ deterministic: use `now()`/`random()`, not `Date`/`Math.random`.
 
 ### Watch any subagent like the main agent
 
-While subagents work, one dim line appears above the editor
-(`1 asks you · 3 working · 12/40 done`). Press `↓` on an empty editor to open
-the list: this session's workflows (sessions are independent), newest
-first, every subagent with its model, what it is
-doing and for how long, and its latest line. Finished ones stay there,
+While subagents work, a small dock sits above the editor: one quiet row per
+working subagent (what it is doing and for how long; it spins while there is
+fresh activity and stops when the agent goes quiet), a question first and
+highlighted, and a summary line (`1 asking · 3 working · 12/40 done · ↓ subagents`).
+When the work ends it shrinks to one sentence and leaves after ten minutes. Set
+`"ui": { "dock": "line" }` (one line) or `"off"` in `~/.pi/durable-subagents/config.json`.
+
+Press `↓` on an empty editor to open the list, a floating panel: this
+session's workflows (sessions are independent), newest first, every
+subagent with its model, what it is doing and for how long, and its latest
+line. Finished ones stay there,
 dimmed, with their conclusion.
 
 The list is also where you act. The footer shows the keys for the selected
@@ -182,6 +188,7 @@ unchanged, with zero edited lines.
 pi-durable-subagents smoke              check this machine and this pi (offline, < 60 s)
 pi-durable-subagents chaos              run the fault suite (offline, about 2 minutes)
 pi-durable-subagents status [wid] [--json]
+pi-durable-subagents events <wid> [--json]   the meaningful timeline of one workflow
 pi-durable-subagents tail [wid] [--json]
 pi-durable-subagents start              start the orchestrator if work is pending; sends nothing
 pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)

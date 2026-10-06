@@ -130,6 +130,35 @@ export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undef
   return `${w.name ?? w.wid} finished: ${parts.join(" · ") || w.status} · ↓ subagents`;
 }
 
+const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/** UI §1: The dock above the editor. While agents work: one row per active agent (questions first, at most `rows`),
+ *  then one summary line; afterwards only the completion sentence for ten minutes; otherwise nothing. Activity spins
+ *  only while there is fresh evidence, so a quiet agent visibly stops moving. */
+export function dockLines(workflows: readonly WorkflowSnapshot[], facts: ReadonlyMap<string, Facts>, name: ModelName, width: number, now = Date.now(), rows = 3): string[] {
+  const live = workflows.filter(w => w.status === "running");
+  const active = live.flatMap(w => {
+    const latest = new Map<string, CallSnapshot>(); for (const c of w.calls) latest.set(c.key, c);
+    return [...latest.values()].filter(c => c.phase !== "sealed").map(c => ({ w, c, asking: w.attention.some(a => a.kind === "question" && a.call === c.callId) }));
+  }).sort((a, b) => Number(b.asking) - Number(a.asking));
+  if (!active.length) {
+    const ended = workflows.filter(w => w.status !== "running").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
+    const line = ended && now - (ended.endedAt ?? 0) < 10 * 60_000 ? mainLine(workflows) : undefined;
+    return line ? [truncateToWidth(line, Math.max(1, width))] : [];
+  }
+  const cols = { key: Math.min(14, Math.max(...active.map(a => visibleWidth(label(a.c))))), model: Math.min(20, Math.max(...active.map(a => visibleWidth(name(facts.get(a.c.callId)?.model ?? a.c.model))))) };
+  const shown = active.slice(0, rows);
+  const lines = shown.map(({ w, c, asking }) => {
+    // A running tool is activity; otherwise a minute without new evidence (no message, no tool) stops the spinner.
+    const f = facts.get(c.callId), fresh = Boolean(f?.activity) || now - Math.max(c.lastActivity ?? 0, f?.lastActivity ?? 0, c.startedAt ?? 0) < 60_000;
+    const mark = asking ? "?" : c.phase === "queued" ? "·" : fresh ? SPIN[Math.floor(now / 500) % SPIN.length]! : "…";
+    const phrase = asking ? `asks: ${w.attention.find(a => a.kind === "question" && a.call === c.callId)!.text}` : statusPhrase(c, w, f, now);
+    return rowText(`${mark} `, label(c), name(f?.model ?? c.model), phrase, [], width, cols);
+  });
+  const more = active.length - shown.length;
+  lines.push(truncateToWidth(`${more ? `+${more} more · ` : ""}${summaryText(workflows)} · ↓ subagents`, Math.max(1, width)));
+  return lines;
+}
+
 /** UI §2, v12 §5: Group workflows (finished ones stay listed, dimmed and expandable — never hidden behind a toggle),
  *  keep unviewed failures visible, and page newest done rows eight at a time. */
 /** v12 §5: Whether a workflow shows its agents: running ones unless folded; finished ones once opened (Enter, or on completion). */

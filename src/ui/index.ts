@@ -3,7 +3,7 @@ import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tu
 import type { UiDeps } from "../agent/main.ts";
 import { UiActions, UiData } from "./data.ts";
 import { SubagentScreen } from "./screen.ts";
-import { mainLine, orderWorkflows, type ViewState } from "./view.ts";
+import { dockLines, mainLine, modelLabel, orderWorkflows, type ViewState } from "./view.ts";
 import { registerCards } from "./cards.ts";
 import { toolRenderers } from "./tool.ts";
 
@@ -34,10 +34,19 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
         for (const result of actions.resolutions.splice(0)) screen?.controlResult(result);
         const own = `main:${ctx.sessionManager.getSessionId()}`;
         data.workflows = orderWorkflows(data.workflows, own);
-        const line = mainLine(data.workflows);
-        ctx.ui.setWidget("durable-subagents", line ? (_tui, theme) => ({
+        // UI §1: the dock — live rows per active agent plus a summary line ("auto"), only the summary ("line"), or nothing.
+        const name = (model: string | undefined) => modelLabel(model, (p, id) => ctx.modelRegistry.find(p, id), data.aliases);
+        const now = Date.now(), dock = data.dock;
+        const lines = (width: number) => dock === "off" ? [] : dock === "line" ? [mainLine(data.workflows) ?? ""].filter(Boolean) : dockLines(data.workflows, data.facts, name, width, now);
+        const right = (text: string, width: number) => { const t = truncateToWidth(text, width); return " ".repeat(Math.max(0, width - visibleWidth(t))) + t; };
+        ctx.ui.setWidget("durable-subagents", lines(200).length ? (_tui, theme) => ({
           invalidate() {},
-          render(width) { const text = truncateToWidth(line, width); return [theme.fg("dim", " ".repeat(Math.max(0, width - visibleWidth(text))) + text)]; },
+          render(width) {
+            const rows = lines(width);
+            // Agent rows read left to right and stay quiet; a question is the one thing that stands out. The last line
+            // (the summary or the completion sentence) sits on the right, where the old single line was.
+            return rows.map((row, i) => i === rows.length - 1 ? theme.fg("dim", right(row, width)) : row.startsWith("? ") ? theme.fg("warning", row) : theme.fg("muted", row));
+          },
         }) : undefined, { placement: "aboveEditor" });
         screen?.refresh();
       } catch { /* P21: journal or UI unavailability must not interrupt the main agent. */ }

@@ -15,6 +15,8 @@ export class UiData {
   facts = new Map<string, Facts>();
   sessions = new Map<string, readonly SessionEntry[]>();
   aliases: Record<string, string> = {};
+  /** UI §1: the dock above the editor — "auto" (live rows), "line" (one summary line) or "off". */
+  dock: "auto" | "line" | "off" = "auto";
   private tails = new Map<string, SessionTail>();
   home: string;
   constructor(home: string) { this.home = home; }
@@ -41,7 +43,8 @@ export class UiData {
     try {
       const config = JSON.parse(readFileSync(join(this.home, "config.json"), "utf8"));
       this.aliases = Object.fromEntries(Object.entries(config.ui?.modelAliases ?? {}).filter(([, v]) => typeof v === "string")) as Record<string, string>;
-    } catch { this.aliases = {}; }
+      this.dock = ["auto", "line", "off"].includes(config.ui?.dock) ? config.ui.dock : "auto";
+    } catch { this.aliases = {}; this.dock = "auto"; }
   }
 }
 
