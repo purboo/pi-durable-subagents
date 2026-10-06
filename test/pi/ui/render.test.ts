@@ -211,6 +211,12 @@ test("actual journals and session growth feed fresh snapshots; rejection is a no
   await j.append("selected", { exec: "run@1/E02@1#1.1", model: { provider: "openai", id: "gpt-6" } }); await j.close();
   data.refresh(); assert.equal(data.workflows[0]!.calls[0]!.phase, "running");
   assert.equal(data.facts.get("run@1/E02@1")!.thinking, "high");
+  // Cached facts follow an appended session record and a new journal entry, not the previous refresh.
+  const grown = session(); grown.push({ ...grown.at(-1)!, id: "6", parentId: "5", type: "thinking_level_change", thinkingLevel: "low" } as never);
+  writeSession(callSession(home, "run", "E02", 1), grown);
+  data.refresh(); assert.equal(data.facts.get("run@1/E02@1")!.thinking, "low");
+  const more = await openJournal(journalPath(home, "run")); await more.append("loss", { exec: "run@1/E02@1#1.1" }); await more.close();
+  data.refresh(); assert.equal(data.facts.get("run@1/E02@1")!.activity, "connection dropped, retrying");
   const notes: string[] = [], actions = new UiActions({ home, submit: async () => ({ submitted: { rid: "rejected" } }), presentNote: n => { notes.push(n); } });
   await actions.send({ action: "send" }, "continued E02");
   const ledger = await openJournal(orchLedger(home)); await ledger.append("rejected", { rid: "rejected", reason: "call-sealed" }); await ledger.close();
