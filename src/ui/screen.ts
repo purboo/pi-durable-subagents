@@ -213,6 +213,9 @@ export class SubagentScreen implements Component {
         else if (key === "x" && (c && c.phase !== "sealed" || row?.kind === "workflow" && w?.status === "running")) {
           this.stopTarget = c ? { id: c.callId, name: label(c) } : { id: w!.wid, name: w!.name ?? w!.wid };
         }
+        // Typing that is not a list key is meant for pi (a message typed with the list still open would
+        // otherwise have its Enter open a watch view): close the list and hand the text to the editor.
+        else if (!"sfamxr".includes(key) && /^[^\x00-\x1f\x7f]+$/u.test(key)) { this.close(); this.ctx.ui.pasteToEditor(key); }
       }
     } else if (this.busy) {
       // Preserve the draft and target until its durable submission resolves.
@@ -341,19 +344,22 @@ export class SubagentScreen implements Component {
     if (!this.watching || this.doneTab) {
       const w = this.current().w;
       const footerRows = this.listInput ? 1 : this.stopTarget || (this.listNotice && this.listNotice.until > Date.now()) ? 1 : 0;
+      // A two-column gutter carries the selection marker: a background alone is invisible in some themes and in
+      // plain-text captures, and x must show which row it would stop.
+      const rowWidth = Math.max(1, size.width - 2);
       this.rows = this.doneTab && w ? doneOrder(w.calls).map(c => {
         const f = this.data.facts.get(c.callId);
-        return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", label(c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], size.width) };
-      }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, size.width);
+        return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", label(c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], rowWidth) };
+      }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, rowWidth);
       height = this.height(Math.max(1, this.rows.length) + footerRows); size = inner(width, height); // inner width does not depend on height
       this.selected = keepSelection(this.rows, this.selectedId, this.selected);
       while (this.rows[this.selected]?.kind === "preview" && this.selected > 0) this.selected--;
       this.selectedId = this.rows[this.selected]?.id;
       const start = Math.max(0, this.selected - size.height + 1);
       const lines = this.rows.slice(start, start + size.height).map((row, i) => {
-        const fit = fitWidth(row.text, size.width);
+        const fit = fitWidth(row.text, rowWidth);
         const text = row.failed ? this.theme.fg("error", fit) : row.kind === "preview" || row.dim ? this.theme.fg("dim", fit) : row.kind === "workflow" ? this.theme.bold(fit) : fit;
-        return i + start === this.selected ? this.theme.bg("selectedBg", text) : text;
+        return i + start === this.selected ? this.theme.bg("selectedBg", this.theme.fg("accent", "› ") + text) : `  ${text}`;
       });
       const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined;
       const asking = c && row?.workflow?.attention.some(a => a.kind === "question" && a.call === c.callId);

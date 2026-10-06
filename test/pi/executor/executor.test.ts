@@ -911,7 +911,7 @@ test("F1 a stuck fence of a real child parks only its call with attention; a sib
   // pi exits when its stdin ends (rpc-mode.js:642) and kills its bash tree (shell.js killProcessTree), so only a
   // detached (setsid) descendant outlives the child: it plays the process the stuck fence cannot retire.
   const a = f.ticket("a", script([{ tool: "bash", args: { command: `${detachedSleep(60)} >/dev/null; sleep 60` } }, { text: "never" }])), b = f.ticket("b", script([{ delayMs: 300, text: "sibling done" }]));
-  const ea = `${a.callId}#1.1`, tagged = async () => (await new ProcessTable().list()).filter(p => p.tag === ea);
+  const ea = `${a.callId}#1.1`, tagged = async () => (await new ProcessTable().list(new Set([ea]))).filter(p => p.tag === ea); // macOS reads tags only for known ids
   t.mock.method(console, "error", () => {});
   stuck = ea;
   try {

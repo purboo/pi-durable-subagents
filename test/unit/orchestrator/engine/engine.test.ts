@@ -687,7 +687,7 @@ test('v12 §3: finished attention digests latest calls, report, errors and stopp
   assert.doesNotMatch(current, /DONE: a/);
 });
 
-test('v12 §3: digest bounds each agent and whole notice, preserving output and report tails', async () => {
+test('v12 §3: digest shares the notice fairly, bounds the whole, and keeps output and report tails', async () => {
   const { finishedText } = await import('../../../../src/orchestrator/engine.ts');
   const e = (seq: number, type: string, fields: Record<string, unknown>) => ({ seq, ts: seq, type, ...fields });
   const entries = [e(1, 'wf-created', { name: 'bulk', revision: 1 })];
@@ -706,7 +706,17 @@ test('v12 §3: digest bounds each agent and whole notice, preserving output and 
   assert.match(digest, /\nError: workflow error\nFull output: subagents status wid:w$/);
   const single = finishedText('w', entries as never, 'w@1/k0@1');
   assert.ok(single.length <= 6000);
-  assert.ok(single.split('\nFull output')[0]!.length < 1600, 'the single report also respects the per-agent bound');
+  assert.match(single, /"detail":"Y{3000}","ending":"report-tail"/, 'a single report that fits is not cut');
+  // Short results take only what they need; the long one gets the rest.
+  const mixed = [e(1, 'wf-created', { name: 'mix', revision: 1 })];
+  for (const [i, output] of ['short-a', 'short-b', 'L'.repeat(9000) + 'long-tail'].entries()) {
+    mixed.push(e(mixed.length + 1, 'call', { key: `m${i}`, gen: 1, spec: { agent: 'x' } }));
+    mixed.push(e(mixed.length + 1, 'sealed', { call: `w@1/m${i}@1`, result: { key: `m${i}`, gen: 1, status: 'ok', ok: true, output } }));
+  }
+  mixed.push(e(mixed.length + 1, 'workflow-done', { status: 'done' }));
+  const fair = finishedText('w', mixed as never);
+  assert.ok(fair.length <= 6000 && fair.length > 5500, `fair notice is ${fair.length} characters`);
+  assert.match(fair, /m0: ok\n  short-a\nm1: ok\n  short-b\nm2: ok\n  …L+long-tail/);
 });
 
 const decision = (ledgers: Ledgers, rid: string) => ledgers.orch.entries().find(e => (e.type === JT.applied || e.type === JT.rejected) && e.rid === rid);

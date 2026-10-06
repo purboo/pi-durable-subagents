@@ -15,7 +15,17 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     const n = next();
     return name !== "subagents" ? n : { ...n, renderCall: n?.renderCall ?? toolRenderers.renderCall as never, renderResult: n?.renderResult ?? toolRenderers.renderResult as never };
   });
-  let cleanup: (() => void) | undefined;
+  let cleanup: (() => void) | undefined, openList: (() => "opened" | "empty" | "busy") | undefined;
+  // `/subagents` opens the same list as ↓ (people look for a command first). With pi-subagents also
+  // installed, pi names the two commands /subagents:1 and /subagents:2.
+  if (typeof pi.registerCommand === "function") pi.registerCommand("subagents", {
+    description: "Open the durable subagents list (same as ↓ on an empty editor)",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      const result = openList?.();
+      if (result === "empty") ctx.ui?.notify?.("No subagent workflows in this session yet. Ask the agent to run some; they appear here and above the editor.", "info");
+      else if (!result) ctx.ui?.notify?.("The subagents list needs interactive pi; from a shell use `pi-durable-subagents status`.", "info");
+    },
+  });
   const start = (_event: unknown, ctx: ExtensionContext) => {
     cleanup?.(); cleanup = undefined;
     if (ctx.mode !== "tui" || !ctx.hasUI || !ctx.ui?.custom || !ctx.ui?.onTerminalInput || !ctx.ui?.setWidget) return;
@@ -24,7 +34,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     let screen: SubagentScreen | undefined, opening = false, stopped = false, closeScreen: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined, timer: ReturnType<typeof setInterval> | undefined;
     const stop = () => {
-      stopped = true; clearInterval(timer); unsubscribe?.(); screen?.dispose(); closeScreen?.();
+      stopped = true; clearInterval(timer); unsubscribe?.(); screen?.dispose(); closeScreen?.(); openList = undefined;
       try { ctx.ui.setWidget("durable-subagents", undefined); } catch { /* P21: disappearing UI surface. */ }
     };
     const refresh = () => {
@@ -53,14 +63,21 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     };
     try {
       refresh();
-      unsubscribe = ctx.ui.onTerminalInput(key => {
-        if (stopped || opening || !matchesKey(key, "down") || ctx.ui.getEditorText() !== "" || !data.workflows.length) return;
+      const open = (): "opened" | "empty" | "busy" => {
+        if (stopped || opening) return "busy";
+        if (!data.workflows.length) return "empty";
         opening = true;
         void (async () => { await ctx.ui.custom<void>((tui, theme, _keys, done) => {
           closeScreen = () => done();
           screen = new SubagentScreen(data, actions, ctx, tui, theme, closeScreen, state);
           return screen;
         }, { overlay: true, overlayOptions: () => screen?.overlay() ?? { anchor: "center", width: "85%", maxHeight: "60%", margin: 1 } }); })().catch(() => {}).finally(() => { screen?.dispose(); screen = undefined; closeScreen = undefined; opening = false; });
+        return "opened";
+      };
+      openList = open;
+      unsubscribe = ctx.ui.onTerminalInput(key => {
+        if (stopped || opening || !matchesKey(key, "down") || ctx.ui.getEditorText() !== "" || !data.workflows.length) return;
+        open();
         return { consume: true };
       });
       timer = setInterval(refresh, 500); timer.unref(); cleanup = stop;

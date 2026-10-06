@@ -102,7 +102,7 @@ export async function scenario(n: number, root: string, env: NodeJS.ProcessEnv) 
     await until(() => main().some(e => e.customType === CT.attention && e.details.items.some((i: AttentionItem) => i.kind === "finished")), "finished presentation");
     await pi.prompt([{ text: "Refresh resolved attention." }]);
     const entries = journal(), seals = entries.filter(e => e.type === JT.sealed), result = done.result as Record<string, any>;
-    check(seals.length === (n === 2 || n === 8 ? 1 : n === 7 ? 2 : 3), `dispatch count / skipped dependents: ${JSON.stringify(seals.map(e => [e.call, (e.result as { status?: string })?.status, (e.result as { error?: string })?.error]))}`);
+    check(seals.length === (n === 2 || n === 8 ? 1 : n === 7 ? 2 : 3), `dispatch count / skipped dependents: seals ${JSON.stringify(seals.map(e => [e.call, (e.result as { status?: string })?.status, (e.result as { error?: string })?.error]))}; result ${JSON.stringify(Object.fromEntries(Object.entries(result ?? {}).map(([k, v]) => [k, [v?.status, String(v?.output ?? v?.error ?? "").slice(0, 80)]])))}; journal ${entries.filter(e => !["time", "observation", "usage"].includes(e.type)).map(e => e.type).join(" ").slice(-1500)}`);
     const expected = n === 2 ? "timeout" : n === 8 ? "failed" : "ok";
     check(result.writer.status === expected, `writer expected ${expected}: ${JSON.stringify(result.writer)}`);
     if ([2, 8].includes(n)) check(result.reviewer.status === "skipped" && result.integrator.status === "skipped", "dependency skips");
