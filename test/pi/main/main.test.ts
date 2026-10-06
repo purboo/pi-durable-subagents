@@ -226,10 +226,19 @@ test("T6/T10 real orchestrator: control actions report applied or the rejection 
   const wake = pi.events.length;
   await until(() => items(pi).some(e => JSON.stringify(e.details).includes('"finished"')), 20000);
   await pi.waitFor(e => pi.events.indexOf(e) >= wake && e.type === "agent_settled", 20000).catch(() => {});
+  // A control is answered with its decision when one arrives within 10 s, else {submitted:{rid}} (a cold orchestrator
+  // start on a slow runner); either way the durable decision is the same.
+  const decided = async () => {
+    const details = result(pi).result.details;
+    if (details.rid) return details;
+    const rid = details.submitted?.rid; assert.ok(rid, JSON.stringify(details));
+    const entry = await until(() => readJournalSnapshot(orchLedger(home)).find(e => (e.type === JT.applied || e.type === JT.rejected) && e.rid === rid), 30000);
+    return entry.type === JT.applied ? { rid, applied: true } : { rid, applied: false, reason: entry.reason };
+  };
   await prompt(pi, [{ tool: "subagents", args: { action: "resume", wid } }, { text: "done" }]);
-  { const { rid, ...rest } = result(pi).result.details; assert.ok(rid); assert.deepEqual(rest, { applied: false, reason: "terminal:done \u2014 start a new run" }); }
+  { const { rid, ...rest } = await decided(); assert.ok(rid); assert.deepEqual(rest, { applied: false, reason: "terminal:done \u2014 start a new run" }); }
   await prompt(pi, [{ tool: "subagents", args: { action: "stop", target: wid } }, { text: "done" }]);
-  { const { rid, ...rest } = result(pi).result.details; assert.ok(rid); assert.deepEqual(rest, { applied: false, reason: "terminal:done" }); }
+  { const { rid, ...rest } = await decided(); assert.ok(rid); assert.deepEqual(rest, { applied: false, reason: "terminal:done" }); }
   await prompt(pi, [{ tool: "subagents", args: { action: "status" } }, { text: "done" }]);
   const view = result(pi).result.details;
   assert.deepEqual(view.workflows.map((w: any) => [w.wid, w.name, w.status, w.origin]), [[wid, "probe", "done", sender]]);
