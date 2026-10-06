@@ -173,13 +173,17 @@ export function registerChild(pi: ExtensionAPI): void {
   // C8: last line of defence before each provider request — pi 1.0.2 occasionally starts a resumed turn with its
   // placeholder model ("unknown"); re-apply the model the executor holds a slot for.
   // A model request applied by this child (P12) replaces the target.
-  pi.on('context', async (_event, ctx) => {
+  // turn_start runs before the request is prepared (pi reads the model then); `context` runs after it, too late for
+  // that request (seen on CI: model_change after the delivered message, then "Unknown provider: unknown"). Keep both.
+  const guard = async (_event: unknown, ctx: ExtensionContext) => {
     const slash = target?.indexOf('/') ?? -1;
     if (!target || slash <= 0 || `${ctx.model?.provider}/${ctx.model?.id}` === target) return;
     const model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
     if (model) await pi.setModel(model);
     else console.error(`durable-subagents: model ${target} is not registered before a provider request`);
-  });
+  };
+  pi.on('turn_start', guard);
+  pi.on('context', guard);
   if (budget) pi.on('context', async (_event, ctx) => {
     if (!active) return;
     const used = usage(ctx.sessionManager.getEntries() as unknown as SessionLike[], call);
