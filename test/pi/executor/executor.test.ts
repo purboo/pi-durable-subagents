@@ -29,7 +29,7 @@ async function until(predicate: () => boolean | Promise<boolean>, ms = 15000) {
 /** A compact journal and session trace for a failure message (CI logs are the only evidence of a flake). */
 function trace(entries: readonly Record<string, unknown>[], native: readonly Record<string, unknown>[]): string {
   const j = entries.filter(e => e.type !== "time").map(e => e.type === "observation" ? `obs:${(e.event as { type?: string }).type}` : `${e.type}${e.exec ? `(${String(e.exec).split("#")[1]})` : ""}`);
-  const n = native.map(e => e.type === "message" ? `msg:${(e.message as { role?: string; stopReason?: string }).role}/${(e.message as { stopReason?: string }).stopReason ?? ""}` : `${e.type}${e.customType ? `:${e.customType}` : ""}`);
+  const n = native.map(e => e.type === "message" ? `msg:${(e.message as { role?: string }).role}/${(e.message as { stopReason?: string }).stopReason ?? ""}${(e.message as { errorMessage?: string }).errorMessage ? `[${(e.message as { errorMessage?: string }).errorMessage}]` : ""}${(e.message as { model?: string }).model ? `@${(e.message as { model?: string }).model}` : ""}` : e.type === "model_change" ? `model_change:${String(e.modelId)}` : `${e.type}${e.customType ? `:${e.customType}` : ""}`);
   return `journal: ${j.join(" ")}\nsession: ${n.join(" ")}`;
 }
 async function setup(t: TestContext, config: OrchestratorConfig = {}, options: Parameters<typeof createExecutor>[1] = {}) {
@@ -754,6 +754,7 @@ test("X1 K7 skips the third-loss candidate and changes the continuation's model"
   assert.equal((await f.executor.run(ticket)).output, "new candidate");
   assert.equal(f.orch.entries().filter(e => e.type === "skip").length, 1);
   const selected = f.journal.entries().filter(e => e.type === "selected").map(e => (e.model as { id: string }).id);
+  if (process.env.DSA_TRACE) console.log("TRACE", trace(f.journal.entries(), await readFile(callSession(f.home, f.wid, "a", 1), "utf8").then(s => s.trim().split("\n").map(l => JSON.parse(l)))));
   assert.deepEqual(selected, ["scripted", "scripted", "scripted", "scripted2"], trace(f.journal.entries(), await readFile(callSession(f.home, f.wid, "a", 1), "utf8").then(s => s.trim().split("\n").map(l => JSON.parse(l)))));
   assert.ok(f.journal.entries().some(e => e.type === "observation" && (e.event as { model?: string }).model === "scripted2"));
 });
