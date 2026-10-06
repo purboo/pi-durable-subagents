@@ -12,7 +12,7 @@ export const SURFACES: readonly Surface[] = [
     .map(name => ({ tier: 2 as const, where: "@earendil-works/pi-coding-agent", name })),
   { tier: 2, where: "ExtensionAPI", name: "registerMessageRenderer" },
   { tier: 2, where: "@earendil-works/pi-tui", name: "wrapTextWithAnsi" },
-  ...["Input", "SelectList", "matchesKey", "truncateToWidth", "visibleWidth"].map(name => ({ tier: 2 as const, where: "@earendil-works/pi-tui", name })),
+  ...["Input", "SelectList", "fuzzyFilter", "matchesKey", "truncateToWidth", "visibleWidth"].map(name => ({ tier: 2 as const, where: "@earendil-works/pi-tui", name })),
 ];
 export interface CapabilityReport { version?: string; missing: Surface[]; execution: boolean; ui: boolean; messages: string[] }
 

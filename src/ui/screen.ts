@@ -1,5 +1,5 @@
 import { AssistantMessageComponent, UserMessageComponent, ToolExecutionComponent, getMarkdownTheme, getSelectListTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { Input, SelectList, matchesKey, truncateToWidth, visibleWidth, type Component, type OverlayOptions, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Input, SelectList, fuzzyFilter, matchesKey, truncateToWidth, visibleWidth, type Component, type SelectItem, type OverlayOptions, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
@@ -31,6 +31,7 @@ export class SubagentScreen implements Component {
   private menu?: SelectList;
   private menuTitle = "";
   private search = new Input({ prompt: "> ", placeholder: "Search models" });
+  private menuItems: SelectItem[] = [];
   private expandedThinking = false;
   private expandedTools = false;
   private following = true;
@@ -130,8 +131,9 @@ export class SubagentScreen implements Component {
     const c = target ?? this.current().c; if (!c) return;
     this.menuTitle = `Model for ${c.key}`;
     const models = this.ctx.modelRegistry.getAvailable();
-    this.menu = new SelectList(models.map(m => ({ value: `${m.provider}/${m.id}`, label: this.name(`${m.provider}/${m.id}`) })), 12, getSelectListTheme());
-    this.search.setValue("");
+    this.menuItems = models.map(m => ({ value: `${m.provider}/${m.id}`, label: this.name(`${m.provider}/${m.id}`) }));
+    this.menu = new SelectList(this.menuItems, 12, getSelectListTheme());
+    this.search = new Input({ prompt: "> ", placeholder: "Search models (e.g. bedrock opus)" }); this.search.focused = this._focused;
     this.menu.onCancel = () => { this.menu = undefined; };
     this.menu.onSelect = item => {
       this.menu = undefined;
@@ -141,12 +143,21 @@ export class SubagentScreen implements Component {
       if (target) this.listAction(args, note); else void this.send(args, note);
     };
   }
+  /** Fuzzy search like pi's own selectors: "bedrock opus" finds amazon-bedrock/claude-opus-4-5 by its id or display name. */
+  private filterMenu(query: string) {
+    if (!this.menu) return;
+    const matches = fuzzyFilter(this.menuItems, query, item => `${item.value} ${item.label ?? ""}`);
+    const { onSelect, onCancel } = this.menu;
+    this.menu = new SelectList(matches, this.menuItems.length === levels.length ? 7 : 12, getSelectListTheme());
+    this.menu.onSelect = onSelect; this.menu.onCancel = onCancel;
+  }
   private thinkingMenu() {
     const { c } = this.current(); if (!c) return;
     const model = this.data.facts.get(c.callId)?.model ?? c.model; if (!model) return;
     this.menuTitle = `Thinking for ${c.key}`;
-    this.search.setValue("");
-    this.menu = new SelectList(levels.map(value => ({ value, label: value })), 7, getSelectListTheme());
+    this.menuItems = levels.map(value => ({ value, label: value }));
+    this.search = new Input({ prompt: "> ", placeholder: "Search thinking levels" }); this.search.focused = this._focused;
+    this.menu = new SelectList(this.menuItems, 7, getSelectListTheme());
     this.menu.onCancel = () => { this.menu = undefined; };
     this.menu.onSelect = item => {
       this.menu = undefined;
@@ -179,7 +190,7 @@ export class SubagentScreen implements Component {
     if (this.disposed) return;
     if (this.menu) {
       if ((["up", "down", "enter", "escape"] as const).some(k => matchesKey(key, k))) this.menu.handleInput(key);
-      else { this.search.handleInput(key); this.menu.setFilter(this.search.getValue()); }
+      else { this.search.handleInput(key); this.filterMenu(this.search.getValue()); }
     } else if (this.listInput) {
       if (matchesKey(key, "escape")) this.listInput = undefined;
       else if (matchesKey(key, "enter")) this.submitListInput();
@@ -379,7 +390,8 @@ export class SubagentScreen implements Component {
     const facts = this.data.facts.get(c.callId), active = w.calls.filter(c => c.phase !== "sealed"), done = w.calls.length - active.length;
     const tabs = size.width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
     const tools = toolCount(facts?.tools), pending = pendingText(c.pending), rule = this.theme.fg("borderMuted", "─".repeat(size.width));
-    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
+    const switching = c.switching ? ` → ${this.name(c.switching)} (at the end of this step)` : "";
+    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾${switching} · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
       this.theme.fg("dim", this.spend(c, facts)), rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
     const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;

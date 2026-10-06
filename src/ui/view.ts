@@ -78,6 +78,10 @@ export function plainReason(reason: string | undefined): string {
   if (r === "nothing-to-resume") return "nothing is paused, so there is nothing to resume";
   if (code === "not-parked") return "it is already running";
   if (r === "already-answered" || r === "stale-question") return "that question was already answered";
+  if (r === "switch-pending") return "a model switch is already on its way; it takes effect when the current step ends";
+  if (r === "provider-full") return "that model's provider has no free slot right now";
+  if (r === "call-not-running") return "the subagent is not running right now (waiting for a slot, paused or finished)";
+  if (r === "unknown-model") return "unknown model";
   if (code === "unknown-call") return r.includes("use one of") ? `no such subagent; ${r.slice(r.indexOf("use one of"))}` : "no such subagent";
   return r;
 }
@@ -218,7 +222,9 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     model: Math.min(26, Math.max(0, ...shownCalls.map(c => visibleWidth(name(facts.get(c.callId)?.model ?? c.model))))) };
   const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string, dim = false) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
-    const text = rowText(indent, label(c), name(f?.model ?? c.model), statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
+    // A requested switch shows at once (it applies when the current step ends; until then it would look as if it had failed).
+    const shown = c.switching ? `${name(f?.model ?? c.model)} → ${name(c.switching)}` : name(f?.model ?? c.model);
+    const text = rowText(indent, label(c), shown, statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
     rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), dim, text });
     // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.
     if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, dim, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)).replaceAll("\x1b[0m", "") });

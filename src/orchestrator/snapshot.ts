@@ -16,6 +16,8 @@ export interface CallSend {
   at: number;
   /** The child resolved it by rejecting it (e.g. `withdrawn`). */
   reason?: string;
+  /** A model switch's target ("provider/id"). */
+  model?: string;
 }
 export interface CallSnapshot {
   key: string; gen: number; callId: string; agent: string; phase: CallPhase;
@@ -29,6 +31,8 @@ export interface CallSnapshot {
   tools?: number;
   /** Forwarded requests in forward order; `pending` counts pending messages (steer, follow-up, answer). */
   sends?: CallSend[]; pending?: number;
+  /** A model switch the child has not applied yet ("provider/id"): it takes effect when the current step ends. */
+  switching?: string;
 }
 export interface WorkflowSnapshot {
   wid: string; rev: number; name?: string; origin?: string; cwd?: string;
@@ -153,7 +157,9 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       const item = e.item as AttentionItem;
       if (!resolved.has(`${item.id}@${item.rev}`)) attention.push(item);
     } else if (e.type === "forward") {
-      const send: CallSend = { rid: String(e.rid), kind: String((e.envelope as { kind?: string } | undefined)?.kind ?? ""), state: "pending", at: e.ts };
+      const envelope = e.envelope as { kind?: string; body?: { provider?: string; model?: string } } | undefined;
+      const send: CallSend = { rid: String(e.rid), kind: String(envelope?.kind ?? ""), state: "pending", at: e.ts,
+        ...(envelope?.kind === "model" && envelope.body?.provider ? { model: `${envelope.body.provider}/${envelope.body.model}` } : {}) };
       const list = sends.get(String(e.dest)) ?? []; list.push(send); sends.set(String(e.dest), list);
       byRid2.set(`${e.dest}\n${e.rid2}`, send); byRid2.set(String(e.rid2), send);
     } else if (e.type === "forward-delivered" || e.type === "forward-retired") {
@@ -175,7 +181,11 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
     const usage = usageOf(c.callId); if (usage) c.usage = { ...usage };
     const n = tools.get(c.callId); if (n) c.tools = n;
     const forwarded = sends.get(c.callId);
-    if (forwarded) { c.sends = forwarded; const pending = forwarded.filter(pendingMessage).length; if (pending) c.pending = pending; }
+    if (forwarded) {
+      c.sends = forwarded; const pending = forwarded.filter(pendingMessage).length; if (pending) c.pending = pending;
+      const switching = c.phase !== "sealed" ? forwarded.findLast(s => s.kind === "model" && s.state === "pending")?.model : undefined;
+      if (switching && switching !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = switching;
+    }
   }
   const usage = zero();
   for (const id of new Set([...live.keys(), ...sealedUsage.keys()])) {
@@ -248,6 +258,8 @@ export interface StatusCall {
   status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage;
   /** Messages forwarded to the call whose child receipt has not been observed yet (P7). */
   pending?: number;
+  /** A requested model switch not applied yet; it takes effect when the current step ends. */
+  switching?: string;
   /** Last non-empty output line (clipped); the full output is in `status wid=<wid>`. */
   lastLine?: string; error?: string;
 }
@@ -283,7 +295,7 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
     calls: wf.calls.map(c => {
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
       return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...(r ? { status: r.status, ok: r.ok } : {}),
-        ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
+        ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),

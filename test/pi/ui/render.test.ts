@@ -355,3 +355,26 @@ test("a multi-line command or name never breaks the frame: every rendered line i
   for (const line of lines) { assert.doesNotMatch(line, /[\n\r\t]/); assert.equal(visibleWidth(line), visibleWidth(lines[0]!)); }
   assert.match(lines.map(l => stripVTControlCharacters(l)).join("\n"), /running PRE=d829 cd \/home\/x && make/);
 });
+
+test("model search is fuzzy (\"bedrock opus\" finds amazon-bedrock/claude-opus-4-5); the thinking menu says what it searches", () => {
+  const { screen, open } = setup(); open();
+  const models = [{ provider: "anthropic", id: "claude-opus-4-5", name: "Claude Opus 4.5" }, { provider: "amazon-bedrock", id: "claude-opus-4-5", name: "Claude Opus 4.5" }, { provider: "openai", id: "gpt-6", name: "GPT-6" }];
+  (screen as unknown as { ctx: { modelRegistry: { getAvailable: () => unknown[]; find: () => undefined } } }).ctx = { ...ctx, modelRegistry: { getAvailable: () => models, find: () => undefined } } as never;
+  screen.handleInput("\x0c"); // ctrl+l: model menu
+  for (const ch of "bedrock opus") screen.handleInput(ch);
+  const text = plain(screen);
+  assert.match(text, /amazon-bedrock|bedrock/); assert.doesNotMatch(text.split("Search models")[1] ?? text, /gpt-6|\(anthropic\)/i);
+  screen.handleInput("\x1b");
+  screen.handleInput("\x1b[Z"); // not a menu; thinking menu opens through the header in pi, here via the method
+  (screen as unknown as { thinkingMenu(): void }).thinkingMenu();
+  assert.match(plain(screen), /Search thinking levels/); assert.doesNotMatch(plain(screen), /Search models/);
+});
+
+test("a requested model switch shows at once in the row and the watch header until the child applies it", () => {
+  const { screen, data } = setup();
+  data.workflows[0]!.calls[0]!.switching = "amazon-bedrock/claude-opus-4-5";
+  screen.render(100); screen.handleInput("\x1b[B");
+  assert.match(plain(screen), /E02 +GPT-6 \(openai\) → claude-opus-4-5/);
+  screen.handleInput("\r");
+  assert.match(plain(screen), /→ .*at the end of this step/);
+});

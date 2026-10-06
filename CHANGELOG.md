@@ -2,7 +2,7 @@
 
 ## 1.0.0
 
-The first and only planned major release.
+The first release.
 
 - Durable subagent workflows for pi. Requests, executions and results are
   journaled; a crash of pi, the orchestrator or the machine resumes the same
