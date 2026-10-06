@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.3
+
+- Recovery delivers a call's task when an earlier execution ended before its
+  subagent received it (for example, an orchestrator restart while the call
+  waited for a provider slot). It used to send only "Continue the task", and
+  the fresh subagent had to guess what the task was.
+
 ## 1.0.2
 
 The first published release (1.0.0 and 1.0.1 were prepared but never
