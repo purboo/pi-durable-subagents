@@ -9,6 +9,10 @@
   switch rejections read in plain words.
 - Calls waiting for a provider slot show as queued, with the model they asked
   for, instead of "thinking"; summaries count queued apart from working.
+- The dock sits below the editor by default (`"ui": { "dockAt": "above" }`
+  restores the old place), is set once instead of twice a second, and keeps a
+  one-column margin; it no longer slips between another extension's editor
+  header (such as a powerline bar) and the editor.
 - A row is always one terminal line: multi-line commands or names no longer
   break the panel border.
 - `/subagents` opens the list; typing with the list open goes to pi's editor;

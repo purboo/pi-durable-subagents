@@ -119,12 +119,13 @@ deterministic: use `now()`/`random()`, not `Date`/`Math.random`.
 
 ### Watch any subagent like the main agent
 
-While subagents work, a small dock sits above the editor: one quiet row per
+While subagents work, a small dock sits below the editor: one quiet row per
 working subagent (what it is doing and for how long; it spins while there is
 fresh activity and stops when the agent goes quiet), a question first and
 highlighted, and a summary line (`1 asking · 3 working · 12/40 done · ↓ subagents`).
 When the work ends it shrinks to one sentence and leaves after ten minutes. Set
-`"ui": { "dock": "line" }` (one line) or `"off"` in `~/.pi/durable-subagents/config.json`.
+`"ui": { "dock": "line" }` (one line) or `"off"` in `~/.pi/durable-subagents/config.json`;
+`"ui": { "dockAt": "above" }` puts it above the editor instead.
 
 Press `↓` on an empty editor, or type `/subagents`, to open the list, a floating panel: this
 session's workflows (sessions are independent), newest first, every
