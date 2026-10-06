@@ -205,9 +205,11 @@ test("actual journals and session growth feed fresh snapshots; rejection is a no
   const home = join(root, "durable"), j = await openJournal(journalPath(home, "run"));
   await j.append("wf-created", { origin: "main:test", cwd: root, revision: 1 });
   await j.append("call", { key: "E02", gen: 1, spec: { agent: "worker" } });
-  await j.append("exec", { call: "run@1/E02@1", exec: "run@1/E02@1#1.1" }); await j.close();
+  await j.append("exec", { call: "run@1/E02@1", exec: "run@1/E02@1#1.1" });
   writeSession(callSession(home, "run", "E02", 1));
-  const data = new UiData(home); data.refresh(); assert.equal(data.workflows[0]!.calls[0]!.phase, "running");
+  const data = new UiData(home); data.refresh(); assert.equal(data.workflows[0]!.calls[0]!.phase, "queued", "an execution waits for its slot until selected");
+  await j.append("selected", { exec: "run@1/E02@1#1.1", model: { provider: "openai", id: "gpt-6" } }); await j.close();
+  data.refresh(); assert.equal(data.workflows[0]!.calls[0]!.phase, "running");
   assert.equal(data.facts.get("run@1/E02@1")!.thinking, "high");
   const notes: string[] = [], actions = new UiActions({ home, submit: async () => ({ submitted: { rid: "rejected" } }), presentNote: n => { notes.push(n); } });
   await actions.send({ action: "send" }, "continued E02");
@@ -222,7 +224,7 @@ test("P7 watch header and list show pending messages from the journal; delivery 
     let j = await openJournal(path);
     await j.append("wf-created", { origin: "main:test", cwd: root, revision: 1 });
     for (const key of ["E02", "E05"]) await j.append("call", { key, gen: 1, spec: { agent: "worker" } });
-    await j.append("exec", { call, exec: `${call}#1.1` });
+    await j.append("exec", { call, exec: `${call}#1.1` }); await j.append("selected", { exec: `${call}#1.1`, model: { provider: "openai", id: "gpt-6" } });
     await j.append("forward", { rid: "s1", rid2: "x1", dest: call, hash: "h", envelope: { to: call, kind: "steer", body: { message: "also docs" } } });
     await j.close();
     writeSession(callSession(home, "msg", "E02", 1));

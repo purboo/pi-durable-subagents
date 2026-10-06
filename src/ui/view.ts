@@ -121,25 +121,27 @@ export const resultWord = (status: CallStatus): string => WORDS[status] ?? "fail
 const WORD_ORDER = ["done", "stopped", "failed", "timeout", "budget", "unknown", "skipped", "parked"];
 
 /** UI §1,4, v12 §4: One working sentence; done/total uses planned totals, `n+` while a script workflow keeps proposing. */
-export function summary(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; paused: number; done: number; total: number; plus: boolean } {
+export function summary(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; queued: number; paused: number; done: number; total: number; plus: boolean } {
   const running = workflows.filter(w => w.status === "running"), open = (w: WorkflowSnapshot) => w.calls.filter(c => c.phase !== "sealed").length;
   const asking = running.reduce((n, w) => n + w.calls.filter(c => c.phase !== "sealed" && w.attention.some(a => a.kind === "question" && a.call === c.callId)).length, 0);
   const paused = running.filter(w => w.paused).reduce((n, w) => n + open(w), 0); // held work is not working: it burns nothing
+  // Waiting for a slot is not working either: nothing is spent until it launches.
+  const queued = running.filter(w => !w.paused).reduce((n, w) => n + w.calls.filter(c => c.phase === "queued" && !w.attention.some(a => a.kind === "question" && a.call === c.callId)).length, 0);
   const progress = running.map(progressOf);
-  return { working: running.reduce((n, w) => n + open(w), 0) - asking - paused, asking, paused,
+  return { working: running.reduce((n, w) => n + open(w), 0) - asking - paused - queued, asking, queued, paused,
     done: progress.reduce((n, p) => n + p.done, 0), total: progress.reduce((n, p) => n + p.total, 0), plus: progress.some(p => p.plus) };
 }
 /** UI §1, v12 §4: What needs you first, then what is running, then progress — e.g. "1 asking · 3 working · 12/40 done". */
 export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
   const s = summary(workflows), finished = workflows.filter(w => w.status !== "running").length;
   if (!s.total) return finished ? `${finished} finished` : "nothing running";
-  return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", s.paused ? `${s.paused} paused` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
+  return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", s.queued ? `${s.queued} queued` : "", s.paused ? `${s.paused} paused` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
 }
 export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
   const s = summary(workflows);
   // The key that opens the list is spelled out: a bare arrow is easy to miss.
-  if (s.working || s.asking || s.paused) return `${summaryText(workflows)} · ↓ subagents`;
+  if (s.working || s.asking || s.queued || s.paused) return `${summaryText(workflows)} · ↓ subagents`;
   const w = workflows.filter(w => w.status !== "running").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
   if (!w) return undefined;
   const latest = [...new Map(w.calls.map(c => [c.key, c])).values()]; // the newest generation of each key (P37)
