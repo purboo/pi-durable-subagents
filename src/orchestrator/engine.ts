@@ -559,7 +559,7 @@ export class Engine {
         const files = await readdir(inbox);
         // Held (drained) workflows cannot progress until a resume request, which restarts the orchestrator: they do not keep it alive.
         if (this.generations.size || [...this.store.workflows.values()].some(w => !this.terminal(w) && !this.held(w.wid)) || this.executor.busy() || files.length) idleSince = performance.now();
-        else if (performance.now() - idleSince >= (this.ledgers.config.k?.idleExitMs ?? 60_000)) return;
+        else if (performance.now() - idleSince >= (this.ledgers.config.k?.idleExitMs ?? 10_000)) return;
         await delay(Math.min(100, this.ledgers.config.k?.idleExitMs ?? 100));
       }
     } finally { this.watcher?.close(); clearInterval(this.poll); }

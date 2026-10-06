@@ -300,12 +300,12 @@ export class SubagentScreen implements Component {
   private spend(c: CallSnapshot, facts: { model?: string; context?: number } | undefined): string {
     const k = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
     const u = c.usage, parts: string[] = [];
-    if (u && (u.input || u.output)) parts.push(`↑${k(u.input)} ↓${k(u.output)}${u.costUsd > 0 ? ` $${u.costUsd.toFixed(u.costUsd < 0.01 ? 4 : 2)}` : ""}`);
+    if (u && (u.input || u.output)) parts.push(`tokens ↑${k(u.input)} ↓${k(u.output)}${u.costUsd > 0 ? ` $${u.costUsd.toFixed(u.costUsd < 0.01 ? 4 : 2)}` : ""}`);
     if (facts?.context) {
       const [p, ...rest] = (facts.model ?? c.model ?? "").split("/"), window = p && rest.length ? this.ctx.modelRegistry.find(p, rest.join("/"))?.contextWindow : undefined;
-      parts.push(window ? `ctx ${k(facts.context)}/${k(window)} (${Math.round(facts.context / window * 100)}%)` : `ctx ${k(facts.context)}`);
+      parts.push(window ? `context ${k(facts.context)}/${k(window)} (${Math.round(facts.context / window * 100)}%)` : `context ${k(facts.context)}`);
     }
-    return parts.length ? ` · ${parts.join(" · ")}` : "";
+    return parts.length ? parts.join(" · ") : "tokens: none reported yet";
   }
   /** The panel height for the current view: `content` rows plus the frame, within the overlay's height cap. */
   private height(content?: number): number {
@@ -355,7 +355,8 @@ export class SubagentScreen implements Component {
     const facts = this.data.facts.get(c.callId), active = w.calls.filter(c => c.phase !== "sealed"), done = w.calls.length - active.length;
     const tabs = size.width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
     const tools = toolCount(facts?.tools), pending = pendingText(c.pending), rule = this.theme.fg("borderMuted", "─".repeat(size.width));
-    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}${this.spend(c, facts)}`, rule];
+    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
+      this.theme.fg("dim", this.spend(c, facts)), rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
     const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
     const empty = new Input({ prompt: "", placeholder, placeholderStyle: text => this.theme.fg("dim", text) });

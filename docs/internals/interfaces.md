@@ -446,7 +446,7 @@ the top of the file that writes them.
 4. Construct the Executor (O1b's default export factory, `createExecutor(ledgers)`)
    and the Engine.
 5. Recover, then loop.
-6. Exit after K6 (60 s) when there is no unfinished workflow, `busy()` is
+6. Exit after K6 (10 s) when there is no unfinished workflow, `busy()` is
    false and the inbox is empty.
 
 **Intake.** The engine watches `orchInbox(home)`, plus a poll every 1 s as a
