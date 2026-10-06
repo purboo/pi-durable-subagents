@@ -345,3 +345,13 @@ test("typing a message with the list open closes the list and hands the text to 
   screen.handleInput("刚");
   assert.equal(closed, true); assert.deepEqual(pasted, ["刚"]);
 });
+
+test("a multi-line command or name never breaks the frame: every rendered line is one line of the full width", () => {
+  const { screen, data } = setup();
+  data.workflows[0]!.name = "two\nlines";
+  data.facts.set("w@1/E02@1", { ...data.facts.get("w@1/E02@1")!, activity: "running PRE=d829\ncd /home/x &&\tmake", latest: "bash: one\ntwo" });
+  screen.render(100); screen.handleInput("\x1b[B");
+  const lines = screen.render(100);
+  for (const line of lines) { assert.doesNotMatch(line, /[\n\r\t]/); assert.equal(visibleWidth(line), visibleWidth(lines[0]!)); }
+  assert.match(lines.map(l => stripVTControlCharacters(l)).join("\n"), /running PRE=d829 cd \/home\/x && make/);
+});

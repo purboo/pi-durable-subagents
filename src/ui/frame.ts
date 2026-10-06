@@ -1,8 +1,14 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
+/** A row is one terminal line: a character that moves the cursor (newline, carriage return, tab, backspace, vertical
+ *  tab, form feed) inside it, as in a multi-line bash command or a name, would break the frame, so each becomes a
+ *  space. Escape sequences (SGR colours, OSC markers ended by BEL) are kept intact. */
+export const oneLine = (text: string) => text.replace(/\r\n|[\n\r\t\b\v\f]/g, " ");
+
 /** UI §2: Pad or cut a styled line to exactly `width` columns so highlights and borders align. */
 export function fitWidth(line: string, width: number): string {
+  line = oneLine(line);
   const cut = visibleWidth(line) > width ? truncateToWidth(line, width) : line;
   return cut + " ".repeat(Math.max(0, width - visibleWidth(cut)));
 }

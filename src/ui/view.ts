@@ -2,6 +2,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import type { CallStatus } from "../types.ts";
 import type { sessionFacts } from "./session.ts";
+import { oneLine } from "./frame.ts";
 
 export type Facts = ReturnType<typeof sessionFacts>;
 export interface ViewState {
@@ -53,6 +54,7 @@ export function keepSelection(rows: readonly { id: string }[], id: string | unde
 }
 /** UI §2: Compose a call row within `width`: model column dropped first (<60), then tool/age tail, then the phrase is cut. */
 export function rowText(indent: string, key: string, model: string, phrase: string, tail: readonly string[], width: number, cols = { key: 0, model: 0 }): string {
+  phrase = oneLine(phrase).replace(/ {2,}/g, " "); key = oneLine(key); // measured widths must be single-line widths
   const short = width < 70 ? model.replace(/\s*\([^)]*\)$/, "") : model; // narrow: drop the provider, keep the model
   const pad = (text: string, n: number) => text + " ".repeat(Math.max(0, n - visibleWidth(text)));
   const end = tail.filter(Boolean).join(" · ");

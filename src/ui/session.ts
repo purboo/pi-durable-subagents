@@ -109,7 +109,7 @@ export function sessionFacts(entries: readonly SessionEntry[], call: string) {
   if (tool) {
     const a = tool.arguments, path = String(a.path ?? a.file_path ?? "");
     activity = tool.name === "read" ? `reading ${path}` : ["edit", "write"].includes(tool.name) ? `editing ${path}` :
-      tool.name === "bash" ? `running ${String(a.command ?? "")}` : `running ${tool.name}`;
+      tool.name === "bash" ? `running ${String(a.command ?? "").replace(/\s+/g, " ").trim()}` : `running ${tool.name}`;
   }
   return { model, thinking, activity, lastActivity, task, tools: count, latest, ...(context !== undefined ? { context } : {}), live: undefined as Live | undefined };
 }
