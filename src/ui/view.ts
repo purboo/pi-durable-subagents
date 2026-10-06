@@ -14,7 +14,8 @@ export type ModelName = (model: string | undefined) => string;
 /** UI §2: Render compact wall-clock durations; never present these as charged active time. */
 export function duration(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));
-  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 3600)}h${String(Math.floor(s / 60) % 60).padStart(2, "0")}m`;
+  // Seconds keep ticking under an hour, so a running age never looks frozen (UI §2 liveness).
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(s / 3600)}h${String(Math.floor(s / 60) % 60).padStart(2, "0")}m`;
 }
 /** UI §2: Resolve human model names and suppress repeated provider family suffixes. */
 export function modelLabel(model: string | undefined, find: (provider: string, id: string) => { name: string } | undefined, aliases: Record<string, string> = {}): string {
@@ -54,10 +55,15 @@ export function keepSelection(rows: readonly { id: string }[], id: string | unde
 export function rowText(indent: string, key: string, model: string, phrase: string, tail: readonly string[], width: number, cols = { key: 0, model: 0 }): string {
   const short = width < 70 ? model.replace(/\s*\([^)]*\)$/, "") : model; // narrow: drop the provider, keep the model
   const pad = (text: string, n: number) => text + " ".repeat(Math.max(0, n - visibleWidth(text)));
-  const head = `${indent}${pad(key, cols.key)}  ${width >= 40 ? `${pad(short, width < 70 ? 0 : cols.model)}  ` : ""}`, end = tail.filter(Boolean).join(" · ");
-  const room = width - visibleWidth(head) - (end ? visibleWidth(end) + 2 : 0);
-  if (!end || room < 12) return truncateToWidth(head + phrase, Math.max(1, width));
-  return `${head}${pad(truncateToWidth(phrase, room), room)}  ${end}`;
+  const end = tail.filter(Boolean).join(" · ");
+  // A long phrase (a long command) is clipped; the tail (tools, age) stays. Under pressure the model column goes first.
+  for (const showModel of width >= 40 ? [true, false] : [false]) {
+    const head = `${indent}${pad(key, cols.key)}  ${showModel ? `${pad(short, width < 70 ? 0 : cols.model)}  ` : ""}`;
+    const room = width - visibleWidth(head) - (end ? visibleWidth(end) + 2 : 0);
+    if (end && room >= 8) return `${head}${pad(truncateToWidth(phrase, room), room)}  ${end}`;
+    if (!end && showModel) return truncateToWidth(head + phrase, Math.max(1, width));
+  }
+  return truncateToWidth(`${indent}${key}  ${phrase}`, Math.max(1, width));
 }
 /** UI §2: Prefer report phrases while retaining truthful terminal status and failure reasons. */
 export function resultPhrase(call: CallSnapshot): string {
@@ -112,7 +118,8 @@ export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
 export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
   const s = summary(workflows);
-  if (s.working || s.asking) return `${summaryText(workflows)}  ↓`;
+  // The key that opens the list is spelled out: a bare arrow is easy to miss.
+  if (s.working || s.asking) return `${summaryText(workflows)} · ↓ subagents`;
   const w = workflows.filter(w => w.status !== "running").sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
   if (!w) return undefined;
   const latest = [...new Map(w.calls.map(c => [c.key, c])).values()]; // the newest generation of each key (P37)
@@ -120,7 +127,7 @@ export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undef
   const words = new Map<string, number>();
   for (const c of latest) { const r = c.result; if (r) words.set(resultWord(r.status), (words.get(resultWord(r.status)) ?? 0) + 1); }
   const parts = WORD_ORDER.filter(word => words.has(word)).map(word => `${words.get(word)} ${word}`);
-  return `${w.name ?? w.wid} finished: ${parts.join(" · ") || w.status}.  ↓`;
+  return `${w.name ?? w.wid} finished: ${parts.join(" · ") || w.status} · ↓ subagents`;
 }
 
 /** UI §2, v12 §5: Group workflows (finished ones stay listed, dimmed and expandable — never hidden behind a toggle),
@@ -163,7 +170,10 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.
     if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, dim, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)) });
   };
-  for (const w of visible) {
+  for (const v of visible) {
+    // One row per key: the newest generation (key@2) stands for the agent; older ones open from its watch view (← →).
+    const latest = new Map<string, CallSnapshot>(); for (const c of v.calls) latest.set(c.key, c);
+    const w = latest.size === v.calls.length ? v : { ...v, calls: v.calls.filter(c => latest.get(c.key) === c) };
     const dim = w.status !== "running"; // v12 §5: finished workflows are dimmed, not hidden
     if (w.calls.length === 1) { callRow(w, w.calls[0]!, "  ", "    ", dim); continue; }
     // Stable order (UI §2): active rows keep proposal (snapshot) order; done rows by immutable end time.

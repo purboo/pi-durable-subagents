@@ -75,18 +75,18 @@ test("successful last call also reopens collapsed done rows without a new failur
 
 test("ordinary status phrases, main line, questions and stalls", () => {
   const c = call("E07"), w = workflow([c]);
-  assert.equal(mainLine([]), undefined); assert.equal(mainLine([w]), "1 working · 0/1+ done  ↓");
+  assert.equal(mainLine([]), undefined); assert.equal(mainLine([w]), "1 working · 0/1+ done · ↓ subagents");
   w.attention = [{ id: "q", rev: 1, kind: "question", call: c.callId, text: "docs/ in write set?", wid: "w" }];
   assert.equal(statusPhrase(c, w, undefined, now), "asking main agent: docs/ in write set?");
   w.attention = [{ id: "s", rev: 1, kind: "stall", call: c.callId, text: "", wid: "w" }]; c.lastActivity = now - 840_000;
-  assert.equal(statusPhrase(c, w, undefined, now), "no activity for 14m");
+  assert.equal(statusPhrase(c, w, undefined, now), "no activity for 14m00s");
   w.attention = []; c.lastActivity = now - 8_000; assert.equal(statusPhrase(c, w, undefined, now), "thinking · 8s", "the age of the newest evidence ticks");
   c.lastActivity = now - 1_000; assert.equal(statusPhrase(c, w, undefined, now), "thinking · 1s", "and resets on new activity");
   assert.equal(statusPhrase(c, w, { ...sessionFacts([], c.callId), activity: "reading src/a.ts" }, now), "reading src/a.ts · 1s");
   c.phase = "queued"; assert.match(statusPhrase(c, w, undefined, now), /^queued:/);
   c.phase = "sealed"; c.result = { key: c.key, gen: 1, status: "failed", ok: false, output: "", error: "blocked" };
   w.status = "failed"; w.endedAt = now;
-  assert.match(mainLine([w])!, /exec-0927 finished: 1 failed\./);
+  assert.match(mainLine([w])!, /exec-0927 finished: 1 failed · ↓ subagents/);
 });
 
 test("thinking summaries never display partial prose or expose empty expansion", () => {
@@ -186,9 +186,9 @@ test("call rows show tool counts within width and keep the model (provider dropp
   for (const width of [24, 40, 59, 60, 80, 100, 140]) {
     const row = listRows([w], state(), facts, () => "GLM-5.3 (zhipu)", width, now).find(r => r.call === c)!;
     assert(visibleWidth(row.text) <= width, `${width}: ${row.text}`);
-    assert.equal(row.text.includes("GLM"), width >= 40, `${width}: ${row.text}`);
+    if (width >= 59) assert(row.text.includes("GLM"), `${width}: ${row.text}`); // the model gives way before the tail
     assert.equal(row.text.includes("(zhipu)"), width >= 70, `${width}: ${row.text}`);
-    if (width >= 60) assert.match(row.text, /12 tools · 3m$/);
+    if (width >= 40) assert.match(row.text, /12 tools · 3m00s$/, "a long command never hides the tools and the age");
   }
   assert.equal(rowText("  ", "E02", "M", "short", ["", ""], 100), "  E02  M  short");
   assert.equal(rowText("", "a", "M", "x", ["2 tools"], 50, { key: 3, model: 0 }).indexOf("M"), 5, "key column padded for alignment");
@@ -213,12 +213,12 @@ test("P7 list rows carry a small pending marker until the message is delivered, 
   const c = call("E02", { pending: 1, sends: [{ rid: "s", kind: "steer", state: "pending", at: now }] }), w = workflow([c, call("E05")]);
   const facts = new Map([[c.callId, { ...sessionFacts([], c.callId), tools: 3 }]]);
   const row = (width: number) => listRows([w], state(), facts, () => "GPT-6 (openai)", width, now).find(r => r.call?.key === "E02")!.text;
-  assert.match(row(100), /thinking · 20s\s+1 pending · 3 tools · 3m$/);
+  assert.match(row(100), /thinking · 20s\s+1 pending · 3 tools · 3m00s$/);
   for (const width of [24, 40, 60, 100]) assert(visibleWidth(row(width)) <= width, `${width}: ${row(width)}`);
   assert(!listRows([w], state(), facts, () => "GPT-6 (openai)", 100, now).find(r => r.call?.key === "E05")!.text.includes("pending"));
   // Delivered: the snapshot no longer counts it, so the marker disappears.
   delete c.pending; c.sends = [{ rid: "s", kind: "steer", state: "delivered", at: now }];
-  assert.doesNotMatch(row(100), /pending/); assert.match(row(100), /3 tools · 3m$/);
+  assert.doesNotMatch(row(100), /pending/); assert.match(row(100), /3 tools · 3m00s$/);
 });
 
 test("drain: a queued call in a drained orchestrator says it waits for resume, not for capacity", () => {
@@ -261,9 +261,9 @@ test("v12 §4: completion words — stopped is never failed; timeout/budget/unkn
     call(key, { phase: "sealed", endedAt: now, result: { key, gen: 1, status, ok: status === "ok", output: "", ...extra } });
   assert.equal(resultWord("stopped"), "stopped"); assert.equal(resultWord("gate-failed"), "failed");
   const w = workflow([seal("a"), seal("b"), seal("c"), seal("d", "stopped"), seal("e", "failed", { error: "merge conflict" })], { status: "stopped", endedAt: now });
-  assert.equal(mainLine([w]), "exec-0927 finished: 3 done · 1 stopped · 1 failed.  ↓");
+  assert.equal(mainLine([w]), "exec-0927 finished: 3 done · 1 stopped · 1 failed · ↓ subagents");
   for (const status of ["timeout", "budget", "unknown", "skipped", "parked"] as const)
-    assert.equal(mainLine([workflow([seal("k", status)], { status: "failed", endedAt: now })]), `exec-0927 finished: 1 ${resultWord(status)}.  ↓`);
+    assert.equal(mainLine([workflow([seal("k", status)], { status: "failed", endedAt: now })]), `exec-0927 finished: 1 ${resultWord(status)} · ↓ subagents`);
   assert.equal(resultPhrase(seal("s", "stopped")), "stopped");
   assert.equal(resultPhrase(seal("s", "stopped", { error: "by user" })), "stopped: by user");
   assert.equal(resultPhrase(seal("s", "timeout")), "timeout");
@@ -290,4 +290,13 @@ test("v12 §5: finished workflows stay expandable with dimmed call rows; finishe
   assert.deepEqual(listRows([w], s, new Map(), () => "—", 100, now).map(r => r.kind), ["workflow"], "folding toggles, but the row never vanishes");
   const solo = listRows([workflow([good], { wid: "solo", status: "done" })], state(), new Map(), () => "—", 100, now);
   assert.equal(solo[0]!.kind, "call"); assert.equal(solo[0]!.dim, true); assert.match(solo[0]!.text, /LEAF: ok/);
+});
+
+test("one row per key: a follow-up generation replaces its key's earlier row, so rows match done/total", () => {
+  const seal = (key: string, gen: number) => call(key, { gen, callId: `w@1/${key}@${gen}`, phase: "sealed", endedAt: now - 1_000 * gen, result: { key, gen, status: "ok", ok: true, output: `${key}@${gen} ok` } });
+  const w = workflow([seal("a", 1), seal("b", 1), seal("c", 1), seal("a", 2)], { status: "done", endedAt: now }), s = state();
+  toggleOpen(w, s);
+  const rows = listRows([w], s, new Map(), () => "—", 100, now);
+  assert.match(rows[0]!.text, /· 3\/3 ·/); assert.equal(rows.filter(r => r.kind === "call").length, 3);
+  assert.ok(rows.some(r => r.call?.callId === "w@1/a@2") && !rows.some(r => r.call?.callId === "w@1/a@1"));
 });
