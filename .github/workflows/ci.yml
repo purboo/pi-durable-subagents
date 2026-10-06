@@ -9,8 +9,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # 22.18 is the engines floor (first release that runs .ts without flags); the real-pi suite runs on 24.
-        node: ["24", "22.18"]
+        # 22.19 is the engines floor (runs .ts without flags; worker.cpuUsage and process.threadCpuUsage, which the
+        # evaluator's CPU limit needs); the real-pi suite runs on 24.
+        node: ["24", "22.19"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

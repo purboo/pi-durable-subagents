@@ -12,7 +12,7 @@ below refer to those documents.
 ## Ground rules for every module
 
 - **Language and tooling.** TypeScript using only erasable syntax: no enums,
-  no namespaces, no parameter properties. Node ≥ 22.18 runs `.ts` directly in
+  no namespaces, no parameter properties. Node ≥ 22.19 runs `.ts` directly in
   tests. Import with explicit `.ts` extensions.
 - **pi imports.** pi packages may be imported only through their root exports
   (`npm run lint:imports`). Do not use the SDK's `createAgentSession`.

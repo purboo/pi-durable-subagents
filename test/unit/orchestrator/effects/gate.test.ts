@@ -1,4 +1,5 @@
 import test from "node:test";
+import { detachedSleep } from "../../../harness/pi.ts";
 import assert from "node:assert/strict";
 import { readFile, access } from "node:fs/promises";
 import { join } from "node:path";
@@ -59,7 +60,7 @@ test("abort during gate fences descendants and preserves the original result", {
   assert.equal(f.journal.entries().filter(e => e.type === "output-intent").length, 0);
 });
 test("a gate that exits after starting a detached descendant fences that descendant", { timeout: 10000 }, async ctx => {
-  const f = await fixture(ctx); f.t.spec.gate = "setsid sleep 30 >/dev/null 2>&1 &";
+  const f = await fixture(ctx); f.t.spec.gate = `${detachedSleep(30)} >/dev/null`;
   assert.equal((await f.before()).status, "ok");
   const id = `gate:${f.t.callId}#1`;
   assert.equal((await new Containment().scan(new Map([[id, []]]))).get(id)?.length ?? 0, 0);
