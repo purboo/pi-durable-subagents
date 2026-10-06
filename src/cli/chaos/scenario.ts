@@ -6,6 +6,8 @@ import { scanInbox } from "../../kernel/mailbox.ts";
 import { CT, JT, type AttentionItem } from "../../types.ts";
 import { rows, script, stack, until } from "./stack.ts";
 
+const tailOf = (path: string) => { try { return readFileSync(path, "utf8").slice(-600); } catch { return ""; } };
+
 /** Construct the rolling DAG; verdict and dependency skips are script decisions. */
 export function workflow(n: number): string {
   const writer: unknown[] = n === 1 ? [{ tool: "bash", args: { command: "printf PARTIAL-KEPT" } }, { error: "chaos stream dropped" }] :
@@ -102,7 +104,7 @@ export async function scenario(n: number, root: string, env: NodeJS.ProcessEnv) 
     await until(() => main().some(e => e.customType === CT.attention && e.details.items.some((i: AttentionItem) => i.kind === "finished")), "finished presentation");
     await pi.prompt([{ text: "Refresh resolved attention." }]);
     const entries = journal(), seals = entries.filter(e => e.type === JT.sealed), result = done.result as Record<string, any>;
-    check(seals.length === (n === 2 || n === 8 ? 1 : n === 7 ? 2 : 3), `dispatch count / skipped dependents: seals ${JSON.stringify(seals.map(e => [e.call, (e.result as { status?: string })?.status, (e.result as { error?: string })?.error]))}; result ${JSON.stringify(Object.fromEntries(Object.entries(result ?? {}).map(([k, v]) => [k, [v?.status, String(v?.output ?? v?.error ?? "").slice(0, 80)]])))}; journal ${entries.filter(e => !["time", "observation", "usage"].includes(e.type)).map(e => e.type).join(" ").slice(-1500)}`);
+    check(seals.length === (n === 2 || n === 8 ? 1 : n === 7 ? 2 : 3), `dispatch count / skipped dependents: seals ${JSON.stringify(seals.map(e => [e.call, (e.result as { status?: string })?.status, (e.result as { error?: string })?.error]))}; result ${JSON.stringify(Object.fromEntries(Object.entries(result ?? {}).map(([k, v]) => [k, [v?.status, String(v?.output ?? v?.error ?? "").slice(0, 80)]])))}; journal ${entries.filter(e => !["time", "observation", "usage", "tracked"].includes(e.type)).map(e => `${e.type}${e.reason ? `(${String(e.reason).slice(0, 60)})` : ""}`).join(" ").slice(-1500)}; writer stderr ${JSON.stringify(tailOf(join(callSession(s.home, wid, "writer", 1), "..", "stderr.log")))}; writer session ${child().map(e => e.type === "message" ? `${e.message?.role}/${e.message?.stopReason ?? ""}${e.message?.errorMessage ? `[${e.message.errorMessage}]` : ""}` : e.customType ?? e.type).join(" ").slice(-800)}`);
     const expected = n === 2 ? "timeout" : n === 8 ? "failed" : "ok";
     check(result.writer.status === expected, `writer expected ${expected}: ${JSON.stringify(result.writer)}`);
     if ([2, 8].includes(n)) check(result.reviewer.status === "skipped" && result.integrator.status === "skipped", "dependency skips");

@@ -13,6 +13,7 @@ export const parameters = Type.Object({
   tasks: Type.Optional(Type.Array(Type.Any(), { description: `Parallel calls. ${stepsDoc}` })),
   chain: Type.Optional(Type.Array(Type.Any(), { description: `Sequential calls ({previous} = previous output). ${stepsDoc}` })),
   agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
+  cwd: Type.Optional(Type.String({ description: "Run directory (default: this session's). Relative workflow, inputs and call cwd paths resolve against it." })),
   to: Type.Optional(Type.String()), kind: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("follow-up"), Type.Literal("answer"), Type.Literal("model")])),
   message: Type.Optional(Type.String()), qid: Type.Optional(Type.String()), rev: Type.Optional(Type.Integer({ minimum: 1 })),
   replaces: Type.Optional(Type.Array(Type.String())), target: Type.Optional(Type.String()), wid: Type.Optional(Type.String()),
@@ -44,14 +45,18 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, by: _by, ...spec } = args;
     const choices = [workflow, source, tasks, chain, spec.agent === undefined && spec.task === undefined ? undefined : spec];
     if (choices.filter(v => v !== undefined).length !== 1) throw new Error("run requires exactly one of workflow, source, tasks, chain, or agent/task");
-    const body: RunBody = { cwd };
-    if (workflow !== undefined) body.workflow = resolve(cwd, string(args, "workflow"));
+    // A top-level cwd on a workflow/tasks/chain/source run is the run's directory: relative paths (the workflow file,
+    // inputs, per-call cwd) resolve against it and calls default to it. It used to be ignored, so a relative
+    // workflow path was looked up in the session's directory instead.
+    const runCwd = choices[4] === undefined && typeof spec.cwd === "string" && spec.cwd ? resolve(cwd, spec.cwd) : cwd;
+    const body: RunBody = { cwd: runCwd };
+    if (workflow !== undefined) body.workflow = resolve(runCwd, string(args, "workflow"));
     else if (source !== undefined) body.source = string(args, "source");
     else if (tasks !== undefined || chain !== undefined) {
       const list = tasks ?? chain;
       if (!Array.isArray(list) || !list.length) throw new Error("tasks/chain must be nonempty");
       const kind = tasks !== undefined ? "tasks" : "chain";
-      body[kind] = list.map((value, i) => call(value, cwd, `${kind}[${i}]`));
+      body[kind] = list.map((value, i) => call(value, runCwd, `${kind}[${i}]`));
       compileFanout(kind === "tasks" ? { tasks: body.tasks! } : { chain: body.chain! }); // duplicate keys fail here, not at admission
     } else body.call = call(spec, cwd, "call");
     if (inputs !== undefined) body.args = inputs;
@@ -65,7 +70,7 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     if (maxCalls !== undefined) { if (!Number.isSafeInteger(maxCalls) || Number(maxCalls) < 1) throw new Error("maxCalls must be a positive integer"); body.maxCalls = maxCalls as number; }
     if (files !== undefined) {
       if (!files || typeof files !== "object" || Array.isArray(files)) throw new Error("inputs must map names to file paths");
-      body.inputs = Object.fromEntries(Object.entries(files).map(([k, v]) => { if (typeof v !== "string" || !v) throw new Error(`inputs.${k} must be a path`); return [k, resolve(cwd, v)]; }));
+      body.inputs = Object.fromEntries(Object.entries(files).map(([k, v]) => { if (typeof v !== "string" || !v) throw new Error(`inputs.${k} must be a path`); return [k, resolve(runCwd, v)]; }));
     }
     return { kind: "run", body };
   }

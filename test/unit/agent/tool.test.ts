@@ -52,3 +52,14 @@ test("T2/T3/T11: invalid call specs fail at the tool with every error; user keys
   const { body } = request({ action: "run", chain: [{ agent: "w", task: "a", key: "plan", cwd: "" }, { agent: "w", task: "{previous}" }] }, "/w");
   assert.deepEqual(body, { cwd: "/w", chain: [{ agent: "w", task: "a", key: "plan", cwd: "/w" }, { agent: "w", task: "{previous}" }] });
 });
+
+test("a top-level cwd is the run's directory: relative workflow, inputs and calls resolve against it", () => {
+  const wf = request({ workflow: "flows/x.js", cwd: "../repo", inputs: { plan: "plan.md" } }, "/w/session");
+  assert.deepEqual(wf.body, { cwd: "/w/repo", workflow: "/w/repo/flows/x.js", inputs: { plan: "/w/repo/plan.md" } });
+  const tasks = request({ tasks: [{ agent: "a", task: "t" }, { agent: "a", task: "u", cwd: "sub" }], cwd: "/abs" }, "/w") as { body: { cwd: string; tasks: { cwd?: string }[] } };
+  assert.equal(tasks.body.cwd, "/abs"); assert.equal(tasks.body.tasks[1]!.cwd, "/abs/sub");
+  // A single agent/task call keeps cwd as the call's own directory, as before.
+  const single = request({ agent: "a", task: "t", cwd: "sub" }, "/w") as { body: { cwd: string; call: { cwd?: string } } };
+  assert.deepEqual([single.body.cwd, single.body.call.cwd], ["/w", "/w/sub"]);
+  assert.equal((request({ workflow: "x.js" }, "/w").body as { workflow: string }).workflow, "/w/x.js");
+});

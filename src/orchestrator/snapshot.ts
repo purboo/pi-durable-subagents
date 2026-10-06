@@ -116,18 +116,24 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;
       const result = e.type === "refused" ? refusedResult(key, e.reason) :
         e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
+      const wanted = (e.spec as { model?: unknown } | undefined)?.model;
       calls.set(callId, { key, gen, callId, pos: Number(e.pos), agent: String((e.spec as { agent?: string } | undefined)?.agent ?? ""),
+        // Until a slot is acquired (`selected`), show the model the call asked for, not nothing.
+        ...(typeof wanted === "string" && wanted ? { model: wanted } : {}),
         phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),
         ...(e.type === "refused" ? { refused: String(e.reason) } : {}), ...(e.type === "reused" ? { reused: String(e.from) } : {}) });
     } else if (e.type === JT.exec) {
       const call = calls.get(String(e.call)); if (!call) continue;
-      call.exec = String(e.exec); call.phase = "running"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
+      // An execution waits for a provider slot and memory before it launches; it is running once `selected` says so
+      // (otherwise a call still waiting for a slot reads "thinking · 2m").
+      call.exec = String(e.exec); call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
     } else if (e.type === JT.fenced) {
       // A fenced execution without a seal (stop-all, a quit pi, a loss before its continuation) waits to run again.
       const call = byExec.get(String(e.exec)); if (call && call.phase === "running") call.phase = "queued";
     } else if (e.type === "selected") {
       const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
       if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
+      if (call && call.phase === "queued") call.phase = "running";
     } else if (e.type === "observation") {
       // Only what the agent did counts as activity; tracker scans and time checkpoints are bookkeeping.
       const call = byExec.get(String(e.exec)); if (call) call.lastActivity = e.ts;
@@ -159,7 +165,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
   }
   for (const item of attention) {
     const call = item.kind === "question" ? [...calls.values()].find(c => item.id.startsWith(`q:${c.callId}:`)) : undefined;
-    if (call && call.phase === "running") call.phase = "asking";
+    if (call && (call.phase === "running" || call.phase === "queued")) call.phase = "asking"; // a hibernated asker is fenced
   }
   const usageOf = (callId: string) => sealedUsage.get(callId) ?? live.get(callId);
   const list = [...calls.values()];

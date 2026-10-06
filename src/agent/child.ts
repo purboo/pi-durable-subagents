@@ -47,8 +47,24 @@ export function registerChild(pi: ExtensionAPI): void {
     console.error('Child mailbox failed:', error); active = false; watcher?.close();
     blocked?.reject(error instanceof Error ? error : new Error(String(error))); blocked = undefined; ctx.shutdown();
   };
+  /** C8: Make the model the executor holds a slot for (or a model request named) the active one before a turn starts.
+   *  pi captures a turn's model when the turn begins, so a correction in the `context` hook comes too late for that
+   *  turn: seen on CI as one "Unknown provider: unknown" reply (pi's placeholder model) after a resume. The registry
+   *  can briefly lack an extension provider at startup, so wait for it up to 5 s. */
+  async function ensureModel(ctx: ExtensionContext): Promise<void> {
+    const slash = target?.indexOf('/') ?? -1;
+    if (!target || slash <= 0 || `${ctx.model?.provider}/${ctx.model?.id}` === target) return;
+    let model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
+    for (let waited = 0; !model && waited < 5000; waited += 50) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
+    }
+    if (model) await pi.setModel(model);
+    else console.error(`durable-subagents: model ${target} is not registered in this pi (have: ${[...new Set(ctx.modelRegistry.getAll().map(m => m.provider))].join(', ')})`);
+  }
   async function consume(ctx: ExtensionContext, mode: Mode): Promise<SessionBoundaryDraft[]> {
     if (!active || (mode === 'idle' && !ctx.isIdle())) return [];
+    if (mode === 'idle') await ensureModel(ctx); // an idle delivery starts a turn
     const candidates = await scanInbox(inbox), byRid = new Map(candidates.map(req => [req.rid, req]));
     // Scan is asynchronous: recheck before using the idle delivery API.
     if (!active || (mode === 'idle' && !ctx.isIdle())) return [];
@@ -139,16 +155,7 @@ export function registerChild(pi: ExtensionAPI): void {
       // The executor names the model it holds a slot for; apply it before any provider request if pi did not.
       // Observed with pi 1.0.2 on resumed sessions: the registry briefly lacks an extension provider at startup.
       // Nothing is delivered (so no provider request starts) until the held model is resolvable, for up to 5 s.
-      const held = process.env[ENV.model], slash = held?.indexOf('/') ?? -1;
-      if (held && slash > 0 && `${ctx.model?.provider}/${ctx.model?.id}` !== held) {
-        let model = ctx.modelRegistry.find(held.slice(0, slash), held.slice(slash + 1));
-        for (let waited = 0; !model && waited < 5000; waited += 50) {
-          await new Promise(resolve => setTimeout(resolve, 50));
-          model = ctx.modelRegistry.find(held.slice(0, slash), held.slice(slash + 1));
-        }
-        if (model) await pi.setModel(model);
-        else console.error(`durable-subagents: model ${held} is not registered in this pi (have: ${[...new Set(ctx.modelRegistry.getAll().map(m => m.provider))].join(', ')})`);
-      }
+      await ensureModel(ctx);
       watcher = watch(inbox, () => { void serial(async () => { await consume(ctx, blocked ? 'ask' : 'idle'); }).catch(error => fail(ctx, error)); });
       watcher.on('error', error => fail(ctx, error));
       await consume(ctx, 'idle');
