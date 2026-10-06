@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.1
+
+- Model and thinking menus search fuzzily, by id or display name (`bedrock opus`
+  finds `amazon-bedrock/claude-opus-4-5`); the thinking menu says what it searches.
+- A requested model switch shows at once in the list and the watch header
+  ("old → new, at the end of this step") until the subagent applies it;
+  switch rejections read in plain words.
+- Calls waiting for a provider slot show as queued, with the model they asked
+  for, instead of "thinking"; summaries count queued apart from working.
+- A row is always one terminal line: multi-line commands or names no longer
+  break the panel border.
+- `/subagents` opens the list; typing with the list open goes to pi's editor;
+  the selected row is marked with `›`.
+- A top-level `cwd` is the run's directory: relative workflow, input and call
+  paths resolve against it.
+- Install from GitHub without a build step:
+  `pi install git:github.com/purboo/pi-durable-subagents`.
+- Robustness: a resumed subagent applies its model before its first turn; a
+  failed process-table scan no longer ends a live subagent's observation; the
+  orchestrator starts through symlinked paths (macOS `/var`); Node.js 22.19 is
+  the minimum (older Node disables execution with a message).
+
 ## 1.0.0
 
 The first release.
