@@ -202,8 +202,13 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
 }
 
 /** P25: Snapshot one workflow from its durable journal (v12 §4: plus the planned total of its pinned run body). */
+// A journal snapshot is immutable and replaced on every append, so its derived workflow snapshot is reused until then:
+// re-deriving every historical workflow on each UI refresh dominated pi's main thread.
+const derived = new WeakMap<readonly Entry[], { wid: string; snapshot: WorkflowSnapshot }>();
 export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
-  const wf = snapshotFromEntries(wid, readJournalSnapshot(journalPath(home, wid)));
+  const entries = readJournalSnapshot(journalPath(home, wid)), hit = derived.get(entries);
+  const wf = hit?.wid === wid ? hit.snapshot : snapshotFromEntries(wid, entries);
+  if (hit?.wid !== wid && entries.length) derived.set(entries, { wid, snapshot: wf });
   const planned = plannedTotal(home, wid, wf.rev);
   return planned === undefined ? wf : { ...wf, planned };
 }

@@ -40,16 +40,23 @@ export function card(theme: Theme, tone: Tone, heading: string, body: readonly s
 /** P15, P16: Register renderers for attention presentations and watch-view notes in the main session. */
 export function registerCards(pi: ExtensionAPI, home: string): void {
   const done = new Set<string>(); // resolution is monotone: once resolved, never re-read
+  // pi renders every visible message on each frame; an open question re-reads its child session at most once a second.
+  const checked = new Map<string, number>();
   const isResolved = (item: AttentionItem) => {
     const id = `${item.id}@${item.rev}`;
     if (done.has(id)) return true;
-    try { if (resolved(home, item)) { done.add(id); return true; } } catch { /* display only */ }
+    const now = Date.now();
+    if (now - (checked.get(id) ?? -Infinity) < 1000) return false;
+    checked.set(id, now);
+    try { if (resolved(home, item)) { done.add(id); checked.delete(id); return true; } } catch { /* display only */ }
     return false;
   };
   pi.registerMessageRenderer<{ items?: AttentionItem[] }>(CT.attention, (message, options, theme) => {
     const items = message.details?.items;
     if (!items?.length) return undefined;
-    return { invalidate() {}, render: (width: number) => items.flatMap(item => {
+    // The lines depend only on width, expansion, theme and which questions are answered: reuse them across frames.
+    let last: { key: string; lines: string[] } | undefined;
+    const draw = (width: number) => items.flatMap(item => {
       const h = HEAD[item.kind] ?? HEAD.unknown, closed = item.kind === "question" && isResolved(item);
       const heading = `${h.icon} ${item.kind === "finished" && !item.call ? "Workflow" : `Subagent ${keyOf(item)}`} ${closed ? "— answered" : h.title}`;
       // v12 §3: a finished digest is first line + dim per-agent lines, clipped; old single-line items read exactly as before.
@@ -58,10 +65,19 @@ export function registerCards(pi: ExtensionAPI, home: string): void {
         ? digestLines(item.text, line => theme.fg("dim", line), inner)
         : [closed ? theme.fg("dim", item.text) : item.text];
       return card(theme, closed ? "muted" : h.tone, heading, body, width, options.expanded);
-    }) };
+    });
+    return { invalidate() { last = undefined; }, render: (width: number) => {
+      const key = `${width}|${items.map(item => item.kind === "question" && isResolved(item) ? 1 : 0).join("")}`;
+      if (last?.key !== key) last = { key, lines: draw(width) };
+      return last.lines;
+    } };
   });
   pi.registerMessageRenderer(CT.note, (message, options, theme) => {
     const text = typeof message.content === "string" ? message.content : "";
-    return { invalidate() {}, render: (width: number) => card(theme, "muted", "you, in the subagent view", text.split("\n"), width, options.expanded) };
+    let last: { width: number; lines: string[] } | undefined;
+    return { invalidate() { last = undefined; }, render: (width: number) => {
+      if (last?.width !== width) last = { width, lines: card(theme, "muted", "you, in the subagent view", text.split("\n"), width, options.expanded) };
+      return last.lines;
+    } };
   });
 }
