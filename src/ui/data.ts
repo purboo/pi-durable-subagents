@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { UiDeps } from "../agent/main.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
+type Entry = ReturnType<typeof readJournalSnapshot>[number];
 import { allWorkflows, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { callDir, callSession, journalPath, orchLedger } from "../paths.ts";
 import { LIVE_FILE, type Live } from "../agent/child/live.ts";
@@ -17,6 +18,22 @@ function readLive(path: string): Live | undefined {
     return live.phase !== "idle" && Date.now() - live.at < 120_000 ? live : undefined;
   } catch { return undefined; }
 }
+type JournalIndex = { length: number; calls: Map<string, Entry>; losses: Map<string, number>; execs: Map<string, number> };
+const indexes = new WeakMap<readonly Entry[], JournalIndex>();
+/** The last call proposal per key/gen and the last loss and launch per execution, built once per journal snapshot
+ *  instead of scanning the whole journal for every call on every refresh. */
+function journalIndex(journal: readonly Entry[]): JournalIndex {
+  const hit = indexes.get(journal);
+  if (hit && hit.length === journal.length) return hit;
+  const index: JournalIndex = { length: journal.length, calls: new Map(), losses: new Map(), execs: new Map() };
+  journal.forEach((e, i) => {
+    if (e.type === "call") index.calls.set(`${e.key}\0${e.gen}`, e);
+    else if (e.type === "loss") index.losses.set(String(e.exec), i);
+    else if (e.type === JT.exec) index.execs.set(String(e.exec), i);
+  });
+  indexes.set(journal, index);
+  return index;
+}
 /** A1, P25: Read the UI's data from durable workflow snapshots and native session tails only. */
 export class UiData {
   workflows: WorkflowSnapshot[] = [];
@@ -28,27 +45,37 @@ export class UiData {
   /** Where the dock sits: below the editor (default; never splits an editor header such as a powerline bar) or above. */
   dockAt: "below" | "above" = "above";
   private tails = new Map<string, SessionTail>();
+  /** Branch and facts per call, reused while its session tail is unchanged: a finished call's session never grows, and
+   *  re-deriving every historical call on each refresh blocked pi's main thread for over a second. */
+  private derived = new Map<string, { source: readonly SessionEntry[]; length: number; entries: SessionEntry[]; facts: Facts }>();
   home: string;
   constructor(home: string) { this.home = home; }
   refresh() {
     const workflows = allWorkflows(this.home), facts = new Map<string, Facts>(), sessions = new Map<string, readonly SessionEntry[]>();
     for (const w of workflows) {
-      const journal = readJournalSnapshot(journalPath(this.home, w.wid));
+      const index = journalIndex(readJournalSnapshot(journalPath(this.home, w.wid)));
       for (const c of w.calls) {
         let tail = this.tails.get(c.callId);
         if (!tail) { tail = new SessionTail(); this.tails.set(c.callId, tail); }
-        const entries = sessionBranch(tail.read(callSession(this.home, w.wid, c.key, c.gen)));
-        const value = sessionFacts(entries, c.callId);
-        const proposal = journal.findLast(e => e.type === "call" && e.key === c.key && e.gen === c.gen);
+        const source = tail.read(callSession(this.home, w.wid, c.key, c.gen));
+        let cached = this.derived.get(c.callId);
+        if (!cached || cached.source !== source || cached.length !== source.length) {
+          const entries = sessionBranch(source);
+          cached = { source, length: source.length, entries, facts: sessionFacts(entries, c.callId) };
+          this.derived.set(c.callId, cached);
+        }
+        const entries = cached.entries;
+        const value: Facts = { ...cached.facts, live: undefined };
+        const proposal = index.calls.get(`${c.key}\0${c.gen}`);
         value.task ||= String((proposal?.spec as { task?: string } | undefined)?.task ?? "");
-        const loss = journal.findLastIndex(e => e.type === "loss" && e.exec === c.exec);
-        const launch = journal.findLastIndex(e => e.type === JT.exec && e.exec === c.exec);
+        const loss = index.losses.get(String(c.exec)) ?? -1;
+        const launch = index.execs.get(String(c.exec)) ?? -1;
         if (c.phase !== "sealed" && loss > launch) value.activity = "connection dropped, retrying";
         if (c.phase !== "sealed") value.live = readLive(join(callDir(this.home, w.wid, c.key, c.gen), LIVE_FILE));
         sessions.set(c.callId, entries); facts.set(c.callId, value);
       }
     }
-    for (const key of this.tails.keys()) if (!sessions.has(key)) this.tails.delete(key);
+    for (const key of this.tails.keys()) if (!sessions.has(key)) { this.tails.delete(key); this.derived.delete(key); }
     this.workflows = workflows; this.facts = facts; this.sessions = sessions;
     // UI-only optional aliases; absence or invalid config must not break execution (P21).
     try {
