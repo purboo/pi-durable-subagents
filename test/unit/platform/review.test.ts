@@ -40,7 +40,7 @@ test("Containment forwards caller exec ids to macOS ps filtering", async () => {
 test("fast true and exit 3 preserve output and status without scanning the table", { timeout: 10000 }, async () => {
   const table = new ProcessTable();
   for (const fixture of [
-    { command: "/bin/true", args: [], code: 0, stdout: "", stderr: "" },
+    { command: "/bin/sh", args: ["-c", "true"], code: 0, stdout: "", stderr: "" },
     { command: "/bin/sh", args: ["-c", "printf 'fast output'; printf 'fast error' >&2; exit 3"], code: 3, stdout: "fast output", stderr: "fast error" },
   ]) {
     const tag = randomUUID();
