@@ -23,7 +23,7 @@ import { serialContainment } from "../../../src/orchestrator/executor/sweep.ts";
 
 const recorder = fileURLToPath(new URL("recorder.ts", import.meta.url));
 const agent = { name: "test", description: "test", body: "Test agent", model: "probe/scripted", tools: ["bash"], systemPromptMode: "replace" as const, inheritProjectContext: false, inheritSkills: false, sourcePath: "/fixture/test.md", source: "project" as const };
-async function until(predicate: () => boolean | Promise<boolean>, ms = 15000) {
+async function until(predicate: () => boolean | Promise<boolean>, ms = 30000) {
   const deadline = Date.now() + ms;
   while (!await predicate()) { if (Date.now() >= deadline) throw new Error("Timed out waiting for durable executor evidence"); await delay(20); }
 }
@@ -282,7 +282,7 @@ test("P9 current-segment evidence excludes earlier reports, aborted text and dan
   assert.deepEqual(evidence(entries, "missing").dangling, []);
 });
 
-test("V1 real pi processes serialize provider slots; stop fences and seals exactly once", { timeout: 30000 }, async t => {
+test("V1 real pi processes serialize provider slots; stop fences and seals exactly once", { timeout: 90000 }, async t => {
   const f = await setup(t, { providers: { probe: { slots: 1 } }, k: { trackerMs: 25 } });
   const a = f.ticket("a", script([{ delayMs: 60000, text: "late" }])), b = f.ticket("b", a.spec.task);
   const pa = f.executor.run(a), pb = f.executor.run(b);

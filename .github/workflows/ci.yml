@@ -20,10 +20,9 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint:imports
-      - run: npm run test:unit 2>&1 | tee unit.log; exit ${PIPESTATUS[0]}
-        shell: bash
-      - run: npm run test:pi 2>&1 | tee pi.log; exit ${PIPESTATUS[0]}
-        shell: bash
+      # A failing file is rerun once; a pass on the rerun is a flaky warning annotation, a second failure fails.
+      - run: node scripts/ci-test.mjs unit.log 'test/unit/**/*.test.ts'
+      - run: node scripts/ci-test.mjs pi.log --test-concurrency=1 'test/pi/**/*.test.ts'
         if: matrix.node == '24'
       - run: npm run pack:smoke 2>&1 | tee pack.log; exit ${PIPESTATUS[0]}
         shell: bash

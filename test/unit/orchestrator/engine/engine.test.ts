@@ -37,7 +37,7 @@ async function fixture(t: test.TestContext, evaluator?: EvaluatorTransport | ((l
   await mkdir(join(home, 'project/.pi/agents'), { recursive: true });
   await writeFile(join(home, 'project/.pi/agents/test.md'), '---\nname: test\ndescription: Test agent\n---\nSynthetic.');
   const ledgers: Ledgers = { home, config: { k: { idleExitMs: 30 } }, orch: await openJournal(orchLedger(home)) };
-  const executor = fakeExecutor(ledgers, { delay: key => key === 'a' ? 70 : key === 'b' ? 10 : 0, hold });
+  const executor = fakeExecutor(ledgers, { delay: key => key === 'a' ? 400 : key === 'b' ? 10 : 0, hold });
   const engine = new Engine(ledgers, executor, { evaluator: typeof evaluator === 'function' ? evaluator(ledgers) : evaluator, discovery: { home, agentDir: join(home, 'config'), globalNpmRoot: null } });
   t.after(async () => { await engine.close(); await ledgers.orch.close(); await rm(home, { recursive: true, force: true }); });
   const run = async (source: string, extra: Partial<RunBody> = {}, sseq = 1) => {
