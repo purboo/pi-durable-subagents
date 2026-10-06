@@ -26,6 +26,12 @@ async function until(predicate: () => boolean | Promise<boolean>, ms = 15000) {
   const deadline = Date.now() + ms;
   while (!await predicate()) { if (Date.now() >= deadline) throw new Error("Timed out waiting for durable executor evidence"); await delay(20); }
 }
+/** A compact journal and session trace for a failure message (CI logs are the only evidence of a flake). */
+function trace(entries: readonly Record<string, unknown>[], native: readonly Record<string, unknown>[]): string {
+  const j = entries.filter(e => e.type !== "time").map(e => e.type === "observation" ? `obs:${(e.event as { type?: string }).type}` : `${e.type}${e.exec ? `(${String(e.exec).split("#")[1]})` : ""}`);
+  const n = native.map(e => e.type === "message" ? `msg:${(e.message as { role?: string; stopReason?: string }).role}/${(e.message as { stopReason?: string }).stopReason ?? ""}` : `${e.type}${e.customType ? `:${e.customType}` : ""}`);
+  return `journal: ${j.join(" ")}\nsession: ${n.join(" ")}`;
+}
 async function setup(t: TestContext, config: OrchestratorConfig = {}, options: Parameters<typeof createExecutor>[1] = {}) {
   const root = tempRoot("dsa-executor-"), home = join(root, "dsa"), cwd = join(root, "work");
   await mkdir(cwd, { recursive: true });
@@ -691,7 +697,7 @@ test("X1 suspend preserves the open executor and resumes the same native session
   assert.equal((await f.executor.run(ticket)).output, "continued after suspend");
   const native = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
   assert.equal(native.filter(e => e.type === "session").length, 1);
-  assert.equal(native.filter(e => e.customType === CT.exec).length, 2);
+  assert.equal(native.filter(e => e.customType === CT.exec).length, 2, trace(f.journal.entries(), native));
 });
 
 test("P9 P15 AC4 a once call whose tool was cut off seals unknown, raises one unknown item and never re-runs the tool", { timeout: 30000 }, async t => {
@@ -748,7 +754,7 @@ test("X1 K7 skips the third-loss candidate and changes the continuation's model"
   assert.equal((await f.executor.run(ticket)).output, "new candidate");
   assert.equal(f.orch.entries().filter(e => e.type === "skip").length, 1);
   const selected = f.journal.entries().filter(e => e.type === "selected").map(e => (e.model as { id: string }).id);
-  assert.deepEqual(selected, ["scripted", "scripted", "scripted", "scripted2"]);
+  assert.deepEqual(selected, ["scripted", "scripted", "scripted", "scripted2"], trace(f.journal.entries(), await readFile(callSession(f.home, f.wid, "a", 1), "utf8").then(s => s.trim().split("\n").map(l => JSON.parse(l)))));
   assert.ok(f.journal.entries().some(e => e.type === "observation" && (e.event as { model?: string }).model === "scripted2"));
 });
 
