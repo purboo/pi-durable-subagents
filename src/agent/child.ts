@@ -11,6 +11,7 @@ import { planDecisions, type DecisionRecord } from '../kernel/lifecycle.ts';
 import { openness } from '../kernel/guards.ts';
 import { recover, type Question } from './child/history.ts';
 import { validate } from './child/schema.ts';
+import { registerLive } from './child/live.ts';
 
 // boundary = turn_end (steer lands between turns); settle = agent_before_settle (follow-ups land only here or idle).
 type Mode = 'idle' | 'boundary' | 'settle' | 'ask';
@@ -158,6 +159,7 @@ export function registerChild(pi: ExtensionAPI): void {
     catch (error) { fail(ctx, error); }
   };
   pi.on('turn_end', boundary('boundary'));
+  registerLive(pi, () => active); // UI §3: in-flight response for watching (ephemeral, not durable state)
   pi.on('agent_before_settle', boundary('settle'));
   // P31b, V8: refuse the next provider request once the per-call budget is reached (one in-flight overshoot at most).
   const budget = process.env[ENV.budget] ? JSON.parse(process.env[ENV.budget]!) as { tokens?: number; costUsd?: number } : undefined;

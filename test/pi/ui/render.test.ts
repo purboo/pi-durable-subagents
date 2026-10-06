@@ -268,7 +268,7 @@ test("list order and selection stay put across activity refreshes and inserted r
   screen.handleInput("\x1b"); screen.handleInput("\r"); assert.match(plain(screen), /E07 · GPT-6/); // Esc returns to the watched row
 });
 
-test("every view is a framed floating panel: compact list and menus, a tall watch view, at several widths and heights", async () => {
+test("every view is one fixed-size framed dialog (smaller than the terminal on all sides), at several widths and heights", async () => {
   const original = Date.now; Date.now = () => now;
   try {
     for (const rows of [45, 12]) {
@@ -276,16 +276,16 @@ test("every view is a framed floating panel: compact list and menus, a tall watc
       (screen as unknown as { tui: { terminal: { rows: number } } }).tui = { ...tui, terminal: { rows, columns: 100 } } as typeof tui;
       // The short panel also runs with styled output: selection background and border colours must not change widths.
       if (rows === 12) (screen as unknown as { theme: typeof theme }).theme = { fg: (_c: string, t: string) => `\x1b[36m${t}\x1b[39m`, bg: (_c: string, t: string) => `\x1b[44m${t}\x1b[49m`, bold: (t: string) => `\x1b[1m${t}\x1b[22m` } as typeof theme;
-      const compact = rows < 20 ? rows : Math.floor(rows * 0.6) - 2, tall = rows < 20 ? rows : Math.floor(rows * 0.85) - 2;
-      const fits = (lines: string[], cap: number, exact = false) => { assert.ok(exact ? lines.length === cap : lines.length <= cap, `${lines.length} rows within ${cap}`); return lines.length; };
+      const tall = rows < 20 ? rows : Math.floor(rows * 0.85) - 2, compact = tall; // one fixed dialog size for every view
+      const fits = (lines: string[], cap: number, _exact = false) => { assert.equal(lines.length, cap, `${lines.length} rows, fixed at ${cap}`); return lines.length; };
       screen.render(100); screen.handleInput("\x1b[B");
       for (const width of [20, 40, 60, 100]) { const lines = screen.render(width); assertFrame(lines, width, fits(lines, compact), /^┏━ Subagents /); }
-      if (rows === 45) assert.equal(screen.render(100).length, 5 + 2, "the list grows with its content, not to the terminal height");
+      if (rows === 45) assert.equal(screen.render(100).length, tall, "the list is the same fixed dialog, whatever its content");
       if (rows === 12) assert(screen.render(100)[2]!.includes("\x1b[44m"), "selected row is highlighted across the panel");
       screen.handleInput("\r");
       for (const width of [20, 40, 60, 100]) { const lines = screen.render(width); assertFrame(lines, width, fits(lines, tall, true), /^┏━ exec-0927 › E02 /); }
       const watch = plain(screen).split("\n");
-      assert.match(watch.at(-2)!, /^┗━ 3m00s · Esc back ━+┛$/); // key hints live in the bottom border
+      assert.match(watch.at(-2)!, /^┗━ 3m00s · ctrl\+t thinking · ctrl\+o tools · Esc back ━+┛$/); // key hints live in the bottom border
       assert.match(watch.at(-4)!, /^Steer E02…/); // the editor sits at the bottom of the panel
       screen.handleInput("\x0c");
       for (const width of [20, 40, 60, 100]) { const lines = screen.render(width); assertFrame(lines, width, fits(lines, compact), /^┏━ Model for E02 /); }
@@ -309,4 +309,16 @@ test("UI §3: the watch header shows the subagent's own token spend and how full
   open();
   const lines = plain(screen).split("\n"), spend = lines[lines.findIndex(l => l.includes("▾")) + 1]!; // its own line under the model
   assert.match(spend, /^tokens ↑12\.3k ↓1\.2k \$0\.04 · context 110(\/\S+ \(\d+%\))?$/);
+});
+
+test("UI §3 be pi: the watch view shows the response in flight — waiting for the model, then streaming thinking (Ctrl+T expands) and text", () => {
+  const { screen, open, data } = setup(); open();
+  const id = data.workflows[0]!.calls[0]!.callId, facts = data.facts.get(id)!;
+  facts.activity = undefined; data.workflows[0]!.calls[0]!.phase = "running";
+  facts.live = { phase: "waiting", since: Date.now() - 7_000, at: Date.now() };
+  assert.match(plain(screen), /Waiting for the model · 7s/);
+  facts.live = { phase: "streaming", since: Date.now() - 3_000, at: Date.now(), thinking: "**Tracing the lease**\nThe timer starts before the lock.", text: "Found it." };
+  assert.match(plain(screen), /▸ Thinking 3s · Tracing the lease/); assert.match(plain(screen), /Found it\./);
+  assert(!plain(screen).includes("The timer starts before the lock."));
+  screen.handleInput("\x14"); assert.match(plain(screen), /The timer starts before the lock\./);
 });

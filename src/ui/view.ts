@@ -60,10 +60,11 @@ export function rowText(indent: string, key: string, model: string, phrase: stri
   for (const showModel of width >= 40 ? [true, false] : [false]) {
     const head = `${indent}${pad(key, cols.key)}  ${showModel ? `${pad(short, width < 70 ? 0 : cols.model)}  ` : ""}`;
     const room = width - visibleWidth(head) - (end ? visibleWidth(end) + 2 : 0);
-    if (end && room >= 8) return `${head}${pad(truncateToWidth(phrase, room), room)}  ${end}`;
-    if (!end && showModel) return truncateToWidth(head + phrase, Math.max(1, width));
+    // truncateToWidth closes its ellipsis with an SGR reset; drop it so a dimmed row stays dim to its end (tools, age).
+    if (end && room >= 8) return `${head}${pad(truncateToWidth(phrase, room).replaceAll("\x1b[0m", ""), room)}  ${end}`;
+    if (!end && showModel) return truncateToWidth(head + phrase, Math.max(1, width)).replaceAll("\x1b[0m", "");
   }
-  return truncateToWidth(`${indent}${key}  ${phrase}`, Math.max(1, width));
+  return truncateToWidth(`${indent}${key}  ${phrase}`, Math.max(1, width)).replaceAll("\x1b[0m", "");
 }
 /** UI §2: Prefer report phrases while retaining truthful terminal status and failure reasons. */
 export function resultPhrase(call: CallSnapshot): string {
@@ -89,7 +90,12 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   if (call.phase === "queued") return workflow.paused ? "paused by stop-all · resume to start" : "queued: waiting for a free slot";
   // Liveness (UI §2): the age of the newest evidence ticks, and resets whenever the agent does anything.
   const since = duration(Math.max(0, now - Math.max(call.lastActivity ?? 0, facts?.lastActivity ?? 0, call.startedAt ?? 0)));
-  return facts?.activity ? `${facts.activity} · ${since}` : `thinking · ${since}`;
+  if (facts?.activity) return `${facts.activity} · ${since}`;
+  // UI §3 "be pi": say what the model is really doing, from the child's live state, rather than guessing "thinking".
+  const live = facts?.live, age = live ? duration(Math.max(0, now - live.since)) : "";
+  if (live?.phase === "waiting") return `waiting for the model · ${age}`;
+  if (live?.phase === "streaming") return live.tool ? `writing a ${live.tool} call · ${age}` : live.text ? `writing · ${age}` : `thinking · ${age}`;
+  return `thinking · ${since}`;
 }
 function failed(c: CallSnapshot) { return c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped"; }
 
@@ -197,7 +203,7 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     const text = rowText(indent, label(c), name(f?.model ?? c.model), statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
     rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), dim, text });
     // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.
-    if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, dim, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)) });
+    if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, dim, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)).replaceAll("\x1b[0m", "") });
   };
   for (const v of visible) {
     // One row per key: the newest generation (key@2) stands for the agent; older ones open from its watch view (← →).

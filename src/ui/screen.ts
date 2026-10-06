@@ -12,6 +12,7 @@ import { thoughtSummary } from "./session.ts";
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /** UI §2–3: A single pi component owns list/watch navigation while the main agent keeps running. */
+const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 export class SubagentScreen implements Component {
   readonly state: ViewState;
   private data: UiData;
@@ -278,7 +279,18 @@ export class SubagentScreen implements Component {
     const last = entries.at(-1);
     const pending = c.phase === "running" && !this.data.facts.get(c.callId)?.activity &&
       !(last?.type === "message" && last.message.role === "assistant");
-    if (pending) {
+    // UI §3 "be pi": the response in flight, from the child's live state: waiting for the provider, or the thinking
+    // and text streaming in (thinking collapsed like pi's, Ctrl+T or a click expands it).
+    const live = c.phase === "running" ? this.data.facts.get(c.callId)?.live : undefined;
+    if (live?.phase === "waiting") components.push(`${SPIN[Math.floor(Date.now() / 500) % SPIN.length]} Waiting for the model · ${duration(Date.now() - live.since)}`);
+    else if (live?.phase === "streaming") {
+      const age = ` ${Math.floor((Date.now() - live.since) / 1000)}s`;
+      if (live.thinking) components.push(`${this.expandedThinking ? "▾ " : "▸ "}Thinking${age}${thoughtSummary(live.thinking) ? ` · ${thoughtSummary(live.thinking)}` : ""}`);
+      const content = [...(this.expandedThinking && live.thinking ? [{ type: "thinking" as const, thinking: live.thinking }] : []), ...(live.text ? [{ type: "text" as const, text: live.text }] : [])];
+      if (content.length) components.push(new AssistantMessageComponent({ role: "assistant", content, api: "", provider: "", model: "", usage: undefined, stopReason: "stop", timestamp: Date.now() } as unknown as AssistantMessage, false, markdown, undefined, 0));
+      if (live.tool) components.push(`${SPIN[Math.floor(Date.now() / 500) % SPIN.length]} Writing a ${live.tool} call`);
+      if (!live.thinking && !live.text && !live.tool) components.push(`${SPIN[Math.floor(Date.now() / 500) % SPIN.length]} Responding · ${duration(Date.now() - live.since)}`);
+    } else if (pending) {
       const elapsed = thinkingElapsed(entries);
       components.push(`Thinking${elapsed === undefined ? "" : ` ${Math.floor(elapsed / 1000)}s`}`);
     }
@@ -307,11 +319,11 @@ export class SubagentScreen implements Component {
     }
     return parts.length ? parts.join(" · ") : "tokens: none reported yet";
   }
-  /** The panel height for the current view: `content` rows plus the frame, within the overlay's height cap. */
-  private height(content?: number): number {
-    const rows = this.termRows(), small = rows < 20;
-    const cap = small ? rows : Math.floor(rows * (content === undefined ? 0.85 : 0.6)) - 2;
-    return content === undefined ? cap : Math.min(cap, Math.max(3, content + 2));
+  /** UI §2: One fixed-size dialog for every view, a little smaller than the terminal on all sides, so it always reads
+   *  as a window over pi rather than part of the chat (it does not grow or shrink with its content). */
+  private height(_content?: number): number {
+    const rows = this.termRows();
+    return rows < 20 ? rows : Math.floor(rows * 0.85) - 2;
   }
   render(width: number): string[] {
     let height = this.height(), size = inner(width, height);
@@ -378,6 +390,7 @@ export class SubagentScreen implements Component {
       this.jumpRow = 1 + head.length + available - 1;
     }
     this.inputRow = 1 + head.length + available + 1;
-    return panel([...head, ...body, rule, ...editor, hint], `${w.name ?? w.wid} › ${label(c)}`, `${duration(Date.now() - (c.startedAt ?? Date.now()))} · Esc back`);
+    // pi's own keys for the transcript, spelled out: thinking and tool output expand in place.
+    return panel([...head, ...body, rule, ...editor, hint], `${w.name ?? w.wid} › ${label(c)}`, `${duration(Date.now() - (c.startedAt ?? Date.now()))} · ctrl+t thinking · ctrl+o tools · Esc back`);
   }
 }
