@@ -2,41 +2,8 @@
 
 ## 1.0.2
 
-- The dock is back above the editor by default (1.0.1 moved it below). It is
-  set once per session, so listed before another extension's editor bar (such
-  as a powerline bar) in `packages`, it sits above that bar.
-  `"ui": { "dockAt": "below" }` puts it below the editor.
-
-## 1.0.1
-
-- Model and thinking menus search fuzzily, by id or display name (`bedrock opus`
-  finds `amazon-bedrock/claude-opus-4-5`); the thinking menu says what it searches.
-- A requested model switch shows at once in the list and the watch header
-  ("old → new, at the end of this step") until the subagent applies it;
-  switch rejections read in plain words.
-- Calls waiting for a provider slot show as queued, with the model they asked
-  for, instead of "thinking"; summaries count queued apart from working.
-- The dock is set once instead of twice a second, so it stays where the
-  extension load order puts it: listed before another extension's editor bar
-  (such as a powerline bar), it sits above that bar instead of slipping between
-  the bar and the editor. `"ui": { "dockAt": "below" }` puts it below the
-  editor. Rows keep a one-column margin.
-- A row is always one terminal line: multi-line commands or names no longer
-  break the panel border.
-- `/subagents` opens the list; typing with the list open goes to pi's editor;
-  the selected row is marked with `›`.
-- A top-level `cwd` is the run's directory: relative workflow, input and call
-  paths resolve against it.
-- Install from GitHub without a build step:
-  `pi install git:github.com/purboo/pi-durable-subagents`.
-- Robustness: a resumed subagent applies its model before its first turn; a
-  failed process-table scan no longer ends a live subagent's observation; the
-  orchestrator starts through symlinked paths (macOS `/var`); Node.js 22.19 is
-  the minimum (older Node disables execution with a message).
-
-## 1.0.0
-
-The first release.
+The first published release (1.0.0 and 1.0.1 were prepared but never
+published).
 
 - Durable subagent workflows for pi. Requests, executions and results are
   journaled; a crash of pi, the orchestrator or the machine resumes the same
@@ -70,3 +37,16 @@ The first release.
   adapted under MIT); `researcher` and `evidence-auditor` use whichever web
   extension is installed.
 - Requires Node.js 22.19 or later and pi 1.0.x.
+- Model and thinking menus search fuzzily, by id or display name (`bedrock opus`
+  finds `amazon-bedrock/claude-opus-4-5`). A requested model switch shows at
+  once ("old → new, at the end of this step") until the subagent applies it.
+- Calls waiting for a provider slot show as queued, with the model they asked
+  for; the summary counts them apart from working ones.
+- The dock is installed once per session: listed before another extension's
+  editor bar (such as a powerline bar) in `packages`, it sits above that bar.
+  `"ui": { "dockAt": "below" }` puts it below the editor.
+- `/subagents` opens the list, like `↓` on an empty editor.
+- A top-level `cwd` is the run's directory: relative workflow, input and call
+  paths resolve against it.
+- Install from npm, or from GitHub without a build step:
+  `pi install git:github.com/purboo/pi-durable-subagents`.
