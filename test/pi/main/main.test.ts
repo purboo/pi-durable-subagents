@@ -41,7 +41,12 @@ function setup(t: { after(fn: () => Promise<void>): void }, receipt = true) {
 async function prompt(pi: PiInstance, steps: unknown[], ms = 20000) {
   const from = pi.events.length;
   pi.send({ type: "prompt", message: script(steps) });
-  await pi.waitFor(e => pi.events.indexOf(e) >= from && e.type === "agent_settled", ms);
+  // A late agent_settled from an earlier turn (a finished notice continues the agent) must not end this wait:
+  // when the prompt calls the tool, wait for that call's end first, then for the settle after it.
+  const calls = steps.some(s => typeof s === "object" && s !== null && "tool" in s);
+  const end = calls ? await pi.waitFor(e => pi.events.indexOf(e) >= from && e.type === "tool_execution_end", ms) : undefined;
+  const after = end ? pi.events.indexOf(end) : from;
+  await pi.waitFor(e => pi.events.indexOf(e) > after && e.type === "agent_settled", ms);
 }
 function result(pi: PiInstance) {
   return pi.events.filter(e => e.type === "tool_execution_end" && e.toolName === "subagents").at(-1) as any;
