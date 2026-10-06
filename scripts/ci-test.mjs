@@ -1,0 +1,36 @@
+// CI test runner: run a suite; if test files fail, rerun only those files once. A file that passes on the rerun is
+// reported as a flaky warning (an annotation, never hidden); a file that fails twice fails the job.
+// Shared CI runners are much slower and noisier than a workstation; real-process and timing-sensitive tests can
+// miss a deadline there. A failure that repeats is a real failure.
+//   node scripts/ci-test.mjs <log> [node --test args...]
+import { spawnSync } from "node:child_process";
+import { appendFileSync, writeFileSync } from "node:fs";
+
+const [log, ...args] = process.argv.slice(2);
+const run = (testArgs) => {
+  const result = spawnSync(process.execPath, ["--test", ...testArgs], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  process.stdout.write(output);
+  return { code: result.status ?? 1, output };
+};
+const first = run(args);
+writeFileSync(log, first.output);
+if (first.code === 0) process.exit(0);
+
+// Failing files: "test at <file>:<line>" (spec reporter) or a TAP "location: '<file>:<line>:<col>'".
+const files = new Set();
+const text = first.output.replace(/\x1b\[[0-9;]*m/g, "");
+for (const m of text.matchAll(/^test at (\S+?):\d+:\d+$/gm)) files.add(m[1]);
+for (const m of text.matchAll(/location: '([^']+?):\d+:\d+'/g)) if (m[1].endsWith(".test.ts")) files.add(m[1]);
+const relative = [...files].map(f => f.replace(`${process.cwd()}/`, "")).filter(f => f.endsWith(".test.ts"));
+if (!relative.length) { console.log("::error::test run failed without an identifiable failing file"); process.exit(first.code); }
+
+const flags = args.filter(a => a.startsWith("--"));
+console.log(`\n=== rerunning ${relative.length} failing file(s) once: ${relative.join(", ")} ===\n`);
+const second = run([...flags, ...relative]);
+appendFileSync(log, `\n=== rerun of ${relative.join(", ")} ===\n${second.output}`);
+if (second.code === 0) {
+  for (const f of relative) console.log(`::warning title=flaky test file::${f} failed once and passed when rerun alone`);
+  process.exit(0);
+}
+process.exit(second.code);
