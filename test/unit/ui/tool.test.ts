@@ -13,7 +13,7 @@ test("UI §5: tool calls render as one line, never the raw script or prompts", (
 test("UI §5: results collapse to started / applied / rejected / one line per workflow", () => {
   assert.deepEqual(resultLines({ wid: "01ABC" }), ["started workflow 01ABC"]);
   assert.deepEqual(resultLines({ wid: "01ABC", paused: "Subagents are paused" }), ["started workflow 01ABC", "⚠ Subagents are paused"]);
-  assert.deepEqual(resultLines({ applied: false, reason: "terminal:done — start a new run", rid: "r" }), ["✗ not applied: terminal:done — start a new run"]);
+  assert.deepEqual(resultLines({ applied: false, reason: "terminal:done — start a new run", rid: "r" }), ["✗ not applied: the workflow already ended (done); start a new run instead"]);
   assert.deepEqual(resultLines({ workflows: [{ wid: "01M4698PE75Q18ZYH588ZW6DNW", status: "running", calls: [{ phase: "sealed", status: "failed" }, { phase: "running" }], attention: [{ kind: "question" }] }] }),
     ["01M4698PE7… · running · 1/2 done · 1 not ok · 1 asking"]);
 });

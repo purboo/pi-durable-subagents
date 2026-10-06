@@ -48,7 +48,7 @@ test('P31: snapshots carry per-call and workflow usage from seals and deduplicat
   assert.deepEqual(by.c!.usage, u(7, 3, 0), 'live usage before a seal');
   assert.equal(by.b!.tools, 1); assert.equal(by.b!.model, 'p/m');
   assert.equal(snap.usage!.input, 1307); assert.equal(snap.usage!.output, 73); assert.ok(Math.abs(snap.usage!.costUsd - 0.13) < 1e-9);
-  assert.equal(finishedText('w', entries), 'nightly (w) stopped: 1 ok; 1 stopped; 1 unknown\nold: ok\n  a\nfinal old\nb: stopped\nc: unknown\nUsage: 1.3K in / 73 out, $0.13\nFull output: subagents status wid:w');
+  assert.equal(finishedText('w', entries), 'nightly (w) stopped: 1 ok; 1 stopped; 1 unknown\nold: ok\n  a\nfinal old\nb: stopped (edits it made so far are left in place)\nc: unknown\nUsage: 1.3K in / 73 out, $0.13\nFull output: subagents status wid:w');
 });
 
 test('T10: events keep the meaningful timeline only', () => {

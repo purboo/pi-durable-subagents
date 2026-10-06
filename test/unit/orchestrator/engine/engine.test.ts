@@ -676,8 +676,8 @@ test('v12 §3: finished attention digests latest calls, report, errors and stopp
     e(7, 'sealed', { call: 'w@1/c@1', result: { ...res('c', 'skipped', 'ignored text'), data: { verdict: 'skip' } } }),
     e(8, 'workflow-done', { status: 'stopped', error: 'workflow stopped' }),
   ];
-  assert.equal(finishedText('w', entries as never), 'nightly (w) stopped: 1 ok; 1 stopped; 1 skipped\na: ok\n  line1\nDONE: a\nb: stopped\n  partially complete\n  Error: user stopped\nc: skipped\n  {"verdict":"skip"}\nError: workflow stopped\nFull output: subagents status wid:w');
-  assert.equal(finishedText('w', entries as never, 'w@1/b@1'), 'nightly/b@1 (follow-up) stopped:\nb: stopped\n  partially complete\n  Error: user stopped\nError: workflow stopped\nFull output: subagents status wid:w');
+  assert.equal(finishedText('w', entries as never), 'nightly (w) stopped: 1 ok; 1 stopped; 1 skipped\na: ok\n  line1\nDONE: a\nb: stopped (edits it made so far are left in place)\n  partially complete\n  Error: user stopped\nc: skipped\n  {"verdict":"skip"}\nError: workflow stopped\nFull output: subagents status wid:w');
+  assert.equal(finishedText('w', entries as never, 'w@1/b@1'), 'nightly/b@1 (follow-up) stopped:\nb: stopped (edits it made so far are left in place)\n  partially complete\n  Error: user stopped\nError: workflow stopped\nFull output: subagents status wid:w');
   assert.doesNotMatch(finishedText('w', entries as never), /failed/);
   entries.push(e(9, 'generation', { key: 'a', gen: 2, from: 'w@1/a@1', spec: { agent: 'x' } }));
   entries.push(e(10, 'sealed', { call: 'w@1/a@2', result: { key: 'a', gen: 2, status: 'timeout', ok: false, output: 'retry timed out' } }));

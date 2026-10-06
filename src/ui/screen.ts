@@ -4,7 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { doneOrder, isOpen, toggleOpen, duration, keepSelection, summaryText, label, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, label, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
 import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
@@ -57,12 +57,12 @@ export class SubagentScreen implements Component {
   /** v12 §5: Show a durable control decision on the list for a bounded interval. */
   controlResult(result: { rid: string; applied: boolean; reason?: string }) {
     if (!this.listPending.delete(result.rid) || this.disposed) return;
-    this.listNotice = { text: result.applied ? "✓ applied" : `✗ ${result.reason ?? "rejected"}`, until: Date.now() + 4000 };
+    this.listNotice = { text: result.applied ? "✓ applied" : `✗ ${plainReason(result.reason)}`, until: Date.now() + 4000 };
     this.refresh();
   }
   private report(result: { state: "applied" | "submitted" | "rejected"; reason?: string; rid?: string }) {
     if (result.rid && result.state === "submitted") this.listPending.add(result.rid);
-    this.listNotice = { text: result.state === "applied" ? "✓ applied" : result.state === "rejected" ? `✗ ${result.reason ?? "rejected"}` : "submitted…", until: Date.now() + 4000, rid: result.rid };
+    this.listNotice = { text: result.state === "applied" ? "✓ applied" : result.state === "rejected" ? `✗ ${plainReason(result.reason)}` : "submitted…", until: Date.now() + 4000, rid: result.rid };
     this.refresh();
   }
   private selectedRow() { return this.rows[this.selected]; }
@@ -124,7 +124,7 @@ export class SubagentScreen implements Component {
     const target = this.watching;
     const result = await this.actions.send(args, note);
     this.busy = false;
-    if (!this.disposed && this.watching === target) { this.notice = result.state === "rejected" ? `${note}: ${result.reason}` : "Submitted"; if (result.state !== "rejected") { this.input.setValue(""); this.uses++; } this.refresh(); }
+    if (!this.disposed && this.watching === target) { this.notice = result.state === "rejected" ? `${note}: ${plainReason(result.reason)}` : "Submitted"; if (result.state !== "rejected") { this.input.setValue(""); this.uses++; } this.refresh(); }
   }
   private modelMenu(target?: CallSnapshot) {
     const c = target ?? this.current().c; if (!c) return;
