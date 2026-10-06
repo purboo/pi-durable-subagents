@@ -22,9 +22,13 @@ export function checkCapabilities(modules: Record<string, Record<string, unknown
   const missing = SURFACES.filter(s => !has(s));
   const name = (list: Surface[]) => list.map(s => `${s.where}.${s.name}`).join(", ");
   const pi = version ? `pi ${version}` : "this pi version";
-  const execution = !missing.some(s => s.tier === 0), ui = execution && !missing.some(s => s.tier === 2);
+  // The evaluator's CPU limit needs worker.cpuUsage and process.threadCpuUsage (Node 22.19); without them a runaway
+  // script would never be stopped, so an older Node disables execution rather than run unguarded.
+  const node = typeof (process as { threadCpuUsage?: unknown }).threadCpuUsage === "function";
+  const execution = node && !missing.some(s => s.tier === 0), ui = execution && !missing.some(s => s.tier === 2);
   const messages: string[] = [];
-  if (!execution) messages.push(`Durable Subagents disabled: ${pi} no longer provides ${name(missing.filter(s => s.tier === 0))}. Running workflows are untouched; run \`pi-durable-subagents smoke\` for details.`);
+  if (!node) messages.push(`Durable Subagents disabled: it needs Node.js 22.19 or later (this is ${process.version}).`);
+  else if (!execution) messages.push(`Durable Subagents disabled: ${pi} no longer provides ${name(missing.filter(s => s.tier === 0))}. Running workflows are untouched; run \`pi-durable-subagents smoke\` for details.`);
   else if (!ui) messages.push(`Durable Subagents: native watch view disabled (${pi} no longer exports ${name(missing.filter(s => s.tier === 2))}); use \`pi-durable-subagents tail\`.`);
   return { ...(version ? { version } : {}), missing, execution, ui, messages };
 }

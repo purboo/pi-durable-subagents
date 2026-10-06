@@ -30,9 +30,13 @@ export interface PiInstance {
 }
 
 export function tempRoot(prefix = "dsa-test-"): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  // Real path: pi reports its cwd resolved (macOS: /var is /private/var), so expectations must use the same form.
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
+/** A shell snippet that starts `sleep <s>` in a new session (detached, like setsid, which macOS lacks) and prints its pid. */
+export const detachedSleep = (seconds: number) =>
+  `'${process.execPath}' -e 'const c = require("child_process").spawn("sleep", ["${seconds}"], { detached: true, stdio: "ignore" }); console.log(c.pid); c.unref()'`;
 export const script = (steps: unknown[]) => `#script: ${JSON.stringify(steps)}`;
 
 export function startPi(opts: { root: string; name: string; extensions?: string[]; args?: string[]; env?: Record<string, string>; model?: boolean }): PiInstance {

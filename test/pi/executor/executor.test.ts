@@ -7,7 +7,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { FAUX, PI_BIN, REPO, script, settled, startPi, tempRoot } from "../../harness/pi.ts";
+import { FAUX, PI_BIN, REPO, script, settled, startPi, tempRoot, detachedSleep } from "../../harness/pi.ts";
+import { parseAgent } from "../../../src/compat/agents.ts";
 import { callDir, callInbox, callSession, journalPath, orchLedger, outboxRoot } from "../../../src/paths.ts";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { scanInbox } from "../../../src/kernel/mailbox.ts";
@@ -472,15 +473,17 @@ test("C1 protocol ask remains available with an empty agent tool allowlist", { t
 
 test("C1 SIGKILL during a tool fences its detached orphan and continues", { timeout: 45000 }, async t => {
   const f = await setup(t, { k: { trackerMs: 25 } }), pidfile = join(f.cwd, "orphan.pid");
-  const ticket = f.ticket("a", script([{ tool: "bash", args: { command: `setsid sleep 60 & echo $! > '${pidfile}'; sleep 60` } }, { text: "recovered" }]));
+  const ticket = f.ticket("a", script([{ tool: "bash", args: { command: `${detachedSleep(60)} > '${pidfile}'; sleep 60` } }, { text: "recovered" }]));
   const pending = f.executor.run(ticket);
-  await until(() => existsSync(pidfile));
+  await until(() => existsSync(pidfile) && /\d\n/.test(readFileSync(pidfile, "utf8")));
   const orphan = Number((await readFile(pidfile, "utf8")).trim());
   const direct = f.journal.entries().find(e => e.type === "tracked" && e.exec === `${ticket.callId}#1.1`)!;
   process.kill(Number(direct.pid), "SIGKILL");
   assert.equal((await pending).status, "ok");
+  // Gone, or a zombie (Linux /proc shows "Z") awaiting its reaper.
+  const alive = (() => { try { process.kill(orphan, 0); return true; } catch { return false; } })();
   const state = await readFile(`/proc/${orphan}/stat`, "utf8").catch(() => "");
-  assert.ok(!state || /\) Z /.test(state));
+  assert.ok(!alive || /\) Z /.test(state), `the detached orphan ${orphan} was fenced`);
   const continuation = sent(f.home).find(r => r.kind === "continue")!;
   assert.match((continuation.body as { message: string }).message, /unknown.*bash/);
 });
@@ -907,7 +910,7 @@ test("F1 a stuck fence of a real child parks only its call with attention; a sib
   const f = await setup(t, { k: { trackerMs: 25 } }, { containment, sweepMs: 100 });
   // pi exits when its stdin ends (rpc-mode.js:642) and kills its bash tree (shell.js killProcessTree), so only a
   // detached (setsid) descendant outlives the child: it plays the process the stuck fence cannot retire.
-  const a = f.ticket("a", script([{ tool: "bash", args: { command: "setsid sleep 60 >/dev/null 2>&1 & sleep 60" } }, { text: "never" }])), b = f.ticket("b", script([{ delayMs: 300, text: "sibling done" }]));
+  const a = f.ticket("a", script([{ tool: "bash", args: { command: `${detachedSleep(60)} >/dev/null; sleep 60` } }, { text: "never" }])), b = f.ticket("b", script([{ delayMs: 300, text: "sibling done" }]));
   const ea = `${a.callId}#1.1`, tagged = async () => (await new ProcessTable().list()).filter(p => p.tag === ea);
   t.mock.method(console, "error", () => {});
   stuck = ea;
@@ -930,4 +933,17 @@ test("F1 a stuck fence of a real child parks only its call with attention; a sib
     assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${ea}` && e.resolution === "fenced"));
     assert.deepEqual(await tagged(), []);
   } finally { stuck = undefined; await real.fence(ea, []).catch(() => {}); }
+});
+
+test("builtin researcher uses a web tool registered by another installed extension", { timeout: 30000 }, async t => {
+  const f = await setup(t);
+  await writeFile(join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({ extensions: [FAUX, join(REPO, "test/harness/web-tool-ext.ts")], defaultProvider: "probe", defaultModel: "scripted" }));
+  const researcher = parseAgent(readFileSync(join(REPO, "agents/researcher.md"), "utf8"), join(REPO, "agents/researcher.md"), "builtin")!;
+  const base = f.ticket("a", script([{ tool: "web_search", args: { query: "durable" } }, { text: "brief done" }]));
+  const result = await f.executor.run({ ...base, agent: { ...researcher, model: "probe/scripted" } });
+  assert.equal(result.output, "brief done");
+  const native = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  const toolResult = native.find(e => e.message?.role === "toolResult" && e.message.toolName === "web_search")?.message;
+  assert.ok(toolResult && !toolResult.isError, JSON.stringify(toolResult));
+  assert.match(JSON.stringify(toolResult.content), /WEB-RESULT for durable/);
 });

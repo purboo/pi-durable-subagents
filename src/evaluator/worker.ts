@@ -19,9 +19,7 @@ function post(message: Record<string, unknown>) {
   port.postMessage({ ...message, ...identity });
 }
 function segment() {
-  // threadCpuUsage is newer than the engines floor (22.18); the evaluator process does little else, so its whole-process
-  // usage is a close stand-in there.
-  const usage = (process as { threadCpuUsage?: () => NodeJS.CpuUsage }).threadCpuUsage?.() ?? process.cpuUsage();
+  const usage = process.threadCpuUsage();
   post({ t: 'segment', cpu: usage.user + usage.system });
 }
 function fail(error: unknown) {

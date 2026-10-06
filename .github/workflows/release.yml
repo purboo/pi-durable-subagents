@@ -1,5 +1,5 @@
 name: release
-# One release per tag: the full CI matrix (Linux + macOS, Node 24 and the 22.18 floor, real pi suite, packaged
+# One release per tag: the full CI matrix (Linux + macOS, Node 24 and the 22.19 floor, real pi suite, packaged
 # smoke) must pass, then the exact tagged commit is published to npm with provenance.
 on:
   push:

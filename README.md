@@ -32,7 +32,7 @@ scratch.
 pi install npm:pi-durable-subagents
 ```
 
-This needs pi 1.0.x and Node.js 22.18 or later. It has been tested with
+This needs pi 1.0.x and Node.js 22.19 or later. It has been tested with
 pi 1.0.2 on Linux. The CI configuration covers Linux and macOS.
 
 The `pi-durable-subagents` command line (below) is optional. Run it without
@@ -168,12 +168,17 @@ in your user or project agents overrides one.
 | Agent | Use it when you want... |
 |---|---|
 | `scout` | Fast local codebase recon: relevant files, entry points, data flow, risks. |
-| `researcher` | Web/docs research with sources and a concise brief (needs a web tool in the child). |
+| `researcher` | Web/docs research with sources and a concise brief. |
 | `evidence-auditor` | An independent check that important research claims are supported by their sources. |
 | `worker` | Implementation: edits files, validates, asks instead of guessing on unapproved decisions. |
 | `reviewer` | Code review and small fixes against the task, tests, edge cases and simplicity. |
 | `oracle` | A second opinion before acting; challenges assumptions without editing. |
 | `delegate` | A lightweight general delegate that behaves close to the parent session. |
+
+`researcher` and `evidence-auditor` search with whatever web extension your pi
+has installed (for example [pi-web-access](https://www.npmjs.com/package/pi-web-access)).
+Without one they can still read given URLs with `curl`, and say that search was
+unavailable.
 
 | pi-subagents | Durable Subagents |
 |---|---|

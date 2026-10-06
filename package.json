@@ -14,7 +14,7 @@
     "multi-agent"
   ],
   "engines": {
-    "node": ">=22.18"
+    "node": ">=22.19"
   },
   "bin": {
     "pi-durable-subagents": "dist/cli/main.js"
