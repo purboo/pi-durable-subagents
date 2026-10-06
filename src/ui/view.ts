@@ -66,6 +66,19 @@ export function rowText(indent: string, key: string, model: string, phrase: stri
   }
   return truncateToWidth(`${indent}${key}  ${phrase}`, Math.max(1, width)).replaceAll("\x1b[0m", "");
 }
+/** UI §5: A control's rejection in plain words for people; the model keeps the exact machine reason. */
+export function plainReason(reason: string | undefined): string {
+  const r = reason ?? "rejected", colon = r.indexOf(":"), code = colon < 0 ? r : r.slice(0, colon);
+  const detail = colon < 0 ? "" : ` (${r.slice(colon + 1).split(" — ")[0]!.trim()})`;
+  if (code === "terminal") return `the workflow already ended${detail}; start a new run instead`;
+  if (code === "already-sealed") return `that subagent already finished${detail}`;
+  if (code === "finished") return `that subagent already finished${detail}; use f to follow up`;
+  if (r === "nothing-to-resume") return "nothing is paused, so there is nothing to resume";
+  if (code === "not-parked") return "it is already running";
+  if (r === "already-answered" || r === "stale-question") return "that question was already answered";
+  if (code === "unknown-call") return r.includes("use one of") ? `no such subagent; ${r.slice(r.indexOf("use one of"))}` : "no such subagent";
+  return r;
+}
 /** UI §2: Prefer report phrases while retaining truthful terminal status and failure reasons. */
 export function resultPhrase(call: CallSnapshot): string {
   const r = call.result;

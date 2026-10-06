@@ -106,7 +106,7 @@ test("v12 §5 stop confirmation cancels on any non-y key and resolves actual con
   assert.deepEqual(requests[0], { action: "stop", target: "w" }); assert.match(plain(screen), /✓ applied/);
   screen.handleInput("\x1b[B"); screen.handleInput("x"); screen.handleInput("\r"); assert.equal(requests.length, 1);
   screen.handleInput("x"); screen.handleInput("y"); await tick();
-  assert.deepEqual(requests[1], { action: "stop", target: "w@1/E02@1" }); assert.match(plain(screen), /✗ already-sealed/);
+  assert.deepEqual(requests[1], { action: "stop", target: "w@1/E02@1" }); assert.match(plain(screen), /✗ that subagent already finished/);
 });
 
 test("v12 §5 pending control shows submitted until the matching durable resolution arrives", async () => {

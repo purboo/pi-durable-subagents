@@ -58,7 +58,8 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
     const allowance = Math.min(1500, Math.floor(remaining / (calls.length - i)));
     if (allowance < 2) break;
     const result = c.result;
-    const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${wakeStatus(result?.status)}`;
+    // A stop leaves the agent's edits where they are; say so, so nobody mistakes a stopped agent for a clean undo.
+    const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${wakeStatus(result?.status)}${result?.status === 'stopped' ? ' (edits it made so far are left in place)' : ''}`;
     const title = `\n${tail(name, allowance - 1)}`;
     const error = result?.error && allowance - title.length > 10 ? `\n  Error: ${tail(result.error, Math.min(300, allowance - title.length - 9))}` : '';
     const space = allowance - title.length - error.length;

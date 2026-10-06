@@ -1,5 +1,6 @@
 import { Text } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { plainReason } from "./view.ts";
 
 type Args = Record<string, unknown>;
 type Step = { key?: unknown; agent?: unknown };
@@ -37,7 +38,7 @@ export function resultLines(details: unknown): string[] {
   const d = (details ?? {}) as Record<string, unknown>;
   if (typeof d.wid === "string" && !Array.isArray(d.calls)) return [`started workflow ${d.wid}`, ...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : [])];
   if (d.applied === true) return ["✓ applied"];
-  if (d.applied === false) return [`✗ not applied: ${String(d.reason ?? "")}`];
+  if (d.applied === false) return [`✗ not applied: ${plainReason(String(d.reason ?? ""))}`];
   if (d.submitted) return ["submitted; the orchestrator has not decided yet"];
   const row = (w: StatusRow) => {
     const done = w.calls.filter(c => c.phase === "sealed").length, failed = w.calls.filter(c => c.status && c.status !== "ok").length;
