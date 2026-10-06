@@ -49,7 +49,8 @@ export class ProcessTable implements Table {
     this.platform = options.platform ?? process.platform;
     this.ps = options.ps ?? (async () => (await exec("ps",
       ["-axEww", "-o", "pid=,ppid=,lstart=,time=,stat=,command="],
-      { env: { ...process.env, LC_ALL: "C" }, timeout: 2000, maxBuffer: 32 * 1024 * 1024 })).stdout);
+      // The whole table with environments is large; 2 s proved too short on loaded macOS machines.
+      { env: { ...process.env, LC_ALL: "C" }, timeout: 10_000, maxBuffer: 32 * 1024 * 1024 })).stdout);
   }
 
   /** C2: Return a fresh process snapshot, caching Linux environments by identity. */
