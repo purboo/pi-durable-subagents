@@ -162,8 +162,18 @@ resolved, never as open.
 
 Agent files, discovery and precedence follow `pi-subagents` 0.75.0. That
 covers user, project and package agents, `model:thinking`, `tools` and
-`skills`. The builtin agents (`worker`, `reviewer`, `scout`, `researcher`,
-`oracle`, `delegate`, `evidence-auditor`) are included.
+`skills`. The same builtin agents are included; an agent file of the same name
+in your user or project agents overrides one.
+
+| Agent | Use it when you want... |
+|---|---|
+| `scout` | Fast local codebase recon: relevant files, entry points, data flow, risks. |
+| `researcher` | Web/docs research with sources and a concise brief (needs a web tool in the child). |
+| `evidence-auditor` | An independent check that important research claims are supported by their sources. |
+| `worker` | Implementation: edits files, validates, asks instead of guessing on unapproved decisions. |
+| `reviewer` | Code review and small fixes against the task, tests, edge cases and simplicity. |
+| `oracle` | A second opinion before acting; challenges assumptions without editing. |
+| `delegate` | A lightweight general delegate that behaves close to the parent session. |
 
 | pi-subagents | Durable Subagents |
 |---|---|
