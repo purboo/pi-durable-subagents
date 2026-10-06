@@ -221,6 +221,11 @@ test("T6/T10 real orchestrator: control actions report applied or the rejection 
   const wid = String(result(pi).result.details.wid);
   assert.ok(wid && wid !== "undefined", JSON.stringify(result(pi).result.details));
   await until(() => readJournalSnapshot(journalPath(home, wid)).some(e => e.type === JT.done), 20000);
+  // The finished notice wakes the agent for a turn of its own; let that turn end before prompting again, or the
+  // prompt races it (seen on slow CI runners as a prompt that never ran its tool call).
+  const wake = pi.events.length;
+  await until(() => items(pi).some(e => JSON.stringify(e.details).includes('"finished"')), 20000);
+  await pi.waitFor(e => pi.events.indexOf(e) >= wake && e.type === "agent_settled", 20000).catch(() => {});
   await prompt(pi, [{ tool: "subagents", args: { action: "resume", wid } }, { text: "done" }]);
   { const { rid, ...rest } = result(pi).result.details; assert.ok(rid); assert.deepEqual(rest, { applied: false, reason: "terminal:done \u2014 start a new run" }); }
   await prompt(pi, [{ tool: "subagents", args: { action: "stop", target: wid } }, { text: "done" }]);
