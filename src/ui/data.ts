@@ -4,11 +4,19 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { UiDeps } from "../agent/main.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { allWorkflows, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
-import { callSession, journalPath, orchLedger } from "../paths.ts";
+import { callDir, callSession, journalPath, orchLedger } from "../paths.ts";
+import { LIVE_FILE, type Live } from "../agent/child/live.ts";
 import { JT } from "../types.ts";
 import { SessionTail, sessionBranch, sessionFacts } from "./session.ts";
 import type { Facts } from "./view.ts";
 
+/** UI §3: The child's in-flight response, if fresh (a crashed child's last write must not look alive for long). */
+function readLive(path: string): Live | undefined {
+  try {
+    const live = JSON.parse(readFileSync(path, "utf8")) as Live;
+    return live.phase !== "idle" && Date.now() - live.at < 120_000 ? live : undefined;
+  } catch { return undefined; }
+}
 /** A1, P25: Read the UI's data from durable workflow snapshots and native session tails only. */
 export class UiData {
   workflows: WorkflowSnapshot[] = [];
@@ -34,6 +42,7 @@ export class UiData {
         const loss = journal.findLastIndex(e => e.type === "loss" && e.exec === c.exec);
         const launch = journal.findLastIndex(e => e.type === JT.exec && e.exec === c.exec);
         if (c.phase !== "sealed" && loss > launch) value.activity = "connection dropped, retrying";
+        if (c.phase !== "sealed") value.live = readLive(join(callDir(this.home, w.wid, c.key, c.gen), LIVE_FILE));
         sessions.set(c.callId, entries); facts.set(c.callId, value);
       }
     }

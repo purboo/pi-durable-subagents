@@ -3,6 +3,7 @@ import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { CT } from "../types.ts";
+import type { Live } from "../agent/child/live.ts";
 
 /** C5: Incrementally read complete pi session records, resetting after replacement or truncation. */
 export class SessionTail {
@@ -110,5 +111,5 @@ export function sessionFacts(entries: readonly SessionEntry[], call: string) {
     activity = tool.name === "read" ? `reading ${path}` : ["edit", "write"].includes(tool.name) ? `editing ${path}` :
       tool.name === "bash" ? `running ${String(a.command ?? "")}` : `running ${tool.name}`;
   }
-  return { model, thinking, activity, lastActivity, task, tools: count, latest, ...(context !== undefined ? { context } : {}) };
+  return { model, thinking, activity, lastActivity, task, tools: count, latest, ...(context !== undefined ? { context } : {}), live: undefined as Live | undefined };
 }

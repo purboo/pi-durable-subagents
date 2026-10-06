@@ -319,3 +319,15 @@ test("UI §1 dock: a row per active agent (questions first, at most three), a su
   assert.deepEqual(dockLines([done], new Map(), () => "GLM", 80, now + 11 * 60_000), [], "the completion sentence leaves after ten minutes");
   assert.deepEqual(dockLines([], new Map(), () => "GLM", 80, now), []);
 });
+
+test("UI §3 be pi: the phrase says what the model is really doing; a dimmed row has no reset before its tail", () => {
+  const c = call("E02", { phase: "running", startedAt: now - 60_000 }), w = workflow([c]);
+  const base = sessionFacts([], c.callId);
+  assert.equal(statusPhrase(c, w, { ...base, live: { phase: "waiting", since: now - 12_000, at: now } }, now), "waiting for the model · 12s");
+  assert.equal(statusPhrase(c, w, { ...base, live: { phase: "streaming", since: now - 5_000, at: now, thinking: "x" } }, now), "thinking · 5s");
+  assert.equal(statusPhrase(c, w, { ...base, live: { phase: "streaming", since: now - 5_000, at: now, text: "y" } }, now), "writing · 5s");
+  assert.equal(statusPhrase(c, w, { ...base, live: { phase: "streaming", since: now - 5_000, at: now, tool: "bash" } }, now), "writing a bash call · 5s");
+  const row = rowText("  ", "E02", "GLM", "running " + "x".repeat(200), ["3 tools", "1m00s"], 80);
+  assert(!row.includes("\x1b[0m"), "no SGR reset inside a row: the whole row takes the dim style");
+  assert.match(row, /3 tools · 1m00s$/);
+});

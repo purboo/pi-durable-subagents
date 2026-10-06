@@ -4,4 +4,33 @@
 ┃   │   bash: 3 failing: lease expires early                                                       ┃
 ┃   ├ E07  GPT-6 (openai)  asking main agent: docs/ in write set?                            3m00s ┃
 ┃   └ ▸ 1 done                                                                                     ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
+┃                                                                                                  ┃
 ┗━ ↑ ↓ select · Enter collapse · x stop · Esc back ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
