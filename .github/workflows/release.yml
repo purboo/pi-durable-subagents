@@ -1,7 +1,8 @@
 name: release
 # One release per tag: the full CI matrix (Linux + macOS, Node 24 and the 22.19 floor, real pi suite, packaged
-# smoke) must pass, then the exact tagged commit is published to npm with provenance and a GitHub Release is
-# created from that version's CHANGELOG section.
+# smoke) must pass, then the exact tagged commit is STAGED on npm with provenance (a stage-only token cannot
+# publish; the owner approves the staged version with 2FA on npmjs.com or `npm stage approve <id>`), and a GitHub
+# Release is created from that version's CHANGELOG section.
 on:
   push:
     tags: ["v*"]
@@ -18,13 +19,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "24", registry-url: "https://registry.npmjs.org" }
+      - run: npm install -g npm@latest # staged publishing needs npm >= 11.15
       - run: npm ci
       - name: Tag matches package version
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
-      - name: Publish to npm (a re-run skips a version that is already published)
+      - name: Stage on npm (a re-run skips a version that is already published or staged)
         run: |
           if npm view "pi-durable-subagents@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "already published"; exit 0; fi
-          npm publish --provenance --access public
+          if npm stage list pi-durable-subagents 2>/dev/null | grep -q "${GITHUB_REF_NAME#v}"; then echo "already staged"; exit 0; fi
+          npm stage publish --provenance --access public
+          echo "::notice::Staged pi-durable-subagents@${GITHUB_REF_NAME#v}; approve it on npmjs.com (or npm stage approve <id>) to publish."
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: GitHub Release from the CHANGELOG
