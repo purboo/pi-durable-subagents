@@ -51,12 +51,21 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
     `${label} (${wid}) ${snap.status}${parts.length ? `: ${parts.join('; ')}` : ''}`;
   const footer = `${snap.error ? `\nError: ${tail(snap.error, 500)}` : ''}${charged(snap.usage) ? `\nUsage: ${charged(snap.usage)}` : ''}\nFull output: subagents status wid:${wid}`;
   const prefix = tail(heading, Math.max(1, 6000 - footer.length - 1));
-  let remaining = Math.max(0, 6000 - prefix.length - footer.length);
+  // Share the space fairly: short results take what they need and the rest goes to longer ones (one agent may use it
+  // all), so a notice is cut only when the results really exceed it; usage and the full-output hint are never lost.
+  const want = calls.map(c => {
+    const message = c.result && Object.hasOwn(c.result, 'data') ? JSON.stringify(c.result.data) : c.result?.output;
+    return 120 + (message?.length ?? 0) + Math.min(320, c.result?.error?.length ?? 0);
+  });
+  const shares = new Array<number>(calls.length).fill(0);
+  let pool = Math.max(0, 6000 - prefix.length - footer.length);
+  for (const [n, i] of [...want.keys()].sort((a, b) => want[a]! - want[b]!).entries()) {
+    shares[i] = Math.min(want[i]!, Math.floor(pool / (calls.length - n))); pool -= shares[i]!;
+  }
   const lines: string[] = [];
   for (const [i, c] of calls.entries()) {
-    // Reserve a slice for every remaining agent; never lose the usage and full-output hint.
-    const allowance = Math.min(1500, Math.floor(remaining / (calls.length - i)));
-    if (allowance < 2) break;
+    const allowance = shares[i]!;
+    if (allowance < 2) continue;
     const result = c.result;
     // A stop leaves the agent's edits where they are; say so, so nobody mistakes a stopped agent for a clean undo.
     const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${wakeStatus(result?.status)}${result?.status === 'stopped' ? ' (edits it made so far are left in place)' : ''}`;
@@ -65,7 +74,7 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
     const space = allowance - title.length - error.length;
     const message = result && Object.hasOwn(result, 'data') ? JSON.stringify(result.data) : result?.output;
     const line = title + (message && space > 4 ? `\n  ${tail(message.trimEnd(), space - 3)}` : '') + error;
-    lines.push(line); remaining -= line.length;
+    lines.push(line);
   }
   return `${prefix}${lines.join('')}${footer}`;
 }

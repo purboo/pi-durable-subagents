@@ -1,4 +1,6 @@
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { main } from '../../../../src/orchestrator/main.ts';
 import { JT, type CallResult } from '../../../../src/types.ts';
 import type { CallTicket, Executor, Ledgers } from '../../../../src/orchestrator/contract.ts';
@@ -64,7 +66,7 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
   };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && realpathSync(resolve(process.argv[1])) === fileURLToPath(import.meta.url)) {
   const home = process.env.DSA_HOME!;
   main({ home, config: { k: { idleExitMs: 100 } }, executor: ledgers => fakeExecutor(ledgers, { hold: process.env.DSA_FAKE_HOLD }),
     discovery: { home, agentDir: `${home}/config`, globalNpmRoot: null },

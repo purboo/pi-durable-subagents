@@ -25,6 +25,7 @@ jobs:
       - run: npm run test:pi 2>&1 | tee pi.log; exit ${PIPESTATUS[0]}
         shell: bash
         if: matrix.node == '24'
-      - run: node scripts/ci-annotate.mjs unit.log pi.log
+      - run: npm run pack:smoke 2>&1 | tee pack.log; exit ${PIPESTATUS[0]}
+        shell: bash
+      - run: node scripts/ci-annotate.mjs unit.log pi.log pack.log
         if: failure()
-      - run: npm run pack:smoke

@@ -255,7 +255,7 @@ test("fullscreen model and thinking controls expose separate selectors", async (
 
 test("list order and selection stay put across activity refreshes and inserted rows", () => {
   const { screen, data } = setup(); screen.render(100); screen.handleInput("\x1b[B"); screen.handleInput("\x1b[B");
-  const order = () => plain(screen).split("\n").filter(line => /^ {2}[├└] E0\d/.test(line)).map(line => line.trim().slice(2, 5));
+  const order = () => plain(screen).split("\n").filter(line => /^[ ›] {3}[├└] E0\d/.test(line)).map(line => line.slice(2).trim().slice(2, 5));
   assert.deepEqual(order(), ["E02", "E07"]);
   for (const t of [10_000, 20_000, 30_000]) {
     data.workflows[0]!.calls[0]!.lastActivity = now + t; data.facts.set("w@1/E07@1", { ...sessionFacts([], "w@1/E07@1"), lastActivity: now + 2 * t });
@@ -330,4 +330,16 @@ test("be pi: a click anywhere on an expanded thinking block collapses it, a clic
   assert(!plain(screen).includes("Checking the tests now"));
   click(row("Thinking")); assert.match(plain(screen), /Checking the tests now/, "the title expands it");
   click(row("Checking the tests now")); assert(!plain(screen).includes("Checking the tests now"), "a click inside the block collapses it");
+});
+
+test("typing a message with the list open closes the list and hands the text to pi's editor", () => {
+  const pasted: string[] = [];
+  const data = new UiData(join(root, "dsa"));
+  data.workflows = [workflow([call("E02")])];
+  let closed = false;
+  const screen = new SubagentScreen(data, new UiActions({ home: data.home, submit: async () => ({}), presentNote() {} }),
+    { ...ctx, ui: { pasteToEditor: (text: string) => { pasted.push(text); } } } as unknown as typeof ctx, tui, theme, () => { closed = true; }, state());
+  screen.render(100); screen.handleInput("\x1b[B");
+  screen.handleInput("刚");
+  assert.equal(closed, true); assert.deepEqual(pasted, ["刚"]);
 });

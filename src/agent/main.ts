@@ -130,7 +130,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     await start(context);
     // Quit pause: say once, at the session's start, which of its workflows wait for a resume.
     const paused = statusView(home, { origin: sender }).workflows.filter(w => w.origin === sender && w.status === "running" && w.paused);
-    if (paused.length) pi.sendMessage({ customType: CT.note, display: true, content: `${paused.length} subagent workflow${paused.length > 1 ? "s were" : " was"} paused when pi quit (${paused.map(w => w.name ?? w.wid).join(", ")}). Ask to resume, or press ↓ then r.` });
+    if (paused.length) pi.sendMessage({ customType: CT.note, display: true, content: `${paused.length} subagent workflow${paused.length > 1 ? "s were" : " was"} paused when pi quit (${paused.map(w => w.name ?? w.wid).join(", ")}). Ask to resume, or open /subagents (or ↓) and press r.` });
   });
   // Quitting pi is a stop-burning-tokens moment: on a quit (Ctrl+D, /quit, a closed terminal, SIGTERM) this session's
   // running workflows are held — fenced without sealing, so nothing is lost and `resume` continues them in the same
@@ -239,7 +239,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); a sealed call → already-sealed:<status>, a finished workflow → terminal:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. status [wid] gives a digest. revise wid + workflow/source/args starts a revision.",
       "Control replies are {applied:true,rid} or {applied:false,reason,rid} when decided; otherwise {submitted:{rid}} after 10s.",
       ...(agents ? [`Available agents: ${agents}.`] : []),
-      "User sees a summary line above the editor; ↓ on an empty editor opens the list, Enter watches live OR finished calls (finished transcripts remain on disk) and expands finished workflows. List keys: s steer (paste-capable input), x stop (confirm y), m model, a answer when asked, f follow-up on finished calls; action feedback appears in footer.",
+      "User sees a summary line above the editor; ↓ on an empty editor (or /subagents) opens the list, Enter watches live OR finished calls (finished transcripts remain on disk) and expands finished workflows. List keys: s steer (paste-capable input), x stop (confirm y), m model, a answer when asked, f follow-up on finished calls; action feedback appears in footer.",
     ].join("\n"), parameters,
     async execute(_id, args, signal, _update, context) {
       const value = await submit(args as Record<string, unknown>, context.cwd, signal);

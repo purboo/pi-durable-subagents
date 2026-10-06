@@ -124,7 +124,7 @@ highlighted, and a summary line (`1 asking · 3 working · 12/40 done · ↓ sub
 When the work ends it shrinks to one sentence and leaves after ten minutes. Set
 `"ui": { "dock": "line" }` (one line) or `"off"` in `~/.pi/durable-subagents/config.json`.
 
-Press `↓` on an empty editor to open the list, a floating panel: this
+Press `↓` on an empty editor, or type `/subagents`, to open the list, a floating panel: this
 session's workflows (sessions are independent), newest first, every
 subagent with its model, what it is doing and for how long, and its latest
 line. Finished ones stay there,

@@ -1,6 +1,7 @@
 import { mkdir, readFile } from 'node:fs/promises';
-import { pathToFileURL } from 'node:url';
-import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { dsaHome, orchLedger, orchLock } from '../paths.ts';
 import { openJournal } from '../kernel/journal.ts';
 import { OsLock } from '../platform/lock.ts';
@@ -37,7 +38,9 @@ export async function main(options: MainOptions = {}): Promise<void> {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Started through a symlinked path (macOS /var is /private/var; a linked install), argv names the link while
+// import.meta.url is the real file: compare real paths, as the CLI does.
+if (process.argv[1] && realpathSync(resolve(process.argv[1])) === fileURLToPath(import.meta.url)) {
   const controller = new AbortController();
   process.once('SIGTERM', () => controller.abort());
   process.once('SIGINT', () => controller.abort());
