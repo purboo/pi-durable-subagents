@@ -63,7 +63,8 @@ export function requestedModel(journal: JournalHandle, call: string, followUp?: 
   let wanted: Model | undefined;
   if (followUp) { const m = parseModel(followUp); if (!usedAfter(m, -1)) wanted = m; }
   for (const [index, e] of all.entries()) {
-    if (e.type !== "forward" || e.dest !== call || (e.envelope as Envelope | undefined)?.kind !== "model") continue;
+    // A failover's switch is not a request: an execution that ends before applying it leaves the choice to the pool.
+    if (e.type !== "forward" || e.dest !== call || (e.envelope as Envelope | undefined)?.kind !== "model" || e.failover) continue;
     const delivered = all.find(r => r.type === "forward-delivered" && r.call === call && r.rid2 === e.rid2);
     if (delivered) { wanted = undefined; continue; } // applied by the child (now the session's model) or refused by it
     if (all.some(r => r.type === "forward" && r.dest === call && (r.envelope as Envelope).kind === "withdraw" && ((r.envelope as Envelope).body as { rids?: string[] }).rids?.includes(String(e.rid2)))) continue;
@@ -518,7 +519,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const x = folded().exhausted.get(provider), now = Date.now();
     // While a probe runs, its outcome alone decides: a late refusal of an execution admitted earlier changes nothing.
     if (x && (x.probe ? x.probe !== exec : now < x.nextTry)) return;
-    if (orch.entries().some(e => e.type === "provider-exhausted" && e.exec === exec)) return;
+    // Once per execution and provider: an execution moved on by failover can find a second provider used up too.
+    if (orch.entries().some(e => e.type === "provider-exhausted" && e.exec === exec && e.provider === provider)) return;
     await orch.append("provider-exhausted", { provider, exec, since: x?.since ?? now, nextTry: now + (config.k?.probeMs ?? 900_000), error: error.slice(0, 300) });
   }
   /** Quota refusals in a row per execution, from one provider (pi retries a refused request on its own). */
@@ -550,7 +552,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (!m.provider || m.provider === provider || unavailable(m.provider) || skipped(pool, m)) continue;
       const rid = contentHash([exec, "failover", provider]);
       if (t.journal.entries().some(e => e.type === "forward" && e.rid === rid)) return;
+      const probe = folded().exhausted.has(m.provider); // its next try is due (`unavailable` said so): this is its probe
       if (!await reserveSwitch(exec, m.provider, rid)) continue;
+      if (probe) await orch.append("provider-probe", { provider: m.provider, exec });
       const body: ModelBody = { provider: m.provider, model: m.id, ...(m.thinking ? { thinking: m.thinking } : {}) };
       const envelope: Envelope = { to: t.callId, kind: "model", body }, hash = contentHash(envelope);
       const entry = await t.journal.append("forward", { rid, rid2: forwardRid(rid, t.callId.slice(0, t.callId.indexOf("/")), t.key, hash), dest: t.callId, hash, envelope, failover: provider });

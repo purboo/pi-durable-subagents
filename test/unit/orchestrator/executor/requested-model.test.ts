@@ -28,6 +28,9 @@ test("P12: a model request stands until the call uses it; then the session's mod
   // A follow-up's model counts until an execution of the generation answers with it.
   assert.equal(requestedModel(journal(), call, "p/b")?.id, "b");
   assert.equal(requestedModel(journal(exec(1), selected(1, "b"), used(1, "c")), call, "p/b"), undefined);
+  // A failover's switch is no request: undelivered when its execution ended, the pool decides the next launch.
+  assert.equal(requestedModel(journal(exec(1), selected(1, "a"), { ...forward("f1", "b"), failover: "p" }), call), undefined);
+  assert.equal(requestedModel(journal(exec(1), forward("r1", "c"), { ...forward("f1", "b"), failover: "p" }), call)?.id, "c");
   assert.notEqual(modelRid("r"), "r");
 });
 
