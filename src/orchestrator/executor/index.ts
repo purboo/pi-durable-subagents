@@ -295,9 +295,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   const indexed = () => writes.scan(journals.values());
   const origin = (w: WorktreeWrite) => writes.origin(w.journal) ?? orch.entries().find(e => e.type === JT.created && e.wid === address(w.call).wid)?.origin;
   // Serial sections only: wrote and attention are durable before another writer or seal can interleave.
-  /** Remind of every pair of calls that wrote in `root` and have not ended, once per pair and journal. */
+  /** Remind of every pair of calls that wrote in `root` and have not ended, once per pair and journal. The index must be
+   *  current; each append here is indexed at once (only that journal is read). */
   async function remind(root: string) {
-    const live = indexed().live(root);
+    const live = writes.live(root);
     for (let i = 0; i < live.length; i++) for (let k = i + 1; k < live.length; k++) {
       const [first, second] = WorktreeIndex.order(live[i]!, live[k]!), id = worktreePair(first.call, second.call);
       // A retry after a partial cross-workflow append keeps the reminder (and its writer) as first written.
@@ -306,7 +307,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const item = prior ?? { id, rev: 1, kind: "conflict" as const, call: second.call, wid: secondWid,
         text: `${worktreeLabel(first.call)} and ${worktreeLabel(second.call)} both write in ${root} (edit/write seen); assign one owner or move one to its own worktree` };
       for (const target of targets) if (!writes.remindedIn(id, target.journal))
-        await target.journal.append(JT.attention, { item: { ...item, wid: address(target.call).wid } });
+        { await target.journal.append(JT.attention, { item: { ...item, wid: address(target.call).wid } }); writes.scan([target.journal]); }
     }
   }
   async function wrote(t: CallTicket, exec: string, cwd: string, path: string) {
@@ -316,6 +317,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (indexed().has(exec, root)) return;
       const after = writes.live(root).map(w => w.call).filter(c => c !== t.callId);
       await t.journal.append("wrote", { exec, root, ...(after.length ? { after } : {}) });
+      writes.scan([t.journal]);
       await remind(root);
     });
   }
@@ -681,7 +683,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       active.set(ticket.callId, a);
       a.promise = serial(async () => {
         // Repair a crash between wrote and attention (or between the two origin journals).
-        for (const root of indexed().roots()) await remind(root);
+        for (const root of indexed().contested()) await remind(root);
         await resolveWorktrees();
       }).then(() => execute(a)).catch(error => {
         completed.delete(ticket.callId);

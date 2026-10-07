@@ -21,7 +21,9 @@ export function toolPath(cwd: string, input: string): string {
  *  repository made inside another while calls run is seen at once; each lookup is a few `lstat`s. */
 export function worktreeRoots() {
   return async (cwd: string, path: string): Promise<string | undefined> => {
-    let dir = dirname(toolPath(cwd, path));
+    // A path pi's tool cannot use either (e.g. a file URL with a host) is no evidence; the tool reports it to the agent.
+    let dir: string;
+    try { dir = dirname(toolPath(cwd, path)); } catch { return; }
     for (;;) {
       try { dir = await realpath(dir); break; }
       catch (error) {
@@ -51,7 +53,9 @@ export type WorktreeWrite = { call: string; journal: JournalHandle; after?: read
  *  running now: a paused call that wrote still counts until it ends. */
 export class WorktreeIndex {
   private scanned = new Map<JournalHandle, number>();
+  /** Writers per root that have not ended; a root is dropped when its last writer ends. */
   private byRoot = new Map<string, Map<string, WorktreeWrite>>();
+  private callRoots = new Map<string, Set<string>>();
   private execRoots = new Set<string>();
   private endedCalls = new Set<string>();
   private reminders = new Map<string, Map<JournalHandle, { item: AttentionItem; open: boolean }>>();
@@ -67,10 +71,21 @@ export class WorktreeIndex {
   }
   private apply(journal: JournalHandle, e: Entry) {
     if (e.type === "wrote" && typeof e.exec === "string" && typeof e.root === "string") {
-      const call = callOf(e.exec), calls = this.byRoot.get(e.root) ?? new Map<string, WorktreeWrite>();
-      this.byRoot.set(e.root, calls); this.execRoots.add(`${e.exec}\0${e.root}`);
+      const call = callOf(e.exec);
+      this.execRoots.add(`${e.exec}\0${e.root}`);
+      if (this.endedCalls.has(call)) return;
+      const calls = this.byRoot.get(e.root) ?? new Map<string, WorktreeWrite>();
+      this.byRoot.set(e.root, calls);
       if (!calls.has(call)) calls.set(call, { call, journal, ...(Array.isArray(e.after) ? { after: e.after.map(String) } : {}) });
-    } else if (e.type === JT.sealed || e.type === "retired") this.endedCalls.add(String(e.call));
+      const roots = this.callRoots.get(call) ?? new Set<string>(); roots.add(e.root); this.callRoots.set(call, roots);
+    } else if (e.type === JT.sealed || e.type === "retired") {
+      const call = String(e.call); this.endedCalls.add(call);
+      for (const root of this.callRoots.get(call) ?? []) {
+        const calls = this.byRoot.get(root); calls?.delete(call);
+        if (calls && !calls.size) this.byRoot.delete(root);
+      }
+      this.callRoots.delete(call);
+    }
     else if (e.type === "wf-created") this.origins.set(journal, e.origin);
     else if (isEntry(e, JT.attention) && e.item?.kind === "conflict") {
       const held = this.reminders.get(e.item.id) ?? new Map();
@@ -82,9 +97,10 @@ export class WorktreeIndex {
   }
   has(exec: string, root: string): boolean { return this.execRoots.has(`${exec}\0${root}`); }
   ended(call: string): boolean { return this.endedCalls.has(call); }
-  roots(): string[] { return [...this.byRoot.keys()]; }
+  /** Roots where two or more calls that have not ended wrote: the only ones a reminder can be due for. */
+  contested(): string[] { return [...this.byRoot].filter(([, calls]) => calls.size > 1).map(([root]) => root); }
   /** Calls that wrote in `root` and have not ended. */
-  live(root: string): WorktreeWrite[] { return [...this.byRoot.get(root)?.values() ?? []].filter(w => !this.endedCalls.has(w.call)); }
+  live(root: string): WorktreeWrite[] { return [...this.byRoot.get(root)?.values() ?? []]; }
   origin(journal: JournalHandle): unknown { return this.origins.get(journal); }
   /** The reminder of a pair as first written (another journal may still lack its copy after a crash). */
   reminder(id: string): AttentionItem | undefined { return this.reminders.get(id)?.values().next().value?.item; }
