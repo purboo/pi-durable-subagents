@@ -83,6 +83,16 @@ async function defaultModel(): Promise<string | undefined> {
 }
 
 /** P2, P9, P22: Construct the journal-owned execution authority under the engine's OS lock. */
+/** Restart feedback: a resumed child believed the test loop it had started was still running and slept on it. Its
+ *  previous execution was stopped (fenced), and with it every process its tools started, background ones included. */
+export function continueMessage(dangling: readonly string[]): string {
+  return "Your previous execution was interrupted and this one continues the task. Processes your tools started " +
+    "(background ones included) were stopped with it: do not wait for them or their output; check what they left " +
+    "and start again what is still needed. Tool calls whose outcomes are unknown: " + (dangling.join(", ") || "none") + ".";
+}
+/** An asker hibernates while it waits (its execution is stopped to free the provider slot), so the answer says so. */
+export const HIBERNATED_NOTE = "While you waited for the answer below your execution was stopped; processes your tools had " +
+  "started (background ones included) were stopped with it. Check them before relying on them.";
 export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects; containment?: Containment } = {}): Executor {
   const { home, config, orch } = ledgers;
   const containment = options.containment ?? serialContainment(), effects = options.effects ?? createEffects(ledgers);
@@ -586,7 +596,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (openingRid && !openingReceived) await sender.send(t.callId, "task", { message: t.opening!.message }, undefined, { rid: openingRid });
       else if (!openingRid && !taskReceived) await sender.send(t.callId, "task", { message: t.spec.task }, undefined, { rid: taskRid });
       else if (unresolved && !receipt) await sender.send(t.callId, "continue", { message: String(unresolved.message) }, { qid: String(unresolved.qid), rev: Number(unresolved.rev) }, { rid: String(unresolved.rid2) });
-      else if (previous) await sender.send(t.callId, "continue", { message: `Continue the task. Tool calls whose outcomes are unknown: ${dangling.join(", ") || "none"}.` }, undefined, { rid: contentHash([exec, "dispatch"]) });
+      else if (previous) await sender.send(t.callId, "continue", { message: continueMessage(dangling) }, undefined, { rid: contentHash([exec, "dispatch"]) });
       else await sender.send(t.callId, "task", { message: t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       let child: Spawned;
@@ -670,7 +680,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             if (sleeping.qid !== req.cond?.qid || sleeping.rev !== req.cond?.rev) return { action: "reject", reason: "stale-rev" } as const;
             const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
             const item = attentionEntries(ctx.journal.entries()).find(e => e.item.call === dest && e.item.qid === sleeping.qid && e.item.rev === sleeping.rev)?.item;
-            await ctx.journal.append("answer-bound", { call: dest, qid: sleeping.qid, rev: sleeping.rev, rid: req.rid, rid2, hash, message: `Question: ${item?.text ?? sleeping.qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
+            await ctx.journal.append("answer-bound", { call: dest, qid: sleeping.qid, rev: sleeping.rev, rid: req.rid, rid2, hash, message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
             active.get(dest)?.wake(); wake();
             return { action: "apply" } as const;
           }

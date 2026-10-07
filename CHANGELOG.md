@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.13
+
+- A subagent resumed after its execution was interrupted (the orchestrator
+  restarted, the process died, a failover) is told that the processes its
+  tools had started, background ones included, were stopped with it, and not
+  to wait for them; an asker that hibernated while waiting is told the same
+  with the answer. Before, it was told only to continue, and one slept on a
+  test loop that no longer ran.
+- The "no execution activity" alert names the tool command running and how
+  long it has run (for example "running bash `make fault-matrix` for 14m"), so
+  a long silent command reads differently from a stuck call.
+
 ## 1.0.12
 
 - Slot, memory and model decisions read the orchestrator settings recorded in

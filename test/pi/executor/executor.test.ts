@@ -100,6 +100,8 @@ test("P28 hibernates without loss, binds once, resumes with one receipt", { time
   const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
   const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
   assert.equal(rows.filter(e => e.type === "custom_message" && e.details?.rid === bound.rid2).length, 1);
+  // The resumed asker is told its execution (and its processes) stopped while it waited.
+  assert.match(String(rows.find(e => e.type === "custom_message" && e.details?.rid === bound.rid2)?.content), /^While you waited for the answer below your execution was stopped;[^]*\nQuestion: Choose\?\nAnswer: yes /);
   assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
   assert.equal(f.journal.entries().filter(e => e.type === "resumed").length, 1);
   assert.deepEqual(await f.executor.forward({ ...req, rid: "retired" }, ctx), { action: "reject", reason: "retired" });
@@ -594,6 +596,8 @@ test("C1 SIGKILL during a tool fences its detached orphan and continues", { time
   assert.ok(!alive || /\) Z /.test(state), `the detached orphan ${orphan} was fenced`);
   const continuation = sent(f.home).find(r => r.kind === "continue")!;
   assert.match((continuation.body as { message: string }).message, /unknown.*bash/);
+  // Restart feedback: the continued model is told its processes are gone, so it does not wait for them.
+  assert.match((continuation.body as { message: string }).message, /^Your previous execution was interrupted.*background ones included\) were stopped with it: do not wait for them/);
 });
 
 test("C1 forwarded steer then withdraw is consumed with child receipts", { timeout: 30000 }, async t => {

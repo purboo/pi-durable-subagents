@@ -9,7 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { openJournal } from "../../../../src/kernel/journal.ts";
 import { callDir, callSession } from "../../../../src/paths.ts";
 import { JT, type AttentionItem } from "../../../../src/types.ts";
-import { observeExecution } from "../../../../src/orchestrator/executor/observe.ts";
+import { observeExecution, toolCommand } from "../../../../src/orchestrator/executor/observe.ts";
 import { evidence, fatalProviderError, quotaExhausted } from "../../../../src/orchestrator/executor/session.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 
@@ -75,6 +75,18 @@ for (const event of [
   for (const time of [500000, 1000000, 1500000]) await f.tick(time, event);
   assert.equal(f.alerts().length, 0);
   await f.tick(2100001); await eventually(() => f.alerts().length === 1); assert.equal(f.alerts().length, 1);
+});
+
+test("stall text names the running tool command and how long it has run, not an ask", { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await f.tick(1, { type: "tool_execution_start", toolCallId: "q", toolName: "ask", args: { question: "x" } });
+  await f.tick(2, { type: "tool_execution_end", toolCallId: "q", toolName: "ask" });
+  await f.tick(60000, { type: "tool_execution_start", toolCallId: "t", toolName: "bash", args: { command: "make   fault-matrix\n  --all" } });
+  await f.tick(60000 + 600001); await eventually(() => f.alerts("stall:").length);
+  assert.equal((f.alerts("stall:")[0]!.item as AttentionItem).text, "w/a: no execution activity for 10m; running bash `make fault-matrix --all` for 10m (no output or CPU use seen)");
+  assert.equal(toolCommand({ command: "x".repeat(200) }), "x".repeat(119) + "…");
+  assert.equal(toolCommand({ path: "a.ts" }), '{"path":"a.ts"}');
+  assert.equal(toolCommand(undefined), "");
 });
 
 test("stall text identifies the call", { timeout: 5000 }, async t => {
