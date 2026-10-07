@@ -25,6 +25,7 @@ type Dependencies = {
   switched(event: Record<string, unknown>): Promise<void>;
   /** An assistant message ended: an answer of a used-up provider makes it available again. */
   answered?(event: Record<string, unknown>): Promise<void>;
+  wrote?(path: string): Promise<void>;
   pendingSwitch(): Entry | undefined;
 };
 /** A tool call's command for a status line: bash's command, else its arguments, on one line and clipped. */
@@ -113,6 +114,8 @@ export async function observeExecution(d: Dependencies) {
     if (event.type === "message_update" || ["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(String(event.type)) ||
       event.type === "message_end" && message?.stopReason !== "error" && (message?.usage?.output ?? 0) > 0) progress = performance.now();
     enqueue(async () => {
+      const args = event.args as { path?: unknown } | undefined;
+      if (event.type === "tool_execution_start" && (event.toolName === "edit" || event.toolName === "write") && typeof args?.path === "string") await d.wrote?.(args.path);
       const slim = observation(event);
       if (slim) {
         await serial(() => t.journal.append("observation", { exec, event: slim }));

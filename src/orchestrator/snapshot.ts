@@ -8,6 +8,7 @@ import { journalPath, orchLedger, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
 import { emptyLedger, foldLedger, type LedgerState } from "./ledger.ts";
 import { packageVersion } from "../version.ts";
+import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
@@ -23,6 +24,8 @@ export interface CallSend {
 }
 export interface CallSnapshot {
   key: string; gen: number; callId: string; agent: string; phase: CallPhase;
+  /** Other calls named by an open shared-worktree reminder. */
+  sharedWorktree?: string[];
   result?: CallResult;
   /** The model in use: the provider/model of the latest answer (`model-used`), else the one launched (`selected`), else
    *  the one the call asked for while it waits for a slot. */
@@ -224,6 +227,11 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
     const list = structuredClone([...calls.values()]);
     const openAttention = structuredClone(attention.filter(item => !resolved.has(`${item.id}@${item.rev}`)));
     for (const item of openAttention) {
+      if (item.kind === "conflict") {
+        const pair = worktreeCalls(item.id);
+        for (const c of list) if (pair.includes(c.callId))
+          c.sharedWorktree = [...new Set([...(c.sharedWorktree ?? []), ...pair.filter(id => id !== c.callId).map(worktreeLabel)])].sort();
+      }
       const call = item.kind === "question" ? list.find(c => item.id.startsWith(`q:${c.callId}:`)) : undefined;
       if (call && (call.phase === "running" || call.phase === "queued")) call.phase = "asking"; // a hibernated asker is fenced
     }
@@ -386,6 +394,7 @@ export function formatUsage(u: Usage): string {
 
 export interface StatusCall {
   key: string; gen: number; callId: string; phase: CallPhase;
+  sharedWorktree?: string[];
   status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage;
   /** Messages forwarded to the call whose child receipt has not been observed yet (P7). */
   pending?: number;
@@ -437,6 +446,7 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
     calls: wf.calls.map(c => {
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
       return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...(r ? { status: r.status, ok: r.ok } : {}),
+        ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}) };
     }),
@@ -487,6 +497,7 @@ const latestCalls = (wf: WorkflowSnapshot) => [...new Map(wf.calls.map(c => [c.k
 
 export interface BriefCall {
   key: string; agent: string; phase: CallPhase; model?: string;
+  sharedWorktree?: string[];
   /** Since the call started, and since its last activity (shown when quiet for a minute or more). */
   for?: string; quiet?: string;
   /** Input + output tokens so far: a running call at 0 has done nothing yet. */
@@ -597,6 +608,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
     const calls = latestCalls(w).filter(c => c.phase !== "sealed" || (c.result && !c.result.ok)).map((c): BriefCall => {
       const live = c.phase !== "sealed", quiet = c.lastActivity !== undefined ? now - c.lastActivity : undefined;
       return { key: c.key, agent: c.agent, phase: c.phase, ...(c.model ? { model: c.model } : {}),
+        ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(live && c.startedAt !== undefined ? { for: age(now - c.startedAt) } : {}),
         ...(live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
         ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
