@@ -245,7 +245,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
       const forwarded = sends.get(c.callId);
       if (forwarded) {
         c.sends = structuredClone(forwarded); const pending = forwarded.filter(pendingMessage).length; if (pending) c.pending = pending;
-        const last = c.phase !== "sealed" && !retired.has(c.callId) ? forwarded.findLast(s => s.kind === "model" && s.reason !== "withdrawn") : undefined;
+        const last = c.phase !== "sealed" && !retired.has(c.callId) ? forwarded.findLast(s => s.kind === "model" && s.reason !== "withdrawn" && s.reason !== "stale-execution") : undefined;
         if (last?.reason !== undefined) c.switchFailed = `${last.model} (${last.reason})`;
         else if (last && last.state !== "retired" && last.model !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = last.model;
       }

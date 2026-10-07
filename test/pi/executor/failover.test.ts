@@ -188,3 +188,23 @@ test("failover: moving to a provider whose next try is due makes that execution 
   const log = f.orch.entries(), available = log.findIndex(e => e.type === "provider-available" && e.provider === "qb");
   assert.ok(available >= 0 && available < log.findIndex(e => e.type === "hold" && e.pool === "qb" && !String(e.exec).includes(exec)), "b admitted after the probe answered");
 });
+
+test("failover: a switch its execution did not apply is refused by the next execution, which keeps its own choice", { timeout: 60000 }, async t => {
+  const config = { pools: { top: ["qa/m", "qb/m", "qc/m"] } };
+  const f = await setup(t, config, { ...PI_RETRY, baseDelayMs: 2000 });
+  await f.exhaust(true);
+  const ticket = f.ticket("a", "top"), run = f.executor.run(ticket); void run.catch(() => {});
+  await until(() => f.journal.entries().some(e => e.type === "forward" && e.failover === "qa"));
+  await f.executor.shutdown(); await run.catch(() => {});
+  const forward = f.journal.entries().find(e => e.type === "forward" && e.failover === "qa")!;
+  assert.ok(!f.journal.entries().some(e => e.type === "forward-delivered" && e.rid2 === forward.rid2), "not applied before the stop");
+  // qb is found used up by another call meanwhile: the next execution chooses qc and holds qc's slot.
+  await f.orch.append("provider-exhausted", { provider: "qb", exec: "other", since: Date.now(), nextTry: Date.now() + 900_000, error: "No available accounts" });
+  const recovered = createExecutor({ home: f.home, orch: f.orch, config });
+  t.after(() => recovered.shutdown());
+  await recovered.recover(ticket.wid, f.journal);
+  const result = await recovered.run(ticket);
+  assert.equal(result.output, "answered by qc");
+  assert.deepEqual(providersOf(f, "a"), ["qa", "qc"]); assert.ok(!(await f.requests()).includes("qb"));
+  assert.equal(f.journal.entries().find(e => e.type === "forward-delivered" && e.rid2 === forward.rid2)?.reason, "stale-execution");
+});

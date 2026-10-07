@@ -222,7 +222,9 @@ export interface DrainBody { fence?: boolean; origin?: string; wid?: Wid }
 /** kinds "task" | "steer" | "follow-up" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */
 export interface MessageBody { message: string }
 /** kind "model": parsed from "provider/id[:thinking]" by the orchestrator. */
-export interface ModelBody { provider: string; model: string; thinking?: string }
+/** `exec`: only that execution may apply it (a failover's switch); a later execution of the call rejects it as
+ *  `stale-execution`, since its own launch already chose a model and holds that model's slot. */
+export interface ModelBody { provider: string; model: string; thinking?: string; exec?: string }
 /** Arguments of the child `report` tool (P24); `data` is validated against DSA_SCHEMA. */
 export interface ReportArgs { outcome: "ok" | "failed"; summary?: string; data?: unknown }
 
