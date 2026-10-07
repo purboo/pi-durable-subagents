@@ -102,39 +102,52 @@ function resolvedIn(entries: readonly Entry[]): Set<string> {
 }
 /** Successful `ask` results per child session file, read incrementally: pi renders an open question's card on every
  *  frame, and re-reading and parsing the whole child session each time stalled typing in the main session. */
-type AskScan = { identity: string; offset: number; pending: string; decoder: StringDecoder; answered: Set<string> };
-const asks = new Map<string, AskScan>();
+type AskScan = { identity: string; offset: number; mark: Buffer; pending: string; decoder: StringDecoder; answered: Set<string> };
+const asks = new Map<string, AskScan>(), ASK_SCANS = 64, MARK = 64;
+function ask(scan: AskScan, line: string): void {
+  if (!line.includes('"ask"')) return;
+  let entry;
+  try { entry = JSON.parse(line); } catch { return; } // a malformed line is skipped, as pi and the session tail do (E4)
+  const msg = entry?.type === "message" ? entry.message : undefined;
+  if (msg?.role === "toolResult" && msg.toolName === "ask" && !msg.isError) scan.answered.add(JSON.stringify([msg.details?.qid, msg.details?.rev]));
+}
 function answeredAsks(path: string): Set<string> | undefined {
   let stat;
   try { stat = statSync(path); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { asks.delete(path); return undefined; } throw error; }
   const identity = `${stat.dev}:${stat.ino}`;
   let scan = asks.get(path);
-  if (!scan || scan.identity !== identity || stat.size < scan.offset) {
-    scan = { identity, offset: 0, pending: "", decoder: new StringDecoder("utf8"), answered: new Set() };
-    asks.set(path, scan);
-  }
-  if (stat.size === scan.offset) return scan.answered;
+  if (scan) { asks.delete(path); asks.set(path, scan); } // least recently used first
   const fd = openSync(path, "r");
   try {
-    const buffer = Buffer.alloc(Math.min(256 * 1024, stat.size - scan.offset));
-    while (scan.offset < stat.size) {
-      const n = readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - scan.offset), scan.offset);
-      if (!n) break;
-      scan.offset += n; scan.pending += scan.decoder.write(buffer.subarray(0, n));
-      let end;
-      while ((end = scan.pending.indexOf("\n")) >= 0) {
-        const line = scan.pending.slice(0, end); scan.pending = scan.pending.slice(end + 1);
-        // Only complete lines are parsed; a malformed one is skipped, as pi and the session tail do (E4).
-        if (!line.includes('"ask"')) continue;
-        let entry;
-        try { entry = JSON.parse(line); } catch { continue; }
-        const msg = entry?.type === "message" ? entry.message : undefined;
-        if (msg?.role === "toolResult" && msg.toolName === "ask" && !msg.isError) scan.answered.add(JSON.stringify([msg.details?.qid, msg.details?.rev]));
-      }
+    // Appending keeps what was read: the bytes just before the old end are still there. Anything else (a replaced or
+    // shorter file, other bytes before the old end) is a rewrite, read again from the start. File times are too coarse
+    // to tell a quick rewrite of the same size, so the bytes are compared.
+    let kept = !!scan && scan.identity === identity && stat.size >= scan.offset;
+    if (kept && scan!.mark.length) {
+      const now = Buffer.alloc(scan!.mark.length);
+      kept = readSync(fd, now, 0, now.length, scan!.offset - now.length) === now.length && now.equals(scan!.mark);
     }
+    if (kept && stat.size === scan!.offset) return scan!.answered;
+    if (!kept) {
+      scan = { identity, offset: 0, mark: Buffer.alloc(0), pending: "", decoder: new StringDecoder("utf8"), answered: new Set() };
+      asks.set(path, scan);
+      if (asks.size > ASK_SCANS) asks.delete(asks.keys().next().value!);
+    }
+    const s = scan!;
+    const buffer = Buffer.alloc(Math.min(256 * 1024, Math.max(1, stat.size - s.offset)));
+    while (s.offset < stat.size) {
+      const n = readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - s.offset), s.offset);
+      if (!n) break;
+      s.offset += n; s.pending += s.decoder.write(buffer.subarray(0, n));
+      s.mark = Buffer.concat([s.mark, buffer.subarray(0, n)]).subarray(-MARK);
+      let end;
+      while ((end = s.pending.indexOf("\n")) >= 0) { ask(s, s.pending.slice(0, end)); s.pending = s.pending.slice(end + 1); }
+    }
+    // A last line without its newline counts once it is complete JSON; it stays pending until the newline arrives.
+    if (s.pending) ask(s, s.pending);
+    return s.answered;
   } finally { closeSync(fd); }
-  return scan.answered;
 }
 /** P15: Refresh a question against durable workflow and child receipts at request time. */
 export function resolved(home: string, item: AttentionItem): boolean {

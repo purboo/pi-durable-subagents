@@ -242,7 +242,8 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
       calls: list, counts, attention: openAttention, usage,
     };
   }
-  return { apply, finish, hasReuse: entries.some(e => e.type === "reused") };
+  // Only the current revision's reuse looks ahead for a seal (entries before the boundary are skipped).
+  return { apply, finish, hasReuse: current.some(e => e.type === "reused") };
 }
 
 export function snapshotFromEntries(wid: string, entries: readonly Entry[]): WorkflowSnapshot {
@@ -252,6 +253,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
 /** P25: Snapshot one workflow from its durable journal (v12 §4: plus the planned total of its pinned run body). */
 // A journal snapshot is immutable and replaced on every append, so its derived workflow snapshot is reused until then:
 // re-deriving every historical workflow on each UI refresh dominated pi's main thread.
+const FOLDS = 256; // workflows whose fold state is kept; pruned and long-idle ones fall out
 const folds = new Map<string, { wid: string; length: number; last?: Entry; reducer: ReturnType<typeof snapshotReducer> }>();
 const derived = new WeakMap<readonly Entry[], { wid: string; snapshot: WorkflowSnapshot }>();
 export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
@@ -274,7 +276,8 @@ export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
     if (reusable) reducer.apply(entries, prior!.length);
     wf = reducer.finish();
     if (entries.length) {
-      folds.set(path, { wid, length: entries.length, last: entries.at(-1), reducer });
+      folds.delete(path); folds.set(path, { wid, length: entries.length, last: entries.at(-1), reducer }); // least recently folded first
+      if (folds.size > FOLDS) folds.delete(folds.keys().next().value!);
       derived.set(entries, { wid, snapshot: wf });
     } else folds.delete(path);
   }

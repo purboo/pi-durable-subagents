@@ -79,7 +79,7 @@ test("the main agent reads each attention item with its address; a question says
 });
 
 test("an answered question is found by reading only what the child session appended", async () => {
-  const { appendFileSync, renameSync } = await import("node:fs");
+  const { appendFileSync, renameSync, statSync } = await import("node:fs");
   const home = join(root, "answers"), session = join(home, "child.jsonl");
   mkdirSync(home, { recursive: true }); writeFileSync(session, JSON.stringify({ type: "session" }) + "\n");
   const q = { id: "q", rev: 1, kind: "question" as const, text: "?", wid: "w9", call: "w9@1/a@1", qid: "x", session };
@@ -93,6 +93,19 @@ test("an answered question is found by reading only what the child session appen
   appendFileSync(session, line.slice(20) + "\n");
   assert.equal(resolved(home, q), true, "the line completed by a later append is");
   assert.equal(resolved(home, { ...q, rev: 2 }), false, "a later revision of the question is still open");
+  const other = answer("y");
+  const padded = (text: string, size: number) => "-".repeat(size - Buffer.byteLength(text) - 1) + "\n" + text;
+  const size = statSync(session).size;
+  writeFileSync(session, padded(other + "\n", size));
+  assert.equal(resolved(home, q), false, "the same file rewritten to the same size without the answer is read again");
+  writeFileSync(session, padded(line + "\n", size));
+  assert.equal(resolved(home, q), true, "and so is a rewrite that brings it back");
+  writeFileSync(session, other + "\n" + "x".repeat(size) + "\n");
+  assert.equal(resolved(home, q), false, "a larger rewrite in place is not taken for an append");
+  writeFileSync(session, line);
+  assert.equal(resolved(home, q), true, "a complete last line without its newline counts");
+  appendFileSync(session, "\n" + other + "\n");
+  assert.equal(resolved(home, q), true, "and keeps counting once its newline arrives");
   writeFileSync(session + ".new", JSON.stringify({ type: "session" }) + "\n"); renameSync(session + ".new", session);
   assert.equal(resolved(home, q), false, "a replaced session file is read again from its start");
   rmSync(session);
