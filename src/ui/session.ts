@@ -62,7 +62,20 @@ export function sessionBranch(entries: readonly SessionEntry[]): SessionEntry[] 
 export function thoughtSummary(text: string): string {
   const headings = [...text.matchAll(/\*\*([^*\n]+)\*\*|^#{1,6}\s+(.+)$/gm)];
   if (headings.length) return (headings.at(-1)![1] ?? headings.at(-1)![2]!).trim();
-  return text.match(/[^.!?。！？]+[.!?。！？](?=\s|$)/gu)?.at(-1)?.trim() ?? "";
+  return lastSentence(text);
+}
+const STOPS = new Set([...".!?。！？"]);
+/** The last match of /[^.!?。！？]+[.!?。！？](?=\s|$)/gu without the regex: a long thought with no sentence end made
+ *  that regex retry from every position (quadratic), which stalled pi's startup on long histories. Such a match is a
+ *  whole run of non-stop characters followed by one stop that ends the text or precedes whitespace. */
+function lastSentence(text: string): string {
+  for (let end = text.length - 1; end > 0; end--) {
+    if (!STOPS.has(text[end]!) || STOPS.has(text[end - 1]!) || (end + 1 < text.length && !/\s/u.test(String.fromCodePoint(text.codePointAt(end + 1)!)))) continue;
+    let start = end - 1;
+    while (start > 0 && !STOPS.has(text[start - 1]!)) start--;
+    return text.slice(start, end + 1).trim();
+  }
+  return "";
 }
 
 /** UI §2–3, P31: Derive model, thinking, tool activity and the call's own tool-call count solely from committed session entries. */

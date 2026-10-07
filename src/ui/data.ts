@@ -34,16 +34,27 @@ function journalIndex(journal: readonly Entry[]): JournalIndex {
   indexes.set(journal, index);
   return index;
 }
+/** A map whose missing entries are produced on first `get`/`has`; iteration and `size` cover only produced entries. */
+export class LazyMap<V> extends Map<string, V> {
+  private produce: (key: string) => void;
+  constructor(produce: (key: string) => void) { super(); this.produce = produce; }
+  put(key: string, value: V) { super.set(key, value); }
+  override get(key: string): V | undefined { if (!super.has(key)) this.produce(key); return super.get(key); }
+  override has(key: string): boolean { return this.get(key) !== undefined; }
+}
 /** A1, P25: Read the UI's data from durable workflow snapshots and native session tails only. */
 export class UiData {
   workflows: WorkflowSnapshot[] = [];
-  facts = new Map<string, Facts>();
-  sessions = new Map<string, readonly SessionEntry[]>();
+  /** Facts and session branch per call id; a finished call's are read on first `get` (see refresh). */
+  facts: Map<string, Facts> = new Map();
+  sessions: Map<string, readonly SessionEntry[]> = new Map();
   aliases: Record<string, string> = {};
   /** UI §1: the dock above the editor — "auto" (live rows), "line" (one summary line) or "off". */
   dock: "auto" | "line" | "off" = "auto";
   /** Where the dock sits: below the editor (default; never splits an editor header such as a powerline bar) or above. */
   dockAt: "below" | "above" = "above";
+  /** Per-refresh budget (ms) for reading not yet read finished sessions (history) in the background. */
+  warmMs = 15;
   private tails = new Map<string, SessionTail>();
   /** Branch and facts per call, reused while its session tail is unchanged: a finished call's session never grows, and
    *  re-deriving every historical call on each refresh blocked pi's main thread for over a second. */
@@ -51,31 +62,42 @@ export class UiData {
   home: string;
   constructor(home: string) { this.home = home; }
   refresh() {
-    const workflows = allWorkflows(this.home), facts = new Map<string, Facts>(), sessions = new Map<string, readonly SessionEntry[]>();
+    const workflows = allWorkflows(this.home), known = new Set<string>(), deferred = new Map<string, () => void>();
+    const facts = new LazyMap<Facts>(key => deferred.get(key)?.()), sessions = new LazyMap<readonly SessionEntry[]>(key => deferred.get(key)?.());
     for (const w of workflows) {
       const index = journalIndex(readJournalSnapshot(journalPath(this.home, w.wid)));
       for (const c of w.calls) {
-        let tail = this.tails.get(c.callId);
-        if (!tail) { tail = new SessionTail(); this.tails.set(c.callId, tail); }
-        const source = tail.read(callSession(this.home, w.wid, c.key, c.gen));
-        let cached = this.derived.get(c.callId);
-        if (!cached || cached.source !== source || cached.length !== source.length) {
-          const entries = sessionBranch(source);
-          cached = { source, length: source.length, entries, facts: sessionFacts(entries, c.callId) };
-          this.derived.set(c.callId, cached);
-        }
-        const entries = cached.entries;
-        const value: Facts = { ...cached.facts, live: undefined };
-        const proposal = index.calls.get(`${c.key}\0${c.gen}`);
-        value.task ||= String((proposal?.spec as { task?: string } | undefined)?.task ?? "");
-        const loss = index.losses.get(String(c.exec)) ?? -1;
-        const launch = index.execs.get(String(c.exec)) ?? -1;
-        if (c.phase !== "sealed" && loss > launch) value.activity = "connection dropped, retrying";
-        if (c.phase !== "sealed") value.live = readLive(join(callDir(this.home, w.wid, c.key, c.gen), LIVE_FILE));
-        sessions.set(c.callId, entries); facts.set(c.callId, value);
+        known.add(c.callId);
+        const load = () => {
+          deferred.delete(c.callId);
+          let tail = this.tails.get(c.callId);
+          if (!tail) { tail = new SessionTail(); this.tails.set(c.callId, tail); }
+          const source = tail.read(callSession(this.home, w.wid, c.key, c.gen));
+          let cached = this.derived.get(c.callId);
+          if (!cached || cached.source !== source || cached.length !== source.length) {
+            const entries = sessionBranch(source);
+            cached = { source, length: source.length, entries, facts: sessionFacts(entries, c.callId) };
+            this.derived.set(c.callId, cached);
+          }
+          const value: Facts = { ...cached.facts, live: undefined };
+          const proposal = index.calls.get(`${c.key}\0${c.gen}`);
+          value.task ||= String((proposal?.spec as { task?: string } | undefined)?.task ?? "");
+          const loss = index.losses.get(String(c.exec)) ?? -1;
+          const launch = index.execs.get(String(c.exec)) ?? -1;
+          if (c.phase !== "sealed" && loss > launch) value.activity = "connection dropped, retrying";
+          if (c.phase !== "sealed") value.live = readLive(join(callDir(this.home, w.wid, c.key, c.gen), LIVE_FILE));
+          sessions.put(c.callId, cached.entries); facts.put(c.callId, value);
+        };
+        // A finished call never read before (history at startup) is read when first shown or by the idle warm-up below;
+        // reading every historical session up front blocked pi's startup for seconds.
+        if (c.phase === "sealed" && !this.tails.has(c.callId)) deferred.set(c.callId, load);
+        else load();
       }
     }
-    for (const key of this.tails.keys()) if (!sessions.has(key)) { this.tails.delete(key); this.derived.delete(key); }
+    for (const key of this.tails.keys()) if (!known.has(key)) { this.tails.delete(key); this.derived.delete(key); }
+    // Warm the history a slice at a time, so opening the list later finds it read without one long stall now.
+    const until = performance.now() + this.warmMs;
+    for (const load of [...deferred.values()]) { if (performance.now() >= until) break; load(); }
     this.workflows = workflows; this.facts = facts; this.sessions = sessions;
     // UI-only optional aliases; absence or invalid config must not break execution (P21).
     try {
