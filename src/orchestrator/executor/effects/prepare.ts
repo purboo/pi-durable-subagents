@@ -8,7 +8,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { publishFile } from "../../../kernel/mailbox.ts";
 import { contentHash } from "../../../kernel/ids.ts";
-import { JT, type Entry } from "../../../types.ts";
+import { JT, isEntry, type Entry } from "../../../types.ts";
 import type { CallTicket } from "../../contract.ts";
 
 const exec = promisify(execFile);
@@ -18,7 +18,7 @@ const records = (t: CallTicket, type: string) => t.journal.entries().filter(e =>
 /** P15, A5: Publish one stable attention item for a retained or conflicting effect. */
 export async function attention(t: CallTicket, kind: string, text: string): Promise<void> {
   const id = `${kind}:${t.callId}`;
-  if (!t.journal.entries().some(e => e.type === JT.attention && (e.item as { id?: string })?.id === id))
+  if (!t.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === id))
     await t.journal.append(JT.attention, { item: { id, rev: 1, kind: "unknown", text, wid: t.wid, call: t.callId } });
 }
 /** Git lists worktrees by real path (macOS: /var is /private/var); compare paths in that form. */

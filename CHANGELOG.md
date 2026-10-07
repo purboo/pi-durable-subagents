@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.12
+
+- Slot, memory and model decisions read the orchestrator settings recorded in
+  its ledger, the same state `status` reports, through one fold of that ledger
+  shared by the executor and `status`; an orchestrator embedded with given
+  settings records them as well. Journal readers use typed entries instead of
+  casts. No change in behavior is intended.
+
 ## 1.0.11
 
 - A gate whose processes outlive their fence is reported once: when the gate

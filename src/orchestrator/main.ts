@@ -38,8 +38,9 @@ export async function main(options: MainOptions = {}): Promise<void> {
     const factory = options.executor ?? (await import(new URL(import.meta.url.endsWith('.ts') ? './executor/index.ts' : './executor/index.js', import.meta.url).href)).default as (ledgers: Ledgers) => Executor;
     const executor = factory(ledgers);
     engine = new Engine(ledgers, executor, options);
+    // A4: admission reads the settings recorded last, so the ones this run starts with are recorded (given ones too).
+    await recordConfig(ledgers.orch, config);
     if (stamp !== undefined) {
-      await recordConfig(ledgers.orch, config);
       // A change applies between slot admissions, so one admission never mixes two versions of the limits.
       watcher = watchConfig({ path: configPath(home), stamp, config, orch: ledgers.orch, intervalMs: Math.min(1000, config.k?.trackerMs ?? 1000),
         apply: change => executor.reconfigure ? executor.reconfigure(change) : change() });

@@ -11,7 +11,7 @@ import { mkdir, open, readdir, readFile, rm, unlink, writeFile } from "node:fs/p
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CT, JT, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
+import { CT, JT, attentionEntries, isEntry, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
 import { callDir, callInbox, callSession, outboxRoot } from "../../paths.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, forwardRid } from "../../kernel/ids.ts";
@@ -23,7 +23,7 @@ import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts"
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
 import { hibernation, openQuestion } from "./hibernate.ts";
-import { foldExhaustion, type Exhaustion } from "../providers.ts";
+import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
 import { observeExecution } from "./observe.ts";
@@ -106,21 +106,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const next = queue.then(fn); queue = next.catch(() => {}); return next;
   };
   const wake = () => { for (const fn of waiters) fn(); waiters.clear(); };
-  // F3: fold only orchestrator entries appended since the last fold (holdings, observed switches, K7 skips).
-  const ledger = { seen: 0, held: new Map<string, Entry>(), observed: new Set<string>(), skips: new Map<string, number>(), exhausted: new Map<string, Exhaustion>() };
-  const folded = () => {
-    const entries = orch.entries();
-    for (; ledger.seen < entries.length; ledger.seen++) {
-      const e = entries[ledger.seen]!, id = `${e.pool}:${e.slot}`;
-      if (e.type === "hold") ledger.held.set(id, e);
-      else if (e.type === "release" && ledger.held.get(id)?.exec === e.exec) ledger.held.delete(id);
-      else if (e.type === "switch-observed") ledger.observed.add(`${e.exec}\n${e.rid}`);
-      else if (e.type === "skip") ledger.skips.set(`${e.pool}\n${e.model}`, Math.max(Number(e.until), ledger.skips.get(`${e.pool}\n${e.model}`) ?? 0));
-      foldExhaustion(ledger.exhausted, e);
-    }
-    return ledger;
-  };
-  const holdings = () => [...folded().held.values()];
+  // F3, A1: fold only orchestrator entries appended since the last fold (ledger.ts, shared with `status`).
+  const ledger = emptyLedger();
+  const folded = () => foldLedger(ledger, orch.entries());
+  /** A4: guards read the settings recorded in the ledger (config.json changes are recorded between admissions). */
+  const settings = () => settingsOf(folded(), config);
+  const holdings = () => holdingsOf(folded());
   const skipped = (pool: string, model: Model) => (folded().skips.get(`${pool}\n${model.provider}/${model.id}`) ?? 0) > Date.now();
   /** A provider whose usage window is used up admits no call until its next try, and then one probe at a time. */
   const unavailable = (provider: string | undefined) => {
@@ -285,13 +276,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   async function workflowReached(t: CallTicket) {
     const hit = reached(totalUsage(t.journal.entries()), t.workflowBudget), id = `budget:${t.wid}`;
-    if (hit && !t.journal.entries().some(e => e.type === JT.attention && (e.item as { id: string }).id === id))
+    if (hit && !t.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === id))
       await t.journal.append(JT.attention, { item: { id, rev: 1, kind: "budget", text: "Workflow budget reached", wid: t.wid } });
     return hit;
   }
   async function retireAttention(journal: JournalHandle, call: string) {
-    for (const e of journal.entries().filter(e => e.type === JT.attention)) {
-      const item = e.item as { id: string; rev: number; call?: string; kind?: string };
+    for (const { item } of attentionEntries(journal.entries())) {
       if (item.kind === "finished" || item.id === `unknown:${call}` || item.id.startsWith("fence:")) continue;
       if (item.call === call && !journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev))
         await journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "retired" });
@@ -300,7 +290,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   /** P15, AC4: A call sealed `unknown` raises exactly one unknown item for its origin; seal and recovery both run this. */
   async function unknownAttention(journal: JournalHandle, call: string) {
     const result = sealed(journal, call), id = `unknown:${call}`;
-    if (result?.status !== "unknown" || journal.entries().some(e => e.type === JT.attention && (e.item as { id?: string }).id === id)) return;
+    if (result?.status !== "unknown" || journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === id)) return;
     const text = `Call ${call} ended with an unknown outcome: ${result.error || "no evidence of what it did"}. It was not re-run; check its effects before continuing.`;
     await journal.append(JT.attention, { item: { id, rev: 1, kind: "unknown", text, wid: address(call).wid, call } });
   }
@@ -364,14 +354,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           if (unavailable(provider)) continue;
           const probe = provider !== undefined && folded().exhausted.has(provider);
           const holders = holdings().filter(e => e.pool === provider);
-          const limit = config.providers?.[provider ?? ""]?.slots ?? Infinity;
+          const limit = settings().providers?.[provider ?? ""]?.slots ?? Infinity;
           if (!capacity({ kind: "provider", holders: holders.length, capacity: limit })) continue;
           // A burst of dispatches all read the same MemAvailable before any child has grown: subtract the children
           // admitted in the last 30 s (their memory is not visible yet), so a burst cannot over-commit the headroom.
-          const perChild = config.memory?.perChildMb ?? 300;
+          const perChild = settings().memory?.perChildMb ?? 300;
           const warming = holdings().filter(e => e.pool === "memory" && Date.now() - e.ts < MEM_WARMUP_MS).length;
           const measured = await (options.memory ?? availableMemory)(), available = measured - warming * perChild;
-          const admitted = capacity({ kind: "memory", available, reserve: config.memory?.reserveMb ?? 2048, perChild });
+          const admitted = capacity({ kind: "memory", available, reserve: settings().memory?.reserveMb ?? 2048, perChild });
           // F3: every admitted dispatch is recorded; repeated refusals at most once per 30 s per call.
           if (admitted || a.refusedAt === undefined || Date.now() - a.refusedAt >= MEM_RECORD_MS) {
             await orch.append("mem", { available, admitted, exec, ...(warming ? { measured, warming } : {}) }); a.refusedAt = admitted ? undefined : Date.now();
@@ -401,9 +391,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const recorded = sessionModel(entries);
     const ownSegment = entries.some(e => e.type === "custom" && e.customType === CT.exec && typeof e.data?.exec === "string" && e.data.exec.startsWith(`${t.callId}#`));
     const freshFork = t.spec.context === "fork" && !t.continueFrom && !ownSegment;
-    const raw = t.spec.model ?? t.agent.model ?? config.defaultModel ?? await defaultModel();
-    const pool = raw && config.pools?.[raw] ? raw : undefined;
-    const candidates = raw ? resolveModel(raw, config.pools) : [{ id: "" }];
+    const { defaultModel: configured, pools } = settings();
+    const raw = t.spec.model ?? t.agent.model ?? configured ?? await defaultModel();
+    const pool = raw && pools?.[raw] ? raw : undefined;
+    const candidates = raw ? resolveModel(raw, pools) : [{ id: "" }];
     const candidate = recorded && candidates.some(m => m.provider === recorded.provider && m.id === recorded.id);
     // Leave the session's model for the pool's others when its pool skips it after losses, or its provider's usage
     // window is used up; and at a new generation, go back to the pool's order of preference.
@@ -426,7 +417,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const { qid, rev, question } = e.data;
         if (typeof qid !== "string" || typeof rev !== "number") continue;
         const id = `q:${t.callId}:${qid}`;
-        if (!t.journal.entries().some(r => r.type === JT.attention && (r.item as { id: string; rev: number }).id === id && (r.item as { rev: number }).rev === rev))
+        if (!t.journal.entries().some(r => isEntry(r, JT.attention) && r.item.id === id && r.item.rev === rev))
           await t.journal.append(JT.attention, { item: { id, rev, kind: "question", text: String(question), wid: t.wid, call: t.callId, qid, session: callSession(home, t.wid, t.key, t.gen) } });
         const answered = entries.some(r => {
           const details = r.message?.details ?? r.details;
@@ -616,7 +607,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             const segment = entries.findLastIndex(e => e.type === "custom" && e.customType === CT.exec && e.data?.exec === exec);
             if (!q || interrupted(a) || segment < 0 || !entries.slice(segment + 1).some(e => e.customType === CT.question && e.data?.qid === q.qid) || journal.entries().some(e => e.type === "answer-bound" && e.call === t.callId && e.qid === q.qid && e.rev === q.rev)) return;
             await serial(async () => {
-              const attention = journal.entries().find(e => e.type === JT.attention && (e.item as { qid?: string; call?: string; rev?: number }).qid === q.qid && (e.item as { call?: string }).call === t.callId && (e.item as { rev?: number }).rev === q.rev);
+              const attention = journal.entries().find(e => isEntry(e, JT.attention) && e.item.qid === q.qid && e.item.call === t.callId && e.item.rev === q.rev);
               if (attention && Date.now() - attention.ts >= (config.k?.hibernateMs ?? 120000) && !has(journal, JT.fenced, exec!) && hibernation(journal, t.callId)?.exec !== exec) {
                 await journal.append("hibernated", { call: t.callId, exec, qid: q.qid, rev: q.rev }); a.wake();
               }
@@ -678,7 +669,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           if (sleeping && current(ctx.journal, dest) === sleeping.exec) {
             if (sleeping.qid !== req.cond?.qid || sleeping.rev !== req.cond?.rev) return { action: "reject", reason: "stale-rev" } as const;
             const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
-            const item = ctx.journal.entries().find(e => e.type === JT.attention && (e.item as { call?: string; qid?: string; rev?: number }).call === dest && (e.item as { qid?: string }).qid === sleeping.qid && (e.item as { rev?: number }).rev === sleeping.rev)?.item as { text?: string } | undefined;
+            const item = attentionEntries(ctx.journal.entries()).find(e => e.item.call === dest && e.item.qid === sleeping.qid && e.item.rev === sleeping.rev)?.item;
             await ctx.journal.append("answer-bound", { call: dest, qid: sleeping.qid, rev: sleeping.rev, rid: req.rid, rid2, hash, message: `Question: ${item?.text ?? sleeping.qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
             active.get(dest)?.wake(); wake();
             return { action: "apply" } as const;
@@ -702,7 +693,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             const held = holdings().filter(h => h.exec === exec);
             if (!held.some(h => h.pool === provider)) {
               const target = holdings().filter(h => h.pool === provider);
-              if (!capacity({ kind: "provider", holders: target.length, capacity: config.providers?.[provider]?.slots ?? Infinity }))
+              if (!capacity({ kind: "provider", holders: target.length, capacity: settings().providers?.[provider]?.slots ?? Infinity }))
                 return { action: "reject", reason: "provider-full" } as const;
               let slot = 0; while (target.some(h => h.slot === slot)) slot++;
               await orch.append("hold", { pool: provider, slot, exec, reserved: true, rid });

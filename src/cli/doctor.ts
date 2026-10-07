@@ -11,7 +11,7 @@ import { OsLock } from "../platform/lock.ts";
 import { journalPath, orchInbox, orchLedger, orchLock } from "../paths.ts";
 import { snapshotFromEntries } from "../orchestrator/snapshot.ts";
 import { diskUsage } from "../orchestrator/store.ts";
-import { JT, type AttentionItem } from "../types.ts";
+import { JT, isEntry } from "../types.ts";
 import { serviceFiles } from "./service.ts";
 
 const HOUR = 3_600_000, DAY = 24 * HOUR, CLI = "pi-durable-subagents";
@@ -67,8 +67,8 @@ export async function doctor(home: string, env: NodeJS.ProcessEnv = process.env,
     // Finished notices are delivered to the origin session and stay open in the journal by design: not counted.
     const resolved = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}@${e.rev}`));
     for (const e of entries) {
-      const item = e.item as AttentionItem | undefined;
-      if (e.type === JT.attention && item && item.kind !== "finished" && !resolved.has(`${item.id}@${item.rev}`) && now - e.ts > HOUR)
+      const item = isEntry(e, JT.attention) ? e.item : undefined;
+      if (item && item.kind !== "finished" && !resolved.has(`${item.id}@${item.rev}`) && now - e.ts > HOUR)
         report.attention.push({ wid, id: item.id, kind: item.kind, ageMs: now - e.ts });
       if (e.type !== "fence-failed") continue;
       const exec = String(e.exec);
