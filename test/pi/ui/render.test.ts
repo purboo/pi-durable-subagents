@@ -12,7 +12,8 @@ initTheme("dark", false);
 const { visibleWidth } = await import("@earendil-works/pi-tui");
 const { SubagentScreen } = await import("../../../src/ui/screen.ts");
 const { UiData, UiActions } = await import("../../../src/ui/data.ts");
-const { sessionFacts } = await import("../../../src/ui/session.ts");
+const { sessionFacts, sessionBranch } = await import("../../../src/ui/session.ts");
+const { JT } = await import("../../../src/types.ts");
 const { openJournal } = await import("../../../src/kernel/journal.ts");
 const { journalPath, callSession, orchLedger } = await import("../../../src/paths.ts");
 after(clean);
@@ -221,6 +222,26 @@ test("actual journals and session growth feed fresh snapshots; rejection is a no
   await actions.send({ action: "send" }, "continued E02");
   const ledger = await openJournal(orchLedger(home)); await ledger.append("rejected", { rid: "rejected", reason: "call-sealed" }); await ledger.close();
   assert.match(actions.reconcile()!, /call-sealed/); actions.reconcile(); assert.equal(notes.length, 2);
+});
+
+test("history: a finished call's session is read when first shown, with the same facts as a live read", async () => {
+  const home = join(root, "history"), j = await openJournal(journalPath(home, "old"));
+  await j.append("wf-created", { origin: "main:test", cwd: root, revision: 1 });
+  await j.append("call", { key: "E02", gen: 1, spec: { agent: "worker", task: "from the spec" } });
+  await j.append("exec", { call: "old@1/E02@1", exec: "old@1/E02@1#1.1" });
+  await j.append("selected", { exec: "old@1/E02@1#1.1", model: { provider: "openai", id: "gpt-6" } });
+  await j.append(JT.sealed, { call: "old@1/E02@1", exec: "old@1/E02@1#1.1", result: { key: "E02", gen: 1, status: "done", ok: true, output: "ok" } });
+  await j.close();
+  writeSession(callSession(home, "old", "E02", 1));
+  const expected = sessionFacts(sessionBranch(session()), "old@1/E02@1");
+  const data = new UiData(home); data.warmMs = -1; data.refresh(); assert.equal(data.workflows[0]!.calls[0]!.phase, "sealed");
+  assert.equal(data.facts.size, 0, "history is not read up front");
+  assert.deepEqual(data.facts.get("old@1/E02@1"), { ...expected, live: undefined });
+  assert.equal(data.sessions.get("old@1/E02@1")!.length, session().length);
+  assert.ok(data.facts.has("old@1/E02@1") && !data.facts.has("old@1/none@1"));
+  data.refresh(); assert.equal(data.facts.size, 1, "a call read once is kept current eagerly");
+  assert.deepEqual(data.facts.get("old@1/E02@1"), { ...expected, live: undefined });
+  const warm = new UiData(home); warm.refresh(); assert.equal(warm.facts.size, 1, "idle warm-up reads history within its budget");
 });
 
 test("P7 watch header and list show pending messages from the journal; delivery clears them", async () => {

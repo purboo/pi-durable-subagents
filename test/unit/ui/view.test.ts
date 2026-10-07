@@ -95,6 +95,18 @@ test("thinking summaries never display partial prose or expose empty expansion",
   assert.equal(thoughtSummary("partial"), ""); assert.equal(thoughtSummary(""), "");
 });
 
+test("thought summaries match the sentence rule exactly and stay linear on long unpunctuated thoughts", () => {
+  const rule = (t: string) => t.match(/[^.!?。！？]+[.!?。！？](?=\s|$)/gu)?.at(-1)?.trim() ?? "";
+  const parts = ["a", "b c", " ", "\n", ".", "!", "?", "。", "！", "？", "\u00a0", "\u3000", "😀", "\t", "x.y", "...", ". "];
+  let seed = 7; const next = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
+  for (let i = 0; i < 20000; i++) {
+    const text = Array.from({ length: Math.floor(next() * 12) }, () => parts[Math.floor(next() * parts.length)]).join("");
+    assert.equal(thoughtSummary(text), rule(text), JSON.stringify(text));
+  }
+  const started = performance.now(); thoughtSummary("word ".repeat(12_000) + "end");
+  assert.ok(performance.now() - started < 1000, "a 60 KB thought is summarised without quadratic backtracking (the regex took seconds)");
+});
+
 test("session tails tolerate split UTF-8, partial and corrupt lines, replacement and truncation", () => {
   const path = join(root, "tail.jsonl"), tail = new SessionTail();
   assert.deepEqual(tail.read(path), []);
