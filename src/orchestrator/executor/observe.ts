@@ -29,6 +29,8 @@ type Dependencies = {
 export async function observeExecution(d: Dependencies) {
   const { home, config, ticket: t, exec, child, serial } = d;
   const session = callSession(home, t.wid, t.key, t.gen), clock = new ActiveTime(), started = clock.last;
+  let progress = started, providerError: string | undefined;
+  const tools = new Set<string>();
   const prior = activeTotal(t.journal.entries(), t.callId);
   let size = (await fileStat(session).catch(() => ({ size: 0 }))).size, checkpoint = performance.now();
   let signal!: () => void;
@@ -55,7 +57,20 @@ export async function observeExecution(d: Dependencies) {
     const fresh = items.at(-1)?.exec === exec ? clock.last > Number(items.at(-1)?.horizon) : clock.last > started;
     if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "activity" });
     else if (!open && !clock.asking && performance.now() - clock.last >= (config.k?.stallMs ?? 600000))
-      await t.journal.append(JT.attention, { exec, horizon: clock.last, item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text: "No execution activity", wid: t.wid, call: t.callId } });
+      await t.journal.append(JT.attention, { exec, horizon: clock.last, item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text: `${t.wid}/${t.key}: no execution activity for ${Math.floor((performance.now() - clock.last) / 60000)}m`, wid: t.wid, call: t.callId } });
+  });
+  const noProgress = () => serial(async () => {
+    const id = `noprogress:${t.callId}`;
+    const items = t.journal.entries().filter(e => e.type === JT.attention && (e.item as { id: string }).id === id);
+    const last = items.at(-1)?.item as { rev: number } | undefined;
+    const open = last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
+    const fresh = items.at(-1)?.exec === exec ? progress > Number(items.at(-1)?.horizon) : progress > started;
+    if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "progress" });
+    else if (!open && !clock.asking && !tools.size && performance.now() - progress >= (config.k?.progressMs ?? 600000)) {
+      const text = `${t.wid}/${t.key}: running but no progress for ${Math.floor((performance.now() - progress) / 60000)}m (no output tokens or tool results)` +
+        (providerError ? `; last provider error: ${providerError.slice(0, 200)}` : "");
+      await t.journal.append(JT.attention, { exec, horizon: progress, item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text, wid: t.wid, call: t.callId } });
+    }
   });
   child.stdin.on("error", () => {});
   // Diagnostics only (never evidence for decisions): keep the first 256 KiB of the child's stderr per call.
@@ -70,6 +85,15 @@ export async function observeExecution(d: Dependencies) {
     // P18: Apply RPC boundaries at receipt, before any in-flight scan can resume.
     // Durable observations remain queued; clock transitions never wait on I/O.
     clock.event(event, performance.now());
+    const message = event.message as { stopReason?: string; errorMessage?: string; usage?: { output?: number } } | undefined;
+    const error = event.type === "auto_retry_start" ? event.errorMessage : event.type === "auto_retry_end" ? event.finalError :
+      event.type === "message_end" && message?.stopReason === "error" ? message.errorMessage : undefined;
+    if (typeof error === "string" && error) providerError = error;
+    if (event.type === "tool_execution_start") tools.add(String(event.toolCallId ?? ""));
+    if (event.type === "tool_execution_end") tools.delete(String(event.toolCallId ?? ""));
+    // Receipt-time progress is independent of RPC chatter, CPU and session growth; open tools suppress alerts.
+    if (event.type === "message_update" || ["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(String(event.type)) ||
+      event.type === "message_end" && message?.stopReason !== "error" && (message?.usage?.output ?? 0) > 0) progress = performance.now();
     enqueue(async () => {
       const slim = observation(event);
       if (slim) {
@@ -77,7 +101,7 @@ export async function observeExecution(d: Dependencies) {
         if (event.type === "message_start") await d.switched(event);
         if (event.type === "message_end") await d.recordUsage([{ id: String(slim.id), usage: slim.usage as Usage }]);
       }
-      await limits(); await stall();
+      await limits(); await stall(); await noProgress();
       if (event.type === "agent_settled") {
         await serial(async () => { if (!has("settled")) await t.journal.append("settled", { exec }); }); signal();
       }
@@ -97,7 +121,7 @@ export async function observeExecution(d: Dependencies) {
       if (nextSize > size) { clock.evidence(); size = nextSize; }
       const entries = await (d.read ? d.read() : readSession(session));
       await d.questions(entries); await d.recordUsage(sessionUsage(entries, t.callId));
-      await limits(); await stall();
+      await limits(); await stall(); await noProgress();
       if (performance.now() - checkpoint >= (config.k?.checkpointMs ?? 10000)) { await saveTime(); checkpoint = performance.now(); }
       const reservation = d.pendingSwitch();
       if (reservation && Date.now() - reservation.ts >= (config.k?.switchTimeoutMs ?? 300000)) signal();

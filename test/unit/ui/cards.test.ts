@@ -6,6 +6,14 @@ import { CT } from "../../../src/types.ts";
 
 const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as never;
 const ansiTheme = { fg: (c: string, t: string) => c === "dim" ? `\u001b[2m${t}\u001b[22m` : t, bold: (t: string) => t } as never;
+test("no-progress attention cards use a distinct heading", () => {
+  const renderers = new Map<string, (m: unknown, o: unknown, t: unknown) => { render(w: number): string[] } | undefined>();
+  registerCards({ registerMessageRenderer: (type: string, r: never) => renderers.set(type, r) } as never, "/nonexistent");
+  const items = [{ id: "noprogress:w@1/a@1", rev: 1, kind: "stall", text: "no output", wid: "w", call: "w@1/a@1" }];
+  const out = renderers.get(CT.attention)!({ details: { items } }, { expanded: false }, theme)!.render(60).join("\n");
+  assert.match(out, /Subagent a no progress/);
+});
+
 test("UI §1: interaction cards are framed to the exact width and cap long bodies", () => {
   const lines = card(theme, "accent", "? Subagent writer asks the main agent", ["Is docs/ in the write set?", "x ".repeat(200)], 60);
   assert.match(lines[0]!, /^╭─ \? Subagent writer asks the main agent/); assert.match(lines.at(-1)!, /^╰─+╯$/);

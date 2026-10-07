@@ -4,7 +4,7 @@ import { CT } from "../../types.ts";
 import type { Model } from "../../compat/model.ts";
 
 interface Block { type?: string; text?: string; id?: string; name?: string }
-interface Message { role?: string; content?: string | Block[]; stopReason?: string; toolCallId?: string; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
+interface Message { role?: string; content?: string | Block[]; stopReason?: string; errorMessage?: string; toolCallId?: string; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
 export interface SessionEntry {
   type: string; id?: string; customType?: string; data?: Record<string, unknown>; message?: Message;
   provider?: string; modelId?: string; details?: Record<string, unknown>;
@@ -80,7 +80,13 @@ export function evidence(entries: SessionEntry[], exec: string) {
     if (m?.role === "toolResult" && m.toolCallId) tools.delete(m.toolCallId);
   }
   const budget = segment.some(e => e.type === "custom" && e.customType === CT.budget && e.data?.exec === exec);
-  return { report, budget, text, dangling: [...tools].map(([id, name]) => `${name} (${id})`), usage };
+  const last = segment.findLast(e => e.message?.role === "assistant")?.message;
+  const error = last?.stopReason === "error" ? last.errorMessage : undefined;
+  return { report, budget, text, error, dangling: [...tools].map(([id, name]) => `${name} (${id})`), usage };
+}
+/** Only explicit quota/payment failures are terminal; rate limits, overload and transport errors still retry. */
+export function fatalProviderError(text: string): boolean {
+  return /\b402\b|insufficient[_ ]?(quota|balance|funds)|quota (exceeded|exhausted)|billing|credit balance|额度|余额|usage limit/i.test(text);
 }
 /** P13, C8: Restore the effective provider from the native session's model changes. */
 export function sessionModel(entries: SessionEntry[]): Model | undefined {

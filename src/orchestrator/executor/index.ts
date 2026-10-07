@@ -23,7 +23,7 @@ import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts"
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
 import { hibernation, openQuestion } from "./hibernate.ts";
-import { evidence, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
+import { evidence, fatalProviderError, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
 import { observeExecution } from "./observe.ts";
 import { availableMemory } from "./memory.ts";
@@ -452,12 +452,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (t.spec.schema === undefined && has(journal, "settled", exec) && ev.text)
           return finish(journal, t.callId, exec, { ...makeResult("ok", ev.text), usage: ev.usage });
         if (t.spec.once && dangling.length) return finish(journal, t.callId, exec, makeResult("unknown", "", `Unknown tool outcomes: ${dangling.join(", ")}`));
+        if (has(journal, "settled", exec) && !ev.text && ev.error && fatalProviderError(ev.error))
+          return finish(journal, t.callId, exec, makeResult("failed", "", `Provider error: ${ev.error}`));
         await serial(async () => {
           if (!has(journal, "loss", exec!)) await journal.append("loss", { exec });
           await skipLostCandidate(journal, orch, exec!);
         });
         const losses = journal.entries().filter(e => e.type === "loss" && String(e.exec).startsWith(`${t.callId}#`)).length;
-        if (losses >= (config.k?.lossBound ?? 5)) return finish(journal, t.callId, exec, makeResult("failed", "", `lost ×${losses}`));
+        if (losses >= (config.k?.lossBound ?? 5)) return finish(journal, t.callId, exec, makeResult("failed", "", `lost ×${losses}${ev.error ? `; last error: ${ev.error.slice(0, 300)}` : ""}`));
         await release(exec);
         }
       }
