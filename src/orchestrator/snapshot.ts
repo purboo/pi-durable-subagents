@@ -35,6 +35,8 @@ export interface CallSnapshot {
   switching?: string;
   /** A follow-up still open on a finished workflow: live work although the workflow's status is final. */
   afterEnd?: true;
+  /** P28: asking and hibernated: its execution is fenced and holds no provider slot until the answer arrives. */
+  hibernated?: true;
 }
 export interface WorkflowSnapshot {
   wid: string; rev: number; name?: string; origin?: string; cwd?: string;
@@ -149,6 +151,11 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       // An execution waits for a provider slot and memory before it launches; it is running once `selected` says so
       // (otherwise a call still waiting for a slot reads "thinking · 2m").
       call.exec = String(e.exec); call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
+      delete call.hibernated;
+    } else if (e.type === "hibernated") {
+      const call = calls.get(String(e.call)); if (call && call.exec === e.exec) call.hibernated = true;
+    } else if (e.type === "answer-bound" || (e.type === "resumed" && e.call)) {
+      const call = calls.get(String(e.call)); if (call) delete call.hibernated;
     } else if (e.type === JT.fenced) {
       // A fenced execution without a seal (stop-all, a quit pi, a loss before its continuation) waits to run again.
       const call = byExec.get(String(e.exec)); if (call && call.phase === "running") call.phase = "queued";
@@ -170,7 +177,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       const usage = (e.result as CallResult | undefined)?.usage;
       if (usage) sealedUsage.set(String(e.call), usage);
       const call = calls.get(String(e.call)); if (!call) continue;
-      call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts;
+      call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated;
     } else if (e.type === JT.attention) {
       const item = e.item as AttentionItem;
       if (!resolved.has(`${item.id}@${item.rev}`)) attention.push(item);
@@ -191,6 +198,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
     const call = item.kind === "question" ? [...calls.values()].find(c => item.id.startsWith(`q:${c.callId}:`)) : undefined;
     if (call && (call.phase === "running" || call.phase === "queued")) call.phase = "asking"; // a hibernated asker is fenced
   }
+  for (const c of calls.values()) if (c.hibernated && c.phase !== "asking") delete c.hibernated;
   const usageOf = (callId: string) => sealedUsage.get(callId) ?? live.get(callId);
   const list = [...calls.values()];
   const counts: Record<CallPhase, number> = { queued: 0, running: 0, asking: 0, sealed: 0 };
@@ -289,6 +297,8 @@ export interface StatusCall {
   switching?: string;
   /** Last non-empty output line (clipped); the full output is in `status wid=<wid>`. */
   lastLine?: string; error?: string;
+  /** Asking and hibernated: no provider slot is held while it waits (P28). */
+  hibernated?: true;
 }
 export interface StatusWorkflow {
   wid: string; name?: string; origin?: string; status: WorkflowSnapshot["status"]; rev: number;
@@ -310,6 +320,8 @@ export interface StatusView {
   hint?: string;
   /** Drain: set while the orchestrator is drained by stop-all/drain; nothing new starts until resume. */
   paused?: string;
+  /** Provider slots held / limit, the settings in effect and a rejected config.json change (see slotsView). */
+  slots?: string[]; config?: string; configRejected?: string;
 }
 export type StatusDetail = WorkflowSnapshot & { scriptLog?: string };
 
@@ -325,7 +337,7 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
       return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...(r ? { status: r.status, ok: r.ok } : {}),
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
-        ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}) };
+        ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
     ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}),
@@ -360,7 +372,8 @@ export function statusView(home: string, options: { origin?: string; keep?: numb
   const hidden = all.length - shown.length;
   const paused = all.filter(w => w.paused).length;
   return { workflows: shown.map(compactWorkflow), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
-    ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused (stop-all, drain or a quit pi) since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}) };
+    ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused (stop-all, drain or a quit pi) since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}),
+    ...slotsView(home) };
 }
 
 const FINAL = ["done", "failed", "stopped"];
@@ -377,6 +390,8 @@ export interface BriefCall {
   for?: string; quiet?: string;
   /** Input + output tokens so far: a running call at 0 has done nothing yet. */
   tokens?: string; status?: CallResult["status"]; error?: string;
+  /** Asking and hibernated: it holds no provider slot while it waits (P28). */
+  hibernated?: true;
 }
 export interface BriefWorkflow {
   wid: string; name?: string; status: WorkflowSnapshot["status"]; paused?: true;
@@ -387,7 +402,7 @@ export interface BriefWorkflow {
   /** Only the calls that need a look: not finished, or finished not ok. */
   calls: BriefCall[];
   /** Open questions (answer with kind "answer" to "<wid>/<key>") and alerts (stall, unknown outcome, budget). */
-  asking?: { to: string; qid?: string; question: string }[];
+  asking?: { to: string; qid?: string; hibernated?: true; question: string }[];
   alerts?: string[];
 }
 export interface StatusBrief {
@@ -398,7 +413,33 @@ export interface StatusBrief {
   finished: string[];
   olderFinished?: number;
   paused?: string;
+  /** Provider slots held / limit, e.g. "s2a 3/4" or "mccodex 2 (no limit)": configured providers and any held ones. */
+  slots?: string[];
+  /** The orchestrator settings in effect: "<hash> since <age>" (config.json is applied when it changes). */
+  config?: string;
+  /** The latest change of config.json that was not applied, while the earlier settings stay in effect. */
+  configRejected?: string;
   hint: string;
+}
+
+/** Provider slots from the orchestrator ledger: holders per provider (hold/release{pool,slot,exec}) and the limits of
+ *  the settings in effect (the latest config{hash,config}); config-rejected after it is reported too. */
+export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected"> {
+  const held = new Map<string, Entry>();
+  let config: Entry | undefined, rejected: Entry | undefined;
+  for (const e of readJournalSnapshot(orchLedger(home))) {
+    if (e.type === "hold") held.set(`${e.pool}:${e.slot}`, e);
+    else if (e.type === "release" && held.get(`${e.pool}:${e.slot}`)?.exec === e.exec) held.delete(`${e.pool}:${e.slot}`);
+    else if (e.type === "config") { config = e; rejected = undefined; }
+    else if (e.type === "config-rejected") rejected = e;
+  }
+  const limits = ((config?.config as { providers?: Record<string, { slots?: number }> } | undefined)?.providers) ?? {};
+  const holders = new Map<string, number>();
+  for (const e of held.values()) if (e.pool !== "memory") holders.set(String(e.pool), (holders.get(String(e.pool)) ?? 0) + 1);
+  const names = [...new Set([...Object.keys(limits), ...holders.keys()])].sort();
+  const slots = names.map(p => { const n = holders.get(p) ?? 0, limit = limits[p]?.slots; return typeof limit === "number" ? `${p} ${n}/${limit}` : `${p} ${n} (no limit)`; });
+  return { ...(slots.length ? { slots } : {}), ...(config ? { config: `${String(config.hash)} since ${age(now - config.ts)} ago` } : {}),
+    ...(rejected ? { configRejected: `${clip(String(rejected.error), 200)} (${age(now - rejected.ts)} ago); ${config ? String(config.hash) : "the start settings"} stay in effect` } : {}) };
 }
 
 /** Tool status without a wid: what runs, what waits for an answer and what failed, with finished workflows one line each.
@@ -420,9 +461,11 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(live && c.startedAt !== undefined ? { for: age(now - c.startedAt) } : {}),
         ...(live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
         ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
-        ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}) };
+        ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
+        ...(c.hibernated ? { hibernated: true as const } : {}) };
     });
-    const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}), question: clip(a.text, 300) }));
+    const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
+      ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300) }));
     const alerts = open.filter(a => a.kind !== "question").map(a => `${a.kind}${a.call ? ` ${w.wid}/${callKey(a.call)}` : ""}: ${clip(a.text, 200)}`);
     return { wid: w.wid, ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.paused ? { paused: true as const } : {}), ...(w.followUps ? { followUps: w.followUps } : {}),
       progress: `${p.done}/${p.total}${p.plus ? "+" : ""}`, tokens: tokens(w.usage), calls,
@@ -437,7 +480,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
   return {
     active: active.filter(mine).map(brief), ...(others.length ? { otherSessions: others.slice(0, 10).map(line) } : {}),
     finished: finished.slice(0, keep).map(line), ...(finished.length > keep ? { olderFinished: finished.length - keep } : {}),
-    ...(paused ? { paused } : {}),
+    ...(paused ? { paused } : {}), ...slotsView(home, now),
     hint: "status wid=<wid> shows one workflow (outputs clipped); add key=<key> for one call's full result, or full:true for everything",
   };
 }

@@ -273,6 +273,11 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   never stopped for memory.
 - **onQuit:** `"pause"` (default) pauses a session's running workflows when
   you quit that pi; `"continue"` lets them run on in the background.
+- **Changes apply without a restart:** the orchestrator re-reads the file
+  when it changes. A new slot limit, pool or default model applies to the next
+  slot acquisition; slots already held are kept when a limit drops. An
+  invalid change is not applied, and `status` reports it next to the settings
+  still in effect (`config: <hash> since …`) and the slots held per provider.
 
 ## Switching back
 
