@@ -6,8 +6,9 @@ import { tempRoot } from "../../harness/pi.ts";
 import { openJournal } from "../../../src/kernel/journal.ts";
 import { journalPath, orchLedger } from "../../../src/paths.ts";
 import { CT, JT } from "../../../src/types.ts";
-import { attention, presentText, presented } from "../../../src/agent/main/snapshots.ts";
-import { workflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
+import { attention, presentText, presented, resolved, workflows } from "../../../src/agent/main/snapshots.ts";
+import { holdOf, workflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
+import type { Entry } from "../../../src/types.ts";
 import { registerCards } from "../../../src/ui/cards.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
@@ -75,4 +76,69 @@ test("the main agent reads each attention item with its address; a question says
   assert.equal(presentText({ id: "s", rev: 1, kind: "stall", text: "No execution activity", wid: "01W", call: "01W@1/a@1" }), "01W/a: No execution activity");
   assert.equal(presentText({ id: "f", rev: 1, kind: "finished", text: "Workflow 01W finished: done", wid: "01W" }), "Workflow 01W finished: done");
   assert.equal(presentText({ id: "b", rev: 1, kind: "budget", text: "Workflow budget reached", wid: "01W" }), "01W: Workflow budget reached");
+});
+
+test("an answered question is found by reading only what the child session appended", async () => {
+  const { appendFileSync, renameSync } = await import("node:fs");
+  const home = join(root, "answers"), session = join(home, "child.jsonl");
+  mkdirSync(home, { recursive: true }); writeFileSync(session, JSON.stringify({ type: "session" }) + "\n");
+  const q = { id: "q", rev: 1, kind: "question", text: "?", wid: "w9", call: "w9@1/a@1", qid: "x", session };
+  const answer = (qid: string, rev = 1) => JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "ask", isError: false, details: { qid, rev } } });
+  assert.equal(resolved(home, q), false);
+  appendFileSync(session, answer("other") + "\n" + "{not json, \"ask\"\n");
+  assert.equal(resolved(home, q), false, "another question's answer and a malformed line do not resolve it");
+  const line = answer("x");
+  appendFileSync(session, line.slice(0, 20));
+  assert.equal(resolved(home, q), false, "a half-written line is not parsed yet");
+  appendFileSync(session, line.slice(20) + "\n");
+  assert.equal(resolved(home, q), true, "the line completed by a later append is");
+  assert.equal(resolved(home, { ...q, rev: 2 }), false, "a later revision of the question is still open");
+  writeFileSync(session + ".new", JSON.stringify({ type: "session" }) + "\n"); renameSync(session + ".new", session);
+  assert.equal(resolved(home, q), false, "a replaced session file is read again from its start");
+  rmSync(session);
+  assert.equal(resolved(home, q), false, "a missing session resolves nothing");
+  await append(journalPath(home, "w9"), JT.attentionResolved, { id: "q", rev: 1 });
+  assert.equal(resolved(home, q), true, "a recorded resolution resolves it without the session");
+});
+
+test("hold lookups through the ledger index agree with a scan of the whole ledger", () => {
+  // The reference is the scan the index replaced: the newest drain/undrain that applies, unless the workflow was created after it.
+  const reference = (ledger: Entry[], wid: string, origin?: string) => {
+    const applies = (e: Entry) => (e.wid === undefined && e.origin === undefined) || e.wid === wid || (origin !== undefined && e.origin === origin);
+    const last = ledger.findLast(e => (e.type === "drain" || e.type === "undrain") && applies(e));
+    if (last?.type !== "drain") return undefined;
+    const created = ledger.find(e => e.type === JT.created && e.wid === wid);
+    return !created || created.seq < last.seq ? last : undefined;
+  };
+  let seed = 7;
+  const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2 ** 31; return seed % n; };
+  const wids = ["w1", "w2", "w3"], origins = ["o1", "o2"];
+  for (let run = 0; run < 200; run++) {
+    const ledger: Entry[] = [];
+    for (let seq = 1; seq <= 1 + rand(30); seq++) {
+      const kind = rand(4), scope = rand(3);
+      const type = kind === 0 ? JT.created : kind === 1 ? "undrain" : "drain";
+      const fields = type === JT.created ? { wid: wids[rand(3)], origin: origins[rand(2)] }
+        : scope === 0 ? {} : scope === 1 ? { wid: wids[rand(3)] } : { origin: origins[rand(2)] };
+      ledger.push({ seq, ts: seq, type, ...fields } as Entry);
+      // Every prefix is checked, as a growing ledger is read.
+      const view = ledger.slice();
+      for (const wid of wids) for (const origin of [undefined, ...origins])
+        assert.equal(holdOf(view, wid, origin), reference(view, wid, origin), `run ${run} seq ${seq} ${wid} ${origin}`);
+    }
+  }
+});
+
+test("attention for one session does not read the journals of workflows the ledger gives to another", async () => {
+  const home = join(root, "origins");
+  await append(orchLedger(home), JT.created, { wid: "mine", origin: sender });
+  await append(orchLedger(home), JT.created, { wid: "theirs", origin: "main:other" });
+  await append(journalPath(home, "mine"), JT.attention, { item: item("m", { wid: "mine" }) });
+  await append(journalPath(home, "theirs"), JT.attention, { item: item("t", { wid: "theirs" }) });
+  mkdirSync(join(home, "w", "orphan"), { recursive: true });
+  await append(journalPath(home, "orphan"), JT.created, { origin: sender, cwd: root, revision: 1 });
+  await append(journalPath(home, "orphan"), JT.attention, { item: item("o", { wid: "orphan" }) });
+  assert.deepEqual(workflows(home, sender).map(w => w.wid), ["mine", "orphan"], "a journal-only workflow is attributed by its own created entry");
+  assert.deepEqual(attention(home, sender, []).map(i => i.id), ["m", "o"]);
+  assert.deepEqual(workflows(home).map(w => w.wid), ["mine", "orphan", "theirs"]);
 });
