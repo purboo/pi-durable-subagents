@@ -242,6 +242,15 @@ test("history: a finished call's session is read when first shown, with the same
   data.refresh(); assert.equal(data.facts.size, 1, "a call read once is kept current eagerly");
   assert.deepEqual(data.facts.get("old@1/E02@1"), { ...expected, live: undefined });
   const warm = new UiData(home); warm.refresh(); assert.equal(warm.facts.size, 1, "idle warm-up reads history within its budget");
+  const original = Date.now;
+  try {
+    Date.now = () => original() + 60_000; // long after the seal the call is final
+    data.refresh(); data.refresh();
+    assert.deepEqual(data.facts.get("old@1/E02@1"), { ...expected, live: undefined }, "a final call keeps its facts");
+    const transcript = data.sessions.get("old@1/E02@1");
+    assert.equal(transcript!.length, session().length, "and its transcript is read again when shown");
+    data.refresh(); assert.equal(data.sessions.get("old@1/E02@1"), transcript, "the shown transcript is not re-read every frame");
+  } finally { Date.now = original; }
 });
 
 test("P7 watch header and list show pending messages from the journal; delivery clears them", async () => {

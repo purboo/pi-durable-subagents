@@ -60,8 +60,17 @@ export class UiData {
   /** Per-refresh budget (ms) for reading not yet read finished sessions (history) in the background. */
   warmMs = 8;
   private tails = new Map<string, SessionTail>();
-  /** Branch and facts of calls sealed more than FINAL_MS ago, read once after their seal. */
-  private final = new Map<string, { endedAt: number; entries: SessionEntry[]; facts: Facts }>();
+  /** Facts of calls sealed more than FINAL_MS ago, read once after their seal; their transcript is read when shown. */
+  private final = new Map<string, { endedAt: number; path: string; facts: Facts }>();
+  /** The transcript of one final call last asked for (the open call view asks on every frame). Keeping every
+   *  historical transcript parsed held hundreds of MB and made pi's garbage collection pause typing. */
+  private opened?: { callId: string; entries: SessionEntry[] };
+  private transcript(callId: string, sessions: LazyMap<readonly SessionEntry[]>): void {
+    const final = this.final.get(callId);
+    if (!final) return;
+    if (this.opened?.callId !== callId) this.opened = { callId, entries: sessionBranch(new SessionTail().read(final.path)) };
+    sessions.put(callId, this.opened.entries);
+  }
   /** Branch and facts per call, reused while its session tail is unchanged: a finished call's session never grows, and
    *  re-deriving every historical call on each refresh blocked pi's main thread for over a second. */
   private derived = new Map<string, { source: readonly SessionEntry[]; length: number; entries: SessionEntry[]; facts: Facts }>();
@@ -69,14 +78,15 @@ export class UiData {
   constructor(home: string) { this.home = home; }
   refresh() {
     const workflows = allWorkflows(this.home), known = new Set<string>(), deferred = new Map<string, () => void>();
-    const facts = new LazyMap<Facts>(key => deferred.get(key)?.()), sessions = new LazyMap<readonly SessionEntry[]>(key => deferred.get(key)?.());
+    const facts = new LazyMap<Facts>(key => deferred.get(key)?.());
+    const sessions = new LazyMap<readonly SessionEntry[]>(key => deferred.has(key) ? deferred.get(key)!() : this.transcript(key, sessions));
     for (const w of workflows) {
       let index: JournalIndex | undefined; // only calls still followed need it
       const journal = () => index ??= journalIndex(readJournalSnapshot(journalPath(this.home, w.wid)));
       for (const c of w.calls) {
         known.add(c.callId);
         const final = this.final.get(c.callId);
-        if (final && c.phase === "sealed" && c.endedAt === final.endedAt) { sessions.put(c.callId, final.entries); facts.put(c.callId, final.facts); continue; }
+        if (final && c.phase === "sealed" && c.endedAt === final.endedAt) { facts.put(c.callId, final.facts); continue; }
         if (final) this.final.delete(c.callId);
         const load = () => {
           deferred.delete(c.callId);
@@ -100,7 +110,8 @@ export class UiData {
           // A call sealed a while ago writes nothing more (a follow-up opens a new generation and session), so its
           // session is not stat'ed again: polling every historical session twice a second kept pi's main thread busy.
           if (c.phase === "sealed" && c.endedAt !== undefined && Date.now() - c.endedAt > FINAL_MS) {
-            this.final.set(c.callId, { endedAt: c.endedAt, entries: cached.entries, facts: value }); this.tails.delete(c.callId); this.derived.delete(c.callId);
+            this.final.set(c.callId, { endedAt: c.endedAt, path: callSession(this.home, w.wid, c.key, c.gen), facts: value });
+            this.tails.delete(c.callId); this.derived.delete(c.callId);
           }
         };
         // A finished call never read before (history at startup) is read when first shown or by the idle warm-up below;
