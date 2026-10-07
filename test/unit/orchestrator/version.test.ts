@@ -12,6 +12,7 @@ import { emptyLedger, foldLedger } from "../../../src/orchestrator/ledger.ts";
 import { orchestratorView, runningOrchestrator, versionNote, type StatusView } from "../../../src/orchestrator/snapshot.ts";
 import { renderView } from "../../../src/cli/main.ts";
 import { packageVersion } from "../../../src/version.ts";
+import { captureStart } from "../../../src/platform/proctable.ts";
 import type { Entry } from "../../../src/types.ts";
 import { fakeExecutor } from "./engine/fake.ts";
 
@@ -33,7 +34,7 @@ test("the orchestrator records its package version while it holds the lock, and 
   assert.deepEqual(runningOrchestrator(home), {}, "an orchestrator that exited is not shown");
 });
 
-test("a running orchestrator of another version is shown with a note; a dead one is not", () => {
+test("a running orchestrator of another version is shown with a note; a dead one is not", async () => {
   const older = foldLedger(emptyLedger(), entries(["orchestrator", { version: "1.0.9", pid: process.pid }]));
   const view = orchestratorView(older, "1.0.13");
   assert.equal(view.orchestrator, `1.0.9 (pid ${process.pid})`);
@@ -46,6 +47,14 @@ test("a running orchestrator of another version is shown with a note; a dead one
   assert.deepEqual(orchestratorView(exited, "1.0.13"), {});
   const restarted = foldLedger(emptyLedger(), entries(["orchestrator", { version: "1.0.9", pid: 1 }], ["orchestrator", { version: "1.0.13", pid: process.pid }], ["orchestrator-exit", { pid: 1 }]));
   assert.deepEqual(orchestratorView(restarted, "1.0.13"), { orchestrator: `1.0.13 (pid ${process.pid})` }, "an earlier process's exit does not hide the running one");
+
+  if (process.platform === "linux") {
+    const start = await captureStart(process.pid);
+    const same = foldLedger(emptyLedger(), entries(["orchestrator", { version: "1.0.9", pid: process.pid, start }]));
+    assert.equal(orchestratorView(same, "1.0.9").orchestrator, `1.0.9 (pid ${process.pid})`);
+    const reused = foldLedger(emptyLedger(), entries(["orchestrator", { version: "1.0.9", pid: process.pid, start: String(Number(start) - 1) }]));
+    assert.deepEqual(orchestratorView(reused, "1.0.13"), {}, "a later process given the same pid is not the orchestrator");
+  }
 });
 
 test("the CLI footer shows the orchestrator version and the note", () => {

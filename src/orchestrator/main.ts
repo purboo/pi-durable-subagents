@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { dsaHome, orchLedger, orchLock } from '../paths.ts';
 import { openJournal } from '../kernel/journal.ts';
 import { OsLock } from '../platform/lock.ts';
+import { captureStart } from '../platform/proctable.ts';
 import type { Executor, Ledgers, OrchestratorConfig } from './contract.ts';
 import { Engine, type EngineOptions } from './engine.ts';
 import { configPath, configProblem, configStamp, recordConfig, stampedConfig, watchConfig } from './config.ts';
@@ -37,7 +38,9 @@ export async function main(options: MainOptions = {}): Promise<void> {
     }
     ledgers = { home, config, orch: await openJournal(orchLedger(home)) };
     // Which version runs is visible to every pi session (status; a notice when it differs from the one pi loaded).
-    await ledgers.orch.append('orchestrator', { version: packageVersion(), pid: process.pid });
+    // `start` (Linux) tells this process from a later one given the same pid after a crash.
+    const start = await captureStart(process.pid).catch(() => '');
+    await ledgers.orch.append('orchestrator', { version: packageVersion(), pid: process.pid, ...(start ? { start } : {}) });
     const factory = options.executor ?? (await import(new URL(import.meta.url.endsWith('.ts') ? './executor/index.ts' : './executor/index.js', import.meta.url).href)).default as (ledgers: Ledgers) => Executor;
     const executor = factory(ledgers);
     engine = new Engine(ledgers, executor, options);

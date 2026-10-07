@@ -57,7 +57,7 @@ export interface EntryFields {
   config: { hash: string; config: Record<string, unknown> };
   "config-rejected": { error: string; hash?: string };
   /** The orchestrator that holds the lock from here: its package version and process. */
-  orchestrator: { version: string; pid: number };
+  orchestrator: { version: string; pid: number; start?: string };
   /** That orchestrator exits (a crash records nothing; readers check the process too). */
   "orchestrator-exit": { pid: number };
 }

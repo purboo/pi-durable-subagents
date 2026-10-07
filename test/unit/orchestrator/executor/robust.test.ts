@@ -160,6 +160,44 @@ test("shared worktree recovery repairs a partial cross-origin reminder without c
   await f.executor.stop({ wid, callId: b.callId }); await pb;
 });
 
+test("shared worktree: a paused writer that has not ended still counts", { timeout: 15000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b");
+  await mkdir(join(f.home, ".git"));
+  const send = await writingChildren(t, f), pa = f.executor.run(a); void pa.catch(() => {});
+  await send(a); await until(() => count(f.journal.entries(), e => e.type === "wrote") === 1);
+  await f.executor.suspend(); await pa.catch(() => {});
+  const pb = f.executor.run(b); void pb.catch(() => {});
+  await send(b); await until(() => count(f.journal.entries(), e => e.type === "wrote") === 2);
+  const alerts = f.journal.entries().filter(e => e.type === JT.attention && item(e).kind === "conflict");
+  assert.equal(alerts.length, 1); assert.equal(item(alerts[0]!).call, b.callId);
+});
+
+test("shared worktree: a crash before the reminder keeps the second writer of the journals, whatever recovers first", { timeout: 15000 }, async t => {
+  // z wrote first and b second (b's write names z); call-id order and recovery order would both say otherwise.
+  const f = await fixture(t), z = f.ticket("z"), b = f.ticket("b");
+  await f.journal.append("wrote", { exec: `${z.callId}#1.1`, root: f.home });
+  await f.journal.append("wrote", { exec: `${b.callId}#1.1`, root: f.home, after: [z.callId] });
+  await f.executor.recover(f.wid, f.journal);
+  const send = await writingChildren(t, f), pz = f.executor.run(z), pb = f.executor.run(b);
+  void pz.catch(() => {}); void pb.catch(() => {});
+  await send(z, "read"); await send(b, "read");
+  const alerts = f.journal.entries().filter(e => e.type === JT.attention && item(e).kind === "conflict");
+  assert.equal(alerts.length, 1); assert.equal(item(alerts[0]!).call, b.callId);
+  assert.match(String((alerts[0]!.item as { text: string }).text), new RegExp(`^${f.wid}/z and ${f.wid}/b both write in `));
+});
+
+test("shared worktree: paths resolve as pi's edit/write resolve them (@ prefix, ~)", { timeout: 15000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b"), other = join(f.home, "other");
+  a.cwd = b.cwd = join(f.home, "cwd");
+  await mkdir(join(a.cwd, ".git"), { recursive: true }); await mkdir(join(other, ".git"), { recursive: true });
+  const send = await writingChildren(t, f), pa = f.executor.run(a), pb = f.executor.run(b);
+  void pa.catch(() => {}); void pb.catch(() => {});
+  await send(a, "write", `@${join(other, "f.txt")}`); await send(b, "edit", join(other, "g.txt"));
+  await until(() => count(f.journal.entries(), e => e.type === "wrote") === 2);
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "wrote").map(e => e.root), [other, other]);
+  assert.equal(count(f.journal.entries(), e => e.type === JT.attention && item(e).kind === "conflict"), 1);
+});
+
 test("shared worktree ignores non-git writes, distinct roots and already sealed writers", { timeout: 15000 }, async t => {
   const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b");
   a.cwd = join(f.home, "one"); b.cwd = join(f.home, "two");

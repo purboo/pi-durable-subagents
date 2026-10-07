@@ -20,7 +20,7 @@ export interface LedgerState {
   exhausted: Map<string, Exhaustion>;
   config?: { hash: string; settings: OrchestratorConfig; ts: number };
   rejected?: { error: string; ts: number };
-  orchestrator?: { version: string; pid: number; ts: number; exited?: true };
+  orchestrator?: { version: string; pid: number; start?: string; ts: number; exited?: true };
 }
 
 export function emptyLedger(): LedgerState {
@@ -35,7 +35,7 @@ export function applyLedger(state: LedgerState, e: Entry): void {
   else if (isEntry(e, "skip")) state.skips.set(`${e.pool}\n${e.model}`, Math.max(Number(e.until), state.skips.get(`${e.pool}\n${e.model}`) ?? 0));
   else if (isEntry(e, "config")) { state.config = { hash: String(e.hash), settings: e.config as OrchestratorConfig, ts: e.ts }; delete state.rejected; }
   else if (isEntry(e, "config-rejected")) state.rejected = { error: String(e.error), ts: e.ts };
-  else if (isEntry(e, "orchestrator")) state.orchestrator = { version: String(e.version), pid: Number(e.pid), ts: e.ts };
+  else if (isEntry(e, "orchestrator")) state.orchestrator = { version: String(e.version), pid: Number(e.pid), ...(e.start ? { start: String(e.start) } : {}), ts: e.ts };
   else if (isEntry(e, "orchestrator-exit")) { if (state.orchestrator?.pid === e.pid) state.orchestrator.exited = true; }
   foldExhaustion(state.exhausted, e);
 }
