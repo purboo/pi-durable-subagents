@@ -82,7 +82,7 @@ test("an answered question is found by reading only what the child session appen
   const { appendFileSync, renameSync } = await import("node:fs");
   const home = join(root, "answers"), session = join(home, "child.jsonl");
   mkdirSync(home, { recursive: true }); writeFileSync(session, JSON.stringify({ type: "session" }) + "\n");
-  const q = { id: "q", rev: 1, kind: "question", text: "?", wid: "w9", call: "w9@1/a@1", qid: "x", session };
+  const q = { id: "q", rev: 1, kind: "question" as const, text: "?", wid: "w9", call: "w9@1/a@1", qid: "x", session };
   const answer = (qid: string, rev = 1) => JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "ask", isError: false, details: { qid, rev } } });
   assert.equal(resolved(home, q), false);
   appendFileSync(session, answer("other") + "\n" + "{not json, \"ask\"\n");
