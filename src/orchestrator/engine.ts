@@ -296,15 +296,7 @@ export class Engine {
         const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message: send.message ?? '' }, ...(send.model !== undefined ? { model: send.model } : {}) });
         this.dispatchGeneration(wf, opened); return { action: 'apply' };
       }
-      if (send.kind === 'follow-up' && send.model !== undefined) {
-        // A follow-up queued on unfinished work: its model is requested first (a model send of its own), then the message.
-        const rid = contentHash([req.rid, 'model']), switched = await this.executor.forward({ ...req, rid, kind: 'send', body: { to: send.to, kind: 'model', model: send.model } }, this.context(wf, entry));
-        if (switched.action === 'reject') return { action: 'reject', reason: `model: ${switched.reason}` };
-        const effect = this.ledgers.orch.entries().find(e => e.type === 'send-note' && e.rid === rid)?.effect;
-        if (effect) await this.note(req.rid, send.model, String(effect));
-        const { model: _model, ...message } = send;
-        return this.executor.forward({ ...req, body: message }, this.context(wf, entry));
-      }
+      // A follow-up naming a model, queued on unfinished work: the executor records its model request with the message.
       return this.executor.forward(req, this.context(wf, entry));
     } else if (req.kind === 'stop') {
       const target = (req.body as { target: string })?.target;

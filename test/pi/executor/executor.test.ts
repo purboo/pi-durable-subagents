@@ -16,7 +16,7 @@ import { contentHash, forwardRid, ulid } from "../../../src/kernel/ids.ts";
 import { CT, JT, type Containment, type JournalHandle, type Request } from "../../../src/types.ts";
 import type { CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
-import createExecutor from "../../../src/orchestrator/executor/index.ts";
+import createExecutor, { modelRid, requestedModel } from "../../../src/orchestrator/executor/index.ts";
 import { availableMemory } from "../../../src/orchestrator/executor/memory.ts";
 import { evidence } from "../../../src/orchestrator/executor/session.ts";
 import { serialContainment } from "../../../src/orchestrator/executor/sweep.ts";
@@ -143,6 +143,32 @@ test("P12 a model send to a call still waiting for a slot applies when it launch
   const selectedB = f.journal.entries().find(e => e.type === "selected" && String(e.exec).startsWith(b.callId))!;
   assert.equal((selectedB.model as { id: string }).id, "scripted2");
   assert.equal(statusOf(f.journal, f.wid, "b").model, "probe/scripted2");
+});
+
+test("P12 a follow-up naming a model records model and message together; withdrawing it withdraws both; a sealed call takes neither", { timeout: 30000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 1 } } });
+  const a = f.ticket("a", script([{ delayMs: 1500, text: "a done" }])), b = f.ticket("b", script([{ text: "b done" }]));
+  const runA = f.executor.run(a);
+  await until(() => f.journal.entries().some(e => e.type === "tracked"));
+  const runB = f.executor.run(b);
+  await until(() => f.journal.entries().some(e => e.type === JT.exec && e.call === b.callId));
+  const ctx = { journal: f.journal, widRev: b.widRev, key: "b", gen: 1 };
+  const followUp: Request = { rid: "b-follow", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: b.callId, kind: "follow-up", message: "then this", model: "probe/scripted2" } };
+  assert.deepEqual(await f.executor.forward(followUp, ctx), { action: "apply" });
+  assert.deepEqual(await f.executor.forward(followUp, ctx), { action: "apply" }, "a replay records nothing twice");
+  const forwards = () => f.journal.entries().filter(e => e.type === "forward" && e.dest === b.callId);
+  assert.deepEqual(forwards().map(e => [e.rid, (e.envelope as { kind: string }).kind]), [[modelRid("b-follow"), "model"], ["b-follow", "follow-up"]]);
+  assert.equal(f.orch.entries().find(e => e.type === "send-note" && e.rid === "b-follow")?.effect, "next-execution");
+  assert.equal(requestedModel(f.journal, b.callId)?.id, "scripted2");
+  const withdraw: Request = { rid: "b-withdraw", from: "main:test", to: "orch", sseq: 2, kind: "withdraw", body: { rids: ["b-follow"] } };
+  assert.deepEqual(await f.executor.forward(withdraw, ctx), { action: "apply" });
+  assert.equal(requestedModel(f.journal, b.callId), undefined, "the model request is withdrawn with the follow-up");
+  assert.equal((await runA).status, "ok"); assert.equal((await runB).status, "ok");
+  const selectedB = f.journal.entries().find(e => e.type === "selected" && String(e.exec).startsWith(b.callId))!;
+  assert.equal((selectedB.model as { id: string }).id, "scripted");
+  const late: Request = { ...followUp, rid: "b-late" };
+  assert.deepEqual(await f.executor.forward(late, ctx), { action: "reject", reason: "call-sealed" });
+  assert.equal(forwards().filter(e => e.rid === modelRid("b-late")).length, 0, "a sealed call takes no model request either");
 });
 
 test("P12 a provider refusal of the content fails the call at once instead of retrying it as lost", { timeout: 30000 }, async t => {
