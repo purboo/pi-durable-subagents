@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import type { CallSpec, Conditions, RequestKind, RunBody } from "../../types.ts";
+import type { CallSpec, Conditions, Entry, RequestKind, RunBody } from "../../types.ts";
 import { validateCallSpec } from "../../compat/spec.ts";
 import { compileFanout } from "../../compat/fanout.ts";
 
@@ -42,6 +42,13 @@ function call(value: unknown, cwd: string, where: string): CallSpec {
   return spec as unknown as CallSpec;
 }
 /** v12 §2: Infer unambiguous runs and normalize controls into unchanged wire bodies. */
+/** P12: a send naming a model is answered with that model and when it applies — `next-request` (a running call switches
+ *  at its next provider request), `next-execution` (a call with no live execution launches on it) or `next-generation`
+ *  (a follow-up's new generation runs on it). From the orchestrator ledger's `send-note`. */
+export function sendReceipt(ledger: readonly Entry[], rid: string): { model?: string; effect?: string } {
+  const note = ledger.find(e => e.type === "send-note" && e.rid === rid);
+  return note ? { model: String(note.model), effect: String(note.effect) } : {};
+}
 export function request(args: Args, cwd: string): { kind: RequestKind; body: unknown; cond?: Conditions; replaces?: string[] } {
   // v12 §2: Infer run only when one launch form is present; never guess a control verb.
   const launchForms = [args.agent !== undefined || args.task !== undefined, args.tasks !== undefined,
@@ -93,7 +100,9 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   if (action === "send") {
     const kind = string(args, "kind");
     if (!["steer", "follow-up", "answer", "model"].includes(kind)) throw new Error("Unsupported send kind");
-    const body = { to: string(args, "to"), kind, ...(kind === "model" ? { model: string(args, "model") } : { message: string(args, "message") }), ...(args.by === "user" ? { by: "user" } : {}) };
+    // follow-up may name the model its continuation runs on (P37); other kinds ignore one.
+    const model = kind === "model" || kind === "follow-up" && args.model !== undefined ? { model: string(args, "model") } : {};
+    const body = { to: string(args, "to"), kind, ...model, ...(kind === "model" ? {} : { message: string(args, "message") }), ...(args.by === "user" ? { by: "user" } : {}) };
     const cond: Conditions = {};
     if (kind === "answer") {
       cond.qid = string(args, "qid");

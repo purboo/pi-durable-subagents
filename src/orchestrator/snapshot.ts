@@ -21,7 +21,10 @@ export interface CallSend {
 }
 export interface CallSnapshot {
   key: string; gen: number; callId: string; agent: string; phase: CallPhase;
-  result?: CallResult; model?: string; exec?: string;
+  result?: CallResult;
+  /** The model in use: the provider/model of the latest answer (`model-used`), else the one launched (`selected`), else
+   *  the one the call asked for while it waits for a slot. */
+  model?: string; exec?: string;
   pos?: number; refused?: string; reused?: string;
   /** Wall-clock ms of the latest durable evidence for this call (display only). */
   lastActivity?: number; startedAt?: number; endedAt?: number;
@@ -31,8 +34,11 @@ export interface CallSnapshot {
   tools?: number;
   /** Forwarded requests in forward order; `pending` counts pending messages (steer, follow-up, answer). */
   sends?: CallSend[]; pending?: number;
-  /** A model switch the child has not applied yet ("provider/id"): it takes effect when the current step ends. */
+  /** The latest model requested ("provider/id") while the call is not answering with it yet: a running call switches at
+   *  its next provider request, one with no live execution (queued, hibernated) launches on it. */
   switching?: string;
+  /** The latest model request was refused by the child: "provider/id (reason)"; the model in use stays. */
+  switchFailed?: string;
   /** A follow-up still open on a finished workflow: live work although the workflow's status is final. */
   afterEnd?: true;
   /** P28: asking and hibernated: its execution is fenced and holds no provider slot until the answer arrives. */
@@ -169,6 +175,10 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
         if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
         if (call && call.phase === "queued") call.phase = "running";
+      } else if (e.type === "model-used") {
+        // Evidence of a switch: the execution answered with another model than it launched with.
+        const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
+        if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
       } else if (e.type === "observation") {
         // Only what the agent did counts as activity; tracker scans and time checkpoints are bookkeeping.
         const call = byExec.get(String(e.exec)); if (call) call.lastActivity = e.ts;
@@ -192,6 +202,10 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         const send: CallSend = { rid: String(e.rid), kind: String(envelope?.kind ?? ""), state: "pending", at: e.ts,
           ...(envelope?.kind === "model" && envelope.body?.provider ? { model: `${envelope.body.provider}/${envelope.body.model}` } : {}) };
         const list = sends.get(String(e.dest)) ?? []; list.push(send); sends.set(String(e.dest), list);
+        // A withdrawn model request no longer stands (the executor ignores it for the next launch as well).
+        if (envelope?.kind === "withdraw") for (const rid2 of (envelope.body as { rids?: string[] } | undefined)?.rids ?? []) {
+          const target = byRid2.get(`${e.dest}\n${rid2}`); if (target?.kind === "model" && target.state === "pending") target.reason = "withdrawn";
+        }
         byRid2.set(`${e.dest}\n${e.rid2}`, send); byRid2.set(String(e.rid2), send);
       } else if (e.type === "forward-delivered" || e.type === "forward-retired") {
         const send = byRid2.get(e.type === "forward-delivered" ? `${e.call}\n${e.rid2}` : String(e.rid2));
@@ -221,8 +235,9 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
       const forwarded = sends.get(c.callId);
       if (forwarded) {
         c.sends = structuredClone(forwarded); const pending = forwarded.filter(pendingMessage).length; if (pending) c.pending = pending;
-        const switching = c.phase !== "sealed" ? forwarded.findLast(s => s.kind === "model" && s.state === "pending")?.model : undefined;
-        if (switching && switching !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = switching;
+        const last = c.phase !== "sealed" ? forwarded.findLast(s => s.kind === "model" && s.reason !== "withdrawn") : undefined;
+        if (last?.reason !== undefined) c.switchFailed = `${last.model} (${last.reason})`;
+        else if (last && last.state !== "retired" && last.model !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = last.model;
       }
     }
     const after = done ? list.filter(c => generations.has(c.callId) && c.phase !== "sealed" && !retired.has(c.callId)) : [];
@@ -372,8 +387,11 @@ export interface StatusCall {
   status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage;
   /** Messages forwarded to the call whose child receipt has not been observed yet (P7). */
   pending?: number;
-  /** A requested model switch not applied yet; it takes effect when the current step ends. */
+  /** The latest model requested while the call does not answer with it yet (running: at its next provider request;
+   *  queued or hibernated: when it launches). */
   switching?: string;
+  /** The child refused the latest model request: "provider/id (reason)"; `model` stays in use. */
+  switchFailed?: string;
   /** Last non-empty output line (clipped); the full output is in `status wid=<wid>`. */
   lastLine?: string; error?: string;
   /** Asking and hibernated: no provider slot is held while it waits (P28). */
@@ -415,7 +433,7 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
     calls: wf.calls.map(c => {
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
       return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...(r ? { status: r.status, ok: r.ok } : {}),
-        ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
+        ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
@@ -471,6 +489,8 @@ export interface BriefCall {
   tokens?: string; status?: CallResult["status"]; error?: string;
   /** Asking and hibernated: it holds no provider slot while it waits (P28). */
   hibernated?: true;
+  /** `model` is the model in use; `switching` one requested and not answering yet; `switchFailed` a refused request. */
+  switching?: string; switchFailed?: string;
 }
 export interface BriefWorkflow {
   wid: string; name?: string; status: WorkflowSnapshot["status"]; paused?: true;
@@ -541,7 +561,8 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
         ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
         ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
-        ...(c.hibernated ? { hibernated: true as const } : {}) };
+        ...(c.hibernated ? { hibernated: true as const } : {}),
+        ...(live && c.switching ? { switching: c.switching } : {}), ...(live && c.switchFailed ? { switchFailed: c.switchFailed } : {}) };
     });
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
       ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300) }));

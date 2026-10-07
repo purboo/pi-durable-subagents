@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { request, parameters } from "../../../src/agent/main/tool.ts";
+import { request, parameters, sendReceipt } from "../../../src/agent/main/tool.ts";
 import { registerMain } from "../../../src/agent/main.ts";
 import { tempRoot } from "../../harness/pi.ts";
 
@@ -79,4 +79,13 @@ test("run-level call fields: defaults for every tasks/chain step (a step's own v
   assert.throws(() => request({ source: "emit(1)", timeoutMs: 5 }, "/w"), /"timeoutMs" cannot be set for a source run/);
   // A single call keeps its fields as before.
   assert.deepEqual(request({ agent: "a", task: "t", model: "p/m", timeoutMs: 5 }, "/w").body, { cwd: "/w", call: { agent: "a", task: "t", model: "p/m", timeoutMs: 5 } });
+});
+
+test("P12: a follow-up may name a model; a send naming one is answered with the model and when it applies", () => {
+  assert.deepEqual(request({ action: "send", to: "w/a", kind: "follow-up", message: "go on", model: "p/m:high" }, "/w").body, { to: "w/a", kind: "follow-up", model: "p/m:high", message: "go on" });
+  assert.deepEqual(request({ action: "send", to: "w/a", kind: "follow-up", message: "go on" }, "/w").body, { to: "w/a", kind: "follow-up", message: "go on" });
+  assert.deepEqual(request({ action: "send", to: "w/a", kind: "model", model: "p/m" }, "/w").body, { to: "w/a", kind: "model", model: "p/m" });
+  const ledger = [{ type: "send-note", seq: 1, ts: 1, rid: "r1", model: "p/m", effect: "next-execution" }] as unknown as Parameters<typeof sendReceipt>[0];
+  assert.deepEqual(sendReceipt(ledger, "r1"), { model: "p/m", effect: "next-execution" });
+  assert.deepEqual(sendReceipt(ledger, "r2"), {});
 });

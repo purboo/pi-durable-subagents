@@ -57,7 +57,7 @@ export function renderStatus(wf: WorkflowSnapshot & { scriptLog?: string }): str
 /** P25, T10: Render the compact status projection shared with the `subagents` tool. */
 export function renderView(view: StatusView): string {
   const lines = view.workflows.map(w => [`${w.wid}@${w.rev}${w.name ? ` ${w.name}` : ""}: ${w.status}${w.followUps ? " (follow-up running)" : ""}${w.error ? ` (${clip(w.error, 200)})` : ""} · ${w.done}/${w.planned ?? w.calls.length}${w.planned === undefined && w.status === "running" ? "+" : ""} done${w.usage.input || w.usage.output || w.usage.costUsd ? ` · ${formatUsage(w.usage)}` : ""}`,
-    ...w.calls.map(c => `  ${c.key}@${c.gen} ${c.status ?? c.phase}${c.hibernated ? " (hibernated, no slot)" : ""}${c.model ? ` ${c.model}` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage ? ` ${formatUsage(c.usage)}` : ""}${c.lastLine ? ` ${JSON.stringify(c.lastLine)}` : c.error ? ` (${c.error})` : ""}`),
+    ...w.calls.map(c => `  ${c.key}@${c.gen} ${c.status ?? c.phase}${c.hibernated ? " (hibernated, no slot)" : ""}${c.model ? ` ${c.model}` : ""}${c.switching ? ` → ${c.switching} (requested)` : ""}${c.switchFailed ? ` (switch refused: ${c.switchFailed})` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage ? ` ${formatUsage(c.usage)}` : ""}${c.lastLine ? ` ${JSON.stringify(c.lastLine)}` : c.error ? ` (${c.error})` : ""}`),
     ...w.attention.map(a => `  ${a.kind}: ${JSON.stringify(a.text.split("\n")[0])}`)].join("\n"));
   if (view.paused) lines.unshift(`${view.paused} (pi-durable-subagents resume)`);
   if (view.olderFinished) lines.push(`(+${view.olderFinished} older finished workflows; status <wid> shows one in detail)`);

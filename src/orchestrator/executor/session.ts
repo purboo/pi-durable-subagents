@@ -88,6 +88,11 @@ export function evidence(entries: SessionEntry[], exec: string) {
 export function fatalProviderError(text: string): boolean {
   return /\b402\b|insufficient[_ ]?(quota|balance|funds)|quota (exceeded|exhausted)|billing|credit balance|额度|余额|usage limit/i.test(text);
 }
+/** A refusal of the request's content (terms of service, usage or content policy): the same request is refused again,
+ *  on this provider and usually on another, so it is reported at once instead of retried as a lost execution. */
+export function refusedByProvider(text: string): boolean {
+  return /terms of service|usage polic(y|ies)|acceptable use|content[_ ]?(policy|filter|management policy)|safety (system|filter)|flagged as (unsafe|harmful)/i.test(text);
+}
 /** P13, C8: Restore the effective provider from the native session's model changes. */
 export function sessionModel(entries: SessionEntry[]): Model | undefined {
   const last = entries.findLast(e => e.type === "model_change" && e.provider && e.modelId);

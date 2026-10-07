@@ -20,6 +20,12 @@ import createExecutor from "../../../src/orchestrator/executor/index.ts";
 import { availableMemory } from "../../../src/orchestrator/executor/memory.ts";
 import { evidence } from "../../../src/orchestrator/executor/session.ts";
 import { serialContainment } from "../../../src/orchestrator/executor/sweep.ts";
+import { snapshotFromEntries } from "../../../src/orchestrator/snapshot.ts";
+/** Status of one call as the engine's journal would show it (the executor alone writes no `call` entry). */
+function statusOf(journal: JournalHandle, wid: string, key = "a") {
+  const call = { type: "call", seq: -1, ts: 0, key, gen: 1, pos: 0, spec: { agent: "test", model: "probe/scripted" } } as unknown as ReturnType<JournalHandle["entries"]>[number];
+  return snapshotFromEntries(wid, [call, ...journal.entries()]).calls[0]!;
+}
 
 const recorder = fileURLToPath(new URL("recorder.ts", import.meta.url));
 const agent = { name: "test", description: "test", body: "Test agent", model: "probe/scripted", tools: ["bash"], systemPromptMode: "replace" as const, inheritProjectContext: false, inheritSkills: false, sourcePath: "/fixture/test.md", source: "project" as const };
@@ -97,6 +103,57 @@ test("P28 hibernates without loss, binds once, resumes with one receipt", { time
   assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
   assert.equal(f.journal.entries().filter(e => e.type === "resumed").length, 1);
   assert.deepEqual(await f.executor.forward({ ...req, rid: "retired" }, ctx), { action: "reject", reason: "retired" });
+});
+
+test("P28/P12 a model send to a hibernated asker is recorded and its resumed execution launches on that model", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
+  const pending = f.executor.run(ticket), first = `${ticket.callId}#1.1`;
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  await until(() => f.journal.entries().some(e => e.type === JT.fenced && e.exec === first));
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  const model: Request = { rid: "to-scripted2", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "model", model: "probe/scripted2" } };
+  assert.deepEqual(await f.executor.forward(model, ctx), { action: "apply" });
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "send-note").map(e => [e.rid, e.model, e.effect]), [["to-scripted2", "probe/scripted2", "next-execution"]]);
+  const waiting = statusOf(f.journal, f.wid);
+  assert.equal(waiting.model, "probe/scripted"); assert.equal(waiting.switching, "probe/scripted2");
+  const answer: Request = { rid: "answer", from: "main:test", to: "orch", sseq: 2, cond: { qid: String(h.qid), rev: Number(h.rev) }, kind: "send", body: { to: ticket.callId, kind: "answer", message: "yes " + script([{ text: "resumed" }]) } };
+  assert.deepEqual(await f.executor.forward(answer, ctx), { action: "apply" });
+  const result = await pending; assert.equal(result.status, "ok");
+  const selected = f.journal.entries().filter(e => e.type === "selected").map(e => (e.model as { id: string }).id);
+  assert.deepEqual(selected, ["scripted", "scripted2"]);
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  assert.equal(rows.findLast(e => e.type === "message" && e.message.role === "assistant").message.model, "scripted2");
+  const done = statusOf(f.journal, f.wid);
+  assert.equal(done.model, "probe/scripted2"); assert.equal(done.switching, undefined);
+});
+
+test("P12 a model send to a call still waiting for a slot applies when it launches", { timeout: 30000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 1 } } });
+  const a = f.ticket("a", script([{ delayMs: 1500, text: "a done" }])), b = f.ticket("b", script([{ text: "b done" }]));
+  const runA = f.executor.run(a);
+  await until(() => f.journal.entries().some(e => e.type === "tracked"));
+  const runB = f.executor.run(b);
+  await until(() => f.journal.entries().some(e => e.type === JT.exec && e.call === b.callId));
+  const req: Request = { rid: "b-model", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: b.callId, kind: "model", model: "probe/scripted2" } };
+  assert.deepEqual(await f.executor.forward(req, { journal: f.journal, widRev: b.widRev, key: "b", gen: 1 }), { action: "apply" });
+  assert.equal(f.orch.entries().find(e => e.type === "send-note" && e.rid === "b-model")?.effect, "next-execution");
+  assert.equal((await runA).status, "ok"); assert.equal((await runB).status, "ok");
+  const selectedB = f.journal.entries().find(e => e.type === "selected" && String(e.exec).startsWith(b.callId))!;
+  assert.equal((selectedB.model as { id: string }).id, "scripted2");
+  assert.equal(statusOf(f.journal, f.wid, "b").model, "probe/scripted2");
+});
+
+test("P12 a provider refusal of the content fails the call at once instead of retrying it as lost", { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { lossBound: 5, trackerMs: 25 } });
+  const refusal = "This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering";
+  const ticket = f.ticket("a", script([{ error: refusal }, { error: refusal }, { error: refusal }]));
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "failed");
+  assert.match(String(result.error), /^Refused by the provider \(not retried\): This request was blocked/);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.exec).length, 1);
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
 });
 
 test("P28 recovery after answer-bound before delivery preserves the answer identity", { timeout: 30000 }, async t => {
@@ -323,6 +380,9 @@ test("V1 pending X to Y switch rejects a return to held X before Y is observed",
   assert.equal(f.journal.entries().filter(e => e.type === "forward").length, 1);
   assert.equal((await scanInbox(callInbox(f.home, f.wid, "a", 1))).filter(r => r.kind === "model").length, 1);
   const result = await pending; assert.equal(result.output, "switched to Y");
+  // Status shows the model the call answers with, not the one it launched with.
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "model-used").map(e => [e.exec, e.model]), [[exec, { provider: "switch-probe", id: "target" }]]);
+  assert.equal(statusOf(f.journal, f.wid).model, "switch-probe/target");
   const observed = f.orch.entries().find(e => e.type === "switch-observed" && e.exec === exec)!;
   assert.ok(observed, "real Y message_start must activate the reservation");
   assert.ok(f.orch.entries().some(e => e.type === "release" && e.exec === exec && e.pool === "probe" && e.seq > observed.seq));

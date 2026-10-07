@@ -77,6 +77,12 @@ answer) or failed, and one line per finished workflow. `status` with a wid
 shows one workflow with outputs clipped; add `key` for one call's full result,
 or `full: true` for everything. When a run replies `{submitted: {rid}}`
 (its workflow was not created within 10 s), the rid works wherever a wid does.
+A call's `model` in `status` is the model its last provider request used; a
+requested switch not used yet shows as `switching`, a refused one as
+`switchFailed`. A send naming a model replies with `model` and `effect`
+(`next-request`, `next-execution` or `next-generation`).
+A provider's refusal of the content (terms of service, usage policy) fails the
+call at once with that error instead of retrying it.
 With `tasks` or `chain`, top-level `model`, `timeoutMs`, `budget`, `isolation`,
 `context`, `tools`, `skills` and `once` apply to every step that does not set
 its own; other call fields there, and any of them beside a workflow script,
@@ -90,9 +96,9 @@ it something. Each verb means one thing, and a refusal says what would work:
 |---|---|---|
 | `run` | — | Start one subagent, `tasks` in parallel, a `chain`, or a workflow script. An unknown agent name is refused before anything starts, with the list of agents. |
 | `send steer` | a running subagent | Reaches it at its next safe point. To a finished one: refused, use `follow-up`; To one waiting on its question: it interrupts the question, and the subagent usually asks again; `answer` answers it. |
-| `send follow-up` | a finished subagent | Continues the same session as a new generation (`key@2`). |
+| `send follow-up` | a finished subagent | Continues the same session as a new generation (`key@2`). With `model`, that generation runs on it. |
 | `send answer` | an open question | Answers it once. |
-| `send model` | any subagent | Switches its model at the next request. |
+| `send model` | any subagent | A running one switches at its next request; one asking, hibernated or waiting for a slot launches on it when it runs again. |
 | `stop` | a subagent or a workflow | Final: `stopped`, usage kept, edits left as they are. |
 | `drain` / `resume` | existing workflows | A reversible hold; runs started later are not held. |
 
