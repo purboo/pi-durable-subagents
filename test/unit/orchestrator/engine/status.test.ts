@@ -300,3 +300,21 @@ test('a run rid stands for its wid once the workflow exists; other values pass t
   assert.equal(widOfRid(ledger, '01W/review'), '01W/review');
   assert.equal(widOfRid(ledger, 'main:s:8'), 'main:s:8');
 });
+
+test('P28 a hibernated asker shows hibernated until its answer is bound, and never after it ends', () => {
+  const call = 'w@1/a@1', exec = `${call}#1.1`;
+  const asked = [
+    e(1, 'wf-created', { revision: 1 }), e(2, 'call', { key: 'a', gen: 1, spec: { agent: 'x' } }),
+    e(3, 'exec', { call, exec }), e(4, 'selected', { exec, model: { provider: 'p', id: 'm' } }),
+    e(5, 'attention', { item: { id: `q:${call}:q1`, rev: 1, kind: 'question', text: 'Choose?', call, qid: 'q1' } }),
+    e(6, 'fenced', { exec }), e(7, 'hibernated', { call, exec, qid: 'q1', rev: 1 }),
+  ];
+  const a = snapshotFromEntries('w', asked).calls[0]!;
+  assert.equal(a.phase, 'asking'); assert.equal(a.hibernated, true);
+  assert.equal(compactWorkflow(snapshotFromEntries('w', asked)).calls[0]!.hibernated, true);
+  // A hibernation recorded for an earlier execution says nothing about the current one.
+  assert.equal(snapshotFromEntries('w', [...asked, e(8, 'exec', { call, exec: `${call}#1.2` })]).calls[0]!.hibernated, undefined);
+  const bound = [...asked, e(8, 'answer-bound', { call, qid: 'q1', rev: 1, rid: 'r', rid2: 'r2', message: 'yes', hash: 'h' }), e(9, 'attention-resolved', { id: `q:${call}:q1`, rev: 1 })];
+  assert.equal(snapshotFromEntries('w', bound).calls[0]!.hibernated, undefined);
+  assert.equal(snapshotFromEntries('w', [...asked, e(8, 'sealed', { call, exec, result: res('a', 'stopped') })]).calls[0]!.hibernated, undefined);
+});
