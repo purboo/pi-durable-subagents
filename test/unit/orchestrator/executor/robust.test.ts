@@ -196,7 +196,8 @@ test("shared worktree: paths resolve as pi's edit/write resolve them (@ prefix, 
   await send(a, "write", `@${join(other, "f.txt")}`); await send(b, "edit", join(other, "g.txt"));
   await until(() => count(f.journal.entries(), e => e.type === "wrote") === 2);
   assert.deepEqual(f.journal.entries().filter(e => e.type === "wrote").map(e => e.root), [other, other]);
-  assert.equal(count(f.journal.entries(), e => e.type === JT.attention && item(e).kind === "conflict"), 1);
+  // The reminder is appended right after the second `wrote`, in the same section: wait for it, not for the write.
+  await until(() => count(f.journal.entries(), e => e.type === JT.attention && item(e).kind === "conflict") === 1);
 });
 
 test("shared worktree: a path pi's tool cannot use is no evidence and does not stop the call", { timeout: 15000 }, async t => {
