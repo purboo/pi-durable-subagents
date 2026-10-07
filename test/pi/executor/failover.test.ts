@@ -99,3 +99,15 @@ test("failover: a pool call's next generation goes back to the preferred provide
   assert.equal(f.orch.entries().filter(e => e.type === "provider-available").length, 1);
   assert.equal(slotsView(f.home).exhausted, undefined);
 });
+
+test("failover: a follow-up naming the model its call is on stays there, though the pool would go back", { timeout: 60000 }, async t => {
+  const f = await setup(t, { pools: { top: ["qa/m", "qb/m"] }, k: { probeMs: 1000 } });
+  await f.exhaust(true);
+  const first = f.ticket("a", "top");
+  assert.equal((await f.executor.run(first)).output, "answered by qb");
+  await f.exhaust(false);
+  await delay(1100);
+  const next: CallTicket = { ...first, gen: 2, callId: `${first.wid}@1/a@2`, continueFrom: first.callId, opening: { rid: "next", kind: "follow-up", message: "next turn" }, model: "qb/m" };
+  assert.equal((await f.executor.run(next)).output, "answered by qb");
+  assert.deepEqual(providersOf(f, "a"), ["qa", "qb", "qb"]);
+});
