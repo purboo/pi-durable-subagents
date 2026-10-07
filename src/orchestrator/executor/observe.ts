@@ -23,6 +23,8 @@ type Dependencies = {
   questions(entries: SessionEntry[]): Promise<void>;
   recordUsage(values: { id: string; usage: Usage }[]): Promise<void>;
   switched(event: Record<string, unknown>): Promise<void>;
+  /** An assistant message ended: an answer of a used-up provider makes it available again. */
+  answered?(event: Record<string, unknown>): Promise<void>;
   pendingSwitch(): Entry | undefined;
 };
 /** P18, P31, P9: Observe slim evidence, decide limits and fence before returning to settlement. */
@@ -99,7 +101,7 @@ export async function observeExecution(d: Dependencies) {
       if (slim) {
         await serial(() => t.journal.append("observation", { exec, event: slim }));
         if (event.type === "message_start") await d.switched(event);
-        if (event.type === "message_end") await d.recordUsage([{ id: String(slim.id), usage: slim.usage as Usage }]);
+        if (event.type === "message_end") { await d.recordUsage([{ id: String(slim.id), usage: slim.usage as Usage }]); await d.answered?.(event); }
       }
       await limits(); await stall(); await noProgress();
       if (event.type === "agent_settled") {

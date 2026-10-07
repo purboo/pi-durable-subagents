@@ -55,6 +55,7 @@ the npx cache, so `install-service` refuses to run from there.
 | You steer a subagent while it is asking you a question | Your message reaches it, in order. Nothing is rejected or lost. |
 | Two steers arrive out of order and the second replaces the first | Only the second one applies. |
 | A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
+| A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded) | A call in a pool continues **in the same session** on the pool's next model; new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
 | A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. |
 
 ## Use it
@@ -272,7 +273,14 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
 ```
 
 - **Pools:** a model can name a pool. The first candidate with a free slot is
-  used, and a candidate that keeps failing is skipped for 10 minutes.
+  used, and a candidate that keeps failing is skipped for 10 minutes. The
+  order is the preference: list the provider you want to use first.
+- **A used-up provider** is not sent new calls until its next try, 15 minutes
+  after it last refused (`"k": { "probeMs": 900000 }`). Then one call at a
+  time goes to it, so finding out costs no extra request. A call that moved to
+  another provider stays there for the rest of its generation (switching back
+  mid-task would lose the prompt cache); a follow-up starts on the first
+  candidate again. `status` lists each used-up provider with its next try.
 - **Provider slots:** never exceeded, including while a model switch is in
   progress.
 - **Memory:** new subagents wait while memory is short. Running ones are

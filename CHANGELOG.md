@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.10
+
+- Provider failover for a used-up usage window. An error such as `503 No
+  available accounts`, "usage limit" or "quota exceeded" (after pi's own
+  retries) marks the provider used up instead of counting as a lost
+  execution: a call in a pool continues in the same session on the pool's next
+  model, and new calls skip the provider. After `k.probeMs` (15 minutes) the
+  next call that wants it is admitted to it alone; when it answers, new calls
+  and new generations go back to it. A call with a single model waits for the
+  provider instead of failing. `status` lists used-up providers with their
+  next try. Billing errors (402, insufficient balance) still fail at once.
+
 ## 1.0.9
 
 - `status` shows the model a call actually uses: the model of its last

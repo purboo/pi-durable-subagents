@@ -14,7 +14,7 @@ export interface OrchestratorConfig {
   providers?: Record<string, { slots: number }>;
   memory?: { reserveMb?: number; perChildMb?: number };
   /** K-parameters overrides (ms / counts). */
-  k?: Partial<Record<"lossBound" | "checkpointMs" | "stallMs" | "progressMs" | "switchTimeoutMs" | "idleExitMs" | "trackerMs" | "hibernateMs" | "spawnBudget", number>>;
+  k?: Partial<Record<"lossBound" | "checkpointMs" | "stallMs" | "progressMs" | "switchTimeoutMs" | "idleExitMs" | "trackerMs" | "hibernateMs" | "spawnBudget" | "probeMs", number>>;
 }
 
 /** Everything the executor needs to run one call generation. */
