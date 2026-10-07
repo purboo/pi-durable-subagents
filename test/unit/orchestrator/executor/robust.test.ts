@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -36,7 +36,8 @@ const agent = { name: "test", description: "test", body: "test", model: "probe/s
 const effects = { prepare: async (t: CallTicket) => ({ cwd: t.cwd }), beforeSeal: async (_t: CallTicket, _e: string, r: never) => r, afterSeal: async () => {}, recover: async () => {} };
 
 async function fixture(t: TestContext, config: OrchestratorConfig = {}, options: { sweepMs?: number; memory?: () => Promise<number>; realEffects?: boolean; containment?: Containment } = {}) {
-  const home = await mkdtemp(join(tmpdir(), "dsa-robust-")), wid = ulid(), fake = new FakeContainment();
+  // Real path: worktree roots are reported resolved (macOS: /var is /private/var).
+  const home = await realpath(await mkdtemp(join(tmpdir(), "dsa-robust-"))), wid = ulid(), fake = new FakeContainment();
   const orch = await openJournal(orchLedger(home)), journal = await openJournal(journalPath(home, wid));
   const errors: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args.map(String).join(" ")); });
