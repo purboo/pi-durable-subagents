@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.6
 
 - A follow-up on a finished workflow shows as running work: in the dock, the
   summary line, the list (no longer dimmed or hidden) and `status`. Quitting pi
