@@ -42,10 +42,10 @@ test("P31a, P36, P11: run carries workflow-level budget, spawn limit and resolve
 
 test("T2/T3/T11: invalid call specs fail at the tool with every error; user keys pass through for fan-out", () => {
   assert.throws(() => request({ action: "run", agent: "w", task: "t", isolaton: "worktree", context: "inherit" }, "/w"),
-    { message: 'Invalid call: unknown field "isolaton"; context must be "fresh" or "fork"' });
+    { message: 'Invalid call: unknown field "isolaton"; context must be "fresh" or "fork" (got \"inherit\")' });
   assert.deepEqual(request({ action: "run", agent: "w", task: "t", key: "a" }, "/w").body, { cwd: "/w", call: { agent: "w", task: "t", key: "a" } }, "a single call may name its key");
   assert.throws(() => request({ action: "run", tasks: [{ agent: "w", task: "a" }, { agent: "w", task: "b", isolation: "vm" }] }, "/w"),
-    { message: 'Invalid tasks[1]: isolation must be "none" or "worktree"' });
+    { message: 'Invalid tasks[1]: isolation must be "none" or "worktree" (got "vm")' });
   assert.throws(() => request({ action: "run", chain: [{ agent: "w", task: "a", schema: { type: "string", minLength: 2 } }] }, "/w"),
     { message: 'Invalid chain[0]: schema: unsupported keyword "minLength"' });
   assert.throws(() => request({ action: "run", tasks: [{ agent: "w", task: "a", key: "k" }, { agent: "w", task: "b", key: "k" }] }, "/w"), /duplicate key "k"/);
@@ -62,4 +62,21 @@ test("a top-level cwd is the run's directory: relative workflow, inputs and call
   const single = request({ agent: "a", task: "t", cwd: "sub" }, "/w") as { body: { cwd: string; call: { cwd?: string } } };
   assert.deepEqual([single.body.cwd, single.body.call.cwd], ["/w", "/w/sub"]);
   assert.equal((request({ workflow: "x.js" }, "/w").body as { workflow: string }).workflow, "/w/x.js");
+});
+
+test("run-level call fields: defaults for every tasks/chain step (a step's own value wins); an error where they cannot apply", () => {
+  const { body } = request({ tasks: [{ agent: "a", task: "t" }, { agent: "a", task: "u", model: "p/own", timeoutMs: 5 }], model: "p/m", timeoutMs: 600000, budget: { tokens: 9 } }, "/w");
+  assert.deepEqual((body as { tasks: unknown[] }).tasks, [
+    { agent: "a", task: "t", model: "p/m", timeoutMs: 600000, budget: { tokens: 9 } },
+    { agent: "a", task: "u", model: "p/own", timeoutMs: 5, budget: { tokens: 9 } }]);
+  const chain = request({ chain: [{ agent: "a", task: "t" }], isolation: "worktree" }, "/w").body as { chain: unknown[] };
+  assert.deepEqual(chain.chain, [{ agent: "a", task: "t", isolation: "worktree" }]);
+  // A run-level default is validated per step, with the received value in the error.
+  assert.throws(() => request({ tasks: [{ agent: "a", task: "t" }], timeoutMs: "600000" }, "/w"),
+    { message: 'Invalid tasks[0]: timeoutMs must be a positive number (milliseconds) (got "600000")' });
+  assert.throws(() => request({ tasks: [{ agent: "a", task: "t" }], output: "o.md", key: "k" }, "/w"), /"output", "key" cannot be set for a whole tasks run; set them in each step/);
+  assert.throws(() => request({ workflow: "x.js", model: "p/m" }, "/w"), /"model" cannot be set for a workflow run; set it in the script's runs.run\(key, spec\) calls/);
+  assert.throws(() => request({ source: "emit(1)", timeoutMs: 5 }, "/w"), /"timeoutMs" cannot be set for a source run/);
+  // A single call keeps its fields as before.
+  assert.deepEqual(request({ agent: "a", task: "t", model: "p/m", timeoutMs: 5 }, "/w").body, { cwd: "/w", call: { agent: "a", task: "t", model: "p/m", timeoutMs: 5 } });
 });

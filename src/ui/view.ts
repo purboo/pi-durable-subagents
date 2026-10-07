@@ -75,7 +75,7 @@ export function plainReason(reason: string | undefined): string {
   if (code === "terminal") return `the workflow already ended${detail}; start a new run instead`;
   if (code === "already-sealed") return `that subagent already finished${detail}`;
   if (code === "finished") return `that subagent already finished${detail}; use f to follow up`;
-  if (r === "nothing-to-resume") return "nothing is paused, so there is nothing to resume";
+  if (code === "nothing-to-resume") return `nothing of this session is paused, so there is nothing to resume${r.includes("other sessions") ? `; ${r.slice(r.indexOf("paused in other sessions")).split(" — ")[0]}` : ""}`;
   if (code === "not-parked") return "it is already running";
   if (r === "already-answered" || r === "stale-question") return "that question was already answered";
   if (r === "switch-pending") return "a model switch is already on its way; it takes effect when the current step ends";

@@ -316,20 +316,143 @@ function origins(home: string): Map<string, string | undefined> {
   return ids;
 }
 
-/** P25, T10: Compact status of all workflows: own session first, then newest first; finished ones beyond the first `keep` collapse into a count. */
-export function statusView(home: string, options: { origin?: string; keep?: number } = {}): StatusView {
-  const keep = options.keep ?? 10, own = (w: WorkflowSnapshot) => Number(!!options.origin && w.origin === options.origin);
+/** Every workflow with its origin and hold, own session first, then newest first. */
+function snapshots(home: string, origin?: string): { all: WorkflowSnapshot[]; since?: number } {
+  const own = (w: WorkflowSnapshot) => Number(!!origin && w.origin === origin);
   const { since, held } = heldWorkflows(home);
   const all = [...origins(home)].sort(([a], [b]) => a < b ? 1 : a > b ? -1 : 0).map(([wid, origin]) => {
     const wf = workflowSnapshot(home, wid), withOrigin = wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
     return withOrigin.status === "running" && held(wid) ? { ...withOrigin, paused: true } : withOrigin;
   }).sort((a, b) => own(b) - own(a));
+  return { all, ...(since !== undefined ? { since } : {}) };
+}
+
+/** P25, T10: Compact status of all workflows: own session first, then newest first; finished ones beyond the first `keep` collapse into a count. */
+export function statusView(home: string, options: { origin?: string; keep?: number } = {}): StatusView {
+  const keep = options.keep ?? 10;
+  const { all, since } = snapshots(home, options.origin);
   let finished = 0;
   const shown = all.filter(w => !["done", "failed", "stopped"].includes(w.status) || ++finished <= keep);
   const hidden = all.length - shown.length;
   const paused = all.filter(w => w.paused).length;
   return { workflows: shown.map(compactWorkflow), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
     ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused (stop-all, drain or a quit pi) since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}) };
+}
+
+const FINAL = ["done", "failed", "stopped"];
+const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`;
+const tokens = (u?: Usage) => { const n = u ? u.input + u.output : 0; return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(n); };
+/** The latest generation of every key, in first-call order. */
+const latestCalls = (wf: WorkflowSnapshot) => [...new Map(wf.calls.map(c => [c.key, c] as const)).values()];
+
+export interface BriefCall {
+  key: string; agent: string; phase: CallPhase; model?: string;
+  /** Since the call started, and since its last activity (shown when quiet for a minute or more). */
+  for?: string; quiet?: string;
+  /** Input + output tokens so far: a running call at 0 has done nothing yet. */
+  tokens?: string; status?: CallResult["status"]; error?: string;
+}
+export interface BriefWorkflow {
+  wid: string; name?: string; status: WorkflowSnapshot["status"]; paused?: true;
+  /** "done/total" of the current revision ("+" while a script may still add calls). */
+  progress: string; tokens: string;
+  /** Only the calls that need a look: not finished, or finished not ok. */
+  calls: BriefCall[];
+  /** Open questions (answer with kind "answer" to "<wid>/<key>") and alerts (stall, unknown outcome, budget). */
+  asking?: { to: string; qid?: string; question: string }[];
+  alerts?: string[];
+}
+export interface StatusBrief {
+  active: BriefWorkflow[];
+  /** Running workflows of other pi sessions, one line each. */
+  otherSessions?: string[];
+  /** The newest finished workflows, one line each. */
+  finished: string[];
+  olderFinished?: number;
+  paused?: string;
+  hint: string;
+}
+
+/** Tool status without a wid: what runs, what waits for an answer and what failed, with finished workflows one line each.
+ *  The full view (every call's last line and usage) ran to tens of thousands of tokens on a busy home. */
+export function statusBrief(home: string, options: { origin?: string; keep?: number; now?: number } = {}): StatusBrief {
+  const keep = options.keep ?? 5, now = options.now ?? Date.now(), origin = options.origin;
+  const { all } = snapshots(home, origin);
+  const mine = (w: WorkflowSnapshot) => !origin || w.origin === origin;
+  const line = (w: WorkflowSnapshot) => {
+    const p = progressOf(w), notOk = latestCalls(w).filter(c => c.result && !c.result.ok).length;
+    return [w.wid, w.name, `${w.paused ? "paused" : w.status}`, `${p.done}/${p.total}${p.plus ? "+" : ""} done`, notOk ? `${notOk} not ok` : "",
+      w.endedAt !== undefined ? `ended ${age(now - w.endedAt)} ago` : w.startedAt !== undefined ? `started ${age(now - w.startedAt)} ago` : ""].filter(Boolean).join(" · ");
+  };
+  const brief = (w: WorkflowSnapshot): BriefWorkflow => {
+    const p = progressOf(w), open = w.attention.filter(a => a.kind !== "finished");
+    const calls = latestCalls(w).filter(c => c.phase !== "sealed" || (c.result && !c.result.ok)).map((c): BriefCall => {
+      const live = c.phase !== "sealed", quiet = c.lastActivity !== undefined ? now - c.lastActivity : undefined;
+      return { key: c.key, agent: c.agent, phase: c.phase, ...(c.model ? { model: c.model } : {}),
+        ...(live && c.startedAt !== undefined ? { for: age(now - c.startedAt) } : {}),
+        ...(live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
+        ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
+        ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}) };
+    });
+    const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}), question: clip(a.text, 300) }));
+    const alerts = open.filter(a => a.kind !== "question").map(a => `${a.kind}${a.call ? ` ${w.wid}/${callKey(a.call)}` : ""}: ${clip(a.text, 200)}`);
+    return { wid: w.wid, ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.paused ? { paused: true as const } : {}),
+      progress: `${p.done}/${p.total}${p.plus ? "+" : ""}`, tokens: tokens(w.usage), calls,
+      ...(asking.length ? { asking } : {}), ...(alerts.length ? { alerts } : {}) };
+  };
+  const active = all.filter(w => !FINAL.includes(w.status));
+  const finished = all.filter(w => FINAL.includes(w.status) && mine(w));
+  const others = active.filter(w => !mine(w));
+  const heldMine = active.filter(w => mine(w) && w.paused).length, heldOthers = others.filter(w => w.paused);
+  const paused = [heldMine ? `${heldMine} workflow${heldMine > 1 ? "s" : ""} of this session ${heldMine > 1 ? "are" : "is"} paused (stop-all, drain or a quit pi); resume continues ${heldMine > 1 ? "them" : "it"}` : "",
+    heldOthers.length ? `${heldOthers.length} workflow${heldOthers.length > 1 ? "s" : ""} of other sessions paused (${heldOthers.slice(0, 8).map(w => w.wid).join(", ")}); resume wid=<wid> continues one` : ""].filter(Boolean).join("; ");
+  return {
+    active: active.filter(mine).map(brief), ...(others.length ? { otherSessions: others.slice(0, 10).map(line) } : {}),
+    finished: finished.slice(0, keep).map(line), ...(finished.length > keep ? { olderFinished: finished.length - keep } : {}),
+    ...(paused ? { paused } : {}),
+    hint: "status wid=<wid> shows one workflow (outputs clipped); add key=<key> for one call's full result, or full:true for everything",
+  };
+}
+
+/** Running workflows of other sessions that a pause holds, as "wid" or "wid (name)": a session's own resume skips them. */
+export function pausedElsewhere(home: string, origin: string): string[] {
+  return snapshots(home, origin).all.filter(w => w.paused && w.origin !== origin && !FINAL.includes(w.status)).map(w => w.name ? `${w.wid} (${w.name})` : w.wid);
+}
+/** "<rid>" or "<rid>/<rest>" of a run request that created a workflow → the same address with its wid; else unchanged.
+ *  A run replies {submitted:{rid}} when its workflow is not created within 10 s, so the rid is all the caller has. */
+export function widOfRid(ledger: readonly Entry[], value: string): string {
+  const cut = value.indexOf("/"), head = cut < 0 ? value : value.slice(0, cut);
+  const created = head ? ledger.find(e => e.type === JT.created && e.rid === head) : undefined;
+  return created ? `${String(created.wid)}${value.slice(head.length)}` : value;
+}
+
+export type StatusCallDetail = Omit<CallSnapshot, "sends"> & { wid: string; sends?: CallSend[] };
+export type StatusCompactDetail = Omit<StatusWorkflow, "calls"> & { cwd?: string; scriptLog?: string; result?: unknown;
+  calls: (StatusCall & { agent: string; output?: string })[]; hint: string };
+const OUTPUT = 600;
+/** Tool status with a wid: one workflow with each call's output clipped (the full detail repeated every output twice and
+ *  reached ~100K characters); `key` gives one call in full. */
+export function statusCompactDetail(home: string, wid: string): StatusCompactDetail {
+  const detail = statusDetail(home, wid), compact = compactWorkflow(detail);
+  const byId = new Map(detail.calls.map(c => [c.callId, c]));
+  const calls = compact.calls.map(({ lastLine: _l, ...c }) => {
+    const full = byId.get(c.callId)!, output = full.result?.output?.trim();
+    return { ...c, agent: full.agent, ...(output ? { output: output.length > OUTPUT ? `${output.slice(0, OUTPUT)}… [${output.length - OUTPUT} more chars: status wid key=${c.key}]` : output } : {}) };
+  });
+  let result: unknown;
+  if (detail.result !== undefined) {
+    const json = JSON.stringify(detail.result) ?? "";
+    result = json.length <= 2000 ? detail.result : `${json.slice(0, 2000)}… [${json.length - 2000} more chars: status wid full:true]`;
+  }
+  return { ...compact, ...(detail.cwd ? { cwd: detail.cwd } : {}), ...(detail.scriptLog ? { scriptLog: detail.scriptLog } : {}),
+    ...(result !== undefined ? { result } : {}), calls, hint: "key=<key> gives one call's full result; full:true gives everything" };
+}
+/** Tool status with a wid and key: that call's latest generation in full (result, usage, sends). */
+export function statusCallDetail(home: string, wid: string, key: string): StatusCallDetail {
+  const detail = statusDetail(home, wid);
+  const call = detail.calls.findLast(c => c.key === key || c.callId === key || `${c.key}@${c.gen}` === key);
+  if (!call) throw new Error(`No call "${key}" in ${wid}; calls: ${[...new Set(detail.calls.map(c => c.key))].join(", ")}`);
+  return { wid, ...call };
 }
 
 /** P25, T10: One workflow in full detail (results, outputs, script log path) but without raw journal entries. */

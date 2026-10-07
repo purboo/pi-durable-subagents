@@ -72,6 +72,16 @@ subagents({ action: "send", to: "<wid>/<key>", kind: "steer", message: "Don't to
 subagents({ action: "status" })
 ```
 
+`status` without a wid is brief: what runs, what asks (with the address to
+answer) or failed, and one line per finished workflow. `status` with a wid
+shows one workflow with outputs clipped; add `key` for one call's full result,
+or `full: true` for everything. When a run replies `{submitted: {rid}}`
+(its workflow was not created within 10 s), the rid works wherever a wid does.
+With `tasks` or `chain`, top-level `model`, `timeoutMs`, `budget`, `isolation`,
+`context`, `tools`, `skills` and `once` apply to every step that does not set
+its own; other call fields there, and any of them beside a workflow script,
+are refused rather than ignored.
+
 Every run is asynchronous. The agent is woken once, when the workflow
 finishes (the notice carries each subagent's result) or when a subagent asks
 it something. Each verb means one thing, and a refusal says what would work:
@@ -79,7 +89,7 @@ it something. Each verb means one thing, and a refusal says what would work:
 | Verb | Applies to | Effect |
 |---|---|---|
 | `run` | — | Start one subagent, `tasks` in parallel, a `chain`, or a workflow script. An unknown agent name is refused before anything starts, with the list of agents. |
-| `send steer` | a running subagent | Reaches it at its next safe point. To a finished one: refused, use `follow-up`. |
+| `send steer` | a running subagent | Reaches it at its next safe point. To a finished one: refused, use `follow-up`; To one waiting on its question: it interrupts the question, and the subagent usually asks again; `answer` answers it. |
 | `send follow-up` | a finished subagent | Continues the same session as a new generation (`key@2`). |
 | `send answer` | an open question | Answers it once. |
 | `send model` | any subagent | Switches its model at the next request. |

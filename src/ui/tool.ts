@@ -36,6 +36,10 @@ type StatusRow = { wid: string; name?: string; status: string; calls: { phase: s
 /** UI §5: The collapsed result: started / applied / rejected, or one line per workflow for status. */
 export function resultLines(details: unknown): string[] {
   const d = (details ?? {}) as Record<string, unknown>;
+  if (typeof d.wid === "string" && typeof d.key === "string" && typeof d.phase === "string") {
+    const r = d.result as { status?: string } | undefined;
+    return [`${d.key} · ${r?.status ?? d.phase}${typeof d.model === "string" ? ` · ${d.model}` : ""}`];
+  }
   if (typeof d.wid === "string" && !Array.isArray(d.calls)) return [`started workflow ${d.wid}`, ...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : [])];
   if (d.applied === true) return ["✓ applied"];
   if (d.applied === false) return [`✗ not applied: ${plainReason(String(d.reason ?? ""))}`];
@@ -45,6 +49,16 @@ export function resultLines(details: unknown): string[] {
     const asks = (w.attention ?? []).filter(a => a.kind === "question").length;
     return `${w.name ?? short(w.wid)} · ${w.status} · ${done}/${w.calls.length} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}`;
   };
+  if (Array.isArray(d.active)) {
+    type Brief = { wid: string; name?: string; status: string; paused?: boolean; progress: string; calls: { status?: string }[]; asking?: unknown[]; alerts?: unknown[] };
+    const rows = (d.active as Brief[]).map(w => {
+      const failed = w.calls.filter(c => c.status && c.status !== "ok").length, asks = w.asking?.length ?? 0, alerts = w.alerts?.length ?? 0;
+      return `${w.name ?? short(w.wid)} · ${w.paused ? "paused" : w.status} · ${w.progress} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}${alerts ? ` · ${alerts} alert${alerts > 1 ? "s" : ""}` : ""}`;
+    });
+    const finished = Array.isArray(d.finished) ? d.finished.length + Number(d.olderFinished ?? 0) : 0;
+    return [...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : []), ...(rows.length ? rows.slice(0, 6) : ["nothing running"]),
+      ...(rows.length > 6 ? [`… ${rows.length - 6} more`] : []), ...(finished ? [`${finished} finished`] : [])];
+  }
   if (Array.isArray(d.workflows)) {
     const rows = (d.workflows as StatusRow[]).map(row);
     return [...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : []), ...(rows.length ? rows.slice(0, 6) : ["no workflows"]), ...(rows.length > 6 ? [`… ${rows.length - 6} more`] : [])];

@@ -19,7 +19,14 @@ export const parameters = Type.Object({
   replaces: Type.Optional(Type.Array(Type.String())), target: Type.Optional(Type.String()), wid: Type.Optional(Type.String()),
   usageBudget: Type.Optional(Type.Object({ tokens: Type.Optional(Type.Number()), costUsd: Type.Optional(Type.Number()) })),
   maxCalls: Type.Optional(Type.Integer({ minimum: 1 })), inputs: Type.Optional(Type.Record(Type.String(), Type.String())),
+  name: Type.Optional(Type.String()),
+  timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number). Omit unless a hard limit is needed; prefer budgets." })),
+  key: Type.Optional(Type.String({ description: "A single agent/task run: the call's key. status with wid: that call's full result." })),
+  full: Type.Optional(Type.Boolean({ description: "status: with wid, the complete workflow detail including every output." })),
 }, { additionalProperties: true });
+
+/** Call fields a tasks/chain run applies to every step that does not set its own. */
+export const stepDefaults = ["model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once"];
 
 type Args = Record<string, unknown>;
 function string(args: Args, name: string): string {
@@ -49,6 +56,15 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     // inputs, per-call cwd) resolve against it and calls default to it. It used to be ignored, so a relative
     // workflow path was looked up in the session's directory instead.
     const runCwd = choices[4] === undefined && typeof spec.cwd === "string" && spec.cwd ? resolve(cwd, spec.cwd) : cwd;
+    // Call fields beside a tasks/chain list are defaults for its steps; anything else beside a list or a script was
+    // silently dropped before (a top-level model or timeoutMs did nothing), so it is an error now.
+    const extra = choices[4] === undefined ? Object.keys(spec).filter(k => k !== "cwd" && spec[k] !== undefined) : [];
+    const fields = (keys: string[]) => keys.map(k => `"${k}"`).join(", ");
+    if (tasks !== undefined || chain !== undefined) {
+      const bad = extra.filter(k => !stepDefaults.includes(k));
+      if (bad.length) throw new Error(`${fields(bad)} cannot be set for a whole ${tasks !== undefined ? "tasks" : "chain"} run; set ${bad.length > 1 ? "them" : "it"} in each step (run-level step defaults: ${stepDefaults.join(", ")})`);
+    } else if (extra.length) throw new Error(`${fields(extra)} cannot be set for a ${workflow !== undefined ? "workflow" : "source"} run; set ${extra.length > 1 ? "them" : "it"} in the script's runs.run(key, spec) calls`);
+    const defaults = Object.fromEntries(extra.map(k => [k, spec[k]]));
     const body: RunBody = { cwd: runCwd };
     if (workflow !== undefined) body.workflow = resolve(runCwd, string(args, "workflow"));
     else if (source !== undefined) body.source = string(args, "source");
@@ -56,7 +72,7 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
       const list = tasks ?? chain;
       if (!Array.isArray(list) || !list.length) throw new Error("tasks/chain must be nonempty");
       const kind = tasks !== undefined ? "tasks" : "chain";
-      body[kind] = list.map((value, i) => call(value, runCwd, `${kind}[${i}]`));
+      body[kind] = list.map((value, i) => call(value && typeof value === "object" && !Array.isArray(value) ? { ...defaults, ...value } : value, runCwd, `${kind}[${i}]`));
       compileFanout(kind === "tasks" ? { tasks: body.tasks! } : { chain: body.chain! }); // duplicate keys fail here, not at admission
     } else body.call = call(spec, cwd, "call");
     if (inputs !== undefined) body.args = inputs;
