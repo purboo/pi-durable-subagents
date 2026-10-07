@@ -7,7 +7,7 @@ import { openJournal } from '../kernel/journal.ts';
 import { OsLock } from '../platform/lock.ts';
 import type { Executor, Ledgers, OrchestratorConfig } from './contract.ts';
 import { Engine, type EngineOptions } from './engine.ts';
-import { configPath, configProblem, configStamp, readConfig, recordConfig, watchConfig } from './config.ts';
+import { configPath, configProblem, configStamp, recordConfig, stampedConfig, watchConfig } from './config.ts';
 
 export interface MainOptions extends EngineOptions {
   home?: string;
@@ -26,9 +26,10 @@ export async function main(options: MainOptions = {}): Promise<void> {
   try {
     let config = options.config, stamp: string | undefined;
     if (!config) {
-      // The stamp is taken before the read: a change made while reading is applied by the first check.
+      // One read gives both the version and the settings: with two, a file changed and changed back in between kept
+      // the second version in effect while the watcher saw no change.
       stamp = await configStamp(configPath(home));
-      const raw = await readConfig(configPath(home));
+      const raw = stampedConfig(stamp);
       const problem = configProblem(raw);
       if (problem) console.error(`durable-subagents: config.json: ${problem}`);
       config = raw as OrchestratorConfig;

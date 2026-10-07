@@ -82,6 +82,9 @@ export async function configStamp(path: string): Promise<string> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw error; }
 }
 
+/** The settings of a version read by `configStamp`; invalid JSON throws, as `readConfig` does. */
+export function stampedConfig(stamp: string): unknown { return stamp === "missing" ? {} : JSON.parse(stamp.slice(1)); }
+
 /** Watch config.json from the version `stamp` (read at start) and apply each valid change in place. */
 /** `apply` runs the change where readers cannot observe half of it (the executor's admission section). */
 export function watchConfig(options: { path: string; stamp: string; config: OrchestratorConfig; orch: JournalHandle; intervalMs?: number; onApplied?: () => void; apply?: (change: () => Promise<void>) => Promise<void> }): { stop: () => Promise<void>; check: () => Promise<void> } {
@@ -92,7 +95,7 @@ export function watchConfig(options: { path: string; stamp: string; config: Orch
     if (now === stamp || stopped) return;
     let raw: unknown;
     // The content compared is the content applied: a second read could see another version than the stamp.
-    try { raw = now === "missing" ? {} : JSON.parse(now.slice(1)); }
+    try { raw = stampedConfig(now); }
     catch (error) {
       // A half-written file reads as invalid JSON: retry on the next change of the file, report it once per version.
       stamp = now;
