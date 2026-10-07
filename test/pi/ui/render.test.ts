@@ -412,5 +412,5 @@ test("a requested model switch shows at once in the row and the watch header unt
   screen.render(100); screen.handleInput("\x1b[B");
   assert.match(plain(screen), /E02 +GPT-6 \(openai\) → claude-opus-4-5/);
   screen.handleInput("\r");
-  assert.match(plain(screen), /→ .*at the end of this step/);
+  assert.match(plain(screen), /→ .*\(requested\)/);
 });

@@ -443,8 +443,10 @@ test("V1 stopping a call waiting on zero capacity acquires nothing and spawns no
   const f = await setup(t, { providers: { probe: { slots: 0 } } }), ticket = f.ticket();
   const pending = f.executor.run(ticket);
   await until(() => f.journal.entries().some(e => e.type === JT.exec));
-  const switchRequest: Request = { rid: "waiting-switch", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "model", model: "other/id" } };
-  assert.deepEqual(await f.executor.forward(switchRequest, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 }), { action: "reject", reason: "call-not-running" });
+  const switchRequest: Request = { rid: "waiting-switch", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "model", model: "probe/scripted2" } };
+  // P12: recorded for its launch; that model's provider has no capacity either, so the call keeps waiting.
+  assert.deepEqual(await f.executor.forward(switchRequest, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 }), { action: "apply" });
+  await delay(100);
   await f.executor.stop({ wid: f.wid }); assert.equal((await pending).status, "stopped");
   assert.equal(f.orch.entries().filter(e => e.type === "hold").length, 0);
   assert.equal(f.journal.entries().filter(e => e.type === "tracked").length, 0);
