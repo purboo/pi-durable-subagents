@@ -10,7 +10,11 @@ export interface Exhaustion { since: number; nextTry: number; error: string; pro
 /** Apply one orchestrator ledger entry to the map of used-up providers. */
 export function foldExhaustion(exhausted: Map<string, Exhaustion>, e: Entry): void {
   const provider = String(e.provider ?? e.pool ?? "");
-  if (e.type === "provider-exhausted") exhausted.set(provider, { since: Number(e.since), nextTry: Number(e.nextTry), error: String(e.error ?? "") });
+  if (e.type === "provider-exhausted") {
+    // A refusal of the probe ends it; any other execution's (the executor records none while a probe runs) keeps it.
+    const probe = exhausted.get(provider)?.probe;
+    exhausted.set(provider, { since: Number(e.since), nextTry: Number(e.nextTry), error: String(e.error ?? ""), ...(probe && probe !== e.exec ? { probe } : {}) });
+  }
   else if (e.type === "provider-available") exhausted.delete(provider);
   else if (e.type === "provider-probe") { const x = exhausted.get(provider); if (x) x.probe = String(e.exec); }
   else if (e.type === "release") { const x = exhausted.get(provider); if (x && x.probe === e.exec) delete x.probe; }

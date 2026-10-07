@@ -93,7 +93,12 @@ export function fatalProviderError(text: string): boolean {
  *  later. Seen as a gateway's `503 No available accounts` once pi's own retries are spent, or a usage-limit message.
  *  The provider is then avoided until a probe finds it accepting requests again. */
 export function quotaExhausted(text: string): boolean {
-  return !fatalProviderError(text) && /no available accounts?|usage limit|quota (exceeded|exhausted)|exceeded your (current )?(usage|quota)|limit (reached|exceeded)[^.]*reset|额度/i.test(text);
+  if (fatalProviderError(text)) return false;
+  if (/no available accounts?/i.test(text)) return true;
+  // A request rate limit clears in seconds ("rate limit exceeded; resets in 1 second", "quota exceeded for requests
+  // per minute"): pi's retries and the lost-execution path handle it; it must not take the provider out for minutes.
+  if (/rate.?limit|too many requests|request limit|per (second|minute)|\b[RT]PM\b|resets? in \d+ ?(ms|s|secs?|seconds?|minutes?)\b/i.test(text)) return false;
+  return /usage limit|quota (exceeded|exhausted)|exceeded your (current )?(usage|quota)|limit (reached|exceeded)[^.]*resets?\b|额度/i.test(text);
 }
 /** A refusal of the request's content (terms of service, usage or content policy): the same request is refused again,
  *  on this provider and usually on another, so it is reported at once instead of retried as a lost execution. */
@@ -102,8 +107,14 @@ export function refusedByProvider(text: string): boolean {
   if (/temporar|unavailable|try again|retry|timed? ?out|overloaded/i.test(text)) return false;
   return /terms of service|usage polic(y|ies)|acceptable use|content[_ ]?(policy|filter|management policy)|safety (system|filter)|flagged as (unsafe|harmful)/i.test(text);
 }
-/** P13, C8: Restore the effective provider from the native session's model changes. */
+/** P13, C8: Restore the effective provider as pi does: from the last model change or assistant message. */
 export function sessionModel(entries: SessionEntry[]): Model | undefined {
-  const last = entries.findLast(e => e.type === "model_change" && e.provider && e.modelId);
-  return last ? { provider: last.provider!, id: last.modelId! } : undefined;
+  // pi restores the model of the last model change or assistant message: a relaunch with `--model` on an existing
+  // session records no model change, so only the answer tells which model the session went on with.
+  const last = entries.findLast(e => e.type === "model_change" && e.provider && e.modelId
+    || e.type === "message" && e.message?.role === "assistant" && !!(e.message as { provider?: string }).provider && !!(e.message as { model?: string }).model);
+  if (!last) return undefined;
+  if (last.type === "model_change") return { provider: last.provider!, id: last.modelId! };
+  const m = last.message as { provider: string; model: string };
+  return { provider: m.provider, id: m.model };
 }

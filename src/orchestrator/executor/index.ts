@@ -410,7 +410,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const skip = pool && candidate && (previous && ownSegment && skipped(pool, recorded!) || unavailable(recorded!.provider) || !ownSegment && !!t.continueFrom);
     // A model the call was asked to use replaces the session's: launched with it, and holding its provider's slot.
     const wanted = requestedModel(t.journal, t.callId, t.model);
-    if (wanted && !(recorded && !freshFork && recorded.provider === wanted.provider && recorded.id === wanted.id)) return { candidates: [wanted], continuation: false, pool: undefined };
+    // It outranks the pool's order at a new generation too, also when it names the model the session already has.
+    if (wanted) return recorded && !freshFork && recorded.provider === wanted.provider && recorded.id === wanted.id
+      ? { candidates: [recorded], continuation: true, pool: undefined }
+      : { candidates: [wanted], continuation: false, pool: undefined };
     if (recorded && !freshFork && !skip) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined };
     return { candidates, continuation: false, pool };
   }
@@ -465,7 +468,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   /** Record a used-up provider once per window: again only when its probe (or any call after the next try) is refused. */
   async function recordExhausted(provider: string, exec: string, error: string) {
     const x = folded().exhausted.get(provider), now = Date.now();
-    if (x && now < x.nextTry && x.probe !== exec) return;
+    // While a probe runs, its outcome alone decides: a late refusal of an execution admitted earlier changes nothing.
+    if (x && (x.probe ? x.probe !== exec : now < x.nextTry)) return;
     if (orch.entries().some(e => e.type === "provider-exhausted" && e.exec === exec)) return;
     await orch.append("provider-exhausted", { provider, exec, since: x?.since ?? now, nextTry: now + (config.k?.probeMs ?? 900_000), error: error.slice(0, 300) });
   }
