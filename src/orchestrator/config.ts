@@ -12,7 +12,7 @@ import type { OrchestratorConfig } from "./contract.ts";
 
 /** The keys the orchestrator reads; config.json also holds pi-side settings (ui, onQuit) that it ignores. */
 const KEYS = ["defaultModel", "pools", "providers", "memory", "k"] as const;
-const K = ["lossBound", "checkpointMs", "stallMs", "progressMs", "switchTimeoutMs", "idleExitMs", "trackerMs", "hibernateMs", "spawnBudget"];
+const K = ["lossBound", "checkpointMs", "stallMs", "progressMs", "switchTimeoutMs", "idleExitMs", "trackerMs", "hibernateMs", "spawnBudget", "probeMs"];
 
 export const configPath = (home: string) => join(home, "config.json");
 

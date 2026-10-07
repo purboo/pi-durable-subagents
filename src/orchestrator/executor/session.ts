@@ -84,9 +84,16 @@ export function evidence(entries: SessionEntry[], exec: string) {
   const error = last?.stopReason === "error" ? last.errorMessage : undefined;
   return { report, budget, text, error, dangling: [...tools].map(([id, name]) => `${name} (${id})`), usage };
 }
-/** Only explicit quota/payment failures are terminal; rate limits, overload and transport errors still retry. */
+/** Only explicit payment failures are terminal; rate limits, overload and transport errors still retry, and a used-up
+ *  usage window (`quotaExhausted`) waits for the provider or moves to another one. */
 export function fatalProviderError(text: string): boolean {
-  return /\b402\b|insufficient[_ ]?(quota|balance|funds)|quota (exceeded|exhausted)|billing|credit balance|额度|余额|usage limit/i.test(text);
+  return /\b402\b|insufficient[_ ]?(quota|balance|funds)|billing|credit balance|余额/i.test(text);
+}
+/** A provider's usage window is used up: its requests are refused (and not counted) until the window resets, hours
+ *  later. Seen as a gateway's `503 No available accounts` once pi's own retries are spent, or a usage-limit message.
+ *  The provider is then avoided until a probe finds it accepting requests again. */
+export function quotaExhausted(text: string): boolean {
+  return !fatalProviderError(text) && /no available accounts?|usage limit|quota (exceeded|exhausted)|exceeded your (current )?(usage|quota)|limit (reached|exceeded)[^.]*reset|额度/i.test(text);
 }
 /** A refusal of the request's content (terms of service, usage or content policy): the same request is refused again,
  *  on this provider and usually on another, so it is reported at once instead of retried as a lost execution. */

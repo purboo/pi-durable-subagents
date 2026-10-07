@@ -6,6 +6,7 @@ import { compileFanout } from "../compat/fanout.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, type AttentionItem, type CallResult, type Entry } from "../types.ts";
+import { foldExhaustion, type Exhaustion } from "./providers.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
@@ -418,7 +419,7 @@ export interface StatusView {
   /** Drain: set while the orchestrator is drained by stop-all/drain; nothing new starts until resume. */
   paused?: string;
   /** Provider slots held / limit, the settings in effect and a rejected config.json change (see slotsView). */
-  slots?: string[]; config?: string; configRejected?: string;
+  slots?: string[]; config?: string; configRejected?: string; exhausted?: string[];
 }
 export type StatusDetail = WorkflowSnapshot & { scriptLog?: string };
 
@@ -518,26 +519,32 @@ export interface StatusBrief {
   config?: string;
   /** The latest change of config.json that was not applied, while the earlier settings stay in effect. */
   configRejected?: string;
+  /** Providers whose usage window is used up: avoided until the next try, then probed by one call (see providers.ts). */
+  exhausted?: string[];
   hint: string;
 }
 
 /** Provider slots from the orchestrator ledger: holders per provider (hold/release{pool,slot,exec}) and the limits of
  *  the settings in effect (the latest config{hash,config}); config-rejected after it is reported too. */
-export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected"> {
-  const held = new Map<string, Entry>();
+export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected" | "exhausted"> {
+  const held = new Map<string, Entry>(), used = new Map<string, Exhaustion>();
   let config: Entry | undefined, rejected: Entry | undefined;
   for (const e of readJournalSnapshot(orchLedger(home))) {
     if (e.type === "hold") held.set(`${e.pool}:${e.slot}`, e);
     else if (e.type === "release" && held.get(`${e.pool}:${e.slot}`)?.exec === e.exec) held.delete(`${e.pool}:${e.slot}`);
     else if (e.type === "config") { config = e; rejected = undefined; }
     else if (e.type === "config-rejected") rejected = e;
+    foldExhaustion(used, e);
   }
+  const exhausted = [...used].sort(([a], [b]) => a.localeCompare(b)).map(([p, x]) => `${p} exhausted since ${age(now - x.since)} ago (${clip(x.error, 80)}), ` +
+    (x.probe ? `probing with ${x.probe.split("#")[0]}` : x.nextTry > now ? `next try in ${age(x.nextTry - now)}` : "next call probes it"));
   const limits = ((config?.config as { providers?: Record<string, { slots?: number }> } | undefined)?.providers) ?? {};
   const holders = new Map<string, number>();
   for (const e of held.values()) if (e.pool !== "memory") holders.set(String(e.pool), (holders.get(String(e.pool)) ?? 0) + 1);
   const names = [...new Set([...Object.keys(limits), ...holders.keys()])].sort();
   const slots = names.map(p => { const n = holders.get(p) ?? 0, limit = limits[p]?.slots; return typeof limit === "number" ? `${p} ${n}/${limit}` : `${p} ${n} (no limit)`; });
   return { ...(slots.length ? { slots } : {}), ...(config ? { config: `${String(config.hash)} since ${age(now - config.ts)} ago` } : {}),
+    ...(exhausted.length ? { exhausted } : {}),
     ...(rejected ? { configRejected: `${clip(String(rejected.error), 200)} (${age(now - rejected.ts)} ago); ${config ? String(config.hash) : "the start settings"} stay in effect` } : {}) };
 }
 

@@ -23,7 +23,8 @@ import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts"
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
 import { hibernation, openQuestion } from "./hibernate.ts";
-import { evidence, fatalProviderError, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
+import { foldExhaustion, type Exhaustion } from "../providers.ts";
+import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
 import { observeExecution } from "./observe.ts";
 import { availableMemory } from "./memory.ts";
@@ -106,7 +107,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   };
   const wake = () => { for (const fn of waiters) fn(); waiters.clear(); };
   // F3: fold only orchestrator entries appended since the last fold (holdings, observed switches, K7 skips).
-  const ledger = { seen: 0, held: new Map<string, Entry>(), observed: new Set<string>(), skips: new Map<string, number>() };
+  const ledger = { seen: 0, held: new Map<string, Entry>(), observed: new Set<string>(), skips: new Map<string, number>(), exhausted: new Map<string, Exhaustion>() };
   const folded = () => {
     const entries = orch.entries();
     for (; ledger.seen < entries.length; ledger.seen++) {
@@ -115,11 +116,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       else if (e.type === "release" && ledger.held.get(id)?.exec === e.exec) ledger.held.delete(id);
       else if (e.type === "switch-observed") ledger.observed.add(`${e.exec}\n${e.rid}`);
       else if (e.type === "skip") ledger.skips.set(`${e.pool}\n${e.model}`, Math.max(Number(e.until), ledger.skips.get(`${e.pool}\n${e.model}`) ?? 0));
+      foldExhaustion(ledger.exhausted, e);
     }
     return ledger;
   };
   const holdings = () => [...folded().held.values()];
   const skipped = (pool: string, model: Model) => (folded().skips.get(`${pool}\n${model.provider}/${model.id}`) ?? 0) > Date.now();
+  /** A provider whose usage window is used up admits no call until its next try, and then one probe at a time. */
+  const unavailable = (provider: string | undefined) => {
+    const x = provider ? folded().exhausted.get(provider) : undefined;
+    return !!x && (Date.now() < x.nextTry || x.probe !== undefined);
+  };
   async function release(exec: string) {
     await serial(async () => { for (const h of holdings().filter(e => e.exec === exec)) await orch.append("release", { pool: h.pool, slot: h.slot, exec }); });
     wake();
@@ -354,6 +361,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         for (const model of models) {
           if (!continuation && pool && skipped(pool, model)) continue;
           const provider = model.provider;
+          if (unavailable(provider)) continue;
+          const probe = provider !== undefined && folded().exhausted.has(provider);
           const holders = holdings().filter(e => e.pool === provider);
           const limit = config.providers?.[provider ?? ""]?.slots ?? Infinity;
           if (!capacity({ kind: "provider", holders: holders.length, capacity: limit })) continue;
@@ -374,6 +383,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           if (provider) {
             let slot = 0; while (holders.some(e => e.slot === slot)) slot++;
             await orch.append("hold", { pool: provider, slot, exec });
+            // After its next try, the first call admitted to a used-up provider is its probe: its first request
+            // either goes through (the provider is available again) or is refused, which uses no quota.
+            if (probe) await orch.append("provider-probe", { provider, exec });
           }
           await a.ticket.journal.append("selected", { exec, model, ...(pool ? { pool } : {}) });
           return model;
@@ -393,7 +405,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const pool = raw && config.pools?.[raw] ? raw : undefined;
     const candidates = raw ? resolveModel(raw, config.pools) : [{ id: "" }];
     const candidate = recorded && candidates.some(m => m.provider === recorded.provider && m.id === recorded.id);
-    const skip = previous && ownSegment && pool && candidate && skipped(pool, recorded!);
+    // Leave the session's model for the pool's others when its pool skips it after losses, or its provider's usage
+    // window is used up; and at a new generation, go back to the pool's order of preference.
+    const skip = pool && candidate && (previous && ownSegment && skipped(pool, recorded!) || unavailable(recorded!.provider) || !ownSegment && !!t.continueFrom);
     // A model the call was asked to use replaces the session's: launched with it, and holding its provider's slot.
     const wanted = requestedModel(t.journal, t.callId, t.model);
     if (wanted && !(recorded && !freshFork && recorded.provider === wanted.provider && recorded.id === wanted.id)) return { candidates: [wanted], continuation: false, pool: undefined };
@@ -441,6 +455,27 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         await orch.append("switch-observed", { exec, rid: target.rid, pool: provider });
         for (const h of holdings().filter(h => h.exec === exec && h.pool !== provider && h.pool !== "memory")) await orch.append("release", { pool: h.pool, slot: h.slot, exec });
       }
+    });
+    wake();
+  }
+  /** The model an execution last answered with, or was launched on. */
+  function modelOf(journal: JournalHandle, exec: string): Model | undefined {
+    return journal.entries().findLast(e => (e.type === "selected" || e.type === "model-used") && e.exec === exec)?.model as Model | undefined;
+  }
+  /** Record a used-up provider once per window: again only when its probe (or any call after the next try) is refused. */
+  async function recordExhausted(provider: string, exec: string, error: string) {
+    const x = folded().exhausted.get(provider), now = Date.now();
+    if (x && now < x.nextTry && x.probe !== exec) return;
+    if (orch.entries().some(e => e.type === "provider-exhausted" && e.exec === exec)) return;
+    await orch.append("provider-exhausted", { provider, exec, since: x?.since ?? now, nextTry: now + (config.k?.probeMs ?? 900_000), error: error.slice(0, 300) });
+  }
+  /** An answer from a used-up provider, requested after it was found used up: available again. */
+  async function answered(exec: string, event: Record<string, unknown>) {
+    const message = event.message as { role?: string; provider?: string; stopReason?: string; timestamp?: number } | undefined, provider = message?.provider;
+    if (message?.role !== "assistant" || !provider || message.stopReason === "error") return;
+    await serial(async () => {
+      const x = folded().exhausted.get(provider);
+      if (x && (x.probe === exec || Number(message.timestamp) > x.since)) await orch.append("provider-available", { provider, exec });
     });
     wake();
   }
@@ -504,7 +539,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         // A refusal of the content is deterministic: the same request is refused again, so it is reported, not retried.
         if (has(journal, "settled", exec) && !ev.text && ev.error && refusedByProvider(ev.error))
           return finish(journal, t.callId, exec, makeResult("failed", "", `Refused by the provider (not retried): ${ev.error.slice(0, 500)}`));
-        await serial(async () => {
+        // A used-up usage window is no loss: the provider is avoided until a probe finds it accepting requests again,
+        // and the call goes on with the pool's next model, or waits for that provider.
+        const exhausted = has(journal, "settled", exec) && !ev.text && ev.error && quotaExhausted(ev.error) ? modelOf(journal, exec)?.provider : undefined;
+        if (exhausted) await serial(() => recordExhausted(exhausted, exec!, ev.error!));
+        else await serial(async () => {
           if (!has(journal, "loss", exec!)) await journal.append("loss", { exec });
           await skipLostCandidate(journal, orch, exec!);
         });
@@ -579,7 +618,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
               }
             });
           }, recordUsage: values => recordUsage(t, values),
-          switched: event => switched(exec!, journal, event), pendingSwitch: () => pendingSwitch(exec!),
+          switched: event => switched(exec!, journal, event), answered: event => answered(exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
       } finally { await fence(journal, exec, { child, park: a }); }
     }

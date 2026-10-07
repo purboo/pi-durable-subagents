@@ -61,7 +61,7 @@ export function renderView(view: StatusView): string {
     ...w.attention.map(a => `  ${a.kind}: ${JSON.stringify(a.text.split("\n")[0])}`)].join("\n"));
   if (view.paused) lines.unshift(`${view.paused} (pi-durable-subagents resume)`);
   if (view.olderFinished) lines.push(`(+${view.olderFinished} older finished workflows; status <wid> shows one in detail)`);
-  const footer = [view.slots?.length ? `slots: ${view.slots.join(", ")}` : "", view.config ? `config: ${view.config}` : "", view.configRejected ? `config.json rejected: ${view.configRejected}` : ""].filter(Boolean);
+  const footer = [view.slots?.length ? `slots: ${view.slots.join(", ")}` : "", view.config ? `config: ${view.config}` : "", view.configRejected ? `config.json rejected: ${view.configRejected}` : "", ...(view.exhausted ?? [])].filter(Boolean);
   if (!lines.length) lines.push("No workflows");
   return [...lines, ...footer].join("\n");
 }

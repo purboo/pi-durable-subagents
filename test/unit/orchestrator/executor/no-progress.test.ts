@@ -10,7 +10,7 @@ import { openJournal } from "../../../../src/kernel/journal.ts";
 import { callDir, callSession } from "../../../../src/paths.ts";
 import { JT, type AttentionItem } from "../../../../src/types.ts";
 import { observeExecution } from "../../../../src/orchestrator/executor/observe.ts";
-import { evidence, fatalProviderError } from "../../../../src/orchestrator/executor/session.ts";
+import { evidence, fatalProviderError, quotaExhausted } from "../../../../src/orchestrator/executor/session.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 
 /** The tracker runs on a 5 ms timer; a loaded machine (the full suite) can need longer than one tick to observe. */
@@ -88,8 +88,14 @@ test("provider evidence uses only the segment's last assistant error", () => {
   assert.equal(evidence([receipt, error], "e").error, error.message.errorMessage);
   assert.equal(evidence([error, receipt], "e").error, undefined);
   assert.equal(evidence([receipt, error, { type: "message", message: { role: "assistant", stopReason: "stop" } }], "e").error, undefined);
-  for (const text of ["402", "insufficient_quota", "insufficient balance", "insufficient funds", "quota exceeded", "quota exhausted", "billing disabled", "credit balance low", "额度不足", "余额不足", "usage limit"])
+  for (const text of ["402", "insufficient_quota", "insufficient balance", "insufficient funds", "billing disabled", "credit balance low", "余额不足"])
     assert.equal(fatalProviderError(text), true, text);
-  for (const text of ["429 rate limit", "529 overloaded", "ECONNRESET", "timeout", "quota remaining: 42"])
+  for (const text of ["429 rate limit", "529 overloaded", "ECONNRESET", "timeout", "quota remaining: 42", "quota exceeded", "usage limit", "额度不足"])
     assert.equal(fatalProviderError(text), false, text);
+  for (const text of ['503 {"error":{"message":"No available accounts: no available accounts","type":"api_error"}}', "You have reached your usage limit", "quota exceeded",
+    "quota exhausted", "You exceeded your current usage quota", "5-hour limit reached ∙ resets 3pm", "额度已用完"])
+    assert.equal(quotaExhausted(text), true, text);
+  for (const text of ["429 rate limit", "Request timed out.", "Anthropic stream ended without a stop reason", "402 insufficient_quota", "quota remaining: 42",
+    "You exceeded your current quota, please check your plan and billing details."])
+    assert.equal(quotaExhausted(text), false, text);
 });
