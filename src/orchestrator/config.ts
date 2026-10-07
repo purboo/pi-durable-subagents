@@ -59,10 +59,11 @@ export async function readConfig(path: string): Promise<unknown> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return {}; throw error; }
 }
 
-/** Record the settings in effect unless the ledger already ends on the same ones (a restart with an unchanged file). */
+/** Record the settings in effect unless the ledger already ends on the same ones (a restart with an unchanged file).
+ *  After a rejection they are recorded again: that confirms the file is back to settings in effect. */
 export async function recordConfig(orch: JournalHandle, config: OrchestratorConfig): Promise<string> {
-  const hash = configHash(config), last = orch.entries().findLast(e => e.type === "config");
-  if (last?.hash !== hash) await orch.append("config", { hash, config: orchestratorSettings(config) });
+  const hash = configHash(config), last = orch.entries().findLast(e => e.type === "config" || e.type === "config-rejected");
+  if (last?.type !== "config" || last.hash !== hash) await orch.append("config", { hash, config: orchestratorSettings(config) });
   return hash;
 }
 
@@ -73,7 +74,6 @@ function applyInPlace(target: OrchestratorConfig, next: OrchestratorConfig) {
   Object.assign(t, orchestratorSettings(next));
 }
 
-/** Watch config.json and apply each valid change in place. Returns a stop function. */
 /** Identity of the file's current version (taken before a read, so a change during the read is seen next time). */
 export async function configStamp(path: string): Promise<string> {
   try { const s = await stat(path); return `${s.ino}:${s.size}:${s.mtimeMs}`; }
@@ -81,7 +81,8 @@ export async function configStamp(path: string): Promise<string> {
 }
 
 /** Watch config.json from the version `stamp` (read at start) and apply each valid change in place. */
-export function watchConfig(options: { path: string; stamp: string; config: OrchestratorConfig; orch: JournalHandle; intervalMs?: number; onApplied?: () => void }): { stop: () => Promise<void>; check: () => Promise<void> } {
+/** `apply` runs the change where readers cannot observe half of it (the executor's admission section). */
+export function watchConfig(options: { path: string; stamp: string; config: OrchestratorConfig; orch: JournalHandle; intervalMs?: number; onApplied?: () => void; apply?: (change: () => Promise<void>) => Promise<void> }): { stop: () => Promise<void>; check: () => Promise<void> } {
   const { path, config, orch } = options;
   let stamp = options.stamp, running: Promise<void> | undefined, rejected: string | undefined, stopped = false;
   const once = async () => {
@@ -97,17 +98,20 @@ export function watchConfig(options: { path: string; stamp: string; config: Orch
       return;
     }
     stamp = now;
-    const next = orchestratorSettings(raw), hash = configHash(next);
-    if (hash === configHash(config)) { rejected = undefined; return; }
-    const problem = configProblem(raw);
+    // Validate the content first: `[]` or `null` project to no settings and must not pass as "unchanged".
+    const problem = configProblem(raw), next = orchestratorSettings(raw), hash = configHash(next);
     if (problem) {
       if (rejected !== hash) { rejected = hash; await orch.append("config-rejected", { hash, error: problem }); }
       return;
     }
     rejected = undefined;
-    applyInPlace(config, next);
-    await recordConfig(orch, config);
-    options.onApplied?.();
+    let changed = false;
+    await (options.apply ?? (change => change()))(async () => {
+      changed = hash !== configHash(config);
+      if (changed) applyInPlace(config, next);
+      await recordConfig(orch, config); // also confirms a return to the settings in effect after a rejection
+    });
+    if (changed) options.onApplied?.();
   };
   const check = () => running ??= once().catch(error => console.error(`durable-subagents: config.json check failed: ${String(error)}`)).finally(() => { running = undefined; });
   const timer = setInterval(check, options.intervalMs ?? 1000);

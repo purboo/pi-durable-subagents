@@ -47,7 +47,7 @@ async function fixture(t: TestContext, config: OrchestratorConfig = {}, options:
     await mkdir(callDir(home, wid, key, 1), { recursive: true });
     await writeFile(callSession(home, wid, key, 1), lines.map(l => typeof l === "string" ? l : JSON.stringify(l)).join("\n") + "\n");
   };
-  return { home, wid, orch, journal, containment: fake, errors, ticket, session, get executor() { return executor; },
+  return { home, wid, orch, journal, config: ledgers.config as OrchestratorConfig, containment: fake, errors, ticket, session, get executor() { return executor; },
     async restart() { await executor.shutdown(); executor = make(); return executor; } };
 }
 const execLine = (exec: string) => ({ type: "custom", customType: CT.exec, data: { exec } });
@@ -314,4 +314,36 @@ test("F1 A2 a fence timeout at the end of a normal gate run is isolated; the cal
     assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${gid}`));
     assert.equal((await readFile(join(a.cwd, "gate-runs"), "utf8")), "ran\n", "the gate ran exactly once");
   } finally { stuck.clear(); await real.fence(gid, []).catch(() => {}); }
+});
+
+test("a call waiting for a slot follows a reloaded defaultModel and limit", { timeout: 10000 }, async t => {
+  const f = await fixture(t, { defaultModel: "p/old", providers: { p: { slots: 0 }, q: { slots: 1 } } });
+  const a = { ...f.ticket("a"), agent: { ...agent, model: undefined } };
+  const run = f.executor.run(a);
+  await until(() => f.journal.entries().some(e => e.type === JT.exec));
+  await delay(100);
+  assert.equal(count(f.journal.entries(), e => e.type === "selected"), 0, "p has no slot");
+  await f.executor.reconfigure!(async () => { f.config.defaultModel = "q/new"; });
+  await run;
+  assert.deepEqual(f.journal.entries().find(e => e.type === "selected")?.model, { provider: "q", id: "new" });
+});
+
+test("a config change waits for an admission in progress instead of changing its limits halfway", { timeout: 10000 }, async t => {
+  let measured!: () => void;
+  const gate = new Promise<void>(resolve => { measured = resolve; });
+  let measuring = false;
+  const f = await fixture(t, { providers: { probe: { slots: 1 } } }, { memory: async () => { measuring = true; await gate; return 1e6; } });
+  const run = f.executor.run(f.ticket("a"));
+  await until(() => measuring);
+  let holdsAtApply = -1;
+  const change = f.executor.reconfigure!(async () => {
+    holdsAtApply = count(f.orch.entries(), e => e.type === "hold" && e.pool === "probe");
+    f.config.providers = { probe: { slots: 0 } };
+  });
+  await delay(50);
+  assert.equal(holdsAtApply, -1, "the change waits for the admission");
+  measured();
+  await change;
+  assert.equal(holdsAtApply, 1, "the admission completed under the limits it checked");
+  await run;
 });

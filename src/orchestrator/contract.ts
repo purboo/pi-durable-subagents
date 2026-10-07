@@ -80,6 +80,8 @@ export interface Executor {
   suspend(only?: (wid: string) => boolean): Promise<void>;
   /** Orchestrator exit: suspend(), then close the outbox. */
   shutdown(): Promise<void>;
+  /** Apply a config.json change between slot admissions (never inside one), then let waiting calls retry. */
+  reconfigure?(apply: () => Promise<void>): Promise<void>;
 }
 
 export interface Ledgers {
