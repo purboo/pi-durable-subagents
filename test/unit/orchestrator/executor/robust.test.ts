@@ -13,6 +13,8 @@ import type { CallTicket, OrchestratorConfig } from "../../../../src/orchestrato
 import createExecutor from "../../../../src/orchestrator/executor/index.ts";
 import createEffects from "../../../../src/orchestrator/executor/effects/index.ts";
 import { serialContainment } from "../../../../src/orchestrator/executor/sweep.ts";
+import { compactWorkflow, snapshotFromEntries, statusBrief } from "../../../../src/orchestrator/snapshot.ts";
+import { renderStatus, renderView } from "../../../../src/cli/main.ts";
 
 // A containment without processes: spawning fails (or, with `exits`, yields a child that exits at once), fences of
 // `stuck` execs time out, scans may fail transiently.
@@ -61,6 +63,121 @@ async function until(predicate: () => boolean, ms = 5000) {
 async function within<T>(promise: Promise<T>, ms = 2000): Promise<T> {
   return Promise.race([promise, delay(ms).then(() => { throw new Error(`not settled within ${ms} ms`); })]);
 }
+
+async function writingChildren(t: TestContext, f: Awaited<ReturnType<typeof fixture>>) {
+  const streams = new Map<string, PassThrough>();
+  t.mock.method(f.containment, "spawn", async (spec: { exec: string }) => {
+    const stdout = new PassThrough(); streams.set(spec.exec.split("#")[0]!, stdout);
+    return { pid: 0, start: "", stdin: new PassThrough(), stdout, stderr: new PassThrough(), exited: new Promise<{ code: number; signal: null }>(() => {}) };
+  });
+  return async (ticket: CallTicket, toolName = "write", path: unknown = "nested/new.txt") => {
+    await until(() => streams.has(ticket.callId));
+    streams.get(ticket.callId)!.write(JSON.stringify({ type: "tool_execution_start", toolCallId: ulid(), toolName, args: { path } }) + "\n");
+  };
+}
+
+test("shared worktree: observed writes remind once, survive recovery, and either seal resolves status", { timeout: 15000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b");
+  await mkdir(join(f.home, ".git"));
+  for (const ticket of [a, b]) await f.journal.append("call", { key: ticket.key, gen: 1, spec: ticket.spec });
+  let send = await writingChildren(t, f);
+  const pa = f.executor.run(a), pb = f.executor.run(b);
+  const conflicts = () => f.journal.entries().filter(e => e.type === JT.attention && item(e).kind === "conflict");
+  await send(a, "read"); await send(b, "bash"); await send(b, "edit", 123);
+  await until(() => count(f.journal.entries(), e => e.type === "observation") >= 3);
+  assert.equal(count(f.journal.entries(), e => e.type === "wrote"), 0);
+  await send(a); await until(() => count(f.journal.entries(), e => e.type === "wrote") === 1);
+  assert.equal(conflicts().length, 0, "one writer has no conflict");
+  await send(b, "edit"); await until(() => conflicts().length === 1);
+  await send(b); await send(a, "edit");
+  await until(() => count(f.journal.entries(), e => e.type === "observation") >= 7);
+  assert.equal(count(f.journal.entries(), e => e.type === "wrote"), 2);
+  assert.equal(conflicts().length, 1);
+  const id = `worktree:${[a.callId, b.callId].sort().join("|")}`;
+  assert.equal(item(conflicts()[0]!).id, id); assert.equal(item(conflicts()[0]!).call, b.callId);
+  const snap = snapshotFromEntries(f.wid, f.journal.entries()), compact = compactWorkflow(snap);
+  assert.deepEqual(snap.calls.map(c => c.sharedWorktree), [[`${f.wid}/b`], [`${f.wid}/a`]]);
+  assert.deepEqual(compact.calls.map(c => c.sharedWorktree), snap.calls.map(c => c.sharedWorktree));
+  assert.match(renderStatus(snap), /\(shares worktree with /);
+  assert.match(renderView({ workflows: [compact] }), /\(shares worktree with /);
+  assert.deepEqual(statusBrief(f.home).active[0]!.calls.map(c => c.sharedWorktree), snap.calls.map(c => c.sharedWorktree));
+  const pending = Promise.allSettled([pa, pb]);
+  await f.restart(); await pending;
+  await f.executor.recover(f.wid, f.journal);
+  send = await writingChildren(t, f);
+  const ra = f.executor.run(a), rb = f.executor.run(b);
+  await send(a); await send(b);
+  await until(() => count(f.journal.entries(), e => e.type === "wrote") === 4);
+  assert.equal(conflicts().length, 1, "recovery and new execs do not repeat the pair");
+  await f.executor.stop({ wid: f.wid, callId: a.callId }); await ra;
+  assert.equal(count(f.journal.entries(), e => e.type === JT.attentionResolved && e.id === id), 1, "first writer sealing also resolves");
+  assert.ok(snapshotFromEntries(f.wid, f.journal.entries()).calls.every(c => c.sharedWorktree === undefined));
+  await send(b); await f.executor.stop({ wid: f.wid, callId: b.callId }); await rb;
+  assert.equal(conflicts().length, 1);
+});
+
+for (const sameOrigin of [true, false]) test(`shared worktree across workflows: ${sameOrigin ? "same" : "different"} origins and recovery cleanup`, { timeout: 15000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a"), wid = ulid();
+  const other = await openJournal(journalPath(f.home, wid));
+  t.after(() => other.close());
+  const b: CallTicket = { ...f.ticket("b"), wid, widRev: `${wid}@1`, callId: `${wid}@1/b@1`, journal: other };
+  await f.journal.append("wf-created", { origin: "main:one" });
+  await other.append("wf-created", { origin: sameOrigin ? "main:one" : "main:two" });
+  await mkdir(join(f.home, ".git"));
+  const send = await writingChildren(t, f), pa = f.executor.run(a), pb = f.executor.run(b);
+  await send(a); await until(() => f.journal.entries().some(e => e.type === "wrote"));
+  await send(b); await until(() => other.entries().some(e => e.type === JT.attention));
+  assert.equal(count(f.journal.entries(), e => e.type === JT.attention), sameOrigin ? 0 : 1);
+  const id = item(other.entries().find(e => e.type === JT.attention)!).id;
+  const pending = Promise.allSettled([pa, pb]); await f.restart(); await pending;
+  // A crash after the seal but before reminder retirement; load the sealed workflow first.
+  await f.journal.append(JT.sealed, { call: a.callId, exec: `${a.callId}#1.1`, result: { key: "a", gen: 1, status: "ok", ok: true, output: "" } });
+  await f.executor.recover(f.wid, f.journal); await f.executor.recover(wid, other);
+  await f.executor.recover(wid, other);
+  assert.equal(count(other.entries(), e => e.type === JT.attentionResolved && e.id === id), 1);
+  assert.equal(count(f.journal.entries(), e => e.type === JT.attentionResolved && e.id === id), sameOrigin ? 0 : 1);
+});
+
+test("shared worktree recovery repairs a partial cross-origin reminder without changing its writer", { timeout: 15000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a"), wid = ulid(), other = await openJournal(journalPath(f.home, wid));
+  t.after(() => other.close());
+  const b: CallTicket = { ...f.ticket("b"), wid, widRev: `${wid}@1`, callId: `${wid}@1/b@1`, journal: other };
+  for (const ticket of [a, b]) {
+    await ticket.journal.append("wf-created", { origin: ticket.wid });
+    await ticket.journal.append("wrote", { exec: `${ticket.callId}#1.1`, root: f.home });
+  }
+  const id = `worktree:${[a.callId, b.callId].sort().join("|")}`;
+  await other.append(JT.attention, { item: { id, rev: 1, kind: "conflict", call: b.callId, wid, text: "original reminder" } });
+  await f.executor.recover(wid, other);
+  const send = await writingChildren(t, f), pa = f.executor.run(a), pb = f.executor.run(b);
+  await send(a, "read"); await send(b, "read");
+  for (const journal of [f.journal, other]) {
+    const alerts = journal.entries().filter(e => e.type === JT.attention && item(e).kind === "conflict");
+    assert.equal(alerts.length, 1); assert.equal(item(alerts[0]!).call, b.callId);
+  }
+  await f.executor.stop({ wid: f.wid, callId: a.callId }); await pa;
+  assert.equal(count(other.entries(), e => e.type === JT.attentionResolved && e.id === id), 1);
+  await f.executor.stop({ wid, callId: b.callId }); await pb;
+});
+
+test("shared worktree ignores non-git writes, distinct roots and already sealed writers", { timeout: 15000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b");
+  a.cwd = join(f.home, "one"); b.cwd = join(f.home, "two");
+  await mkdir(join(a.cwd, ".git"), { recursive: true }); await mkdir(join(b.cwd, ".git"), { recursive: true });
+  const send = await writingChildren(t, f), pa = f.executor.run(a), pb = f.executor.run(b);
+  await send(a, "write", join(f.home, "outside.txt"));
+  await until(() => count(f.journal.entries(), e => e.type === "observation") === 1);
+  assert.equal(count(f.journal.entries(), e => e.type === "wrote"), 0);
+  await send(a); await send(b);
+  await until(() => count(f.journal.entries(), e => e.type === "wrote") === 2);
+  assert.deepEqual(new Set(f.journal.entries().filter(e => e.type === "wrote").map(e => e.root)), new Set([a.cwd, b.cwd]));
+  assert.equal(count(f.journal.entries(), e => e.type === JT.attention), 0);
+  await f.executor.stop({ wid: f.wid, callId: a.callId }); await pa;
+  await send(b, "edit", join(a.cwd, "after.txt"));
+  await until(() => count(f.journal.entries(), e => e.type === "wrote") === 3);
+  assert.equal(count(f.journal.entries(), e => e.type === JT.attention && item(e).kind === "conflict"), 0);
+  await f.executor.stop({ wid: f.wid, callId: b.callId }); await pb;
+});
 
 test("settled quota errors seal failed without loss or relaunch", { timeout: 10000 }, async t => {
   const f = await fixture(t), a = f.ticket("a");

@@ -225,7 +225,7 @@ export interface ReportArgs { outcome: "ok" | "failed"; summary?: string; data?:
 export interface AttentionItem {
   id: string;
   rev: number;
-  kind: "question" | "finished" | "stall" | "unknown" | "budget";
+  kind: "question" | "finished" | "stall" | "unknown" | "budget" | "conflict";
   /** Human-readable one-liner shown to the main agent. */
   text: string;
   wid: Wid;

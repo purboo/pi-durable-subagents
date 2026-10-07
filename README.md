@@ -56,6 +56,7 @@ the npx cache, so `install-service` refuses to run from there.
 | Two steers arrive out of order and the second replaces the first | Only the second one applies. |
 | A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
 | A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded) | A call in a pool continues **in the same session** on the pool's next model; new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
+| Two subagents edit the same worktree | A reminder names both calls; neither is blocked or locked. Only observed `edit`/`write` calls count (bash-only writes are not seen). Calls with `isolation: "worktree"` have their own worktrees. |
 | A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. |
 
 ## Use it
@@ -176,6 +177,7 @@ The main agent is interrupted only when there is something to decide:
 - a finished workflow;
 - a stalled subagent (the alert names the command it is running and for how long, so a long silent command reads differently from a stuck call);
 - an unknown outcome;
+- two unfinished calls observed editing the same worktree (a reminder, never a block);
 - a reached budget.
 
 Each one arrives once. A reminder that was already resolved is shown as

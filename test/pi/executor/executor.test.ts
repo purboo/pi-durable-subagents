@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { execFileSync, fork } from "node:child_process";
 import { once } from "node:events";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
@@ -80,6 +80,32 @@ function assertSealed(journal: JournalHandle, call: string, status: string) {
   assert.equal(seals.length, 1); assert.equal((seals[0]!.result as { status: string }).status, status);
   assert.ok(journal.entries().some(e => e.type === JT.fenced && e.exec === seals[0]!.exec && e.seq < seals[0]!.seq));
 }
+
+test("shared worktree reminder observes real pi writes without blocking either call", { timeout: 60000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } }, { memory: async () => 1e6 });
+  execFileSync("git", ["init", "--quiet", f.cwd], { timeout: 5000 });
+  const writer = (key: string) => {
+    const ticket = f.ticket(key, script([{ tool: "write", args: { path: `${key}.txt`, content: key } }, { tool: "ask", args: { question: "Keep working?" } }, { text: "done" }]));
+    ticket.spec.tools = ["write"];
+    return ticket;
+  };
+  const a = writer("a"), b = writer("b"), pa = f.executor.run(a);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated" && e.call === a.callId));
+  const conflicts = () => f.journal.entries().filter(e => e.type === JT.attention && (e.item as { kind: string }).kind === "conflict");
+  assert.equal(conflicts().length, 0, "a call writing alone has no reminder");
+  const pb = f.executor.run(b);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated" && e.call === b.callId));
+  assert.equal(conflicts().length, 1);
+  assert.equal((conflicts()[0]!.item as { call: string }).call, b.callId);
+  assert.equal(await readFile(join(f.cwd, "a.txt"), "utf8"), "a");
+  assert.equal(await readFile(join(f.cwd, "b.txt"), "utf8"), "b");
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "wrote").map(e => e.root), [f.cwd, f.cwd]);
+  await f.executor.stop({ wid: f.wid, callId: b.callId }); await pb;
+  const id = (conflicts()[0]!.item as { id: string }).id;
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === id).length, 1);
+  await f.executor.stop({ wid: f.wid, callId: a.callId }); await pa;
+  assert.equal(conflicts().length, 1);
+});
 
 test("P28 hibernates without loss, binds once, resumes with one receipt", { timeout: 30000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
