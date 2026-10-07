@@ -5,6 +5,7 @@
 //   provider-*: used-up usage windows (providers.ts).
 //   config{hash,config}: the orchestrator settings in effect from here; config-rejected{error,hash?}: a change of
 //     config.json refused, while the earlier settings stay (cleared by the next config record).
+//   orchestrator{version,pid} / orchestrator-exit{pid}: the orchestrator running (its package version) and its exit.
 import { foldExhaustion, type Exhaustion } from "./providers.ts";
 import type { OrchestratorConfig } from "./contract.ts";
 import { isEntry, type Entry, type EntryOf } from "../types.ts";
@@ -19,6 +20,7 @@ export interface LedgerState {
   exhausted: Map<string, Exhaustion>;
   config?: { hash: string; settings: OrchestratorConfig; ts: number };
   rejected?: { error: string; ts: number };
+  orchestrator?: { version: string; pid: number; ts: number; exited?: true };
 }
 
 export function emptyLedger(): LedgerState {
@@ -33,6 +35,8 @@ export function applyLedger(state: LedgerState, e: Entry): void {
   else if (isEntry(e, "skip")) state.skips.set(`${e.pool}\n${e.model}`, Math.max(Number(e.until), state.skips.get(`${e.pool}\n${e.model}`) ?? 0));
   else if (isEntry(e, "config")) { state.config = { hash: String(e.hash), settings: e.config as OrchestratorConfig, ts: e.ts }; delete state.rejected; }
   else if (isEntry(e, "config-rejected")) state.rejected = { error: String(e.error), ts: e.ts };
+  else if (isEntry(e, "orchestrator")) state.orchestrator = { version: String(e.version), pid: Number(e.pid), ts: e.ts };
+  else if (isEntry(e, "orchestrator-exit")) { if (state.orchestrator?.pid === e.pid) state.orchestrator.exited = true; }
   foldExhaustion(state.exhausted, e);
 }
 
@@ -40,7 +44,7 @@ export function applyLedger(state: LedgerState, e: Entry): void {
  *  folded so far (shorter, or another entry where the last folded one was) is folded from the start. */
 export function foldLedger(state: LedgerState, entries: readonly Entry[]): LedgerState {
   // Journal readers keep the entry objects of a ledger as it grows (kernel/journal.ts), so identity tells them apart.
-  if (state.seen && entries[state.seen - 1] !== state.last) Object.assign(state, emptyLedger(), { config: undefined, rejected: undefined, last: undefined });
+  if (state.seen && entries[state.seen - 1] !== state.last) Object.assign(state, emptyLedger(), { config: undefined, rejected: undefined, orchestrator: undefined, last: undefined });
   for (; state.seen < entries.length; state.seen++) applyLedger(state, entries[state.seen]!);
   state.last = entries[state.seen - 1];
   return state;
