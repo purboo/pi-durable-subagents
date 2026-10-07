@@ -82,7 +82,7 @@ export async function tail(home: string, wid: string | undefined, write: (line: 
 }
 /** P1: A service bound to an npx cache path breaks when the cache is pruned; require a stable install. */
 export function serviceEntryError(entry: string): string | undefined {
-  if (/[/\\]_npx[/\\]/.test(entry)) return `install-service refuses to run from an npx cache (${entry}); the cache can be pruned and the service would break. Install the CLI with \`npm i -g pi-durable-subagents\` and run \`pi-durable-subagents install-service\` again.`;
+  if (/[/\\]_npx[/\\]/.test(entry)) return `install-service refuses to run from an npx cache (${entry}); the cache can be pruned and the service would break. Install the CLI with \`npm i -g @purboo/pi-durable-subagents\` and run \`pi-durable-subagents install-service\` again.`;
   return undefined;
 }
 export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | prune [wid] [--older-than <days>] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
