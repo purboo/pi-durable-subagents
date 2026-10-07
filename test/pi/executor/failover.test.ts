@@ -21,7 +21,7 @@ async function until(predicate: () => boolean | Promise<boolean>, ms = 30000) {
   while (!await predicate()) { if (Date.now() >= deadline) throw new Error("Timed out waiting for failover evidence"); await delay(20); }
 }
 
-async function setup(t: TestContext, config: OrchestratorConfig) {
+async function setup(t: TestContext, config: OrchestratorConfig, retry: Record<string, unknown> = { enabled: false }) {
   const root = tempRoot("dsa-failover-"), home = join(root, "dsa"), cwd = join(root, "work");
   await mkdir(cwd, { recursive: true });
   const old = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PROBE_DIR: process.env.PROBE_DIR, PI_OFFLINE: process.env.PI_OFFLINE, PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK };
@@ -29,8 +29,8 @@ async function setup(t: TestContext, config: OrchestratorConfig) {
   process.env.PI_CODING_AGENT_DIR = join(root, "agent"); process.env.PROBE_DIR = root;
   process.env.PI_OFFLINE = "1"; process.env.PI_SKIP_VERSION_CHECK = "1";
   await mkdir(process.env.PI_CODING_AGENT_DIR, { recursive: true });
-  // pi's own retries are off: the error a child settles with is what the executor classifies.
-  await writeFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), JSON.stringify({ extensions: [FAUX, QUOTA], defaultProvider: "qa", defaultModel: "m", retry: { enabled: false } }));
+  // pi's own retries are off unless a test turns them on: then the executor sees each refusal while pi retries.
+  await writeFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), JSON.stringify({ extensions: [FAUX, QUOTA], defaultProvider: "qa", defaultModel: "m", retry }));
   const orch = await openJournal(orchLedger(home)), wid = ulid(), journal = await openJournal(journalPath(home, wid));
   const executor = createExecutor({ home, orch, config });
   const ticket = (key: string, model: string): CallTicket => ({ wid, widRev: `${wid}@1`, key, gen: 1, callId: `${wid}@1/${key}@1`, cwd, journal, spec: { agent: "test", task: "work", model }, agent });
@@ -110,4 +110,53 @@ test("failover: a follow-up naming the model its call is on stays there, though 
   const next: CallTicket = { ...first, gen: 2, callId: `${first.wid}@1/a@2`, continueFrom: first.callId, opening: { rid: "next", kind: "follow-up", message: "next turn" }, model: "qb/m" };
   assert.equal((await f.executor.run(next)).output, "answered by qb");
   assert.deepEqual(providersOf(f, "a"), ["qa", "qb", "qb"]);
+});
+
+// pi retries a refused request itself (the user's settings: up to 10 times, backing off to a minute): the window is
+// found used up at the second refusal in a row, while the execution still runs, not after pi gives up.
+const PI_RETRY = { enabled: true, maxRetries: 8, baseDelayMs: 800, maxAgentDelayMs: 5000 };
+
+test("failover: with pi retrying, a pool call moves to the next candidate in the same execution at the second refusal", { timeout: 60000 }, async t => {
+  const f = await setup(t, { pools: { top: ["qa/m", "qb/m"] } }, PI_RETRY);
+  await f.exhaust(true);
+  const a = await f.executor.run(f.ticket("a", "top"));
+  assert.equal(a.status, "ok"); assert.equal(a.output, "answered by qb");
+  assert.deepEqual(providersOf(f, "a"), ["qa"], "one execution: switched at pi's next retry, not relaunched");
+  const used = f.journal.entries().filter(e => e.type === "model-used").map(e => (e.model as { provider: string }).provider);
+  assert.deepEqual(used, ["qb"]);
+  const log = await f.requests();
+  assert.deepEqual(log.slice(0, 2), ["qa", "qa"]); assert.equal(log.at(-1), "qb");
+  assert.ok(log.filter(p => p === "qa").length <= 3, `pi's retries stop going to qa: ${log.join(",")}`);
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "provider-exhausted").map(e => e.provider), ["qa"]);
+  assert.equal(f.journal.entries().filter(e => e.type === "forward" && e.failover === "qa").length, 1);
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+});
+
+test("failover: with pi retrying, a single-model call finds its provider used up while it waits, and goes on when it answers", { timeout: 60000 }, async t => {
+  const f = await setup(t, {}, PI_RETRY);
+  await f.exhaust(true);
+  const a = f.executor.run(f.ticket("a", "qa/m"));
+  await until(() => f.orch.entries().some(e => e.type === "provider-exhausted"));
+  assert.ok(!f.journal.entries().some(e => e.type === "settled"), "found while pi still retries");
+  assert.match(String(slotsView(f.home).exhausted?.[0]), /^qa exhausted/);
+  await f.exhaust(false);
+  const r = await a;
+  assert.equal(r.status, "ok"); assert.equal(r.output, "answered by qa");
+  assert.equal(f.orch.entries().filter(e => e.type === "provider-available").length, 1);
+  assert.equal(slotsView(f.home).exhausted, undefined);
+});
+
+test("failover: a model send may name a pool: its first model not used up, and the call keeps the pool", { timeout: 60000 }, async t => {
+  const f = await setup(t, { pools: { top: ["qa/m", "qb/m"] } });
+  await f.exhaust(true);
+  assert.equal((await f.executor.run(f.ticket("a", "top"))).output, "answered by qb"); // qa is now used up
+  // Before b starts, a send naming its pool picks qb (qa is used up); b launches on it and stays in the pool.
+  const b = f.ticket("b", "top"), ctx = { journal: f.journal, widRev: b.widRev, key: "b", gen: 1 };
+  assert.deepEqual(await f.executor.forward({ kind: "send", rid: "unknown", from: "main:test", to: "orch", sseq: 1, body: { to: "b", kind: "model", model: "nope" } }, ctx), { action: "reject", reason: "unknown-model" });
+  const sent = await f.executor.forward({ kind: "send", rid: "pool", from: "main:test", to: "orch", sseq: 2, body: { to: "b", kind: "model", model: "top" } }, ctx);
+  assert.deepEqual(sent, { action: "apply" });
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "send-note").map(e => [e.model, e.effect, e.pool]), [["qb/m", "next-execution", "top"]]);
+  const rb = await f.executor.run(b);
+  assert.equal(rb.output, "answered by qb");
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "selected" && String(e.exec).includes("/b@")).map(e => [(e.model as { provider: string }).provider, e.pool]), [["qb", "top"]]);
 });

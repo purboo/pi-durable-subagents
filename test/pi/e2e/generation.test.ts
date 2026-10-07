@@ -62,6 +62,7 @@ test("P37/P12 E2E: a follow-up naming a model runs its generation on that model 
   await mkdir(join(cwd, ".pi/agents"), { recursive: true }); await mkdir(agentDir, { recursive: true });
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: [FAUX] }));
   await writeFile(join(cwd, ".pi/agents/test.md"), "---\nname: test\ndescription: test\nmodel: probe/scripted\n---\nTest.");
+  await mkdir(home, { recursive: true }); await writeFile(join(home, "config.json"), JSON.stringify({ pools: { alt: ["probe/scripted"] } }));
   const controller = new AbortController(), running = main({ home, signal: controller.signal, discovery: { home: root } });
   t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } await rm(root, { recursive: true, force: true }); });
   await publishRequest(orchInbox(home), { rid: "run", from: "main:test", to: "orch", sseq: 1, kind: "run", body: { cwd, source: `return await runs.run('a', {agent:'test', task:${JSON.stringify(script([{ text: "first" }]))}});` } } as Request);
@@ -79,4 +80,11 @@ test("P37/P12 E2E: a follow-up naming a model runs its generation on that model 
   assert.deepEqual(selected, ["scripted", "scripted2"]);
   const rows = (await readFile(callSession(home, wid, "a", 2), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
   assert.equal(rows.findLast(e => e.type === "message" && e.message.role === "assistant").message.model, "scripted2");
+  // A pool's name: the generation runs from the pool (its order and failover apply), not as one fixed model.
+  await publishRequest(orchInbox(home), { rid: "pool", from: "main:test", to: "orch", sseq: 4, kind: "send", body: { to: `${wid}/a`, kind: "follow-up", model: "alt", message: script([{ text: "third" }]) } } as Request);
+  await until(() => entries().some(e => e.type === JT.sealed && String(e.call).endsWith("/a@3")));
+  const third = entries().findLast(e => e.type === "generation")!;
+  assert.equal((third.spec as { model: string }).model, "alt"); assert.equal(third.model, undefined);
+  assert.deepEqual(entries().filter(e => e.type === "selected").map(e => [(e.model as { id: string }).id, e.pool]).at(-1), ["scripted", "alt"]);
+  assert.equal(orch().find(e => e.type === "send-note" && e.rid === "pool")!.model, "alt");
 });
