@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.9
+
+- `status` shows the model a call actually uses: the model of its last
+  provider request. A requested switch not used yet shows as `switching`
+  (also in the brief status), a switch the subagent refused as
+  `switchFailed`. Before, `status` kept the model the execution started with,
+  so a switch that had worked looked as if it had not.
+- `send follow-up` with `model` runs the new generation on that model; it was
+  ignored, and the generation continued on the session's model. A send that
+  names a model replies with `model` and `effect`: `next-request` (a running
+  call switches at its next request), `next-execution` or `next-generation`.
+- `send model` to a call that is asking (hibernated) or still waiting for a
+  slot is recorded and applied when it runs again, instead of being refused
+  with `call-not-running`.
+- A provider's refusal of the content (terms of service, usage policy) fails
+  the call at once with that error. It was retried as a lost execution five
+  times and reported as `lost ×5`.
+
 ## 1.0.8
 
 - pi stays responsive with a long history: the extension's polling in pi's

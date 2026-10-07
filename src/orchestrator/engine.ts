@@ -24,6 +24,7 @@ import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts'
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
 import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
 import { validateCallSpec } from '../compat/spec.ts';
+import { parseModel } from '../compat/model.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
 const charged = (u?: { input: number; output: number; costUsd: number }) => u && (u.input || u.output || u.costUsd) ? formatUsage(u) : undefined;
@@ -283,10 +284,26 @@ export class Engine {
       const from = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
       const seal = wf.journal.entries().find(e => e.type === JT.sealed && e.call === from);
       if (seal && send.kind === 'steer') return { action: 'reject', reason: `finished:${(seal.result as CallResult).status} — use kind "follow-up" to continue it` };
+      if (send.kind === 'follow-up' && send.model !== undefined) {
+        try { if (!parseModel(send.model).provider) throw new Error('missing provider'); }
+        catch { return { action: 'reject', reason: 'unknown-model' }; }
+      }
       if (seal && send.kind === 'follow-up') {
         const gen = Math.max(0, ...wf.journal.entries().filter(e => ['call', 'generation'].includes(e.type) && e.key === entry.key).map(e => Number(e.gen))) + 1;
-        const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec: entry.spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message: send.message ?? '' } });
+        // A follow-up's model replaces the continued session's for this generation and those continuing it.
+        const spec = send.model !== undefined ? { ...(entry.spec as CallSpec), model: send.model } : entry.spec;
+        if (send.model !== undefined) await this.note(req.rid, send.model, 'next-generation');
+        const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message: send.message ?? '' }, ...(send.model !== undefined ? { model: send.model } : {}) });
         this.dispatchGeneration(wf, opened); return { action: 'apply' };
+      }
+      if (send.kind === 'follow-up' && send.model !== undefined) {
+        // A follow-up queued on unfinished work: its model is requested first (a model send of its own), then the message.
+        const rid = contentHash([req.rid, 'model']), switched = await this.executor.forward({ ...req, rid, kind: 'send', body: { to: send.to, kind: 'model', model: send.model } }, this.context(wf, entry));
+        if (switched.action === 'reject') return { action: 'reject', reason: `model: ${switched.reason}` };
+        const effect = this.ledgers.orch.entries().find(e => e.type === 'send-note' && e.rid === rid)?.effect;
+        if (effect) await this.note(req.rid, send.model, String(effect));
+        const { model: _model, ...message } = send;
+        return this.executor.forward({ ...req, body: message }, this.context(wf, entry));
       }
       return this.executor.forward(req, this.context(wf, entry));
     } else if (req.kind === 'stop') {
@@ -419,13 +436,18 @@ export class Engine {
       this.background(async () => { throw error; });
     });
   }
+  /** The reply to a send that names a model says which model and when it applies (orchestrator ledger `send-note`). */
+  private async note(rid: string, model: string, effect: string): Promise<void> {
+    if (!this.ledgers.orch.entries().some(e => e.type === 'send-note' && e.rid === rid)) await this.ledgers.orch.append('send-note', { rid, model, effect });
+  }
   private ticket(st: State, entry: Entry): CallTicket {
     const spec = entry.spec as CallSpec, agent = st.wf.pins.agents.find(a => a.name === spec.agent);
     if (!agent) throw new Error(`Unknown pinned agent: ${spec.agent}`);
     return { wid: st.wf.wid, widRev: `${st.wf.wid}@${st.wf.revision}`, key: entry.key as string, gen: entry.gen as number,
       callId: `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`, spec, agent, workflowBudget: st.wf.pins.usageBudget, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal,
       ...(st.wf.pins.origin !== undefined ? { originSession: join(pinnedDir(this.ledgers.home, st.wf.wid), ...(st.wf.revision === 1 ? [] : [`r${st.wf.revision}`]), 'origin.jsonl') } : {}),
-      ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}) };
+      ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}),
+      ...(entry.type === 'generation' && typeof entry.model === 'string' ? { model: entry.model } : {}) };
   }
   private sealed(st: State, entry: Entry): CallResult | undefined {
     if (entry.type === 'refused') return refusedResult(String(entry.key), entry.reason);

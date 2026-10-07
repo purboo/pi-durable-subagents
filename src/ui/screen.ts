@@ -390,7 +390,7 @@ export class SubagentScreen implements Component {
     const facts = this.data.facts.get(c.callId), active = w.calls.filter(c => c.phase !== "sealed"), done = w.calls.length - active.length;
     const tabs = size.width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
     const tools = toolCount(facts?.tools), pending = pendingText(c.pending), rule = this.theme.fg("borderMuted", "─".repeat(size.width));
-    const switching = c.switching ? ` → ${this.name(c.switching)} (at the end of this step)` : "";
+    const switching = c.switching ? ` → ${this.name(c.switching)} (requested)` : "";
     const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾${switching} · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
       this.theme.fg("dim", this.spend(c, facts)), rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);

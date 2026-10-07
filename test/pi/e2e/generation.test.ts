@@ -54,3 +54,29 @@ test("P37/P33 E2E: completed workflow opens g+1 once, same session, pinned origi
   assert.equal(JSON.parse(sessions[0]!.split("\n")[0]!).id, JSON.parse(sessions[1]!.split("\n")[0]!).id);
   assert.equal(sessions[1]!.split("\n").filter(line => line.includes('"kind":"task"') && line.includes('second')).length, 1);
 });
+
+test("P37/P12 E2E: a follow-up naming a model runs its generation on that model and says so", { timeout: 60000 }, async t => {
+  const root = tempRoot("dsa-generation-model-"), home = join(root, "dsa"), cwd = join(root, "work"), agentDir = join(root, "agent");
+  const old = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_OFFLINE: process.env.PI_OFFLINE, PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK, PROBE_DIR: process.env.PROBE_DIR };
+  Object.assign(process.env, { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root });
+  await mkdir(join(cwd, ".pi/agents"), { recursive: true }); await mkdir(agentDir, { recursive: true });
+  await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: [FAUX] }));
+  await writeFile(join(cwd, ".pi/agents/test.md"), "---\nname: test\ndescription: test\nmodel: probe/scripted\n---\nTest.");
+  const controller = new AbortController(), running = main({ home, signal: controller.signal, discovery: { home: root } });
+  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } await rm(root, { recursive: true, force: true }); });
+  await publishRequest(orchInbox(home), { rid: "run", from: "main:test", to: "orch", sseq: 1, kind: "run", body: { cwd, source: `return await runs.run('a', {agent:'test', task:${JSON.stringify(script([{ text: "first" }]))}});` } } as Request);
+  const created = await until(() => readJournalSnapshot(orchLedger(home)).find(e => e.type === JT.created));
+  const wid = String(created.wid), entries = () => readJournalSnapshot(journalPath(home, wid)), orch = () => readJournalSnapshot(orchLedger(home));
+  await until(() => entries().some(e => e.type === JT.done));
+  await publishRequest(orchInbox(home), { rid: "bad", from: "main:test", to: "orch", sseq: 2, kind: "send", body: { to: `${wid}/a`, kind: "follow-up", model: "no-provider", message: "x" } } as Request);
+  assert.equal((await until(() => orch().find(e => e.type === JT.rejected && e.rid === "bad"))).reason, "unknown-model");
+  await publishRequest(orchInbox(home), { rid: "open", from: "main:test", to: "orch", sseq: 3, kind: "send", body: { to: `${wid}/a`, kind: "follow-up", model: "probe/scripted2", message: script([{ text: "second" }]) } } as Request);
+  await until(() => entries().some(e => e.type === JT.sealed && String(e.call).endsWith("/a@2")));
+  const note = orch().find(e => e.type === "send-note" && e.rid === "open")!;
+  assert.deepEqual([note.model, note.effect], ["probe/scripted2", "next-generation"]);
+  assert.equal(entries().find(e => e.type === "generation")!.model, "probe/scripted2");
+  const selected = entries().filter(e => e.type === "selected").map(e => (e.model as { id: string }).id);
+  assert.deepEqual(selected, ["scripted", "scripted2"]);
+  const rows = (await readFile(callSession(home, wid, "a", 2), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  assert.equal(rows.findLast(e => e.type === "message" && e.message.role === "assistant").message.model, "scripted2");
+});

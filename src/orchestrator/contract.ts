@@ -38,6 +38,8 @@ export interface CallTicket {
   continueFrom?: CallId;
   /** P37: the send that opened this generation; its message is the first thing the generation receives. */
   opening?: { rid: string; kind: "steer" | "follow-up"; message: string };
+  /** "provider/id[:thinking]" a follow-up asked this generation to run on (replaces the continued session's model). */
+  model?: string;
 }
 
 /** P19, P30, P32, P33: Call-scoped effects around executions, implemented in src/orchestrator/executor/effects/

@@ -11,7 +11,7 @@ import { mkdir, open, readdir, readFile, rm, unlink, writeFile } from "node:fs/p
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CT, JT, type CallResult, type Containment, type Entry, type JournalHandle, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
+import { CT, JT, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
 import { callDir, callInbox, callSession, outboxRoot } from "../../paths.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, forwardRid } from "../../kernel/ids.ts";
@@ -23,7 +23,7 @@ import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts"
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
 import { hibernation, openQuestion } from "./hibernate.ts";
-import { evidence, fatalProviderError, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
+import { evidence, fatalProviderError, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
 import { observeExecution } from "./observe.ts";
 import { availableMemory } from "./memory.ts";
@@ -45,6 +45,20 @@ const entriesFor = (journal: JournalHandle, call: string) => journal.entries().f
 const current = (journal: JournalHandle, call: string) => entriesFor(journal, call).findLast(e => e.type === JT.exec)?.exec as string | undefined;
 const sealed = (journal: JournalHandle, call: string) => entriesFor(journal, call).find(e => e.type === JT.sealed)?.result as CallResult | undefined;
 const has = (journal: JournalHandle, type: string, exec: string) => journal.entries().some(e => e.type === type && e.exec === exec);
+/** The model a call was last asked to use and has not refused: a follow-up's `model`, then each model send in order
+ *  (one the child rejected or that was withdrawn does not count). Its next execution launches on it (P12, P37). */
+export function requestedModel(journal: JournalHandle, call: string, followUp?: string): Model | undefined {
+  const all = journal.entries();
+  let wanted = followUp ? parseModel(followUp) : undefined;
+  for (const e of all) {
+    if (e.type !== "forward" || e.dest !== call || (e.envelope as Envelope | undefined)?.kind !== "model") continue;
+    if (all.some(r => r.type === "forward-delivered" && r.call === call && r.rid2 === e.rid2 && r.reason !== undefined)) continue;
+    if (all.some(r => r.type === "forward" && r.dest === call && (r.envelope as Envelope).kind === "withdraw" && ((r.envelope as Envelope).body as { rids?: string[] }).rids?.includes(String(e.rid2)))) continue;
+    const body = (e.envelope as Envelope).body as ModelBody;
+    wanted = { provider: body.provider, id: body.model, ...(body.thinking ? { thinking: body.thinking as Model["thinking"] } : {}) };
+  }
+  return wanted;
+}
 function address(call: string) {
   const match = /^(.*)@(\d+)\/(.*)@(\d+)$/.exec(call);
   if (!match) throw new Error(`Invalid call identity: ${call}`);
@@ -215,6 +229,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     }
   }
   /** P7, P27: Record forward-delivered once when a forward's child receipt is first observed; serial sections only. */
+  /** The reply to a model send says which model and when it applies (orchestrator ledger `send-note`, once per rid). */
+  async function note(rid: string, model: string, effect: string) {
+    if (!orch.entries().some(e => e.type === "send-note" && e.rid === rid)) await orch.append("send-note", { rid, model, effect });
+  }
   async function forwardsDelivered(journal: JournalHandle, call: string, entries: SessionEntry[]) {
     const all = journal.entries();
     const open = all.filter(e => e.type === "forward" && e.dest === call &&
@@ -366,6 +384,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const candidates = raw ? resolveModel(raw, config.pools) : [{ id: "" }];
     const candidate = recorded && candidates.some(m => m.provider === recorded.provider && m.id === recorded.id);
     const skip = previous && ownSegment && pool && candidate && skipped(pool, recorded!);
+    // A model the call was asked to use replaces the session's: launched with it, and holding its provider's slot.
+    const wanted = requestedModel(t.journal, t.callId, t.model);
+    if (wanted && !(recorded && !freshFork && recorded.provider === wanted.provider && recorded.id === wanted.id)) return { candidates: [wanted], continuation: false, pool: undefined };
     if (recorded && !freshFork && !skip) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined };
     return { candidates, continuation: false, pool };
   }
@@ -389,10 +410,21 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       }
     });
   }
-  async function switched(exec: string, event: Record<string, unknown>) {
-    const provider = (event.message as { provider?: string } | undefined)?.provider;
+  /** The model each execution last answered with (`selected`, then `model-used`), cached per execution. */
+  const inUse = new Map<string, string>();
+  async function switched(exec: string, journal: JournalHandle, event: Record<string, unknown>) {
+    const message = event.message as { role?: string; provider?: string; model?: string } | undefined, provider = message?.provider;
     if (!provider) return;
     await serial(async () => {
+      // Evidence of the model in use: the provider and model of each assistant message, recorded when it changes.
+      if (message.role === "assistant" && message.model) {
+        const name = `${provider}/${message.model}`;
+        if (!inUse.has(exec)) {
+          const last = journal.entries().findLast(e => (e.type === "selected" || e.type === "model-used") && e.exec === exec)?.model as Model | undefined;
+          if (last) inUse.set(exec, `${last.provider}/${last.id}`);
+        }
+        if (inUse.get(exec) !== name) { await journal.append("model-used", { exec, model: { provider, id: message.model } }); inUse.set(exec, name); }
+      }
       const target = holdings().find(h => h.exec === exec && h.pool === provider && h.reserved);
       if (!target) return;
       if (!folded().observed.has(`${exec}\n${target.rid}`)) {
@@ -459,6 +491,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (t.spec.once && dangling.length) return finish(journal, t.callId, exec, makeResult("unknown", "", `Unknown tool outcomes: ${dangling.join(", ")}`));
         if (has(journal, "settled", exec) && !ev.text && ev.error && fatalProviderError(ev.error))
           return finish(journal, t.callId, exec, makeResult("failed", "", `Provider error: ${ev.error}`));
+        // A refusal of the content is deterministic: the same request is refused again, so it is reported, not retried.
+        if (has(journal, "settled", exec) && !ev.text && ev.error && refusedByProvider(ev.error))
+          return finish(journal, t.callId, exec, makeResult("failed", "", `Refused by the provider (not retried): ${ev.error.slice(0, 500)}`));
         await serial(async () => {
           if (!has(journal, "loss", exec!)) await journal.append("loss", { exec });
           await skipLostCandidate(journal, orch, exec!);
@@ -534,7 +569,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
               }
             });
           }, recordUsage: values => recordUsage(t, values),
-          switched: event => switched(exec!, event), pendingSwitch: () => pendingSwitch(exec!),
+          switched: event => switched(exec!, journal, event), pendingSwitch: () => pendingSwitch(exec!),
         });
       } finally { await fence(journal, exec, { child, park: a }); }
     }
@@ -559,7 +594,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const exec = current(ticket.journal, ticket.callId);
         try { if (exec && await fence(ticket.journal, exec)) await release(exec); }
         finally {
-          active.delete(ticket.callId); collected.delete(ticket.callId); forgetSession(callSession(home, ticket.wid, ticket.key, ticket.gen)); wake();
+          active.delete(ticket.callId); collected.delete(ticket.callId); for (const e of inUse.keys()) if (callOf(e) === ticket.callId) inUse.delete(e); forgetSession(callSession(home, ticket.wid, ticket.key, ticket.gen)); wake();
         }
       });
       // Shutdown rejection is still delivered to callers, without an unhandled rejection during teardown.
@@ -617,8 +652,18 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
         if (kind === "model") {
           const exec = current(ctx.journal, dest), provider = (body as { provider: string }).provider;
-          if (!exec || has(ctx.journal, JT.fenced, exec) || !has(ctx.journal, "tracked", exec)) return { action: "reject", reason: "call-not-running" } as const;
-          if (pendingSwitch(exec)) return { action: "reject", reason: "switch-pending" } as const;
+          // P28: with no live execution (not started yet, between executions, hibernated while asking) the model is
+          // recorded and the next execution launches on it (`requestedModel`); its slot is acquired then, as for any launch.
+          // Launching (`selected`, not `tracked` yet): the child may start on the old model; ask again in a moment.
+          const idle = !exec || has(ctx.journal, JT.fenced, exec) || !has(ctx.journal, "selected", exec);
+          if (!idle && !has(ctx.journal, "tracked", exec)) return { action: "reject", reason: "call-starting" } as const;
+          if (!idle && pendingSwitch(exec!)) return { action: "reject", reason: "switch-pending" } as const;
+          if (idle) {
+            await note(req.rid, (req.body as SendBody).model!, "next-execution");
+            const entry = await ctx.journal.append("forward", { rid: req.rid, rid2, dest, hash, envelope });
+            await replayForward(entry); active.get(dest)?.wake(); wake();
+            return { action: "apply" } as const;
+          }
           const held = holdings().filter(h => h.exec === exec);
           if (!held.some(h => h.pool === provider)) {
             const target = holdings().filter(h => h.pool === provider);
@@ -627,6 +672,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             let slot = 0; while (target.some(h => h.slot === slot)) slot++;
             await orch.append("hold", { pool: provider, slot, exec, reserved: true, rid: req.rid });
           }
+          await note(req.rid, (req.body as SendBody).model!, "next-request");
         }
         const entry = await ctx.journal.append("forward", { rid: req.rid, rid2, dest, hash, envelope });
         await replayForward(entry);
