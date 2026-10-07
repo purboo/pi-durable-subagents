@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { publishFile } from "../../../kernel/mailbox.ts";
 import { callDir } from "../../../paths.ts";
 import { validate } from "../../../agent/child/schema.ts";
-import { recordFenceFailure, resolveFenceAttention } from "../sweep.ts";
+import { fenceAttentionResolved, recordFenceFailure, recordOnce } from "../sweep.ts";
 import type { CallResult, Containment, Entry, JournalHandle, ProcInfo } from "../../../types.ts";
 import type { CallTicket } from "../../contract.ts";
 
@@ -15,8 +15,10 @@ const tracked = (journal: JournalHandle, id: string) => journal.entries().filter
 const parked = new Map<string, Set<() => void>>();
 /** P30, F1: A gate proven retired after a failed fence gets its unknown outcome once and its attention resolved. */
 export async function gateRetired(journal: JournalHandle, id: string): Promise<void> {
-  if (!journal.entries().some(e => e.type === "gate" && e.id === id)) await journal.append("gate", { id, unknown: true });
-  await resolveFenceAttention(journal, id);
+  await recordOnce(journal, async () => {
+    if (!journal.entries().some(e => e.type === "gate" && e.id === id)) await journal.append("gate", { id, unknown: true });
+    await fenceAttentionResolved(journal, id);
+  });
   for (const wake of parked.get(id) ?? []) wake();
 }
 /** A2, F1: Wait until the sweep has fenced a gate and recorded its outcome; a settlement abort (stop, timeout,
@@ -42,7 +44,7 @@ async function fenceGate(journal: JournalHandle, intent: Entry, containment: Pic
   catch (error) {
     if (!journal.entries().some(e => e.type === "fence-failed" && e.exec === id)) console.error(`durable-subagents: fence of ${id} failed: ${String(error)}`);
     if (/Fence timeout/.test(String(error))) await recordFenceFailure(journal, id, String(intent.call), error);
-    else if (!journal.entries().some(e => e.type === "fence-failed" && e.exec === id)) await journal.append("fence-failed", { exec: id, error: String(error) });
+    else await recordOnce(journal, async () => { if (!journal.entries().some(e => e.type === "fence-failed" && e.exec === id)) await journal.append("fence-failed", { exec: id, error: String(error) }); });
     return false;
   }
 }
