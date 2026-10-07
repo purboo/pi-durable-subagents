@@ -1,32 +1,44 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readJournalSnapshot } from "../../kernel/journal.ts";
 import { journalPath, orchLedger } from "../../paths.ts";
 import { CT, JT, type AttentionItem, type Entry } from "../../types.ts";
-import { holdOf } from "../../orchestrator/snapshot.ts";
+import { holdOf, ledgerIndex } from "../../orchestrator/snapshot.ts";
 
 /** P15, P25: Read workflow snapshots without modifying another domain's history; a wid with an orchestrator.jsonl
  *  `pruned{wid}` entry is gone (housekeeping), even while its directory is still being removed. */
-export function workflows(home: string): { wid: string; origin?: string; entries: Entry[] }[] {
-  const ledger = readJournalSnapshot(orchLedger(home));
+export function workflows(home: string, origin?: string): { wid: string; origin?: string; entries: Entry[] }[] {
+  const ledger = readJournalSnapshot(orchLedger(home)), { created: createdBy, pruned } = ledgerIndex(ledger);
   let names: string[];
   try { names = readdirSync(join(home, "w")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
-  const pruned = new Set(ledger.filter(e => e.type === "pruned").map(e => String(e.wid)));
-  const ids = new Set([...ledger.filter(e => e.type === JT.created).map(e => String(e.wid)), ...names].filter(wid => !pruned.has(wid)));
-  const createdBy = new Map<unknown, Entry>();
-  for (const e of ledger) if (e.type === JT.created && !createdBy.has(e.wid)) createdBy.set(e.wid, e);
-  return [...ids].sort().map(wid => {
+  const ids = new Set([...[...createdBy.keys()].map(String), ...names].filter(wid => !pruned.has(wid)));
+  const result: { wid: string; origin?: string; entries: Entry[] }[] = [];
+  for (const wid of [...ids].sort()) {
+    // With an origin wanted, a workflow the ledger attributes to another session is skipped without reading its journal.
+    const known = createdBy.get(wid);
+    if (origin !== undefined && known && known.origin !== origin) continue;
     const entries = readJournalSnapshot(journalPath(home, wid));
-    const created = createdBy.get(wid) ?? entries.find(e => e.type === JT.created);
-    return { wid, origin: created?.origin as string | undefined, entries };
-  });
+    const created = known ?? entries.find(e => e.type === JT.created);
+    if (origin !== undefined && created?.origin !== origin) continue;
+    result.push({ wid, origin: created?.origin as string | undefined, entries });
+  }
+  return result;
 }
 
 /** P37: a generation opened by a send (possibly after the workflow finished) that has no seal yet is pending work. */
+const opened = new WeakMap<object, { length: number; open: boolean }>();
 export function openGeneration(entries: readonly { type: string; [k: string]: unknown }[]): boolean {
-  return entries.some(g => g.type === "generation" && !entries.some(s => s.type === JT.sealed && String(s.call).endsWith(`/${String(g.key)}@${String(g.gen)}`)));
+  const hit = opened.get(entries);
+  if (hit?.length === entries.length) return hit.open;
+  // Sealed call ids end in `/<key>@<gen>`; collect every such suffix once instead of rescanning per generation.
+  const sealed = new Set<string>();
+  for (const s of entries) if (s.type === JT.sealed) { const call = String(s.call); for (let i = call.indexOf("/"); i >= 0; i = call.indexOf("/", i + 1)) sealed.add(call.slice(i)); }
+  const open = entries.some(g => g.type === "generation" && !sealed.has(`/${String(g.key)}@${String(g.gen)}`));
+  opened.set(entries, { length: entries.length, open });
+  return open;
 }
 /** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation,
  *  unless a drain (stop-all) holds it: held work waits for an explicit resume, which starts the orchestrator itself. */
@@ -63,8 +75,7 @@ function unresolved(entries: readonly Entry[]): AttentionItem[] {
 /** P15, V7: Select only unresolved, unpresented items owned by this session. */
 export function attention(home: string, sender: string, seen: { id: string; rev: number }[]): AttentionItem[] {
   const items: AttentionItem[] = [], shown = new Set(seen.map(s => `${s.id}\0${s.rev}`));
-  for (const workflow of workflows(home)) {
-    if (workflow.origin !== sender) continue;
+  for (const workflow of workflows(home, sender)) {
     for (const item of unresolved(workflow.entries)) {
       const key = `${item.id}\0${item.rev}`;
       if (shown.has(key)) continue; // singlePresentation: one presentation per id/rev
@@ -82,21 +93,52 @@ export function presentText(item: AttentionItem): string {
   return item.text.includes(item.wid) ? item.text : `${where}: ${item.text}`;
 }
 
+/** Resolutions recorded in one immutable journal snapshot, keyed by id and rev. */
+const resolutions = new WeakMap<readonly Entry[], Set<string>>();
+function resolvedIn(entries: readonly Entry[]): Set<string> {
+  let done = resolutions.get(entries);
+  if (!done) { done = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => JSON.stringify([e.id, e.rev]))); resolutions.set(entries, done); }
+  return done;
+}
+/** Successful `ask` results per child session file, read incrementally: pi renders an open question's card on every
+ *  frame, and re-reading and parsing the whole child session each time stalled typing in the main session. */
+type AskScan = { identity: string; offset: number; pending: string; decoder: StringDecoder; answered: Set<string> };
+const asks = new Map<string, AskScan>();
+function answeredAsks(path: string): Set<string> | undefined {
+  let stat;
+  try { stat = statSync(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { asks.delete(path); return undefined; } throw error; }
+  const identity = `${stat.dev}:${stat.ino}`;
+  let scan = asks.get(path);
+  if (!scan || scan.identity !== identity || stat.size < scan.offset) {
+    scan = { identity, offset: 0, pending: "", decoder: new StringDecoder("utf8"), answered: new Set() };
+    asks.set(path, scan);
+  }
+  if (stat.size === scan.offset) return scan.answered;
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(Math.min(256 * 1024, stat.size - scan.offset));
+    while (scan.offset < stat.size) {
+      const n = readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - scan.offset), scan.offset);
+      if (!n) break;
+      scan.offset += n; scan.pending += scan.decoder.write(buffer.subarray(0, n));
+      let end;
+      while ((end = scan.pending.indexOf("\n")) >= 0) {
+        const line = scan.pending.slice(0, end); scan.pending = scan.pending.slice(end + 1);
+        // Only complete lines are parsed; a malformed one is skipped, as pi and the session tail do (E4).
+        if (!line.includes('"ask"')) continue;
+        let entry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        const msg = entry?.type === "message" ? entry.message : undefined;
+        if (msg?.role === "toolResult" && msg.toolName === "ask" && !msg.isError) scan.answered.add(JSON.stringify([msg.details?.qid, msg.details?.rev]));
+      }
+    }
+  } finally { closeSync(fd); }
+  return scan.answered;
+}
 /** P15: Refresh a question against durable workflow and child receipts at request time. */
 export function resolved(home: string, item: AttentionItem): boolean {
-  if (readJournalSnapshot(journalPath(home, item.wid)).some(e => e.type === JT.attentionResolved && e.id === item.id && e.rev === item.rev)) return true;
+  if (resolvedIn(readJournalSnapshot(journalPath(home, item.wid))).has(JSON.stringify([item.id, item.rev]))) return true;
   if (item.kind !== "question" || !item.session || !item.qid) return false;
-  let text: string;
-  try { text = readFileSync(item.session, "utf8"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
-  const lines = text.split("\n");
-  for (let index = 0; index < lines.length; index++) {
-    if (!lines[index]) continue;
-    let entry;
-    try { entry = JSON.parse(lines[index]!); }
-    catch (error) { if (index >= lines.length - 2) break; throw error; }
-    const msg = entry.type === "message" ? entry.message : undefined;
-    if (msg?.role === "toolResult" && msg.toolName === "ask" && !msg.isError && msg.details?.qid === item.qid && msg.details?.rev === item.rev) return true;
-  }
-  return false;
+  return answeredAsks(item.session)?.has(JSON.stringify([item.qid, item.rev])) ?? false;
 }

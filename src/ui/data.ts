@@ -42,6 +42,8 @@ export class LazyMap<V> extends Map<string, V> {
   override get(key: string): V | undefined { if (!super.has(key)) this.produce(key); return super.get(key); }
   override has(key: string): boolean { return this.get(key) !== undefined; }
 }
+/** How long after its seal a call's session is still followed (a late write after the seal is still shown). */
+const FINAL_MS = 10_000;
 /** A1, P25: Read the UI's data from durable workflow snapshots and native session tails only. */
 export class UiData {
   workflows: WorkflowSnapshot[] = [];
@@ -54,8 +56,10 @@ export class UiData {
   /** Where the dock sits: below the editor (default; never splits an editor header such as a powerline bar) or above. */
   dockAt: "below" | "above" = "above";
   /** Per-refresh budget (ms) for reading not yet read finished sessions (history) in the background. */
-  warmMs = 15;
+  warmMs = 8;
   private tails = new Map<string, SessionTail>();
+  /** Branch and facts of calls sealed more than FINAL_MS ago, read once after their seal. */
+  private final = new Map<string, { entries: SessionEntry[]; facts: Facts }>();
   /** Branch and facts per call, reused while its session tail is unchanged: a finished call's session never grows, and
    *  re-deriving every historical call on each refresh blocked pi's main thread for over a second. */
   private derived = new Map<string, { source: readonly SessionEntry[]; length: number; entries: SessionEntry[]; facts: Facts }>();
@@ -65,9 +69,12 @@ export class UiData {
     const workflows = allWorkflows(this.home), known = new Set<string>(), deferred = new Map<string, () => void>();
     const facts = new LazyMap<Facts>(key => deferred.get(key)?.()), sessions = new LazyMap<readonly SessionEntry[]>(key => deferred.get(key)?.());
     for (const w of workflows) {
-      const index = journalIndex(readJournalSnapshot(journalPath(this.home, w.wid)));
+      let index: JournalIndex | undefined; // only calls still followed need it
+      const journal = () => index ??= journalIndex(readJournalSnapshot(journalPath(this.home, w.wid)));
       for (const c of w.calls) {
         known.add(c.callId);
+        const final = this.final.get(c.callId);
+        if (final && c.phase === "sealed") { sessions.put(c.callId, final.entries); facts.put(c.callId, final.facts); continue; }
         const load = () => {
           deferred.delete(c.callId);
           let tail = this.tails.get(c.callId);
@@ -80,13 +87,18 @@ export class UiData {
             this.derived.set(c.callId, cached);
           }
           const value: Facts = { ...cached.facts, live: undefined };
-          const proposal = index.calls.get(`${c.key}\0${c.gen}`);
+          const proposal = journal().calls.get(`${c.key}\0${c.gen}`);
           value.task ||= String((proposal?.spec as { task?: string } | undefined)?.task ?? "");
-          const loss = index.losses.get(String(c.exec)) ?? -1;
-          const launch = index.execs.get(String(c.exec)) ?? -1;
+          const loss = journal().losses.get(String(c.exec)) ?? -1;
+          const launch = journal().execs.get(String(c.exec)) ?? -1;
           if (c.phase !== "sealed" && loss > launch) value.activity = "connection dropped, retrying";
           if (c.phase !== "sealed") value.live = readLive(join(callDir(this.home, w.wid, c.key, c.gen), LIVE_FILE));
           sessions.put(c.callId, cached.entries); facts.put(c.callId, value);
+          // A call sealed a while ago writes nothing more (a follow-up opens a new generation and session), so its
+          // session is not stat'ed again: polling every historical session twice a second kept pi's main thread busy.
+          if (c.phase === "sealed" && c.endedAt !== undefined && Date.now() - c.endedAt > FINAL_MS) {
+            this.final.set(c.callId, { entries: cached.entries, facts: value }); this.tails.delete(c.callId); this.derived.delete(c.callId);
+          }
         };
         // A finished call never read before (history at startup) is read when first shown or by the idle warm-up below;
         // reading every historical session up front blocked pi's startup for seconds.
@@ -95,6 +107,7 @@ export class UiData {
       }
     }
     for (const key of this.tails.keys()) if (!known.has(key)) { this.tails.delete(key); this.derived.delete(key); }
+    for (const key of this.final.keys()) if (!known.has(key)) this.final.delete(key);
     // Warm the history a slice at a time, so opening the list later finds it read without one long stall now.
     const until = performance.now() + this.warmMs;
     for (const load of [...deferred.values()]) { if (performance.now() >= until) break; load(); }

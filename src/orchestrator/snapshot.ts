@@ -248,7 +248,42 @@ export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
 
 /** Ops: wids archived by `prune` (orchestrator ledger `pruned{wid}`); they no longer exist for any reader. */
 function prunedIds(home: string): Set<string> {
-  return new Set(readJournalSnapshot(orchLedger(home)).filter(e => e.type === "pruned").map(e => String(e.wid)));
+  return ledgerIndex(readJournalSnapshot(orchLedger(home))).pruned;
+}
+
+/** What the readers polled by pi's main thread need from the orchestrator ledger, folded once per ledger snapshot
+ *  (and extended in place when a live ledger array grows): scanning the whole ledger once per workflow on every
+ *  refresh cost pi a steady few percent of its main thread. Indexes are positions in the ledger. */
+export interface LedgerIndex {
+  /** First `created` entry per wid (the raw `wid` value is the key, compared like `===`). */
+  created: Map<unknown, Entry>;
+  /** wids archived by `prune`. */
+  pruned: Set<string>;
+  /** Last drain/undrain without scope, per `wid` and per `origin`. */
+  global?: number; byWid: Map<unknown, number>; byOrigin: Map<unknown, number>;
+  lastDrain?: number;
+}
+type Folded = LedgerIndex & { length: number; last?: Entry };
+const ledgerIndexes = new WeakMap<readonly Entry[], Folded>();
+export function ledgerIndex(ledger: readonly Entry[]): LedgerIndex {
+  let ix = ledgerIndexes.get(ledger);
+  if (!ix || ix.length > ledger.length || (ix.length && ledger[ix.length - 1] !== ix.last)) {
+    ix = { length: 0, created: new Map(), pruned: new Set(), byWid: new Map(), byOrigin: new Map() };
+    ledgerIndexes.set(ledger, ix);
+  }
+  for (let i = ix.length; i < ledger.length; i++) {
+    const e = ledger[i]!;
+    if (e.type === JT.created) { if (!ix.created.has(e.wid)) ix.created.set(e.wid, e); }
+    else if (e.type === "pruned") ix.pruned.add(String(e.wid));
+    else if (e.type === "drain" || e.type === "undrain") {
+      if (e.type === "drain") ix.lastDrain = i;
+      if (e.wid === undefined && e.origin === undefined) ix.global = i;
+      if (e.wid !== undefined) ix.byWid.set(e.wid, i);
+      if (e.origin !== undefined) ix.byOrigin.set(e.origin, i);
+    }
+  }
+  ix.length = ledger.length; ix.last = ledger[ledger.length - 1];
+  return ix;
 }
 
 function workflowIds(home: string): string[] {
@@ -261,18 +296,20 @@ function workflowIds(home: string): string[] {
 /** Drain: the one hold rule. drain/undrain entries apply to every workflow (no scope), one session's (`origin`) or one
  *  workflow (`wid`). A workflow is held when the newest entry that applies to it is a drain recorded after it was created. */
 export function holdOf(ledger: readonly Entry[], wid: string, origin?: string): Entry | undefined {
-  const applies = (e: Entry) => (e.wid === undefined && e.origin === undefined) || e.wid === wid || (origin !== undefined && e.origin === origin);
-  const last = ledger.findLast(e => (e.type === "drain" || e.type === "undrain") && applies(e));
+  // The newest applicable entry is the newest of the newest unscoped, the newest for this wid and the newest for its origin.
+  const ix = ledgerIndex(ledger);
+  const at = Math.max(ix.global ?? -1, ix.byWid.get(wid) ?? -1, origin !== undefined ? ix.byOrigin.get(origin) ?? -1 : -1);
+  const last = at >= 0 ? ledger[at] : undefined;
   if (last?.type !== "drain") return undefined;
-  const created = ledger.find(e => e.type === JT.created && e.wid === wid);
+  const created = ix.created.get(wid);
   return !created || created.seq < last.seq ? last : undefined;
 }
 /** Drain: the workflows a drain (stop-all, a quit pi) holds until resume, and since when. */
 export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean } {
-  const ledger = readJournalSnapshot(orchLedger(home));
-  const origin = (wid: string) => ledger.find(e => e.type === JT.created && e.wid === wid)?.origin as string | undefined;
+  const ledger = readJournalSnapshot(orchLedger(home)), ix = ledgerIndex(ledger);
+  const origin = (wid: string) => ix.created.get(wid)?.origin as string | undefined;
   const hold = (wid: string) => holdOf(ledger, wid, origin(wid));
-  const since = ledger.filter(e => e.type === "drain").at(-1)?.ts;
+  const since = ix.lastDrain !== undefined ? ledger[ix.lastDrain]!.ts : undefined;
   return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined };
 }
 
