@@ -14,6 +14,9 @@
 - `send model` to a call that is asking (hibernated) or still waiting for a
   slot is recorded and applied when it runs again, instead of being refused
   with `call-not-running`.
+  A requested model applies once: afterwards the session and the pool choose
+  as before. Withdrawing a follow-up that names a model withdraws the switch
+  too.
 - A provider's refusal of the content (terms of service, usage policy) fails
   the call at once with that error. It was retried as a lost execution five
   times and reported as `lost ×5`.
