@@ -4,7 +4,7 @@
 // config-rejected{hash,error} — a changed file that was not applied; the settings before it stay in effect.
 // A reload changes the shared config object in place: every later read sees it (the next slot acquisition, model
 // resolution or check). Slots already held are kept when a limit drops; timers of running executions keep their period.
-import { readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { contentHash } from "../kernel/ids.ts";
 import type { JournalHandle } from "../types.ts";
@@ -75,8 +75,10 @@ function applyInPlace(target: OrchestratorConfig, next: OrchestratorConfig) {
 }
 
 /** Identity of the file's current version (taken before a read, so a change during the read is seen next time). */
+/** The version of config.json: its content. File times are too coarse to tell two quick writes of the same size apart
+ *  (a change could be missed for good), and the file is small enough to read once a second. */
 export async function configStamp(path: string): Promise<string> {
-  try { const s = await stat(path); return `${s.ino}:${s.size}:${s.mtimeMs}`; }
+  try { return `=${await readFile(path, "utf8")}`; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw error; }
 }
 
@@ -89,7 +91,8 @@ export function watchConfig(options: { path: string; stamp: string; config: Orch
     const now = await configStamp(path);
     if (now === stamp || stopped) return;
     let raw: unknown;
-    try { raw = await readConfig(path); }
+    // The content compared is the content applied: a second read could see another version than the stamp.
+    try { raw = now === "missing" ? {} : JSON.parse(now.slice(1)); }
     catch (error) {
       // A half-written file reads as invalid JSON: retry on the next change of the file, report it once per version.
       stamp = now;
