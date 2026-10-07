@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openJournal } from "../../../../src/kernel/journal.ts";
 import { Containment } from "../../../../src/platform/containment.ts";
-import { recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
+import { recordFenceFailure, recordOnce, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
 import { gateRetired } from "../../../../src/orchestrator/executor/effects/gate.ts";
 import { JT, type Entry, type ProcInfo } from "../../../../src/types.ts";
 import { setTimeout as delay } from "node:timers/promises";
@@ -99,4 +99,12 @@ test("F1 A5 fence failure and gate retirement records are written once under con
   await Promise.all([gateRetired(journal, id), gateRetired(journal, id), resolveFenceAttention(journal, id)]);
   assert.equal(count(e => e.type === "gate" && e.id === id), 1);
   assert.equal(count(e => e.type === JT.attentionResolved && e.id === `fence:${id}`), 1);
+});
+
+test("A5 a failed record section reports its error and the next one still runs", async () => {
+  const journal = {} as Parameters<typeof recordOnce>[0], order: string[] = [];
+  const failed = recordOnce(journal, async () => { order.push("a"); throw new Error("append failed"); });
+  const next = recordOnce(journal, async () => { order.push("b"); return 2; });
+  await assert.rejects(failed, /append failed/);
+  assert.equal(await next, 2); assert.deepEqual(order, ["a", "b"]);
 });
