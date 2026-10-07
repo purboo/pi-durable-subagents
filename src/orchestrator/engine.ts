@@ -100,6 +100,11 @@ export class Engine {
   private held(wid: string): boolean {
     return holdOf(this.ledgers.orch.entries(), wid, this.store.workflows.get(wid)?.origin) !== undefined;
   }
+  /** Follow-ups (generations) of the current revision that have not ended: on a finished workflow they are its only live work. */
+  private openFollowUps(wf: Workflow): boolean {
+    const log = revisionEntries(wf), ended = new Set(log.filter(e => e.type === JT.sealed || e.type === 'retired').map(e => String(e.call)));
+    return log.some(e => e.type === 'generation' && !ended.has(`${wf.wid}@${wf.revision}/${e.key}@${e.gen}`));
+  }
   private watcher?: FSWatcher;
   private poll?: ReturnType<typeof setInterval>;
   constructor(ledgers: Ledgers, executor: Executor, options: EngineOptions = {}) {
@@ -315,7 +320,8 @@ export class Engine {
       const inScope = (wf: Workflow) => wid ? wf.wid === wid : origin ? wf.origin === origin : true;
       const took = (wf: Workflow) => wf.journal.entries().some(e => e.type === 'resumed' && e.rid === req.rid);
       const replayed = this.ledgers.orch.entries().some(e => e.type === 'undrain' && e.rid === req.rid);
-      const holding = [...this.store.workflows.values()].filter(wf => inScope(wf) && this.held(wf.wid) && !this.terminal(wf));
+      // Held follow-ups of a finished workflow are released too; they run again through dispatchGeneration below.
+      const holding = [...this.store.workflows.values()].filter(wf => inScope(wf) && this.held(wf.wid) && (!this.terminal(wf) || this.openFollowUps(wf)));
       const releasing = replayed || holding.length > 0;
       const final = (wf: Workflow) => { const done = this.terminal(wf); return done && done.status !== 'parked' ? String(done.status) : undefined; };
       const parked = (wf: Workflow) => this.terminal(wf)?.status === 'parked';

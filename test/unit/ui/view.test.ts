@@ -350,3 +350,35 @@ test("UI §3 be pi: the phrase says what the model is really doing; a dimmed row
   assert(!row.includes("\x1b[0m"), "no SGR reset inside a row: the whole row takes the dim style");
   assert.match(row, /3 tools · 1m00s$/);
 });
+
+test("a follow-up on a finished workflow is live: the dock, the summary and the list show it", async () => {
+  const { snapshotFromEntries } = await import("../../../src/orchestrator/snapshot.ts");
+  let seq = 0;
+  const e = (type: string, fields: Record<string, unknown>) => ({ seq: ++seq, ts: now - 60_000 + seq * 1000, type, ...fields });
+  const ok = (key: string) => ({ key, gen: 1, ok: true, status: "ok", output: `${key} built` });
+  const step = { agent: "worker", task: "t" };
+  const entries = [
+    e("wf-created", { revision: 1, name: "tier1-build" }),
+    e("call", { key: "harness", gen: 1, spec: step }), e("sealed", { call: "W@1/harness@1", result: ok("harness") }),
+    e("call", { key: "ext", gen: 1, spec: step }), e("sealed", { call: "W@1/ext@1", result: ok("ext") }),
+    e("workflow-done", { status: "done", result: 1 }),
+    e("generation", { key: "harness", gen: 2, from: "W@1/harness@1", rid: "f", opening: { kind: "follow-up" } }),
+    e("exec", { call: "W@1/harness@2", exec: "W@1/harness@2#1.1" }), e("selected", { exec: "W@1/harness@2#1.1", model: { provider: "p", id: "m" } }),
+  ];
+  const w = snapshotFromEntries("W", entries as never);
+  assert.equal(w.status, "done"); assert.equal(w.followUps, 1);
+  const later = now + 30 * 60_000; // long after the workflow ended: the completion sentence alone would be gone
+  const dock = dockLines([w], new Map(), () => "M", 100, later);
+  assert.ok(dock.some(l => l.includes("harness")), dock.join("\n"));
+  assert.equal(summary([w]).working, 1);
+  assert.match(summaryText([w]), /1 working/);
+  const rows = listRows([w], state(), new Map(), () => "M", 100, later);
+  const harness = rows.find(r => r.call?.callId === "W@1/harness@2");
+  assert.ok(harness && !harness.dim, rows.map(r => r.text).join("\n"));
+  assert.ok(rows.some(r => r.kind === "done" && r.text.includes("1 done")), "finished agents fold under done, as in a running workflow");
+  // once the follow-up ends, the workflow is finished again
+  const sealed = snapshotFromEntries("W", [...entries, e("sealed", { call: "W@1/harness@2", result: { ...ok("harness"), gen: 2 } })] as never);
+  assert.equal(sealed.followUps, undefined);
+  assert.deepEqual(dockLines([sealed], new Map(), () => "M", 100, later), []);
+  assert.equal(summaryText([sealed]), "1 finished");
+});

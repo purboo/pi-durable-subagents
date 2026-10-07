@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A follow-up on a finished workflow shows as running work: in the dock, the
+  summary line, the list (no longer dimmed or hidden) and `status`. Quitting pi
+  pauses it, and `resume` continues it; before, a resume refused it as finished.
+- ↓ opens the subagent list only from pi's input editor. With `/model`'s
+  selector, a dialog or another overlay in focus, ↓ moves in that list again.
+
 ## 1.0.5
 
 - `status` without a wid is brief: what runs, what asks (with the address to

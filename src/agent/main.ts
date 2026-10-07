@@ -12,7 +12,7 @@ import { OsLock } from "../platform/lock.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type RunBody } from "../types.ts";
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
-import { pausedElsewhere, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
+import { isLive, pausedElsewhere, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
 import { parameters, request } from "./main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
 
@@ -130,7 +130,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   pi.on("session_start", async (_event, context) => {
     await start(context);
     // Quit pause: say once, at the session's start, which of its workflows wait for a resume.
-    const paused = statusView(home, { origin: sender }).workflows.filter(w => w.origin === sender && w.status === "running" && w.paused);
+    const paused = statusView(home, { origin: sender }).workflows.filter(w => w.origin === sender && isLive(w) && w.paused);
     if (paused.length) pi.sendMessage({ customType: CT.note, display: true, content: `${paused.length} subagent workflow${paused.length > 1 ? "s were" : " was"} paused when pi quit (${paused.map(w => w.name ?? w.wid).join(", ")}). Ask to resume, or open /subagents (or ↓) and press r.` });
   });
   // Quitting pi is a stop-burning-tokens moment: on a quit (Ctrl+D, /quit, a closed terminal, SIGTERM) this session's
@@ -140,7 +140,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   pi.on("session_shutdown", async event => {
     if (event.reason === "quit" && quitPolicy(home) === "pause" && outbox && !stopped) {
       try {
-        const running = statusView(home, { origin: sender }).workflows.some(w => w.origin === sender && w.status === "running" && !w.paused);
+        const running = statusView(home, { origin: sender }).workflows.some(w => w.origin === sender && isLive(w) && !w.paused);
         if (running) await serial(async () => { await outbox?.send("orch", "drain", { fence: true, origin: sender }); });
       } catch (error) { console.error("durable-subagents: could not pause on quit:", error); }
     }

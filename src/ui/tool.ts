@@ -50,10 +50,10 @@ export function resultLines(details: unknown): string[] {
     return `${w.name ?? short(w.wid)} · ${w.status} · ${done}/${w.calls.length} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}`;
   };
   if (Array.isArray(d.active)) {
-    type Brief = { wid: string; name?: string; status: string; paused?: boolean; progress: string; calls: { status?: string }[]; asking?: unknown[]; alerts?: unknown[] };
+    type Brief = { wid: string; name?: string; status: string; paused?: boolean; followUps?: number; progress: string; calls: { status?: string }[]; asking?: unknown[]; alerts?: unknown[] };
     const rows = (d.active as Brief[]).map(w => {
       const failed = w.calls.filter(c => c.status && c.status !== "ok").length, asks = w.asking?.length ?? 0, alerts = w.alerts?.length ?? 0;
-      return `${w.name ?? short(w.wid)} · ${w.paused ? "paused" : w.status} · ${w.progress} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}${alerts ? ` · ${alerts} alert${alerts > 1 ? "s" : ""}` : ""}`;
+      return `${w.name ?? short(w.wid)} · ${w.paused ? "paused" : w.followUps ? `${w.status}, follow-up running` : w.status} · ${w.progress} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}${alerts ? ` · ${alerts} alert${alerts > 1 ? "s" : ""}` : ""}`;
     });
     const finished = Array.isArray(d.finished) ? d.finished.length + Number(d.olderFinished ?? 0) : 0;
     return [...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : []), ...(rows.length ? rows.slice(0, 6) : ["nothing running"]),
