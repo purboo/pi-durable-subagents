@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { toolPath, worktreeRoots } from "../../../../src/orchestrator/executor/worktree.ts";
+import { WorktreeIndex, toolPath, worktreeRoots } from "../../../../src/orchestrator/executor/worktree.ts";
 
 test("worktree roots: git directories, linked worktree files, nested and nonexistent paths, realpaths and non-git", async t => {
   const dir = await mkdtemp(join(tmpdir(), "dsa-roots-"));
@@ -46,4 +46,20 @@ test("worktree roots follow a repository created inside another after a lookup",
   assert.equal(await root(dir, "inner/file.txt"), dir);
   await mkdir(join(dir, "inner", ".git"));
   assert.equal(await root(dir, "inner/file.txt"), join(dir, "inner"));
+});
+
+test("the worktree index keeps only roots with writers that have not ended, and reads each entry once", () => {
+  let reads = 0;
+  const journal = (entries: object[]) => { const list = entries.map((e, i) => ({ seq: i + 1, ts: 0, ...e })); return { entries: () => { reads++; return list; } } as never; };
+  const journals = Array.from({ length: 2000 }, (_, i) => journal([
+    { type: "wrote", exec: `w${i}@1/a@1#1.1`, root: `/r${i}` }, { type: "sealed", call: `w${i}@1/a@1` }]));
+  const index = new WorktreeIndex().scan(journals);
+  assert.deepEqual(index.contested(), []); assert.deepEqual(index.live("/r1"), []);
+  assert.equal(reads, 2000);
+  const x = journal([{ type: "wrote", exec: "x@1/a@1#1.1", root: "/s" }]), y = journal([{ type: "wrote", exec: "y@1/b@1#1.1", root: "/s", after: ["x@1/a@1"] }]);
+  index.scan([x, y]);
+  assert.deepEqual(index.contested(), ["/s"]);
+  const [first, second] = WorktreeIndex.order(...(index.live("/s") as [never, never]));
+  assert.equal((first as { call: string }).call, "x@1/a@1"); assert.equal((second as { call: string }).call, "y@1/b@1");
+  assert.equal(index.has("w5@1/a@1#1.1", "/r5"), true, "a write stays known after its call ended");
 });

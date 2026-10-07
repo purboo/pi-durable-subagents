@@ -198,6 +198,18 @@ test("shared worktree: paths resolve as pi's edit/write resolve them (@ prefix, 
   assert.equal(count(f.journal.entries(), e => e.type === JT.attention && item(e).kind === "conflict"), 1);
 });
 
+test("shared worktree: a path pi's tool cannot use is no evidence and does not stop the call", { timeout: 15000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a");
+  await mkdir(join(f.home, ".git"));
+  const send = await writingChildren(t, f), pa = f.executor.run(a); void pa.catch(() => {});
+  await send(a, "write", "file://remote/tmp/a.txt"); await send(a, "read");
+  await until(() => count(f.journal.entries(), e => e.type === "observation") >= 2);
+  await delay(100);
+  assert.equal(count(f.journal.entries(), e => e.type === JT.fenced), 0);
+  assert.equal(count(f.journal.entries(), e => e.type === "wrote"), 0);
+  await send(a); await until(() => count(f.journal.entries(), e => e.type === "wrote") === 1);
+});
+
 test("shared worktree ignores non-git writes, distinct roots and already sealed writers", { timeout: 15000 }, async t => {
   const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b");
   a.cwd = join(f.home, "one"); b.cwd = join(f.home, "two");
