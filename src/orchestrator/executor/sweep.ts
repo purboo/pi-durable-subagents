@@ -25,8 +25,21 @@ export async function skipLostCandidate(journal: JournalHandle, orch: JournalHan
   if (tail.length === 3 && tail.every(e => e.type === "candidate-loss" && e.model === name))
     await orch.append("skip", { pool: selected.pool, model: name, until: Date.now() + 600000 });
 }
+// The gate path records outside the executor's serial section and the sweep inside it: each check-then-append of a
+// fence record runs in this per-journal section, so two recorders that both find no record still write it once (A5).
+const sections = new WeakMap<JournalHandle, Promise<unknown>>();
+/** A5: Run a check-then-append of fence records alone on its journal. Not reentrant: never nest two. */
+export function recordOnce<T>(journal: JournalHandle, operation: () => Promise<T>): Promise<T> {
+  const result = (sections.get(journal) ?? Promise.resolve()).then(operation);
+  const tail = result.catch(() => {}); sections.set(journal, tail);
+  void tail.then(() => { if (sections.get(journal) === tail) sections.delete(journal); });
+  return result;
+}
 /** F1: Record a fence timeout of an execution or gate identity once, with one unknown attention item for the origin. */
-export async function recordFenceFailure(journal: JournalHandle, id: string, call: string, error: unknown) {
+export function recordFenceFailure(journal: JournalHandle, id: string, call: string, error: unknown) {
+  return recordOnce(journal, () => fenceFailure(journal, id, call, error));
+}
+async function fenceFailure(journal: JournalHandle, id: string, call: string, error: unknown) {
   if (!journal.entries().some(e => e.type === "fence-failed" && e.exec === id)) await journal.append("fence-failed", { exec: id, error: String(error) });
   const item = `fence:${id}`;
   if (journal.entries().some(e => e.type === JT.attention && (e.item as { id: string }).id === item)) return;
@@ -36,7 +49,11 @@ export async function recordFenceFailure(journal: JournalHandle, id: string, cal
   await journal.append(JT.attention, { item: { id: item, rev: 1, kind: "unknown", text, wid: call.slice(0, call.lastIndexOf("@", call.indexOf("/"))), call } });
 }
 /** F1: Resolve the fence attention item of an identity that a later fence proved retired. */
-export async function resolveFenceAttention(journal: JournalHandle, id: string) {
+export function resolveFenceAttention(journal: JournalHandle, id: string) {
+  return recordOnce(journal, () => fenceAttentionResolved(journal, id));
+}
+/** The same, inside a `recordOnce` section. */
+export async function fenceAttentionResolved(journal: JournalHandle, id: string) {
   const item = journal.entries().find(e => e.type === JT.attention && (e.item as { id: string }).id === `fence:${id}`)?.item as { rev: number } | undefined;
   if (item && !journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${id}` && e.rev === item.rev))
     await journal.append(JT.attentionResolved, { id: `fence:${id}`, rev: item.rev, resolution: "fenced" });

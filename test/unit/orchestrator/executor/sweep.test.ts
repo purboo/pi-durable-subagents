@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openJournal } from "../../../../src/kernel/journal.ts";
 import { Containment } from "../../../../src/platform/containment.ts";
-import { serialContainment, skipLostCandidate, sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
-import { JT, type ProcInfo } from "../../../../src/types.ts";
+import { recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
+import { gateRetired } from "../../../../src/orchestrator/executor/effects/gate.ts";
+import { JT, type Entry, type ProcInfo } from "../../../../src/types.ts";
 import { setTimeout as delay } from "node:timers/promises";
 
 test("K7 three consecutive candidate losses skip ten minutes; replay is idempotent", async t => {
@@ -83,4 +84,19 @@ test("F4 a serial containment never overlaps process-table snapshots", async () 
   const results = await Promise.allSettled([1, 2, 3, 4, 5].map(() => containment.scan(new Map())));
   assert.equal(most, 1); assert.equal(calls, 5);
   assert.deepEqual(results.map(r => r.status), ["fulfilled", "rejected", "fulfilled", "fulfilled", "fulfilled"], "a failed snapshot does not block the queue");
+});
+
+// F1, A5: the gate path (outside the executor's serial section) and the sweep (inside it) record the same failure and
+// retirement; each record and its attention must be written once even when both check before either appends.
+test("F1 A5 fence failure and gate retirement records are written once under concurrent recorders", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-sweep-once-")), journal = await openJournal(join(home, "journal.jsonl"));
+  t.after(async () => { await journal.close(); await rm(home, { recursive: true, force: true }); });
+  const id = "gate:W@1/a@1#1", call = "W@1/a@1", error = new Error(`Fence timeout: ${id}`);
+  const count = (pred: (e: Entry) => boolean) => journal.entries().filter(pred).length;
+  await Promise.all([recordFenceFailure(journal, id, call, error), recordFenceFailure(journal, id, call, error), recordFenceFailure(journal, id, call, error)]);
+  assert.equal(count(e => e.type === "fence-failed" && e.exec === id), 1);
+  assert.equal(count(e => e.type === JT.attention && (e.item as { id: string }).id === `fence:${id}`), 1);
+  await Promise.all([gateRetired(journal, id), gateRetired(journal, id), resolveFenceAttention(journal, id)]);
+  assert.equal(count(e => e.type === "gate" && e.id === id), 1);
+  assert.equal(count(e => e.type === JT.attentionResolved && e.id === `fence:${id}`), 1);
 });
