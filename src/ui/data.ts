@@ -42,7 +42,9 @@ export class LazyMap<V> extends Map<string, V> {
   override get(key: string): V | undefined { if (!super.has(key)) this.produce(key); return super.get(key); }
   override has(key: string): boolean { return this.get(key) !== undefined; }
 }
-/** How long after its seal a call's session is still followed (a late write after the seal is still shown). */
+/** How long after its seal a call's session is still followed. A sealed execution has been fenced, so its session is
+ *  final: a follow-up or a revision runs as a new generation with its own session. A session changed after that (by
+ *  hand) shows in a new pi session only. */
 const FINAL_MS = 10_000;
 /** A1, P25: Read the UI's data from durable workflow snapshots and native session tails only. */
 export class UiData {
@@ -59,7 +61,7 @@ export class UiData {
   warmMs = 8;
   private tails = new Map<string, SessionTail>();
   /** Branch and facts of calls sealed more than FINAL_MS ago, read once after their seal. */
-  private final = new Map<string, { entries: SessionEntry[]; facts: Facts }>();
+  private final = new Map<string, { endedAt: number; entries: SessionEntry[]; facts: Facts }>();
   /** Branch and facts per call, reused while its session tail is unchanged: a finished call's session never grows, and
    *  re-deriving every historical call on each refresh blocked pi's main thread for over a second. */
   private derived = new Map<string, { source: readonly SessionEntry[]; length: number; entries: SessionEntry[]; facts: Facts }>();
@@ -74,7 +76,8 @@ export class UiData {
       for (const c of w.calls) {
         known.add(c.callId);
         const final = this.final.get(c.callId);
-        if (final && c.phase === "sealed") { sessions.put(c.callId, final.entries); facts.put(c.callId, final.facts); continue; }
+        if (final && c.phase === "sealed" && c.endedAt === final.endedAt) { sessions.put(c.callId, final.entries); facts.put(c.callId, final.facts); continue; }
+        if (final) this.final.delete(c.callId);
         const load = () => {
           deferred.delete(c.callId);
           let tail = this.tails.get(c.callId);
@@ -97,7 +100,7 @@ export class UiData {
           // A call sealed a while ago writes nothing more (a follow-up opens a new generation and session), so its
           // session is not stat'ed again: polling every historical session twice a second kept pi's main thread busy.
           if (c.phase === "sealed" && c.endedAt !== undefined && Date.now() - c.endedAt > FINAL_MS) {
-            this.final.set(c.callId, { entries: cached.entries, facts: value }); this.tails.delete(c.callId); this.derived.delete(c.callId);
+            this.final.set(c.callId, { endedAt: c.endedAt, entries: cached.entries, facts: value }); this.tails.delete(c.callId); this.derived.delete(c.callId);
           }
         };
         // A finished call never read before (history at startup) is read when first shown or by the idle warm-up below;
