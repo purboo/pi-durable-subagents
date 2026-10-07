@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { WorktreeIndex, toolPath, worktreeRoots } from "../../../../src/orchestrator/executor/worktree.ts";
 
 test("worktree roots: git directories, linked worktree files, nested and nonexistent paths, realpaths and non-git", async t => {
-  const dir = await mkdtemp(join(tmpdir(), "dsa-roots-"));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "dsa-roots-"))); // macOS: /var is /private/var
   t.after(() => rm(dir, { recursive: true, force: true }));
   const repo = join(dir, "repo"), linked = join(dir, "linked"), root = worktreeRoots();
   await mkdir(join(repo, ".git"), { recursive: true });
@@ -39,7 +39,7 @@ test("toolPath resolves as pi's edit/write tools do", () => {
 });
 
 test("worktree roots follow a repository created inside another after a lookup", async t => {
-  const dir = await mkdtemp(join(tmpdir(), "dsa-roots-"));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "dsa-roots-"))); // macOS: /var is /private/var
   t.after(() => rm(dir, { recursive: true, force: true }));
   const root = worktreeRoots();
   await mkdir(join(dir, ".git")); await mkdir(join(dir, "inner"));

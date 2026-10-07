@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.15
+
+- The changes listed under 1.0.14, which was tagged but never published:
+  its macOS CI failed because two test files compared worktree roots (real
+  paths) with temporary paths under the `/var` symlink. Only those tests
+  changed.
+
 ## 1.0.14
 
 - The running orchestrator's version is visible. `status` shows it
