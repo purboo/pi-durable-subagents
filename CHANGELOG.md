@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.16
+
+- A used-up usage window is found while pi is still retrying: at the second
+  quota refusal in a row (`No available accounts`, usage limit, quota
+  exceeded), not after pi's retries end. A call from a pool moves to the
+  pool's next model that is not used up and has a free slot, in the same
+  execution and session, at pi's next retry; one with a single model waits
+  for its provider. Before, a call kept retrying the used-up provider for as
+  long as pi's retry settings allowed (over ten minutes with ten retries).
+- `send kind:"model"` and a follow-up's `model` accept a pool's name: the
+  first model of the pool that is not used up (for a running call, also with
+  a free slot). The reply names the model picked; a call from that pool stays
+  in it, so a later used-up window still moves it on. A follow-up naming a
+  pool starts its generation from the pool's order.
+
 ## 1.0.15
 
 - The changes listed under 1.0.14, which was tagged but never published:

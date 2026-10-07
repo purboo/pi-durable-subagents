@@ -45,9 +45,9 @@ function call(value: unknown, cwd: string, where: string): CallSpec {
 /** P12: a send naming a model is answered with that model and when it applies — `next-request` (a running call switches
  *  at its next provider request), `next-execution` (a call with no live execution launches on it) or `next-generation`
  *  (a follow-up's new generation runs on it). From the orchestrator ledger's `send-note`. */
-export function sendReceipt(ledger: readonly Entry[], rid: string): { model?: string; effect?: string } {
+export function sendReceipt(ledger: readonly Entry[], rid: string): { model?: string; effect?: string; pool?: string } {
   const note = ledger.find(e => e.type === "send-note" && e.rid === rid);
-  return note ? { model: String(note.model), effect: String(note.effect) } : {};
+  return note ? { model: String(note.model), effect: String(note.effect), ...(note.pool ? { pool: String(note.pool) } : {}) } : {};
 }
 export function request(args: Args, cwd: string): { kind: RequestKind; body: unknown; cond?: Conditions; replaces?: string[] } {
   // v12 §2: Infer run only when one launch form is present; never guess a control verb.

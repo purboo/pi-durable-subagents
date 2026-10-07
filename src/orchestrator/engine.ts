@@ -284,7 +284,9 @@ export class Engine {
       const from = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
       const seal = wf.journal.entries().find(e => e.type === JT.sealed && e.call === from);
       if (seal && send.kind === 'steer') return { action: 'reject', reason: `finished:${(seal.result as CallResult).status} — use kind "follow-up" to continue it` };
-      if (send.kind === 'follow-up' && send.model !== undefined) {
+      // A pool's name is a model too: the call keeps the pool, and its order and failover apply to the new generation.
+      const pools = this.ledgers.config.pools, pool = send.model !== undefined && pools && Object.hasOwn(pools, send.model);
+      if (send.kind === 'follow-up' && send.model !== undefined && !pool) {
         try { if (!parseModel(send.model).provider) throw new Error('missing provider'); }
         catch { return { action: 'reject', reason: 'unknown-model' }; }
       }
@@ -293,7 +295,7 @@ export class Engine {
         // A follow-up's model replaces the continued session's for this generation and those continuing it.
         const spec = send.model !== undefined ? { ...(entry.spec as CallSpec), model: send.model } : entry.spec;
         if (send.model !== undefined) await this.note(req.rid, send.model, 'next-generation');
-        const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message: send.message ?? '' }, ...(send.model !== undefined ? { model: send.model } : {}) });
+        const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message: send.message ?? '' }, ...(send.model !== undefined && !pool ? { model: send.model } : {}) });
         this.dispatchGeneration(wf, opened); return { action: 'apply' };
       }
       // A follow-up naming a model, queued on unfinished work: the executor records its model request with the message.

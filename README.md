@@ -55,7 +55,7 @@ the npx cache, so `install-service` refuses to run from there.
 | You steer a subagent while it is asking you a question | Your message reaches it, in order. Nothing is rejected or lost. |
 | Two steers arrive out of order and the second replaces the first | Only the second one applies. |
 | A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
-| A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded) | A call in a pool continues **in the same session** on the pool's next model; new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
+| A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded) | Found at the second refusal in a row, while pi is still retrying. A call in a pool continues **in the same session** on the pool's next model (at pi's next retry); new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
 | Two subagents edit the same worktree | A reminder names both calls; neither is blocked or locked. Only observed `edit`/`write` calls count (bash-only writes are not seen). Calls with `isolation: "worktree"` have their own worktrees. |
 | A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. |
 
@@ -98,9 +98,9 @@ it something. Each verb means one thing, and a refusal says what would work:
 |---|---|---|
 | `run` | — | Start one subagent, `tasks` in parallel, a `chain`, or a workflow script. An unknown agent name is refused before anything starts, with the list of agents. |
 | `send steer` | a running subagent | Reaches it at its next safe point. To a finished one: refused, use `follow-up`; To one waiting on its question: it interrupts the question, and the subagent usually asks again; `answer` answers it. |
-| `send follow-up` | a finished subagent | Continues the same session as a new generation (`key@2`). With `model`, that generation runs on it. |
+| `send follow-up` | a finished subagent | Continues the same session as a new generation (`key@2`). With `model` (a model or a pool's name), that generation runs on it. |
 | `send answer` | an open question | Answers it once. |
-| `send model` | any subagent | A running one switches at its next request; one asking, hibernated or waiting for a slot launches on it when it runs again. |
+| `send model` | any subagent | A running one switches at its next request; one asking, hibernated or waiting for a slot launches on it when it runs again. A pool's name picks its first model that is not used up (and, for a running call, has a free slot); the reply names the model picked, and a call from that pool stays in it. |
 | `stop` | a subagent or a workflow | Final: `stopped`, usage kept, edits left as they are. |
 | `drain` / `resume` | existing workflows | A reversible hold; runs started later are not held. |
 

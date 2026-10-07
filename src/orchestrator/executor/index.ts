@@ -39,6 +39,8 @@ type Active = { ticket: CallTicket; controller: AbortController; promise: Promis
 const MEM_RECORD_MS = 30000;
 /** A4, P29: A child admitted within this window may not show in MemAvailable yet; its share is reserved explicitly. */
 const MEM_WARMUP_MS = 30000;
+/** Quota refusals in a row that find a provider's usage window used up while pi is still retrying. */
+const QUOTA_REFUSALS = 2;
 const ignoreMissing = (error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; };
 const callOf = (exec: string) => exec.slice(0, exec.lastIndexOf("#"));
 const shutdownError = () => Object.assign(new Error("executor shutdown; call resumes on recovery"), { name: "ExecutorShutdown" });
@@ -249,8 +251,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   /** P7, P27: Record forward-delivered once when a forward's child receipt is first observed; serial sections only. */
   /** The reply to a model send says which model and when it applies (orchestrator ledger `send-note`, once per rid). */
-  async function note(rid: string, model: string, effect: string) {
-    if (!orch.entries().some(e => e.type === "send-note" && e.rid === rid)) await orch.append("send-note", { rid, model, effect });
+  async function note(rid: string, model: string, effect: string, pool?: string) {
+    if (!orch.entries().some(e => e.type === "send-note" && e.rid === rid)) await orch.append("send-note", { rid, model, effect, ...(pool ? { pool } : {}) });
   }
   async function forwardsDelivered(journal: JournalHandle, call: string, entries: SessionEntry[]) {
     const all = journal.entries();
@@ -399,7 +401,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const decision = await decide(), models = decision.candidates, pool = decision.pool;
         continuation = decision.continuation;
         for (const model of models) {
-          if (!continuation && pool && skipped(pool, model)) continue;
+          if (!continuation && pool && models.length > 1 && skipped(pool, model)) continue;
           const provider = model.provider;
           if (unavailable(provider)) continue;
           const probe = provider !== undefined && folded().exhausted.has(provider);
@@ -448,13 +450,18 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const candidate = recorded && candidates.some(m => m.provider === recorded.provider && m.id === recorded.id);
     // Leave the session's model for the pool's others when its pool skips it after losses, or its provider's usage
     // window is used up; and at a new generation, go back to the pool's order of preference.
-    const skip = pool && candidate && (previous && ownSegment && skipped(pool, recorded!) || unavailable(recorded!.provider) || !ownSegment && !!t.continueFrom);
+    // A new generation of a pool call starts from the pool also when the session's model is not one of its models
+    // (switched outside it, or the follow-up named the pool).
+    const skip = pool && (candidate ? previous && ownSegment && skipped(pool, recorded!) || unavailable(recorded!.provider) || !ownSegment && !!t.continueFrom
+      : !ownSegment && !!t.continueFrom);
     // A model the call was asked to use replaces the session's: launched with it, and holding its provider's slot.
     const wanted = requestedModel(t.journal, t.callId, t.model);
     // It outranks the pool's order at a new generation too, also when it names the model the session already has.
+    // A requested model of the call's own pool keeps the pool: a used-up window still moves the call on.
+    const keep = pool && candidates.some(m => m.provider === wanted?.provider && m.id === wanted?.id) ? pool : undefined;
     if (wanted) return recorded && !freshFork && recorded.provider === wanted.provider && recorded.id === wanted.id
-      ? { candidates: [recorded], continuation: true, pool: undefined }
-      : { candidates: [wanted], continuation: false, pool: undefined };
+      ? { candidates: [recorded], continuation: true, pool: keep }
+      : { candidates: [wanted], continuation: false, pool: keep };
     if (recorded && !freshFork && !skip) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined };
     return { candidates, continuation: false, pool };
   }
@@ -514,10 +521,58 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     if (orch.entries().some(e => e.type === "provider-exhausted" && e.exec === exec)) return;
     await orch.append("provider-exhausted", { provider, exec, since: x?.since ?? now, nextTry: now + (config.k?.probeMs ?? 900_000), error: error.slice(0, 300) });
   }
+  /** Quota refusals in a row per execution, from one provider (pi retries a refused request on its own). */
+  const refusals = new Map<string, { provider: string; count: number }>();
+  /** A used-up window shows while pi still retries: the second refusal in a row (the first for a probe) finds the
+   *  provider used up, and a call launched from a pool switches to the pool's next model at its next request. */
+  async function refused(t: CallTicket, exec: string, provider: string, error: string) {
+    if (!quotaExhausted(error)) return;
+    const last = refusals.get(exec), count = last?.provider === provider ? last.count + 1 : 1;
+    refusals.set(exec, { provider, count });
+    const probe = folded().exhausted.get(provider)?.probe === exec;
+    if (count < (probe ? 1 : QUOTA_REFUSALS)) return;
+    await serial(async () => {
+      if (has(t.journal, JT.fenced, exec) || current(t.journal, t.callId) !== exec) return;
+      await recordExhausted(provider, exec, error);
+      await failover(t, exec, provider);
+    });
+    wake();
+  }
+  /** Switch a running execution off a used-up provider: to the first model of its pool on another provider that is
+   *  neither used up nor full, reserving that slot as a requested switch does. Without one, pi's retries go on and
+   *  the call waits for the provider once they end. */
+  async function failover(t: CallTicket, exec: string, provider: string) {
+    if (pendingSwitch(exec)) return;
+    const pool = t.journal.entries().findLast(e => e.type === "selected" && e.exec === exec)?.pool as string | undefined, pools = settings().pools;
+    if (!pool || !pools?.[pool]) return;
+    let models: Model[]; try { models = resolveModel(pool, pools); } catch { return; }
+    for (const m of models) {
+      if (!m.provider || m.provider === provider || unavailable(m.provider) || skipped(pool, m)) continue;
+      const rid = contentHash([exec, "failover", provider]);
+      if (t.journal.entries().some(e => e.type === "forward" && e.rid === rid)) return;
+      if (!await reserveSwitch(exec, m.provider, rid)) continue;
+      const body: ModelBody = { provider: m.provider, model: m.id, ...(m.thinking ? { thinking: m.thinking } : {}) };
+      const envelope: Envelope = { to: t.callId, kind: "model", body }, hash = contentHash(envelope);
+      const entry = await t.journal.append("forward", { rid, rid2: forwardRid(rid, t.callId.slice(0, t.callId.indexOf("/")), t.key, hash), dest: t.callId, hash, envelope, failover: provider });
+      await replayForward(entry);
+      return;
+    }
+  }
+  /** Hold a slot of `provider` for a running execution's switch, unless it holds one; false when it is full. */
+  async function reserveSwitch(exec: string, provider: string, rid: string): Promise<boolean> {
+    if (holdings().some(h => h.exec === exec && h.pool === provider)) return true;
+    const target = holdings().filter(h => h.pool === provider);
+    if (!capacity({ kind: "provider", holders: target.length, capacity: settings().providers?.[provider]?.slots ?? Infinity })) return false;
+    let slot = 0; while (target.some(h => h.slot === slot)) slot++;
+    await orch.append("hold", { pool: provider, slot, exec, reserved: true, rid });
+    return true;
+  }
   /** An answer from a used-up provider, requested after it was found used up: available again. */
-  async function answered(exec: string, event: Record<string, unknown>) {
-    const message = event.message as { role?: string; provider?: string; stopReason?: string; timestamp?: number } | undefined, provider = message?.provider;
-    if (message?.role !== "assistant" || !provider || message.stopReason === "error") return;
+  async function answered(t: CallTicket, exec: string, event: Record<string, unknown>) {
+    const message = event.message as { role?: string; provider?: string; stopReason?: string; timestamp?: number; errorMessage?: string } | undefined, provider = message?.provider;
+    if (message?.role !== "assistant" || !provider) return;
+    if (message.stopReason === "error") return refused(t, exec, provider, String(message.errorMessage ?? ""));
+    refusals.delete(exec);
     await serial(async () => {
       const x = folded().exhausted.get(provider);
       if (x && (x.probe === exec || Number(message.timestamp) > x.since)) await orch.append("provider-available", { provider, exec });
@@ -664,7 +719,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             });
           }, recordUsage: values => recordUsage(t, values),
           wrote: path => wrote(t, exec!, cwd, path),
-          switched: event => switched(exec!, journal, event), answered: event => answered(exec!, event), pendingSwitch: () => pendingSwitch(exec!),
+          switched: event => switched(exec!, journal, event), answered: event => answered(t, exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
       } finally { await fence(journal, exec, { child, park: a }); }
     }
@@ -693,7 +748,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const exec = current(ticket.journal, ticket.callId);
         try { if (exec && await fence(ticket.journal, exec)) await release(exec); }
         finally {
-          active.delete(ticket.callId); collected.delete(ticket.callId); for (const e of inUse.keys()) if (callOf(e) === ticket.callId) inUse.delete(e); forgetSession(callSession(home, ticket.wid, ticket.key, ticket.gen)); wake();
+          active.delete(ticket.callId); collected.delete(ticket.callId); for (const e of inUse.keys()) if (callOf(e) === ticket.callId) inUse.delete(e);
+          for (const e of refusals.keys()) if (callOf(e) === ticket.callId) refusals.delete(e); forgetSession(callSession(home, ticket.wid, ticket.key, ticket.gen)); wake();
         }
       });
       // Shutdown rejection is still delivered to callers, without an unhandled rejection during teardown.
@@ -733,28 +789,30 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         /** P12: a model request to this call, recorded with the rid given; a reject has no effect. */
         const requestModel = async (rid: string, model: string, hash: string, cond?: Envelope["cond"]) => {
           let body: ModelBody;
+          const exec = current(ctx.journal, dest);
+          // P28: with no live execution (not started yet, between executions, hibernated while asking) the model is
+          // recorded and the next execution launches on it (`requestedModel`); its slot is acquired then, as for any launch.
+          const idle = !exec || has(ctx.journal, JT.fenced, exec) || !has(ctx.journal, "selected", exec);
+          // A pool's name asks for its first model that can take the call now: provider not used up, and (for a running
+          // call) a free slot. The call's own pool stays, so a used-up window later moves it on as before.
+          const pools = settings().pools, pool = pools && Object.hasOwn(pools, model) ? model : undefined;
+          if (pool) {
+            let models: Model[]; try { models = resolveModel(pool, pools); } catch { return { action: "reject", reason: "unknown-model" } as const; }
+            const free = (p: string) => idle || holdings().some(h => h.exec === exec && h.pool === p) ||
+              capacity({ kind: "provider", holders: holdings().filter(h => h.pool === p).length, capacity: settings().providers?.[p]?.slots ?? Infinity });
+            const m = models.find(m => m.provider && !unavailable(m.provider) && free(m.provider));
+            if (!m) return { action: "reject", reason: "pool-unavailable" } as const;
+            model = `${m.provider}/${m.id}${m.thinking ? `:${m.thinking}` : ""}`;
+          }
           try { const m = parseModel(model); if (!m.provider) throw new Error("Missing provider"); body = { provider: m.provider, model: m.id, ...(m.thinking ? { thinking: m.thinking } : {}) }; }
           catch { return { action: "reject", reason: "unknown-model" } as const; }
           const envelope: Envelope = { to: dest, kind: "model", body, ...(cond && Object.keys(cond).length ? { cond } : {}) };
           const rid2 = forwardRid(rid, ctx.widRev, ctx.key, hash);
-          const exec = current(ctx.journal, dest), provider = body.provider;
-          // P28: with no live execution (not started yet, between executions, hibernated while asking) the model is
-          // recorded and the next execution launches on it (`requestedModel`); its slot is acquired then, as for any launch.
           // Launching (`selected`, not `tracked` yet): the child may start on the old model; ask again in a moment.
-          const idle = !exec || has(ctx.journal, JT.fenced, exec) || !has(ctx.journal, "selected", exec);
-          if (!idle && !has(ctx.journal, "tracked", exec)) return { action: "reject", reason: "call-starting" } as const;
+          if (!idle && !has(ctx.journal, "tracked", exec!)) return { action: "reject", reason: "call-starting" } as const;
           if (!idle && pendingSwitch(exec!)) return { action: "reject", reason: "switch-pending" } as const;
-          if (!idle) {
-            const held = holdings().filter(h => h.exec === exec);
-            if (!held.some(h => h.pool === provider)) {
-              const target = holdings().filter(h => h.pool === provider);
-              if (!capacity({ kind: "provider", holders: target.length, capacity: settings().providers?.[provider]?.slots ?? Infinity }))
-                return { action: "reject", reason: "provider-full" } as const;
-              let slot = 0; while (target.some(h => h.slot === slot)) slot++;
-              await orch.append("hold", { pool: provider, slot, exec, reserved: true, rid });
-            }
-          }
-          await note(req.rid, model, idle ? "next-execution" : "next-request");
+          if (!idle && !await reserveSwitch(exec!, body.provider, rid)) return { action: "reject", reason: "provider-full" } as const;
+          await note(req.rid, model, idle ? "next-execution" : "next-request", pool);
           const entry = await ctx.journal.append("forward", { rid, rid2, dest, hash, envelope });
           await replayForward(entry);
           if (idle) { active.get(dest)?.wake(); wake(); }
