@@ -62,8 +62,8 @@ export function renderView(view: StatusView): string {
   if (view.paused) lines.unshift(`${view.paused} (pi-durable-subagents resume)`);
   if (view.olderFinished) lines.push(`(+${view.olderFinished} older finished workflows; status <wid> shows one in detail)`);
   const footer = [view.slots?.length ? `slots: ${view.slots.join(", ")}` : "", view.config ? `config: ${view.config}` : "", view.configRejected ? `config.json rejected: ${view.configRejected}` : ""].filter(Boolean);
-  if (footer.length && lines.length) lines.push(...footer);
-  return lines.join("\n") || "No workflows";
+  if (!lines.length) lines.push("No workflows");
+  return [...lines, ...footer].join("\n");
 }
 function snapshots(home: string, wid?: string) {
   if (!wid) return allWorkflows(home);

@@ -34,12 +34,15 @@ export async function main(options: MainOptions = {}): Promise<void> {
       config = raw as OrchestratorConfig;
     }
     ledgers = { home, config, orch: await openJournal(orchLedger(home)) };
+    const factory = options.executor ?? (await import(new URL(import.meta.url.endsWith('.ts') ? './executor/index.ts' : './executor/index.js', import.meta.url).href)).default as (ledgers: Ledgers) => Executor;
+    const executor = factory(ledgers);
+    engine = new Engine(ledgers, executor, options);
     if (stamp !== undefined) {
       await recordConfig(ledgers.orch, config);
-      watcher = watchConfig({ path: configPath(home), stamp, config, orch: ledgers.orch, intervalMs: Math.min(1000, config.k?.trackerMs ?? 1000) });
+      // A change applies between slot admissions, so one admission never mixes two versions of the limits.
+      watcher = watchConfig({ path: configPath(home), stamp, config, orch: ledgers.orch, intervalMs: Math.min(1000, config.k?.trackerMs ?? 1000),
+        apply: change => executor.reconfigure ? executor.reconfigure(change) : change() });
     }
-    const factory = options.executor ?? (await import(new URL(import.meta.url.endsWith('.ts') ? './executor/index.ts' : './executor/index.js', import.meta.url).href)).default as (ledgers: Ledgers) => Executor;
-    engine = new Engine(ledgers, factory(ledgers), options);
     await engine.recover();
     await engine.loop(options.signal);
   } finally {

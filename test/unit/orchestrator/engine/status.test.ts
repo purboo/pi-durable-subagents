@@ -307,8 +307,11 @@ test('P28 a hibernated asker shows hibernated until its answer is bound, and nev
     e(1, 'wf-created', { revision: 1 }), e(2, 'call', { key: 'a', gen: 1, spec: { agent: 'x' } }),
     e(3, 'exec', { call, exec }), e(4, 'selected', { exec, model: { provider: 'p', id: 'm' } }),
     e(5, 'attention', { item: { id: `q:${call}:q1`, rev: 1, kind: 'question', text: 'Choose?', call, qid: 'q1' } }),
-    e(6, 'fenced', { exec }), e(7, 'hibernated', { call, exec, qid: 'q1', rev: 1 }),
+    e(6, 'hibernated', { call, exec, qid: 'q1', rev: 1 }), e(7, 'fenced', { exec }),
   ];
+  // The decision precedes the fence: until the execution is fenced it still holds its slot (and a failed fence keeps it).
+  const deciding = snapshotFromEntries('w', asked.slice(0, 6)).calls[0]!;
+  assert.equal(deciding.phase, 'asking'); assert.equal(deciding.hibernated, undefined);
   const a = snapshotFromEntries('w', asked).calls[0]!;
   assert.equal(a.phase, 'asking'); assert.equal(a.hibernated, true);
   assert.equal(compactWorkflow(snapshotFromEntries('w', asked)).calls[0]!.hibernated, true);

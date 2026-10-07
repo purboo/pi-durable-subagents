@@ -123,6 +123,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
   const done = terminal?.type === JT.done ? terminal : undefined;
   const calls = new Map<string, CallSnapshot>();
   const byExec = new Map<string, CallSnapshot>();
+  const hibernating = new Map<string, string>(); // callId → exec that decided to hibernate and is not fenced yet
   const resolved = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}@${e.rev}`));
   const generations = new Set<string>(), retired = new Set<string>();
   const attention: AttentionItem[] = [];
@@ -151,14 +152,16 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       // An execution waits for a provider slot and memory before it launches; it is running once `selected` says so
       // (otherwise a call still waiting for a slot reads "thinking · 2m").
       call.exec = String(e.exec); call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
-      delete call.hibernated;
+      delete call.hibernated; hibernating.delete(call.callId);
     } else if (e.type === "hibernated") {
-      const call = calls.get(String(e.call)); if (call && call.exec === e.exec) call.hibernated = true;
+      // The decision to hibernate precedes the fence; the slot is released only once the execution is fenced.
+      const call = calls.get(String(e.call)); if (call?.exec && call.exec === e.exec) hibernating.set(call.callId, call.exec);
     } else if (e.type === "answer-bound" || (e.type === "resumed" && e.call)) {
-      const call = calls.get(String(e.call)); if (call) delete call.hibernated;
+      const call = calls.get(String(e.call)); if (call) { delete call.hibernated; hibernating.delete(call.callId); }
     } else if (e.type === JT.fenced) {
       // A fenced execution without a seal (stop-all, a quit pi, a loss before its continuation) waits to run again.
       const call = byExec.get(String(e.exec)); if (call && call.phase === "running") call.phase = "queued";
+      if (call && hibernating.get(call.callId) === e.exec) call.hibernated = true;
     } else if (e.type === "selected") {
       const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
       if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
@@ -177,7 +180,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       const usage = (e.result as CallResult | undefined)?.usage;
       if (usage) sealedUsage.set(String(e.call), usage);
       const call = calls.get(String(e.call)); if (!call) continue;
-      call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated;
+      call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated; hibernating.delete(call.callId);
     } else if (e.type === JT.attention) {
       const item = e.item as AttentionItem;
       if (!resolved.has(`${item.id}@${item.rev}`)) attention.push(item);

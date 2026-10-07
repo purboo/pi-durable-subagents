@@ -7,7 +7,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { openJournal } from "../../../src/kernel/journal.ts";
 import { orchLedger } from "../../../src/paths.ts";
 import { configHash, configProblem, configStamp, recordConfig, watchConfig } from "../../../src/orchestrator/config.ts";
-import { slotsView } from "../../../src/orchestrator/snapshot.ts";
+import { slotsView, type StatusView } from "../../../src/orchestrator/snapshot.ts";
+import { renderView } from "../../../src/cli/main.ts";
 import type { OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 
 test("configProblem accepts pi-side keys and names the first invalid orchestrator setting", () => {
@@ -63,6 +64,40 @@ test("watchConfig applies a valid change in place, records it once, and rejects 
   assert.equal(slotsView(home).configRejected, undefined, "an applied change clears the rejection");
   await delay(100);
   assert.equal(configs().length, 3, "an unchanged file records nothing");
+
+  // Back to the settings in effect after a rejection: confirmed, so the rejection no longer shows.
+  await writeFile(path, JSON.stringify({ providers: { probe: { slots: -2 } } }));
+  await until(() => slotsView(home).configRejected !== undefined);
+  await writeFile(path, JSON.stringify({ providers: { probe: { slots: 2 } }, ui: { dock: "off" } }));
+  await until(() => configs().length === 4);
+  assert.equal(slotsView(home).configRejected, undefined); assert.equal(applied, 2, "nothing changed in effect");
+});
+
+test("watchConfig validates before comparing, and applies through the given section", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-config-")), path = join(home, "config.json");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await writeFile(path, "{}");
+  const orch = await openJournal(orchLedger(home));
+  t.after(() => orch.close());
+  const config: OrchestratorConfig = {}, stamp = await configStamp(path);
+  await recordConfig(orch, config);
+  let sections = 0;
+  const watcher = watchConfig({ path, stamp, config, orch, intervalMs: 20, apply: async change => { sections++; await change(); } });
+  t.after(() => watcher.stop());
+  const until = async (p: () => boolean) => { for (let i = 0; i < 200 && !p(); i++) await delay(20); assert.ok(p()); };
+  await writeFile(path, "[]"); // projects to the same (empty) settings, but is not a config object
+  await until(() => orch.entries().some(e => e.type === "config-rejected"));
+  assert.equal(orch.entries().findLast(e => e.type === "config-rejected")!.error, "config.json must be a JSON object");
+  assert.equal(sections, 0);
+  await writeFile(path, JSON.stringify({ providers: { a: { slots: 1 } } }));
+  await until(() => config.providers?.a?.slots === 1);
+  assert.equal(sections, 1);
+});
+
+test("renderView shows slots and a rejected config even without workflows", () => {
+  assert.equal(renderView({ workflows: [], slots: ["a 0/1"], configRejected: "bad (1s ago); abc stay in effect" } as unknown as StatusView),
+    "No workflows\nslots: a 0/1\nconfig.json rejected: bad (1s ago); abc stay in effect");
+  assert.equal(renderView({ workflows: [] } as unknown as StatusView), "No workflows");
 });
 
 test("slotsView counts held provider slots against the limits in effect, without memory", async t => {

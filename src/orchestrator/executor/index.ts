@@ -312,12 +312,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   const stopped = (a: Active) => a.stopped || entriesFor(a.ticket.journal, a.ticket.callId).some(e => e.type === "stop-intent");
   const interrupted = (a: Active) => closed || a.suspended || a.retired || stopped(a);
-  async function acquire(a: Active, exec: string, models: Model[], pool?: string, continuation = false): Promise<Model | undefined> {
+  /** Wait for a slot. The candidates are decided again on every attempt, inside the serial section that also applies
+   *  config.json changes: a queued call follows a reloaded defaultModel, pool or limit, never a mix of two versions. */
+  async function acquire(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>): Promise<{ model?: Model; continuation: boolean }> {
+    let continuation = false;
     for (;;) {
       let signal!: () => void;
       const changed = new Promise<void>(resolve => { signal = resolve; waiters.add(resolve); });
       const chosen = await serial(async () => {
         if (interrupted(a) || await workflowReached(a.ticket)) return;
+        const decision = await decide(), models = decision.candidates, pool = decision.pool;
+        continuation = decision.continuation;
         for (const model of models) {
           if (!continuation && pool && skipped(pool, model)) continue;
           const provider = model.provider;
@@ -346,7 +351,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           return model;
         }
       });
-      if (chosen || interrupted(a) || reached(totalUsage(a.ticket.journal.entries()), a.ticket.workflowBudget)) { waiters.delete(signal); return chosen; }
+      if (chosen || interrupted(a) || reached(totalUsage(a.ticket.journal.entries()), a.ticket.workflowBudget)) { waiters.delete(signal); return { model: chosen, continuation }; }
       const timer = setTimeout(signal, config.k?.trackerMs ?? 1000);
       try { await changed; } finally { clearTimeout(timer); waiters.delete(signal); }
     }
@@ -469,13 +474,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await serial(() => journal.append(JT.exec, { exec, call: t.callId }));
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       if (await serial(() => workflowReached(t))) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", "workflow budget reached")); }
-      let decision: Awaited<ReturnType<typeof launchModel>>;
+      let decision: Awaited<ReturnType<typeof acquire>>;
       try {
-        decision = await launchModel(t, entries, previous);
+        decision = await acquire(a, exec, () => launchModel(t, entries, previous));
       } catch (error) {
         await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
       }
-      const model = await acquire(a, exec, decision.candidates, decision.pool, decision.continuation);
+      const model = decision.model;
       if (!model || interrupted(a)) {
         await fence(journal, exec, { park: a });
         return finish(journal, t.callId, exec, !interrupted(a) ? makeResult("failed", "", "workflow budget reached") : makeResult("stopped"));
@@ -539,6 +544,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     await (await outbox).send(envelope.to, envelope.kind, envelope.body, envelope.cond, { rid: String(e.rid2) });
   }
   return {
+    async reconfigure(apply) { await serial(apply); wake(); },
     run(ticket) {
       const existing = completed.get(ticket.callId); if (existing) return existing;
       if (closed || suspending) return Promise.reject(shutdownError());
