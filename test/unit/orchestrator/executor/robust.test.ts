@@ -62,6 +62,41 @@ async function within<T>(promise: Promise<T>, ms = 2000): Promise<T> {
   return Promise.race([promise, delay(ms).then(() => { throw new Error(`not settled within ${ms} ms`); })]);
 }
 
+test("settled quota errors seal failed without loss or relaunch", { timeout: 10000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a");
+  let launches = 0;
+  t.mock.method(f.containment, "spawn", async () => {
+    const exec = `${a.callId}#1.${++launches}`;
+    await f.session("a", [execLine(exec), { type: "message", message: { role: "assistant", stopReason: "error", errorMessage: "402 insufficient_quota" } }]);
+    const stdout = new PassThrough(), stderr = new PassThrough();
+    stdout.end('{"type":"agent_settled"}\n'); stderr.end();
+    return { pid: 0, start: "", stdin: new PassThrough(), stdout, stderr, exited: Promise.resolve({ code: 0, signal: null }) };
+  });
+  const result = await f.executor.run(a);
+  assert.equal(result.error, "Provider error: 402 insufficient_quota");
+  assert.equal(result.status, "failed"); assert.equal(launches, 1);
+  assert.equal(count(f.journal.entries(), e => e.type === "loss"), 0);
+  const sealed = f.journal.entries().find(e => e.type === JT.sealed)!;
+  assert.ok(f.journal.entries().some(e => e.type === JT.fenced && e.exec === sealed.exec && e.seq < sealed.seq));
+});
+
+test("nonfatal provider errors relaunch and include the clipped final error at loss bound", { timeout: 10000 }, async t => {
+  const f = await fixture(t, { k: { trackerMs: 20, lossBound: 2 } }), a = f.ticket("a");
+  let launches = 0;
+  const error = "529 overloaded " + "x".repeat(400);
+  t.mock.method(f.containment, "spawn", async () => {
+    const exec = `${a.callId}#1.${++launches}`;
+    await f.session("a", [execLine(exec), { type: "message", message: { role: "assistant", stopReason: "error", errorMessage: error } }]);
+    const stdout = new PassThrough(), stderr = new PassThrough();
+    stdout.end('{"type":"agent_settled"}\n'); stderr.end();
+    return { pid: 0, start: "", stdin: new PassThrough(), stdout, stderr, exited: Promise.resolve({ code: 0, signal: null }) };
+  });
+  const result = await f.executor.run(a);
+  assert.equal(result.error, `lost ×2; last error: ${error.slice(0, 300)}`);
+  assert.equal(result.status, "failed"); assert.equal(launches, 2);
+  assert.equal(count(f.journal.entries(), e => e.type === "loss"), 2);
+});
+
 test("F2 a failing sweep is logged and retried; it never poisons later dispatch", { timeout: 10000 }, async t => {
   const f = await fixture(t), old = f.ticket("old"), oldExec = `${old.callId}#1.1`;
   await f.journal.append(JT.exec, { call: old.callId, exec: oldExec }); await f.journal.append(JT.fenced, { exec: oldExec });

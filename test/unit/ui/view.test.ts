@@ -73,6 +73,13 @@ test("successful last call also reopens collapsed done rows without a new failur
   s.done.set("w", 0); assert.equal(render().filter(r => r.kind === "call").length, 0);
 });
 
+test("no-progress status retains the progress duration despite retry activity", () => {
+  const c = call("E07", { lastActivity: now }), w = workflow([c]);
+  w.attention = [{ id: `noprogress:${c.callId}`, rev: 1, kind: "stall", call: c.callId, wid: "w",
+    text: "w/E07: running but no progress for 10m (no output tokens or tool results); last provider error: 529 overloaded" }];
+  assert.equal(statusPhrase(c, w, undefined, now), "no progress for 10m");
+});
+
 test("ordinary status phrases, main line, questions and stalls", () => {
   const c = call("E07"), w = workflow([c]);
   assert.equal(mainLine([]), undefined); assert.equal(mainLine([w]), "1 working · 0/1+ done · ↓ subagents");
