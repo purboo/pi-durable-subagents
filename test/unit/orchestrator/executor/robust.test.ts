@@ -128,6 +128,8 @@ for (const sameOrigin of [true, false]) test(`shared worktree across workflows: 
   const send = await writingChildren(t, f), pa = f.executor.run(a), pb = f.executor.run(b);
   await send(a); await until(() => f.journal.entries().some(e => e.type === "wrote"));
   await send(b); await until(() => other.entries().some(e => e.type === JT.attention));
+  // Both reminders are appended in one section, the other workflow's first: wait for this one too.
+  if (!sameOrigin) await until(() => count(f.journal.entries(), e => e.type === JT.attention) === 1);
   assert.equal(count(f.journal.entries(), e => e.type === JT.attention), sameOrigin ? 0 : 1);
   const id = item(other.entries().find(e => e.type === JT.attention)!).id;
   const pending = Promise.allSettled([pa, pb]); await f.restart(); await pending;
@@ -169,6 +171,7 @@ test("shared worktree: a paused writer that has not ended still counts", { timeo
   await f.executor.suspend(); await pa.catch(() => {});
   const pb = f.executor.run(b); void pb.catch(() => {});
   await send(b); await until(() => count(f.journal.entries(), e => e.type === "wrote") === 2);
+  await until(() => f.journal.entries().some(e => e.type === JT.attention && item(e).kind === "conflict")); // appended after `wrote`
   const alerts = f.journal.entries().filter(e => e.type === JT.attention && item(e).kind === "conflict");
   assert.equal(alerts.length, 1); assert.equal(item(alerts[0]!).call, b.callId);
 });
