@@ -34,7 +34,18 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     const state: ViewState = { folded: new Set(), done: new Map(), viewed: new Set(), finished: false };
     let screen: SubagentScreen | undefined, opening = false, stopped = false, closeScreen: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined, timer: ReturnType<typeof setInterval> | undefined;
-    let dockRows: (width: number) => string[] = () => [], dockAt: "above" | "below" | undefined, dockTui: { requestRender(): void } | undefined, lastDock = "";
+    let dockRows: (width: number) => string[] = () => [], dockAt: "above" | "below" | undefined | null = null, dockTui: { requestRender(): void } | undefined, lastDock = "";
+    // ↓ opens the list only from pi's own input editor. Another surface — /model's selector, a dialog, another
+    // extension's overlay — has the focus instead, and its ↓ belongs to it. pi's editor (and any editor built on
+    // CustomEditor) carries the app action map; the TUI comes from the dock widget, so without a dock the check
+    // falls back to the editor text alone.
+    let keysTui: object | undefined;
+    const editorFocused = () => {
+      const focus = (keysTui as { getFocusedComponent?(): unknown } | undefined)?.getFocusedComponent;
+      if (typeof focus !== "function") return true;
+      const focused = focus.call(keysTui);
+      return !!focused && typeof focused === "object" && (focused as { actionHandlers?: unknown }).actionHandlers instanceof Map;
+    };
     const right = (text: string, width: number) => { const t = truncateToWidth(text, width); return " ".repeat(Math.max(0, width - visibleWidth(t))) + t; };
     const stop = () => {
       stopped = true; clearInterval(timer); unsubscribe?.(); screen?.dispose(); closeScreen?.(); openList = undefined;
@@ -59,8 +70,10 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
         const at = dock === "off" ? undefined : data.dockAt;
         if (at !== dockAt) {
           dockAt = at; dockTui = undefined;
-          ctx.ui.setWidget("durable-subagents", at ? (tui, theme) => {
-            dockTui = tui;
+          // With the dock off, an empty widget below the editor still lends the TUI to the ↓ focus check; pi adds no
+          // spacer for it, so it takes no line.
+          ctx.ui.setWidget("durable-subagents", !at ? tui => { keysTui = tui; return { invalidate() {}, render: () => [] }; } : (tui, theme) => {
+            dockTui = tui; keysTui = tui;
             return {
               invalidate() {},
               render(width) {
@@ -72,7 +85,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
                 return rows.map((row, i) => ` ${i === rows.length - 1 ? theme.fg("dim", right(row, inner)) : row.startsWith("? ") ? theme.fg("warning", row) : theme.fg("muted", row)}`);
               },
             };
-          } : undefined, { placement: at === "above" ? "aboveEditor" : "belowEditor" });
+          }, { placement: at === "above" ? "aboveEditor" : "belowEditor" });
         }
         const shown = dockRows(200).join("\n");
         if (shown !== lastDock) { lastDock = shown; dockTui?.requestRender(); }
@@ -94,7 +107,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
       };
       openList = open;
       unsubscribe = ctx.ui.onTerminalInput(key => {
-        if (stopped || opening || !matchesKey(key, "down") || ctx.ui.getEditorText() !== "" || !data.workflows.length) return;
+        if (stopped || opening || !matchesKey(key, "down") || ctx.ui.getEditorText() !== "" || !editorFocused() || !data.workflows.length) return;
         open();
         return { consume: true };
       });

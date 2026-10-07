@@ -11,7 +11,7 @@ import { publishRequest } from '../../../../src/kernel/mailbox.ts';
 import { orchInbox, orchLedger, orchLock, pinnedDir, journalPath } from '../../../../src/paths.ts';
 import { OsLock } from '../../../../src/platform/lock.ts';
 import { Engine } from '../../../../src/orchestrator/engine.ts';
-import { statusView, workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
+import { statusBrief, statusView, workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
 import { contentHash } from '../../../../src/kernel/ids.ts';
 import { main } from '../../../../src/orchestrator/main.ts';
 import { EvaluatorClient, type EvaluatorTransport } from '../../../../src/orchestrator/evaluator-client.ts';
@@ -600,6 +600,31 @@ test('durable drain lets an in-flight call finish, blocks the next dispatch and 
   assert.equal(ledgers.orch.entries().findLast(e => e.type === 'undrain')!.rid, 'control-2');
   assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 2);
   assert.equal(workflowSnapshot(home, wf.wid).status, 'done');
+});
+
+test('a follow-up on a finished workflow is live work: a drain holds it, status shows it, and resume releases it', async t => {
+  const { engine, home, run, ledgers } = await fixture(t);
+  const wf = await run(`return await runs.run('b', {agent:'test',task:'b'});`);
+  await until(() => wf.journal.entries().some(e => e.type === JT.done));
+  await submit(engine, home, 'drain', { fence: true }, 1);
+  const sent = await submit(engine, home, 'send', { to: `${wf.wid}/b`, kind: 'follow-up', message: 'more' }, 2);
+  assert.equal(decision(ledgers, sent)?.type, JT.applied);
+  await delay(50);
+  assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 1, 'held: the follow-up waits');
+  const held = workflowSnapshot(home, wf.wid);
+  assert.equal(held.status, 'done'); assert.equal(held.followUps, 1);
+  assert.ok(statusView(home).workflows.some(w => w.wid === wf.wid && w.paused && w.followUps === 1));
+  const brief = statusBrief(home, { origin: 'main:test' });
+  assert.deepEqual(brief.active.map(w => [w.wid, w.followUps, w.calls.map(c => c.key)]), [[wf.wid, 1, ['b']]]);
+  assert.equal(brief.finished.length, 0);
+  const resumed = await submit(engine, home, 'resume', {}, 3);
+  assert.equal(decision(ledgers, resumed)?.type, JT.applied, String(decision(ledgers, resumed)?.reason));
+  await until(() => wf.journal.entries().some(e => e.type === JT.sealed && e.call === `${wf.wid}@1/b@2`));
+  assert.equal(wf.journal.entries().filter(e => e.type === JT.done).length, 1, 'the workflow result stays');
+  const after = workflowSnapshot(home, wf.wid);
+  assert.equal(after.status, 'done'); assert.equal(after.followUps, undefined);
+  assert.ok(statusView(home).workflows.some(w => w.wid === wf.wid && !w.paused && !w.followUps));
+  assert.equal(statusBrief(home, { origin: 'main:test' }).active.length, 0);
 });
 
 test('drain without workflows idle-exits; the drain stays durable for the next orchestrator', async t => {

@@ -33,6 +33,8 @@ export interface CallSnapshot {
   sends?: CallSend[]; pending?: number;
   /** A model switch the child has not applied yet ("provider/id"): it takes effect when the current step ends. */
   switching?: string;
+  /** A follow-up still open on a finished workflow: live work although the workflow's status is final. */
+  afterEnd?: true;
 }
 export interface WorkflowSnapshot {
   wid: string; rev: number; name?: string; origin?: string; cwd?: string;
@@ -44,10 +46,23 @@ export interface WorkflowSnapshot {
   startedAt?: number; endedAt?: number;
   /** Drain: the orchestrator is drained (stop-all); queued calls start only after resume. */
   paused?: boolean;
+  /** Follow-ups still open on a finished workflow: its status stays final (its result does not change), but this work
+   *  runs, can be paused and shows as live — see `isLive`. */
+  followUps?: number;
   /** v12 §4: planned total — the tasks/chain length pinned at admission; scripts have none. */
   planned?: number;
   /** P31: every call ever charged to this workflow, across revisions (always set by snapshotFromEntries). */
   usage?: Usage;
+}
+
+/** A workflow has live work: it runs, or follow-ups opened on it after it finished have not ended yet. */
+export function isLive(wf: Pick<WorkflowSnapshot, "status" | "followUps">): boolean {
+  return wf.status === "running" || (wf.followUps ?? 0) > 0;
+}
+
+/** The calls of a workflow that are live work: every unfinished call of a running workflow, else open follow-ups. */
+export function liveCalls(wf: Pick<WorkflowSnapshot, "status" | "calls">): CallSnapshot[] {
+  return wf.calls.filter(c => c.phase !== "sealed" && (wf.status === "running" || c.afterEnd === true));
 }
 
 /** v12 §4: done/total of one workflow: `done` counts keys whose latest generation is sealed; `total` is the planned
@@ -107,6 +122,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
   const calls = new Map<string, CallSnapshot>();
   const byExec = new Map<string, CallSnapshot>();
   const resolved = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}@${e.rev}`));
+  const generations = new Set<string>(), retired = new Set<string>();
   const attention: AttentionItem[] = [];
   // P31: usage per call id, deduplicated by message id; a seal carries the authoritative total.
   const live = new Map<string, Usage>(), sealedUsage = new Map<string, Usage>(), seen = new Set<string>();
@@ -118,6 +134,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
       const key = String(e.key), gen = Number(e.gen) || (e.type === "refused" ? 0 : 1);
       const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;
+      if (e.type === "generation") generations.add(callId);
       const result = e.type === "refused" ? refusedResult(key, e.reason) :
         e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
       const wanted = (e.spec as { model?: unknown } | undefined)?.model;
@@ -126,6 +143,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
         ...(typeof wanted === "string" && wanted ? { model: wanted } : {}),
         phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),
         ...(e.type === "refused" ? { refused: String(e.reason) } : {}), ...(e.type === "reused" ? { reused: String(e.from) } : {}) });
+    } else if (e.type === "retired") { retired.add(String(e.call));
     } else if (e.type === JT.exec) {
       const call = calls.get(String(e.call)); if (!call) continue;
       // An execution waits for a provider slot and memory before it launches; it is running once `selected` says so
@@ -187,6 +205,9 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
       if (switching && switching !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = switching;
     }
   }
+  const after = done ? list.filter(c => generations.has(c.callId) && c.phase !== "sealed" && !retired.has(c.callId)) : [];
+  for (const c of after) c.afterEnd = true;
+  const followUps = after.length;
   const usage = zero();
   for (const id of new Set([...live.keys(), ...sealedUsage.keys()])) {
     const u = usageOf(id)!; usage.input += u.input; usage.output += u.output; usage.costUsd += u.costUsd;
@@ -197,6 +218,7 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
     status: done ? done.status as WorkflowSnapshot["status"] : "running",
     ...(done?.error ? { error: String(done.error) } : {}), ...(done && "result" in done ? { result: done.result } : {}),
     ...(done ? { endedAt: done.ts } : {}),
+    ...(followUps ? { followUps } : {}),
     calls: list, counts, attention, usage,
   };
 }
@@ -246,7 +268,7 @@ export function heldWorkflows(home: string): { since?: number; held: (wid: strin
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
 export function allWorkflows(home: string): WorkflowSnapshot[] {
   const { held } = heldWorkflows(home);
-  return workflowIds(home).sort().reverse().map(wid => { const wf = workflowSnapshot(home, wid); return wf.status === "running" && held(wid) ? { ...wf, paused: true } : wf; });
+  return workflowIds(home).sort().reverse().map(wid => { const wf = workflowSnapshot(home, wid); return isLive(wf) && held(wid) ? { ...wf, paused: true } : wf; });
 }
 
 /** P10/P11: Per-workflow script console log written by the orchestrator (bounded, human-readable). */
@@ -278,6 +300,8 @@ export interface StatusWorkflow {
   calls: StatusCall[]; attention: Pick<AttentionItem, "id" | "rev" | "kind" | "text" | "call" | "qid">[];
   /** Drain: held by stop-all/drain or a quit pi; `resume` continues it. */
   paused?: boolean;
+  /** Follow-ups still open on this finished workflow. */
+  followUps?: number;
 }
 export interface StatusView {
   workflows: StatusWorkflow[];
@@ -304,7 +328,7 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
-    ...(wf.paused ? { paused: true } : {}),
+    ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}),
   };
 }
 
@@ -322,7 +346,7 @@ function snapshots(home: string, origin?: string): { all: WorkflowSnapshot[]; si
   const { since, held } = heldWorkflows(home);
   const all = [...origins(home)].sort(([a], [b]) => a < b ? 1 : a > b ? -1 : 0).map(([wid, origin]) => {
     const wf = workflowSnapshot(home, wid), withOrigin = wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
-    return withOrigin.status === "running" && held(wid) ? { ...withOrigin, paused: true } : withOrigin;
+    return isLive(withOrigin) && held(wid) ? { ...withOrigin, paused: true } : withOrigin;
   }).sort((a, b) => own(b) - own(a));
   return { all, ...(since !== undefined ? { since } : {}) };
 }
@@ -332,7 +356,7 @@ export function statusView(home: string, options: { origin?: string; keep?: numb
   const keep = options.keep ?? 10;
   const { all, since } = snapshots(home, options.origin);
   let finished = 0;
-  const shown = all.filter(w => !["done", "failed", "stopped"].includes(w.status) || ++finished <= keep);
+  const shown = all.filter(w => !settled(w) || ++finished <= keep);
   const hidden = all.length - shown.length;
   const paused = all.filter(w => w.paused).length;
   return { workflows: shown.map(compactWorkflow), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
@@ -340,6 +364,8 @@ export function statusView(home: string, options: { origin?: string; keep?: numb
 }
 
 const FINAL = ["done", "failed", "stopped"];
+/** Finished with nothing left running (a follow-up on a finished workflow is live work). */
+const settled = (w: WorkflowSnapshot) => FINAL.includes(w.status) && !w.followUps;
 const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`;
 const tokens = (u?: Usage) => { const n = u ? u.input + u.output : 0; return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(n); };
 /** The latest generation of every key, in first-call order. */
@@ -354,6 +380,8 @@ export interface BriefCall {
 }
 export interface BriefWorkflow {
   wid: string; name?: string; status: WorkflowSnapshot["status"]; paused?: true;
+  /** Follow-ups still open on this finished workflow (its status stays final). */
+  followUps?: number;
   /** "done/total" of the current revision ("+" while a script may still add calls). */
   progress: string; tokens: string;
   /** Only the calls that need a look: not finished, or finished not ok. */
@@ -381,7 +409,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
   const mine = (w: WorkflowSnapshot) => !origin || w.origin === origin;
   const line = (w: WorkflowSnapshot) => {
     const p = progressOf(w), notOk = latestCalls(w).filter(c => c.result && !c.result.ok).length;
-    return [w.wid, w.name, `${w.paused ? "paused" : w.status}`, `${p.done}/${p.total}${p.plus ? "+" : ""} done`, notOk ? `${notOk} not ok` : "",
+    return [w.wid, w.name, `${w.paused ? "paused" : w.followUps ? `${w.status}, follow-up running` : w.status}`, `${p.done}/${p.total}${p.plus ? "+" : ""} done`, notOk ? `${notOk} not ok` : "",
       w.endedAt !== undefined ? `ended ${age(now - w.endedAt)} ago` : w.startedAt !== undefined ? `started ${age(now - w.startedAt)} ago` : ""].filter(Boolean).join(" · ");
   };
   const brief = (w: WorkflowSnapshot): BriefWorkflow => {
@@ -396,12 +424,12 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
     });
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}), question: clip(a.text, 300) }));
     const alerts = open.filter(a => a.kind !== "question").map(a => `${a.kind}${a.call ? ` ${w.wid}/${callKey(a.call)}` : ""}: ${clip(a.text, 200)}`);
-    return { wid: w.wid, ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.paused ? { paused: true as const } : {}),
+    return { wid: w.wid, ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.paused ? { paused: true as const } : {}), ...(w.followUps ? { followUps: w.followUps } : {}),
       progress: `${p.done}/${p.total}${p.plus ? "+" : ""}`, tokens: tokens(w.usage), calls,
       ...(asking.length ? { asking } : {}), ...(alerts.length ? { alerts } : {}) };
   };
-  const active = all.filter(w => !FINAL.includes(w.status));
-  const finished = all.filter(w => FINAL.includes(w.status) && mine(w));
+  const active = all.filter(w => !settled(w));
+  const finished = all.filter(w => settled(w) && mine(w));
   const others = active.filter(w => !mine(w));
   const heldMine = active.filter(w => mine(w) && w.paused).length, heldOthers = others.filter(w => w.paused);
   const paused = [heldMine ? `${heldMine} workflow${heldMine > 1 ? "s" : ""} of this session ${heldMine > 1 ? "are" : "is"} paused (stop-all, drain or a quit pi); resume continues ${heldMine > 1 ? "them" : "it"}` : "",
@@ -416,7 +444,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
 
 /** Running workflows of other sessions that a pause holds, as "wid" or "wid (name)": a session's own resume skips them. */
 export function pausedElsewhere(home: string, origin: string): string[] {
-  return snapshots(home, origin).all.filter(w => w.paused && w.origin !== origin && !FINAL.includes(w.status)).map(w => w.name ? `${w.wid} (${w.name})` : w.wid);
+  return snapshots(home, origin).all.filter(w => w.paused && w.origin !== origin && !settled(w)).map(w => w.name ? `${w.wid} (${w.name})` : w.wid);
 }
 /** "<rid>" or "<rid>/<rest>" of a run request that created a workflow → the same address with its wid; else unchanged.
  *  A run replies {submitted:{rid}} when its workflow is not created within 10 s, so the rid is all the caller has. */
