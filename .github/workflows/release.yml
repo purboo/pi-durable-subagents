@@ -25,10 +25,11 @@ jobs:
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
       - name: Stage on npm (a re-run skips a version that is already published or staged)
         run: |
-          if npm view "pi-durable-subagents@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "already published"; exit 0; fi
-          if npm stage list pi-durable-subagents 2>/dev/null | grep -q "${GITHUB_REF_NAME#v}"; then echo "already staged"; exit 0; fi
+          name="$(node -p "require('./package.json').name")"
+          if npm view "$name@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "already published"; exit 0; fi
+          if npm stage list "$name" 2>/dev/null | grep -q "${GITHUB_REF_NAME#v}"; then echo "already staged"; exit 0; fi
           npm stage publish --provenance --access public
-          echo "::notice::Staged pi-durable-subagents@${GITHUB_REF_NAME#v}; approve it on npmjs.com (or npm stage approve <id>) to publish."
+          echo "::notice::Staged $name@${GITHUB_REF_NAME#v}; approve it on npmjs.com (or npm stage approve <id>) to publish."
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: GitHub Release from the CHANGELOG

@@ -203,13 +203,13 @@ test('P1 start reuses the lock-checked detached starter', { timeout: 10000 }, as
 
 test('P1 install-service refuses an npx cache entry and recommends a global install', async t => {
   const home = await root(t), out: string[] = [];
-  const entry = join(home, '.npm/_npx/0123abcd/node_modules/pi-durable-subagents/dist/cli/main.js');
-  assert.match(serviceEntryError(entry)!, /npm i -g pi-durable-subagents/);
-  assert.equal(serviceEntryError('/usr/lib/node_modules/pi-durable-subagents/dist/cli/main.js'), undefined);
+  const entry = join(home, '.npm/_npx/0123abcd/node_modules/@purboo/pi-durable-subagents/dist/cli/main.js');
+  assert.match(serviceEntryError(entry)!, /npm i -g @purboo\/pi-durable-subagents/);
+  assert.equal(serviceEntryError('/usr/lib/node_modules/@purboo/pi-durable-subagents/dist/cli/main.js'), undefined);
   assert.equal(serviceEntryError('C:\\Users\\u\\AppData\\Local\\npm-cache\\_npx\\1\\main.js') !== undefined, true);
   const runner = async () => { throw new Error('must not run'); };
   assert.equal(await main(['install-service'], { env: { HOME: home, DSA_HOME: join(home, 'state') }, entry, serviceRunner: runner, write: s => out.push(s) }), 1);
-  assert.match(out.join('\n'), /npx cache.*npm i -g pi-durable-subagents/s);
+  assert.match(out.join('\n'), /npx cache.*npm i -g @purboo\/pi-durable-subagents/s);
   assert.deepEqual((await readdir(home)).filter(n => n !== '.npm'), []);
   assert.equal(await main(['uninstall-service', '--dry-run'], { env: { HOME: home, DSA_HOME: join(home, 'state') }, entry, serviceRunner: runner, write() {} }), 0);
 });

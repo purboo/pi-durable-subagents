@@ -12,7 +12,7 @@ const run = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: "utf8"
 try {
   run("npm", ["run", "build"], { cwd: repo });
   const tgz = run("npm", ["pack", "--pack-destination", root, "--silent"], { cwd: repo }).trim().split("\n").at(-1);
-  const pkg = join(root, "node_modules", "pi-durable-subagents");
+  const pkg = join(root, "node_modules", "@purboo", "pi-durable-subagents");
   mkdirSync(pkg, { recursive: true });
   run("tar", ["-xzf", join(root, tgz), "-C", pkg, "--strip-components=1"]);
   const files = run("tar", ["-tzf", join(root, tgz)]).trim().split("\n");
