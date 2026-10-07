@@ -10,7 +10,7 @@ before a crash is the one thing it cannot undo; see
 [What we do not promise](#what-we-do-not-promise)).
 
 ```text
-$ npx @purboo/pi-durable-subagents chaos
+$ npx pi-durable-subagents chaos
   killed host ×1 · dropped streams ×1 · empty replies ×6 · out-of-order steers ×1
   duplicate runs ........ 0
   lost results .......... 0
@@ -29,24 +29,17 @@ scratch.
 ## Install
 
 ```bash
-pi install npm:@purboo/pi-durable-subagents
+pi install npm:pi-durable-subagents
 # or straight from GitHub (no build step; runs the TypeScript sources)
 pi install git:github.com/purboo/pi-durable-subagents
 ```
-
-Versions up to 1.0.4 were published as the unscoped `pi-durable-subagents`;
-that name is retired. To move, replace `npm:pi-durable-subagents` with
-`npm:@purboo/pi-durable-subagents` in `packages` of `~/.pi/agent/settings.json`
-(and `npm i -g @purboo/pi-durable-subagents` if you installed the CLI). Nothing
-else changes: the command is still `pi-durable-subagents`, and workflows in
-`~/.pi/durable-subagents` carry over.
 
 This needs pi 1.0.x and Node.js 22.19 or later. It has been tested with
 pi 1.0.2 on Linux. The CI configuration covers Linux and macOS.
 
 The `pi-durable-subagents` command line (below) is optional. Run it without
-installing through `npx @purboo/pi-durable-subagents …`, or install it once with
-`npm i -g @purboo/pi-durable-subagents`. Use the global install if you want the
+installing through `npx pi-durable-subagents …`, or install it once with
+`npm i -g pi-durable-subagents`. Use the global install if you want the
 optional login service (`install-service`): a service must not point into
 the npx cache, so `install-service` refuses to run from there.
 
@@ -145,7 +138,7 @@ When the work ends it shrinks to one sentence and leaves after ten minutes. Set
 `"ui": { "dockAt": "below" }` puts it below the editor instead. pi stacks the
 lines above the editor in extension load order, so to keep the dock above
 another extension's editor bar (a powerline bar, for example), list
-`npm:@purboo/pi-durable-subagents` before that extension in `packages`.
+pi-durable-subagents before that extension in `packages`.
 
 Press `↓` on an empty editor, or type `/subagents`, to open the list, a floating panel: this
 session's workflows (sessions are independent), newest first, every
@@ -243,7 +236,7 @@ pi-durable-subagents uninstall-service
 ```
 
 The service only runs `start`: it never resumes work you drained or
-stopped. Install the CLI globally (`npm i -g @purboo/pi-durable-subagents`) before
+stopped. Install the CLI globally (`npm i -g pi-durable-subagents`) before
 `install-service`.
 
 ### Housekeeping
@@ -289,7 +282,7 @@ next to `pi-subagents` (tool `subagent`). To switch back:
 1. Optionally, run `pi-durable-subagents drain` (running work finishes) or
    `pi-durable-subagents stop-all` (pauses everything; resumable later).
 2. Optionally, run `pi-durable-subagents uninstall-service`.
-3. In `~/.pi/agent/settings.json`, replace `npm:@purboo/pi-durable-subagents` with
+3. In `~/.pi/agent/settings.json`, replace `npm:pi-durable-subagents` with
    `npm:pi-subagents` under `packages`. New sessions use it.
 
 Journals and pending questions stay on disk. If you install Durable
