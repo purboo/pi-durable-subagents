@@ -548,12 +548,17 @@ const ledgerStates = new Map<string, LedgerState>();
  *  its version is not the one this process loaded: running work stays on the version it started with. */
 export function orchestratorView(state: LedgerState, loaded = packageVersion()): { orchestrator?: string; versionNote?: string } {
   const o = state.orchestrator;
-  if (!o || o.exited || !alive(o.pid)) return {};
+  if (!o || o.exited || !alive(o.pid, o.start)) return {};
   return { orchestrator: `${o.version} (pid ${o.pid})`, ...(o.version === loaded ? {} : { versionNote: versionNote(o.version, loaded) }) };
 }
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+/** Whether the recorded orchestrator still runs. On Linux its start time also tells it from a later process given the
+ *  same pid after a crash (elsewhere the pid alone is checked). */
+function alive(pid: number, start?: string): boolean {
+  try { process.kill(pid, 0); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPERM") return false; }
+  if (!start || process.platform !== "linux") return true;
+  try { const stat = readFileSync(`/proc/${pid}/stat`, "utf8"); return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] === start; }
+  catch { return false; }
 }
 const parts = (v: string) => v.split(/[.-]/).map(n => Number.parseInt(n, 10) || 0);
 function newer(a: string, b: string): boolean {
@@ -565,8 +570,10 @@ export function versionNote(running: string, loaded: string): string {
   return newer(running, loaded)
     ? `this pi session loaded durable-subagents ${loaded}, older than the running orchestrator ${running}; start a new pi session to use ${running}`
     : `the orchestrator runs durable-subagents ${running}, this pi loaded ${loaded}: running work stays on ${running}. ` +
-      `It exits about 10 s after all work ends and starts again on ${loaded}; to switch sooner without stopping running calls, ` +
-      `drain (running calls finish, nothing new starts) and then resume. pi sessions started before the update start ${running} again`;
+      `It exits about 10 s after all work ends and starts again on ${loaded}. To switch sooner without stopping running calls: ` +
+      `drain (running calls finish, nothing new starts in existing workflows; calls waiting for an answer keep it running), ` +
+      `wait until status no longer shows ${running}, then resume from a pi session started after the update. ` +
+      `A resume before it exits keeps ${running}, and pi sessions started before the update start ${running} again`;
 }
 
 /** orchestratorView of the home's orchestrator ledger. */

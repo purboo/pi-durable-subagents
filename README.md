@@ -329,9 +329,18 @@ restarted under it. When the orchestrator runs another version than the one a
 pi session loaded, that pi says so once, and `status` shows the running
 version with a note. The orchestrator exits about 10 s after all work ends,
 and the next start runs the new version. To switch sooner without stopping
-running calls, `drain` (running calls finish, nothing new starts; a call
-waiting for your answer still counts as running) and then `resume`. A pi session started before the update still loads the old version;
-start a new one.
+running calls:
+
+1. `drain`: running calls finish and nothing new starts in existing
+   workflows. A call waiting for your answer still counts as running, and a
+   workflow started after the drain is not held.
+2. Wait until `status` no longer shows the old version (about 10 s after the
+   last call ends).
+3. `resume` from a pi session started after the update.
+
+A `resume` before the old orchestrator exits keeps it running the old
+version, and a pi session started before the update still starts the old
+version; start a new one.
 
 ## What we do not promise
 
