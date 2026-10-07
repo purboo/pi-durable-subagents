@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { callSession, orchInbox } from "../../paths.ts";
 import { scanInbox } from "../../kernel/mailbox.ts";
 import { CT, JT, type AttentionItem } from "../../types.ts";
+import { presentText } from "../../agent/main/snapshots.ts";
 import { rows, script, stack, until } from "./stack.ts";
 
 const tailOf = (path: string) => { try { return readFileSync(path, "utf8").slice(-600); } catch { return ""; } };
@@ -144,7 +145,7 @@ export async function scenario(n: number, root: string, env: NodeJS.ProcessEnv) 
       for (const item of message.details?.items ?? []) {
         const resolved = entries.some(e => e.type === JT.attentionResolved && e.id === item.id && e.rev === item.rev && e.ts <= observation.at) ||
           (item.session && rows(item.session).some(e => e.message?.toolName === "ask" && e.message.details?.qid === item.qid && e.message.details?.rev === item.rev && Date.parse(e.timestamp) <= observation.at));
-        check(!resolved || String(message.content).includes(`(resolved: ${item.text})`), `AC4 stale reminder ${item.id}@${item.rev}`);
+        check(!resolved || String(message.content).includes(`(resolved: ${presentText(item)})`), `AC4 stale reminder ${item.id}@${item.rev}`);
       }
     }
     return { scenario: n, passed: true, duplicateRuns: 0, lostResults: 0, restartedFromScratch: 0, wakes, presentations: attention.length, questions, evidence: root };

@@ -166,9 +166,10 @@ test("idle attention wakes once, survives restart, and status orders origin firs
   await prompt(resumed, [{ tool: "subagents", args: { action: "status" } }, { text: "done" }]);
   const entries = readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
   assert.equal(entries.filter(e => e.type === "custom_message" && e.customType === CT.attention).length, 1);
+  // The brief lists this session's work; another session's finished workflow is not this session's business.
   const view = result(resumed).result.details;
-  assert.deepEqual(view.workflows.map((w: { wid: string }) => w.wid), ["owned", "aaa-foreign"]);
-  assert.ok(view.workflows.every((w: object) => !("entries" in w)));
+  assert.deepEqual(view.active, []); assert.equal(view.finished.length, 1); assert.match(view.finished[0], /^owned · done · /);
+  assert.ok(!JSON.stringify(view).includes("aaa-foreign"));
   assert.equal(resumed.events.filter(e => e.type === "agent_start").length, 1);
 });
 
@@ -184,13 +185,13 @@ test("busy attention appends at turn_end and refreshes child and journal resolut
   writeFileSync(childSession, JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "ask", details: { qid: "q1", rev: 1 } } }) + "\n");
   await prompt(pi, [{ text: "refreshed" }]);
   let contexts = observed(pi).filter(e => e.kind === "context");
-  assert.ok(contexts.at(-1).value.some((m: any) => m.customType === CT.attention && m.content === "(resolved: Choose a branch)"));
+  assert.ok(contexts.at(-1).value.some((m: any) => m.customType === CT.attention && m.content === "(resolved: owned: Choose a branch)"));
   writeFileSync(childSession, "");
   await append(journalPath(home, "owned"), JT.attentionResolved, { id: "question", rev: 1, resolution: "answered" });
   await prompt(pi, [{ text: "journal refreshed" }]);
   contexts = observed(pi).filter(e => e.kind === "context");
-  assert.ok(contexts.at(-1).value.some((m: any) => m.customType === CT.attention && m.content === "(resolved: Choose a branch)"));
-  assert.equal(items(pi)[0].content, "Choose a branch");
+  assert.ok(contexts.at(-1).value.some((m: any) => m.customType === CT.attention && m.content === "(resolved: owned: Choose a branch)"));
+  assert.equal(items(pi)[0].content, "owned: Choose a branch"); // the agent reads which workflow asks
 });
 
 test("starter replays pending outbox at boot and notes never request continuation", { timeout: 30000 }, async t => {
@@ -241,11 +242,12 @@ test("T6/T10 real orchestrator: control actions report applied or the rejection 
   { const { rid, ...rest } = await decided(); assert.ok(rid); assert.deepEqual(rest, { applied: false, reason: "terminal:done" }); }
   await prompt(pi, [{ tool: "subagents", args: { action: "status" } }, { text: "done" }]);
   const view = result(pi).result.details;
-  assert.deepEqual(view.workflows.map((w: any) => [w.wid, w.name, w.status, w.origin]), [[wid, "probe", "done", sender]]);
-  assert.ok(!("entries" in view.workflows[0]) && view.workflows[0].usage);
-  await prompt(pi, [{ tool: "subagents", args: { action: "status", wid } }, { text: "done" }]);
+  assert.deepEqual(view.active, []); assert.equal(view.finished.length, 1); assert.match(view.finished[0], new RegExp(`^${wid} · probe · done · 0/0 done · ended `));
+  // The run's rid stands for its wid.
+  const runRid = String(readJournalSnapshot(orchLedger(home)).find(e => e.type === JT.created && e.wid === wid)!.rid);
+  await prompt(pi, [{ tool: "subagents", args: { action: "status", wid: runRid } }, { text: "done" }]);
   const detail = result(pi).result.details;
-  assert.equal(detail.result, 1); assert.ok(!("entries" in detail));
+  assert.equal(detail.wid, wid); assert.equal(detail.result, 1); assert.ok(!("entries" in detail));
   assert.match(readFileSync(detail.scriptLog, "utf8"), /ev=1 log: from script 7\n/);
   // Every resolved control request is retired from the session outbox (a reply that came back as submitted is
   // retired by the session's next reconcile, so wait for it).

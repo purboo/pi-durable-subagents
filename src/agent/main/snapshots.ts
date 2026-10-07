@@ -74,6 +74,14 @@ export function attention(home: string, sender: string, seen: { id: string; rev:
   return items;
 }
 
+/** What the main agent reads for an attention item: the text, addressed. A question's own text named neither the asking
+ *  call nor how to answer it, so answers went out as steers or to the wrong id. */
+export function presentText(item: AttentionItem): string {
+  const call = item.call ? item.call.replace(/@\d+\/([^@/]+)@\d+$/, "/$1") : undefined, where = call ?? item.wid;
+  if (item.kind === "question" && call) return `Question from ${call}${item.qid ? ` (qid ${item.qid})` : ""}; reply with send kind:"answer" to:"${call}": ${item.text}`;
+  return item.text.includes(item.wid) ? item.text : `${where}: ${item.text}`;
+}
+
 /** P15: Refresh a question against durable workflow and child receipts at request time. */
 export function resolved(home: string, item: AttentionItem): boolean {
   if (readJournalSnapshot(journalPath(home, item.wid)).some(e => e.type === JT.attentionResolved && e.id === item.id && e.rev === item.rev)) return true;

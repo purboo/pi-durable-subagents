@@ -5,6 +5,8 @@ type Spec = Record<string, unknown>;
 const isObject = (v: unknown): v is Spec => v !== null && typeof v === "object" && !Array.isArray(v);
 const positive = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
 const text = (v: unknown) => typeof v === "string" && v.trim() !== "";
+/** The received value, clipped, so a rejected field says what was sent (e.g. a number sent as a string). */
+const got = (v: unknown) => { const s = typeof v === "number" ? String(v) : JSON.stringify(v) ?? String(v); return ` (got ${s.length > 60 ? `${s.slice(0, 60)}…` : s})`; };
 const unknown = (value: Spec, known: readonly string[], prefix = "") =>
   Object.keys(value).filter(k => value[k] !== undefined && !known.includes(k)).map(k => `unknown field "${prefix}${k}"`);
 
@@ -15,14 +17,14 @@ function gate(value: unknown): string[] {
   if (!text(value.command)) errors.push("gate.command must be a non-empty string");
   if (value.output !== undefined && value.output !== "json") errors.push('gate.output must be "json"');
   if (value.schema !== undefined) errors.push(...schemaProblems(value.schema, "gate.schema"));
-  if (value.timeoutMs !== undefined && !positive(value.timeoutMs)) errors.push("gate.timeoutMs must be a positive number");
+  if (value.timeoutMs !== undefined && !positive(value.timeoutMs)) errors.push(`gate.timeoutMs must be a positive number${got(value.timeoutMs)}`);
   return errors;
 }
 function budget(value: unknown): string[] {
   if (!isObject(value)) return ["budget must be an object {tokens?, costUsd?}"];
   const errors = unknown(value, ["tokens", "costUsd"], "budget.");
   if (value.tokens === undefined && value.costUsd === undefined) errors.push("budget needs tokens or costUsd");
-  for (const k of ["tokens", "costUsd"]) if (value[k] !== undefined && !positive(value[k])) errors.push(`budget.${k} must be a positive number`);
+  for (const k of ["tokens", "costUsd"]) if (value[k] !== undefined && !positive(value[k])) errors.push(`budget.${k} must be a positive number${got(value[k])}`);
   return errors;
 }
 
@@ -35,17 +37,17 @@ export function validateCallSpec(spec: unknown, options: { fanout?: boolean } = 
     if (!fields.has(k)) errors.push(`unknown field "${k}"`);
     else if (k === "key" && !options.fanout) errors.push("key is only allowed in tasks/chain steps");
   }
-  if (!text(s.agent)) errors.push("agent must be a non-empty string");
+  if (!text(s.agent)) errors.push(`agent must be a non-empty string${has("agent") ? got(s.agent) : ""}`);
   if (!text(s.task)) errors.push("task must be a non-empty string");
-  for (const k of ["model", "cwd", "output"]) if (has(k) && typeof s[k] !== "string") errors.push(`${k} must be a string`);
-  if (has("timeoutMs") && !positive(s.timeoutMs)) errors.push("timeoutMs must be a positive number");
+  for (const k of ["model", "cwd", "output"]) if (has(k) && typeof s[k] !== "string") errors.push(`${k} must be a string${got(s[k])}`);
+  if (has("timeoutMs") && !positive(s.timeoutMs)) errors.push(`timeoutMs must be a positive number (milliseconds)${got(s.timeoutMs)}`);
   if (has("schema")) errors.push(...schemaProblems(s.schema, "schema"));
   if (has("gate")) errors.push(...gate(s.gate));
-  if (has("isolation") && s.isolation !== "none" && s.isolation !== "worktree") errors.push('isolation must be "none" or "worktree"');
-  if (has("context") && s.context !== "fresh" && s.context !== "fork") errors.push('context must be "fresh" or "fork"');
+  if (has("isolation") && s.isolation !== "none" && s.isolation !== "worktree") errors.push(`isolation must be "none" or "worktree"${got(s.isolation)}`);
+  if (has("context") && s.context !== "fresh" && s.context !== "fork") errors.push(`context must be "fresh" or "fork"${got(s.context)}`);
   if (has("budget")) errors.push(...budget(s.budget));
-  if (has("once") && typeof s.once !== "boolean") errors.push("once must be a boolean");
-  for (const k of ["tools", "skills"]) if (has(k) && (!Array.isArray(s[k]) || !(s[k] as unknown[]).every(v => typeof v === "string"))) errors.push(`${k} must be an array of strings`);
+  if (has("once") && typeof s.once !== "boolean") errors.push(`once must be a boolean${got(s.once)}`);
+  for (const k of ["tools", "skills"]) if (has(k) && (!Array.isArray(s[k]) || !(s[k] as unknown[]).every(v => typeof v === "string"))) errors.push(`${k} must be an array of strings${got(s[k])}`);
   if (options.fanout && has("key") && !text(s.key)) errors.push("key must be a non-empty string");
   return errors;
 }

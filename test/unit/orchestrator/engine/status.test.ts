@@ -8,7 +8,7 @@ import { openJournal } from '../../../../src/kernel/journal.ts';
 import { journalPath, orchLedger, pinnedDir } from '../../../../src/paths.ts';
 import { compileFanout } from '../../../../src/compat/fanout.ts';
 import { finishedText } from '../../../../src/orchestrator/engine.ts';
-import { compactWorkflow, eventsFromEntries, plannedFromScript, progressOf, renderEvent, snapshotFromEntries, statusDetail, statusView, workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
+import { compactWorkflow, eventsFromEntries, plannedFromScript, progressOf, renderEvent, snapshotFromEntries, pausedElsewhere, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid, workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
 import { JT, type Entry } from '../../../../src/types.ts';
 
 const e = (seq: number, type: string, f: Record<string, unknown> = {}) => ({ seq, ts: 1_700_000_000_000 + seq, type, ...f }) as Entry;
@@ -228,4 +228,75 @@ test('drain: work a drain holds is not pending for the starters (no start/idle-e
   await orch.append(JT.created, { rid: 'r2', wid: 'W2' });
   const j2 = await openJournal(journalPath(home, 'W2')); await j2.append('wf-created', { rid: 'r2' }); await j2.close();
   assert.equal(unfinishedWorkflow(home), true); await orch.close();
+});
+
+test('tool status: brief lists only what runs, asks or failed; one line per finished workflow; details clip outputs', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-brief-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const ledger = await openJournal(orchLedger(home));
+  const write = async (wid: string, origin: string, list: Entry[]) => {
+    await ledger.append(JT.created, { rid: `r-${wid}`, wid, origin });
+    const journal = await openJournal(journalPath(home, wid));
+    for (const { seq: _s, ts: _t, type, ...fields } of list) await journal.append(type, fields);
+    await journal.close();
+  };
+  const big = `${'y'.repeat(5000)}\nend`;
+  for (let i = 0; i < 8; i++) await write(`01F${i}`, 'main:me', [e(1, 'wf-created', { revision: 1, origin: 'main:me' }),
+    e(2, 'call', { key: 'k', gen: 1, spec: { agent: 'x' } }), e(3, 'sealed', { call: `01F${i}@1/k@1`, result: res('k', 'ok', { output: big }) }), e(4, 'workflow-done', { status: 'done' })]);
+  await write('01R', 'main:me', [e(1, 'wf-created', { revision: 1, origin: 'main:me', name: 'wave' }),
+    e(2, 'call', { key: 'done', gen: 1, spec: { agent: 'x' } }), e(3, 'sealed', { call: '01R@1/done@1', result: res('done', 'ok', { output: big, usage: u(9, 1, 0) }) }),
+    e(4, 'call', { key: 'bad', gen: 1, spec: { agent: 'x' } }), e(5, 'sealed', { call: '01R@1/bad@1', result: res('bad', 'failed', { error: 'Provider error: quota' }) }),
+    e(6, 'call', { key: 'run', gen: 1, spec: { agent: 'w' } }), e(7, 'exec', { call: '01R@1/run@1', exec: '01R@1/run@1#1.1' }),
+    e(8, 'selected', { exec: '01R@1/run@1#1.1', model: { provider: 'p', id: 'm' } }),
+    e(9, 'call', { key: 'ask', gen: 1, spec: { agent: 'w' } }), e(10, 'exec', { call: '01R@1/ask@1', exec: '01R@1/ask@1#1.1' }),
+    e(11, JT.attention, { item: { id: 'q:01R@1/ask@1:Q1', rev: 1, kind: 'question', text: 'Which base?', wid: '01R', call: '01R@1/ask@1', qid: 'Q1' } }),
+    e(12, JT.attention, { item: { id: 'noprogress:01R@1/run@1', rev: 1, kind: 'stall', text: '01R/run: running but no progress for 10m', wid: '01R', call: '01R@1/run@1' } })]);
+  await write('01O', 'main:other', [e(1, 'wf-created', { revision: 1, origin: 'main:other' }), e(2, 'call', { key: 'k', gen: 1, spec: { agent: 'x' } })]);
+  await ledger.close();
+  const now = Date.now() + 15 * 60_000; // journal.append stamps entries with the real clock
+  const brief = statusBrief(home, { origin: 'main:me', now });
+  assert.deepEqual(brief.active, [{ wid: '01R', name: 'wave', status: 'running', progress: '2/4+', tokens: '10',
+    calls: [
+      { key: 'bad', agent: 'x', phase: 'sealed', status: 'failed', error: 'Provider error: quota' },
+      { key: 'run', agent: 'w', phase: 'running', model: 'p/m', for: '15m', quiet: '15m', tokens: '0' },
+      { key: 'ask', agent: 'w', phase: 'asking', for: '15m', tokens: '0' }],
+    asking: [{ to: '01R/ask', qid: 'Q1', question: 'Which base?' }],
+    alerts: ['stall 01R/run: 01R/run: running but no progress for 10m'] }]);
+  assert.equal(brief.otherSessions?.length, 1); assert.match(brief.otherSessions![0]!, /^01O · running · 0\/1\+ done · started 15m ago$/);
+  assert.equal(brief.finished.length, 5); assert.equal(brief.olderFinished, 3);
+  assert.match(brief.finished[0]!, /^01F7 · done · 1\/1 done · ended /);
+  assert.ok(JSON.stringify(brief).length < 2000, 'no outputs in the brief');
+  const compact = statusCompactDetail(home, '01R');
+  const done = compact.calls.find(c => c.key === 'done')!;
+  assert.equal(done.output, `${'y'.repeat(600)}… [${big.length - 600} more chars: status wid key=done]`);
+  assert.ok(JSON.stringify(compact).length < 4000);
+  assert.equal(statusCallDetail(home, '01R', 'done').result!.output, big);
+  assert.equal(statusDetail(home, '01R').calls.find(c => c.key === 'done')!.result!.output, big);
+  assert.throws(() => statusCallDetail(home, '01R', 'nope'), /No call "nope" in 01R; calls: done, bad, run, ask/);
+});
+
+test('tool status: paused workflows of this session and of other sessions are told apart', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-brief-held-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const ledger = await openJournal(orchLedger(home));
+  for (const [wid, origin] of [['01A', 'main:me'], ['01B', 'main:other']] as const) {
+    await ledger.append(JT.created, { rid: `r-${wid}`, wid, origin });
+    const journal = await openJournal(journalPath(home, wid));
+    await journal.append('wf-created', { revision: 1, origin }); await journal.close();
+  }
+  await ledger.append('drain', { rid: 'd1', origin: 'main:other', fence: true });
+  assert.equal(statusBrief(home, { origin: 'main:me' }).paused, '1 workflow of other sessions paused (01B); resume wid=<wid> continues one');
+  assert.deepEqual(pausedElsewhere(home, 'main:me'), ['01B']); assert.deepEqual(pausedElsewhere(home, 'main:other'), []);
+  await ledger.append('drain', { rid: 'd2', origin: 'main:me', fence: true });
+  await ledger.close();
+  assert.equal(statusBrief(home, { origin: 'main:me' }).paused,
+    "1 workflow of this session is paused (stop-all, drain or a quit pi); resume continues it; 1 workflow of other sessions paused (01B); resume wid=<wid> continues one");
+});
+
+test('a run rid stands for its wid once the workflow exists; other values pass through', () => {
+  const ledger = [e(1, JT.created, { rid: 'main:s:7', wid: '01W' })];
+  assert.equal(widOfRid(ledger, 'main:s:7'), '01W');
+  assert.equal(widOfRid(ledger, 'main:s:7/review'), '01W/review');
+  assert.equal(widOfRid(ledger, '01W/review'), '01W/review');
+  assert.equal(widOfRid(ledger, 'main:s:8'), 'main:s:8');
 });

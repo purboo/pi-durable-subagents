@@ -11,8 +11,8 @@ import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type RunBody } from "../types.ts";
-import { attention, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
-import { statusDetail, statusView } from "../orchestrator/snapshot.ts";
+import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
+import { pausedElsewhere, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
 import { parameters, request } from "./main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
 
@@ -62,13 +62,14 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     for (const rid of decisions().keys()) await outbox?.markResolved(rid);
     for (const entry of ledger()) if (entry.type === JT.created) await outbox?.markResolved(String(entry.rid));
   }
-  function pendingOutbox() {
+  function pendingOutbox() { return pendingRids().size > 0; }
+  function pendingRids() {
     const pending = new Set<string>();
     for (const entry of readJournalSnapshot(join(outboxRoot(home), "outbox", `${sender}.jsonl`))) {
       if (entry.type === "sent") pending.add((entry.request as { rid: string }).rid);
       else if (entry.type === "resolved") pending.delete(String(entry.rid));
     }
-    return pending.size > 0;
+    return pending;
   }
   async function starter(submitting = false) {
     if (stopped) return;
@@ -86,7 +87,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   }
   function collect() { return ctx ? attention(home, sender, [...presented(ctx), ...reserved]) : []; }
   function message(items: AttentionItem[]): CustomMessageEntryDraft {
-    return { type: "custom_message", customType: CT.attention, content: items.map(i => i.text).join("\n"), display: true, details: { items } };
+    return { type: "custom_message", customType: CT.attention, content: items.map(presentText).join("\n"), display: true, details: { items } };
   }
   async function idle() {
     if (stopped || !ctx?.isIdle()) return;
@@ -150,7 +151,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (msg.role !== "custom" || msg.customType !== CT.attention) return msg;
     const items = (msg.details as { items?: AttentionItem[] } | undefined)?.items;
     if (!items) return msg;
-    return { ...msg, content: items.map(item => resolved(home, item) ? `(resolved: ${item.text})` : item.text).join("\n") };
+    return { ...msg, content: items.map(item => resolved(home, item) ? `(resolved: ${presentText(item)})` : presentText(item)).join("\n") };
   }) }));
   /** P25, P38, T6, T10: One durable submission path for the tool and the UI; replies say what happened when known within 10 s. */
   /** v12 §2, §6: An answer finds its open question (qid, rev and target) from whatever the caller gave; a send without a
@@ -174,8 +175,31 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     }
     return args;
   }
+  /** "<rid>" or "<rid>/<key>" of a created run → the same address with its wid; anything else is unchanged. */
+  function ridToWid(value: string): string { return widOfRid(ledger(), value); }
+  /** A run request without a workflow yet (still pending, or rejected), asked about by its rid. */
+  function pendingRun(rid: string): unknown {
+    const decision = decisions().get(rid);
+    if (decision?.type === "rejected") throw new Error(`${rid} is a run request that was rejected: ${decision.reason}`);
+    if (pendingRids().has(rid)) return { submitted: { rid }, state: "pending: no workflow yet; its wid arrives with the next notice" };
+    return undefined;
+  }
+  /** A session's resume found nothing of its own: name the workflows other sessions hold, which need resume wid=<wid>. */
+  function resumeElsewhere(reason: string): string {
+    if (reason !== "nothing-to-resume") return reason;
+    const others = pausedElsewhere(home, sender);
+    return others.length ? `nothing-to-resume: nothing of this session is paused; paused in other sessions: ${others.slice(0, 8).join(", ")} — resume wid=<wid> continues one` : reason;
+  }
   async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal, wait = true): Promise<unknown> {
-    if (args.action === "status") return typeof args.wid === "string" && args.wid ? statusDetail(home, args.wid) : statusView(home, { origin: sender });
+    // A run answers {submitted:{rid}} when its workflow is not created within 10 s; that rid then stands for the wid.
+    for (const field of ["wid", "to", "target"]) if (typeof args[field] === "string") args = { ...args, [field]: ridToWid(args[field] as string) };
+    if (args.action === "status") {
+      if (typeof args.wid !== "string" || !args.wid) return statusBrief(home, { origin: sender });
+      const pending = pendingRun(args.wid);
+      if (pending) return pending;
+      if (typeof args.key === "string" && args.key) return statusCallDetail(home, args.wid, args.key);
+      return args.full === true ? statusDetail(home, args.wid) : statusCompactDetail(home, args.wid);
+    }
     if (args.action === "agents") return agentsAt(cwd).map(({ name, description, model, source }) =>
       ({ name, description, ...(model === undefined ? {} : { model }), source }));
     // A send addressed like a stop (target:) means the same call; the field name is not worth a failed round trip.
@@ -216,7 +240,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
         await serial(async () => { await outbox?.markResolved(sent.rid); });
         if (receipt) return { wid: receipt.wid };
         // The rid is returned so a later send can supersede this one (replaces: [rid]).
-        if (decision!.type === "rejected") return { applied: false, reason: decision!.reason, rid: sent.rid };
+        if (decision!.type === "rejected") return { applied: false, reason: sent.kind === "resume" && args.wid === undefined ? resumeElsewhere(String(decision!.reason)) : decision!.reason, rid: sent.rid };
         if (sent.kind !== "run") return { applied: true, rid: sent.rid };
       }
       if (performance.now() >= deadline || signal?.aborted) break;
@@ -233,10 +257,10 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   pi.registerTool(defineTool({
     name: "subagents", label: "Subagents", description: [
       "Durable asynchronous subagents; run returns {wid} when created (or {submitted:{rid}} while pending). A finished workflow (its notice carries every agent's result) or a question wakes you, so after starting work end your turn: never poll with sleep or repeated status. Crash recovery resumes sessions, not external side effects. Background helper processes (orchestrator, evaluator) exit by themselves about 10 s after all work ends: never kill processes or delete files to 'clean up'. When the user quits pi, this session's running workflows pause (nothing is spent); resume continues them.",
-      "run (action optional for exactly one launch form): agent+task; tasks:[call specs] parallel; chain:[call specs] sequential ({previous}); workflow:'./script.js' or source (runs.run(key,spec), runs.all([...]), emit(value), args, runs.input(name)). Optional name, model, cwd, timeoutMs, usageBudget, maxCalls, inputs. Explicit unknown agents are rejected BEFORE creation, with available names; unknown script agents fail only their call.",
+      "run (action optional for exactly one launch form): agent+task; tasks:[call specs] parallel; chain:[call specs] sequential ({previous}); workflow:'./script.js' or source (runs.run(key,spec), runs.all([...]), emit(value), args, runs.input(name)). Optional name, cwd, usageBudget, maxCalls, inputs. With tasks/chain, top-level model, timeoutMs, budget, isolation, context, tools, skills, once are defaults for every step (a step's own value wins); a workflow/source script sets them per runs.run call. timeoutMs is milliseconds of active time (a number); omit it unless a hard limit is needed. Explicit unknown agents are rejected BEFORE creation, with available names; unknown script agents fail only their call.",
       "agents: list names, descriptions, default models and source for this cwd; use these names for run.",
-      "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn. answer: give the qid (or just the call, or nothing when one question is open); to and rev are filled in. A question that needs the user's decision goes to the user; if you answer one yourself, tell the user what you chose. model switches at next provider request. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
-      "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); a sealed call → already-sealed:<status>, a finished workflow → terminal:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. status [wid] gives a digest. revise wid + workflow/source/args starts a revision.",
+      "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); a steer to a call waiting on its question interrupts the question and the subagent usually asks again — use answer to answer it; sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn. answer: give the qid (or just the call, or nothing when one question is open); to and rev are filled in. A question that needs the user's decision goes to the user; if you answer one yourself, tell the user what you chose. model switches at next provider request. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
+      "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); a sealed call → already-sealed:<status>, a finished workflow → terminal:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. status: without wid, what runs, asks (with its answer address) or failed, finished workflows one line each; wid: one workflow, outputs clipped; wid+key: one call's full result; full:true: everything. A run's rid from {submitted:{rid}} works wherever a wid is expected. revise wid + workflow/source/args starts a revision.",
       "Control replies are {applied:true,rid} or {applied:false,reason,rid} when decided; otherwise {submitted:{rid}} after 10s.",
       ...(agents ? [`Available agents: ${agents}.`] : []),
       "User sees a summary line above the editor; ↓ on an empty editor (or /subagents) opens the list, Enter watches live OR finished calls (finished transcripts remain on disk) and expands finished workflows. List keys: s steer (paste-capable input), x stop (confirm y), m model, a answer when asked, f follow-up on finished calls; action feedback appears in footer.",

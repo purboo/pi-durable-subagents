@@ -6,7 +6,7 @@ import { tempRoot } from "../../harness/pi.ts";
 import { openJournal } from "../../../src/kernel/journal.ts";
 import { journalPath, orchLedger } from "../../../src/paths.ts";
 import { CT, JT } from "../../../src/types.ts";
-import { attention, presented } from "../../../src/agent/main/snapshots.ts";
+import { attention, presentText, presented } from "../../../src/agent/main/snapshots.ts";
 import { workflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
 import { registerCards } from "../../../src/ui/cards.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -67,4 +67,12 @@ test("attention cards reuse their lines per width and redraw once a question is 
   } finally { Date.now = original; }
   const note = renderers.get(CT.note)!({ content: "stop" }, { expanded: false }, theme)!;
   assert.equal(note.render(60), note.render(60)); note.invalidate(); assert.match(note.render(60).join("\n"), /stop/);
+});
+
+test("the main agent reads each attention item with its address; a question says how to answer it", () => {
+  assert.equal(presentText({ id: "q", rev: 1, kind: "question", text: "Which base?", wid: "01W", call: "01W@2/review@3", qid: "Q1" }),
+    'Question from 01W/review (qid Q1); reply with send kind:"answer" to:"01W/review": Which base?');
+  assert.equal(presentText({ id: "s", rev: 1, kind: "stall", text: "No execution activity", wid: "01W", call: "01W@1/a@1" }), "01W/a: No execution activity");
+  assert.equal(presentText({ id: "f", rev: 1, kind: "finished", text: "Workflow 01W finished: done", wid: "01W" }), "Workflow 01W finished: done");
+  assert.equal(presentText({ id: "b", rev: 1, kind: "budget", text: "Workflow budget reached", wid: "01W" }), "01W: Workflow budget reached");
 });
