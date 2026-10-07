@@ -114,17 +114,16 @@ function callKey(call: unknown): string {
 export function refusedResult(key: string, reason: unknown): CallResult {
   return { key, gen: 0, status: "failed", ok: false, error: reason === "spawn-budget" ? "spawn budget exceeded" : String(reason), output: "" };
 }
-export function snapshotFromEntries(wid: string, entries: readonly Entry[]): WorkflowSnapshot {
+function snapshotReducer(wid: string, entries: readonly Entry[]) {
   const created = entries.find(e => e.type === "wf-created");
   const rev = Math.max(1, ...entries.filter(e => e.type === "wf-created" || e.type === "revised").map(e => Number(e.revision) || 1));
   const boundary = entries.findLastIndex(e => e.type === "revised");
   const current = entries.slice(Math.max(0, boundary));
-  const terminal = current.findLast(e => e.type === JT.done || (e.type === "resumed" && !e.call));
-  const done = terminal?.type === JT.done ? terminal : undefined;
+  let terminal = current.findLast(e => e.type === JT.done || (e.type === "resumed" && !e.call));
   const calls = new Map<string, CallSnapshot>();
   const byExec = new Map<string, CallSnapshot>();
   const hibernating = new Map<string, string>(); // callId → exec that decided to hibernate and is not fenced yet
-  const resolved = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}@${e.rev}`));
+  const resolved = new Set<string>();
   const generations = new Set<string>(), retired = new Set<string>();
   const attention: AttentionItem[] = [];
   // P31: usage per call id, deduplicated by message id; a seal carries the authoritative total.
@@ -132,116 +131,153 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
   const tools = new Map<string, number>();
   // P7, P27: forward / forward-delivered / forward-retired, by destination call; retirements carry only rid2.
   const sends = new Map<string, CallSend[]>(), byRid2 = new Map<string, CallSend>();
-  for (const e of entries) {
-    if (["call", "generation", "refused", "reused"].includes(e.type)) {
-      if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
-      const key = String(e.key), gen = Number(e.gen) || (e.type === "refused" ? 0 : 1);
-      const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;
-      if (e.type === "generation") generations.add(callId);
-      const result = e.type === "refused" ? refusedResult(key, e.reason) :
-        e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
-      const wanted = (e.spec as { model?: unknown } | undefined)?.model;
-      calls.set(callId, { key, gen, callId, pos: Number(e.pos), agent: String((e.spec as { agent?: string } | undefined)?.agent ?? ""),
-        // Until a slot is acquired (`selected`), show the model the call asked for, not nothing.
-        ...(typeof wanted === "string" && wanted ? { model: wanted } : {}),
-        phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),
-        ...(e.type === "refused" ? { refused: String(e.reason) } : {}), ...(e.type === "reused" ? { reused: String(e.from) } : {}) });
-    } else if (e.type === "retired") { retired.add(String(e.call));
-    } else if (e.type === JT.exec) {
-      const call = calls.get(String(e.call)); if (!call) continue;
-      // An execution waits for a provider slot and memory before it launches; it is running once `selected` says so
-      // (otherwise a call still waiting for a slot reads "thinking · 2m").
-      call.exec = String(e.exec); call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
-      delete call.hibernated; hibernating.delete(call.callId);
-    } else if (e.type === "hibernated") {
-      // The decision to hibernate precedes the fence; the slot is released only once the execution is fenced.
-      const call = calls.get(String(e.call)); if (call?.exec && call.exec === e.exec) hibernating.set(call.callId, call.exec);
-    } else if (e.type === "answer-bound" || (e.type === "resumed" && e.call)) {
-      const call = calls.get(String(e.call)); if (call) { delete call.hibernated; hibernating.delete(call.callId); }
-    } else if (e.type === JT.fenced) {
-      // A fenced execution without a seal (stop-all, a quit pi, a loss before its continuation) waits to run again.
-      const call = byExec.get(String(e.exec)); if (call && call.phase === "running") call.phase = "queued";
-      if (call && hibernating.get(call.callId) === e.exec) call.hibernated = true;
-    } else if (e.type === "selected") {
-      const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
-      if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
-      if (call && call.phase === "queued") call.phase = "running";
-    } else if (e.type === "observation") {
-      // Only what the agent did counts as activity; tracker scans and time checkpoints are bookkeeping.
-      const call = byExec.get(String(e.exec)); if (call) call.lastActivity = e.ts;
-      if (call && e.type === "observation" && (e.event as { type?: string } | undefined)?.type === "tool_execution_start") tools.set(call.callId, (tools.get(call.callId) ?? 0) + 1);
-    } else if (e.type === "usage") {
-      const id = `${e.call}:${e.id}`, u = e.usage as Usage | undefined;
-      if (seen.has(id) || !u) continue;
-      seen.add(id);
-      const total = live.get(String(e.call)) ?? zero();
-      total.input += u.input; total.output += u.output; total.costUsd += u.costUsd; live.set(String(e.call), total);
-    } else if (e.type === JT.sealed) {
-      const usage = (e.result as CallResult | undefined)?.usage;
-      if (usage) sealedUsage.set(String(e.call), usage);
-      const call = calls.get(String(e.call)); if (!call) continue;
-      call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated; hibernating.delete(call.callId);
-    } else if (e.type === JT.attention) {
-      const item = e.item as AttentionItem;
-      if (!resolved.has(`${item.id}@${item.rev}`)) attention.push(item);
-    } else if (e.type === "forward") {
-      const envelope = e.envelope as { kind?: string; body?: { provider?: string; model?: string } } | undefined;
-      const send: CallSend = { rid: String(e.rid), kind: String(envelope?.kind ?? ""), state: "pending", at: e.ts,
-        ...(envelope?.kind === "model" && envelope.body?.provider ? { model: `${envelope.body.provider}/${envelope.body.model}` } : {}) };
-      const list = sends.get(String(e.dest)) ?? []; list.push(send); sends.set(String(e.dest), list);
-      byRid2.set(`${e.dest}\n${e.rid2}`, send); byRid2.set(String(e.rid2), send);
-    } else if (e.type === "forward-delivered" || e.type === "forward-retired") {
-      const send = byRid2.get(e.type === "forward-delivered" ? `${e.call}\n${e.rid2}` : String(e.rid2));
-      if (!send || send.state !== "pending") continue;
-      send.state = e.type === "forward-delivered" ? "delivered" : "retired"; send.at = e.ts;
-      if (e.type === "forward-delivered" && e.reason !== undefined) send.reason = String(e.reason);
+  function apply(batch: readonly Entry[], from = 0) {
+    for (let i = from; i < batch.length; i++) {
+      const e = batch[i]!;
+      if (i >= boundary && (e.type === JT.done || (e.type === "resumed" && !e.call))) terminal = e;
+      if (e.type === JT.attentionResolved) resolved.add(`${e.id}@${e.rev}`);
+      if (["call", "generation", "refused", "reused"].includes(e.type)) {
+        if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
+        const key = String(e.key), gen = Number(e.gen) || (e.type === "refused" ? 0 : 1);
+        const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;
+        if (e.type === "generation") generations.add(callId);
+        const result = e.type === "refused" ? refusedResult(key, e.reason) :
+          e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
+        const wanted = (e.spec as { model?: unknown } | undefined)?.model;
+        calls.set(callId, { key, gen, callId, pos: Number(e.pos), agent: String((e.spec as { agent?: string } | undefined)?.agent ?? ""),
+          // Until a slot is acquired (`selected`), show the model the call asked for, not nothing.
+          ...(typeof wanted === "string" && wanted ? { model: wanted } : {}),
+          phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),
+          ...(e.type === "refused" ? { refused: String(e.reason) } : {}), ...(e.type === "reused" ? { reused: String(e.from) } : {}) });
+      } else if (e.type === "retired") { retired.add(String(e.call));
+      } else if (e.type === JT.exec) {
+        const call = calls.get(String(e.call)); if (!call) continue;
+        // An execution waits for a provider slot and memory before it launches; it is running once `selected` says so
+        // (otherwise a call still waiting for a slot reads "thinking · 2m").
+        call.exec = String(e.exec); call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
+        delete call.hibernated; hibernating.delete(call.callId);
+      } else if (e.type === "hibernated") {
+        // The decision to hibernate precedes the fence; the slot is released only once the execution is fenced.
+        const call = calls.get(String(e.call)); if (call?.exec && call.exec === e.exec) hibernating.set(call.callId, call.exec);
+      } else if (e.type === "answer-bound" || (e.type === "resumed" && e.call)) {
+        const call = calls.get(String(e.call)); if (call) { delete call.hibernated; hibernating.delete(call.callId); }
+      } else if (e.type === JT.fenced) {
+        // A fenced execution without a seal (stop-all, a quit pi, a loss before its continuation) waits to run again.
+        const call = byExec.get(String(e.exec)); if (call && call.phase === "running") call.phase = "queued";
+        if (call && hibernating.get(call.callId) === e.exec) call.hibernated = true;
+      } else if (e.type === "selected") {
+        const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
+        if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
+        if (call && call.phase === "queued") call.phase = "running";
+      } else if (e.type === "observation") {
+        // Only what the agent did counts as activity; tracker scans and time checkpoints are bookkeeping.
+        const call = byExec.get(String(e.exec)); if (call) call.lastActivity = e.ts;
+        if (call && e.type === "observation" && (e.event as { type?: string } | undefined)?.type === "tool_execution_start") tools.set(call.callId, (tools.get(call.callId) ?? 0) + 1);
+      } else if (e.type === "usage") {
+        const id = `${e.call}:${e.id}`, u = e.usage as Usage | undefined;
+        if (seen.has(id) || !u) continue;
+        seen.add(id);
+        const total = live.get(String(e.call)) ?? zero();
+        total.input += u.input; total.output += u.output; total.costUsd += u.costUsd; live.set(String(e.call), total);
+      } else if (e.type === JT.sealed) {
+        const usage = (e.result as CallResult | undefined)?.usage;
+        if (usage) sealedUsage.set(String(e.call), usage);
+        const call = calls.get(String(e.call)); if (!call) continue;
+        call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated; hibernating.delete(call.callId);
+      } else if (e.type === JT.attention) {
+        const item = e.item as AttentionItem;
+        attention.push(item);
+      } else if (e.type === "forward") {
+        const envelope = e.envelope as { kind?: string; body?: { provider?: string; model?: string } } | undefined;
+        const send: CallSend = { rid: String(e.rid), kind: String(envelope?.kind ?? ""), state: "pending", at: e.ts,
+          ...(envelope?.kind === "model" && envelope.body?.provider ? { model: `${envelope.body.provider}/${envelope.body.model}` } : {}) };
+        const list = sends.get(String(e.dest)) ?? []; list.push(send); sends.set(String(e.dest), list);
+        byRid2.set(`${e.dest}\n${e.rid2}`, send); byRid2.set(String(e.rid2), send);
+      } else if (e.type === "forward-delivered" || e.type === "forward-retired") {
+        const send = byRid2.get(e.type === "forward-delivered" ? `${e.call}\n${e.rid2}` : String(e.rid2));
+        if (!send || send.state !== "pending") continue;
+        send.state = e.type === "forward-delivered" ? "delivered" : "retired"; send.at = e.ts;
+        if (e.type === "forward-delivered" && e.reason !== undefined) send.reason = String(e.reason);
+      }
     }
   }
-  for (const item of attention) {
-    const call = item.kind === "question" ? [...calls.values()].find(c => item.id.startsWith(`q:${c.callId}:`)) : undefined;
-    if (call && (call.phase === "running" || call.phase === "queued")) call.phase = "asking"; // a hibernated asker is fenced
-  }
-  for (const c of calls.values()) if (c.hibernated && c.phase !== "asking") delete c.hibernated;
-  const usageOf = (callId: string) => sealedUsage.get(callId) ?? live.get(callId);
-  const list = [...calls.values()];
-  const counts: Record<CallPhase, number> = { queued: 0, running: 0, asking: 0, sealed: 0 };
-  for (const c of list) {
-    counts[c.phase]++;
-    const usage = usageOf(c.callId); if (usage) c.usage = { ...usage };
-    const n = tools.get(c.callId); if (n) c.tools = n;
-    const forwarded = sends.get(c.callId);
-    if (forwarded) {
-      c.sends = forwarded; const pending = forwarded.filter(pendingMessage).length; if (pending) c.pending = pending;
-      const switching = c.phase !== "sealed" ? forwarded.findLast(s => s.kind === "model" && s.state === "pending")?.model : undefined;
-      if (switching && switching !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = switching;
+  apply(entries);
+  function finish(): WorkflowSnapshot {
+    const done = terminal?.type === JT.done ? terminal : undefined;
+    // Finish owns every exposed object; UI decoration and consumers cannot alter reducer history.
+    const list = structuredClone([...calls.values()]);
+    const openAttention = structuredClone(attention.filter(item => !resolved.has(`${item.id}@${item.rev}`)));
+    for (const item of openAttention) {
+      const call = item.kind === "question" ? list.find(c => item.id.startsWith(`q:${c.callId}:`)) : undefined;
+      if (call && (call.phase === "running" || call.phase === "queued")) call.phase = "asking"; // a hibernated asker is fenced
     }
+    for (const c of list) if (c.hibernated && c.phase !== "asking") delete c.hibernated;
+    const usageOf = (callId: string) => sealedUsage.get(callId) ?? live.get(callId);
+    const counts: Record<CallPhase, number> = { queued: 0, running: 0, asking: 0, sealed: 0 };
+    for (const c of list) {
+      counts[c.phase]++;
+      const usage = usageOf(c.callId); if (usage) c.usage = { ...usage };
+      const n = tools.get(c.callId); if (n) c.tools = n;
+      const forwarded = sends.get(c.callId);
+      if (forwarded) {
+        c.sends = structuredClone(forwarded); const pending = forwarded.filter(pendingMessage).length; if (pending) c.pending = pending;
+        const switching = c.phase !== "sealed" ? forwarded.findLast(s => s.kind === "model" && s.state === "pending")?.model : undefined;
+        if (switching && switching !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = switching;
+      }
+    }
+    const after = done ? list.filter(c => generations.has(c.callId) && c.phase !== "sealed" && !retired.has(c.callId)) : [];
+    for (const c of after) c.afterEnd = true;
+    const followUps = after.length;
+    const usage = zero();
+    for (const id of new Set([...live.keys(), ...sealedUsage.keys()])) {
+      const u = usageOf(id)!; usage.input += u.input; usage.output += u.output; usage.costUsd += u.costUsd;
+    }
+    return {
+      wid, rev, ...(typeof created?.name === "string" ? { name: created.name } : {}),
+      ...(created ? { origin: String(created.origin), cwd: String(created.cwd), startedAt: created.ts } : {}),
+      status: done ? done.status as WorkflowSnapshot["status"] : "running",
+      ...(done?.error ? { error: String(done.error) } : {}), ...(done && "result" in done ? { result: structuredClone(done.result) } : {}),
+      ...(done ? { endedAt: done.ts } : {}),
+      ...(followUps ? { followUps } : {}),
+      calls: list, counts, attention: openAttention, usage,
+    };
   }
-  const after = done ? list.filter(c => generations.has(c.callId) && c.phase !== "sealed" && !retired.has(c.callId)) : [];
-  for (const c of after) c.afterEnd = true;
-  const followUps = after.length;
-  const usage = zero();
-  for (const id of new Set([...live.keys(), ...sealedUsage.keys()])) {
-    const u = usageOf(id)!; usage.input += u.input; usage.output += u.output; usage.costUsd += u.costUsd;
-  }
-  return {
-    wid, rev, ...(typeof created?.name === "string" ? { name: created.name } : {}),
-    ...(created ? { origin: String(created.origin), cwd: String(created.cwd), startedAt: created.ts } : {}),
-    status: done ? done.status as WorkflowSnapshot["status"] : "running",
-    ...(done?.error ? { error: String(done.error) } : {}), ...(done && "result" in done ? { result: done.result } : {}),
-    ...(done ? { endedAt: done.ts } : {}),
-    ...(followUps ? { followUps } : {}),
-    calls: list, counts, attention, usage,
-  };
+  return { apply, finish, hasReuse: entries.some(e => e.type === "reused") };
+}
+
+export function snapshotFromEntries(wid: string, entries: readonly Entry[]): WorkflowSnapshot {
+  return snapshotReducer(wid, entries).finish();
 }
 
 /** P25: Snapshot one workflow from its durable journal (v12 §4: plus the planned total of its pinned run body). */
 // A journal snapshot is immutable and replaced on every append, so its derived workflow snapshot is reused until then:
 // re-deriving every historical workflow on each UI refresh dominated pi's main thread.
+const folds = new Map<string, { wid: string; length: number; last?: Entry; reducer: ReturnType<typeof snapshotReducer> }>();
 const derived = new WeakMap<readonly Entry[], { wid: string; snapshot: WorkflowSnapshot }>();
 export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
-  const entries = readJournalSnapshot(journalPath(home, wid)), hit = derived.get(entries);
-  const wf = hit?.wid === wid ? hit.snapshot : snapshotFromEntries(wid, entries);
-  if (hit?.wid !== wid && entries.length) derived.set(entries, { wid, snapshot: wf });
+  const path = journalPath(home, wid), entries = readJournalSnapshot(path), hit = derived.get(entries);
+  let wf: WorkflowSnapshot;
+  if (hit?.wid === wid) wf = hit.snapshot;
+  else {
+    const prior = folds.get(path);
+    // The journal reader preserves entry identity only when extending the same committed prefix.
+    const prefix = prior?.wid === wid && entries.length >= prior.length &&
+      (prior.length === 0 || entries[prior.length - 1] === prior.last);
+    let reusable = prefix;
+    if (reusable) for (let i = prior!.length; i < entries.length; i++) {
+      const e = entries[i]!;
+      // Revisions change earlier call identities/boundaries. Reuse looks ahead for the first seal.
+      if (e.type === "revised" || e.type === "wf-created" || e.type === "reused" ||
+          (prior!.reducer.hasReuse && e.type === JT.sealed)) { reusable = false; break; }
+    }
+    const reducer = reusable ? prior!.reducer : snapshotReducer(wid, entries);
+    if (reusable) reducer.apply(entries, prior!.length);
+    wf = reducer.finish();
+    if (entries.length) {
+      folds.set(path, { wid, length: entries.length, last: entries.at(-1), reducer });
+      derived.set(entries, { wid, snapshot: wf });
+    } else folds.delete(path);
+  }
   const planned = plannedTotal(home, wid, wf.rev);
   return planned === undefined ? wf : { ...wf, planned };
 }
