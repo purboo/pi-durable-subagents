@@ -11,6 +11,12 @@
   and new generations go back to it. A call with a single model waits for the
   provider instead of failing. `status` lists used-up providers with their
   next try. Billing errors (402, insufficient balance) still fail at once.
+  A short request rate limit ("429 … resets in 1 second") is not a used-up
+  window and is retried as before. A follow-up naming a model runs on it even
+  where the pool would start over.
+- After a call moved to another model by a relaunch, the orchestrator now
+  reads the session's model as pi restores it (from the last answer), so a
+  later relaunch holds the slot of the provider it actually uses.
 
 ## 1.0.9
 
