@@ -13,6 +13,11 @@ import { observeExecution } from "../../../../src/orchestrator/executor/observe.
 import { evidence, fatalProviderError } from "../../../../src/orchestrator/executor/session.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 
+/** The tracker runs on a 5 ms timer; a loaded machine (the full suite) can need longer than one tick to observe. */
+async function eventually<T>(fn: () => T, ms = 3000): Promise<T> {
+  const deadline = Date.now() + ms;
+  for (;;) { const value = fn(); if (value || Date.now() > deadline) return value; await delay(10); }
+}
 async function fixture(t: TestContext) {
   let now = 0, wake = () => {}, ready!: () => void;
   t.mock.method(performance, "now", () => now);
@@ -41,13 +46,13 @@ for (const [source, event] of [
 ] as const) test(`no-progress ignores ${source} and session growth, resolves and re-arms`, { timeout: 5000 }, async t => {
   const f = await fixture(t);
   await f.grow(); await f.tick(600001, event);
-  const first = f.alerts()[0]!;
+  const first = (await eventually(() => f.alerts()[0]))!;
   assert.deepEqual(first.item, { id: "noprogress:w@1/a@1", rev: 1, kind: "stall", wid: "w", call: "w@1/a@1",
     text: "w/a: running but no progress for 10m (no output tokens or tool results); last provider error: " + ("quota exhausted " + "x".repeat(250)).slice(0, 200) });
   assert.equal(first.exec, "w@1/a@1#1.1"); assert.equal(first.horizon, 0);
   await f.tick(600002, { type: "message_update" });
-  assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === "noprogress:w@1/a@1" && e.rev === 1 && e.resolution === "progress"));
-  await f.tick(1200003, event);
+  assert.ok(await eventually(() => f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === "noprogress:w@1/a@1" && e.rev === 1 && e.resolution === "progress")));
+  await f.tick(1200003, event); await eventually(() => f.alerts().length === 2);
   assert.deepEqual(f.alerts().map(e => (e.item as AttentionItem).rev), [1, 2]);
 });
 
@@ -58,7 +63,7 @@ for (const toolName of ["bash", "ask"]) test(`no-progress waits for open ${toolN
   assert.equal(f.alerts().length, 0);
   await f.tick(1200001, { type: "tool_execution_end", toolCallId: "t", toolName });
   await f.tick(1800000); assert.equal(f.alerts().length, 0);
-  await f.tick(1800002); assert.equal(f.alerts().length, 1);
+  await f.tick(1800002); await eventually(() => f.alerts().length === 1); assert.equal(f.alerts().length, 1);
 });
 
 for (const event of [
@@ -69,11 +74,11 @@ for (const event of [
   const f = await fixture(t);
   for (const time of [500000, 1000000, 1500000]) await f.tick(time, event);
   assert.equal(f.alerts().length, 0);
-  await f.tick(2100001); assert.equal(f.alerts().length, 1);
+  await f.tick(2100001); await eventually(() => f.alerts().length === 1); assert.equal(f.alerts().length, 1);
 });
 
 test("stall text identifies the call", { timeout: 5000 }, async t => {
-  const f = await fixture(t); await f.tick(600001);
+  const f = await fixture(t); await f.tick(600001); await eventually(() => f.alerts("stall:").length);
   assert.equal((f.alerts("stall:")[0]!.item as AttentionItem).text, "w/a: no execution activity for 10m");
 });
 

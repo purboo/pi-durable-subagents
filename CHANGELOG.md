@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- `status` without a wid is brief: what runs, what asks (with the address to
+  answer) and what failed, with finished workflows one line each; it used to
+  return every call's usage and last line (tens of thousands of tokens on a
+  busy home). With a wid, outputs are clipped; `key` gives one call's full
+  result and `full: true` the previous complete detail.
+- A run's rid (from `{submitted: {rid}}`) works wherever a wid is expected.
+- With `tasks` or `chain`, top-level `model`, `timeoutMs`, `budget`,
+  `isolation`, `context`, `tools`, `skills` and `once` are defaults for every
+  step; other fields there, or any call field beside a workflow script, are
+  refused instead of silently ignored. Invalid fields report the value
+  received.
+- A call that keeps running without producing output tokens or tool results
+  (for example, retrying against an exhausted provider) raises a
+  "no progress" alert after 10 minutes (`k.progressMs`), with the last
+  provider error. A call that ends on an explicit quota or billing error fails
+  at once with `Provider error: …` instead of being relaunched; other lost
+  executions report their last error.
+- Attention reaches the main agent with the call's address; a question says
+  how to answer it.
+- `resume` without a wid names workflows that other sessions hold paused.
+
 ## 1.0.4
 
 - The TUI no longer stalls pi with a long subagent history. Its 500 ms refresh
