@@ -45,17 +45,27 @@ const entriesFor = (journal: JournalHandle, call: string) => journal.entries().f
 const current = (journal: JournalHandle, call: string) => entriesFor(journal, call).findLast(e => e.type === JT.exec)?.exec as string | undefined;
 const sealed = (journal: JournalHandle, call: string) => entriesFor(journal, call).find(e => e.type === JT.sealed)?.result as CallResult | undefined;
 const has = (journal: JournalHandle, type: string, exec: string) => journal.entries().some(e => e.type === type && e.exec === exec);
-/** The model a call was last asked to use and has not refused: a follow-up's `model`, then each model send in order
- *  (one the child rejected or that was withdrawn does not count). Its next execution launches on it (P12, P37). */
+/** The rid of the model request a follow-up naming a model makes (P12): derived, so withdrawing or replacing the
+ *  follow-up withdraws its model request too. */
+export const modelRid = (rid: string) => contentHash([rid, "model"]);
+/** The model a call was asked to use and has not used yet: a follow-up's `model`, then each model send in order. One the
+ *  child rejected or that was withdrawn does not count; one already used does not either — the child applied it, or an
+ *  execution of the call answered with it — so the session's model and the pool's fallback rule again after that.
+ *  Its next execution launches on it (P12, P37). */
 export function requestedModel(journal: JournalHandle, call: string, followUp?: string): Model | undefined {
-  const all = journal.entries();
-  let wanted = followUp ? parseModel(followUp) : undefined;
-  for (const e of all) {
+  const all = journal.entries(), execs = new Set(all.filter(e => e.type === JT.exec && e.call === call).map(e => String(e.exec)));
+  const same = (a: Model, b: unknown) => (b as Model | undefined)?.provider === a.provider && (b as Model | undefined)?.id === a.id;
+  const usedAfter = (m: Model, index: number) => all.some((e, i) => i > index && (e.type === "selected" || e.type === "model-used") && execs.has(String(e.exec)) && same(m, e.model));
+  let wanted: Model | undefined;
+  if (followUp) { const m = parseModel(followUp); if (!usedAfter(m, -1)) wanted = m; }
+  for (const [index, e] of all.entries()) {
     if (e.type !== "forward" || e.dest !== call || (e.envelope as Envelope | undefined)?.kind !== "model") continue;
-    if (all.some(r => r.type === "forward-delivered" && r.call === call && r.rid2 === e.rid2 && r.reason !== undefined)) continue;
+    const delivered = all.find(r => r.type === "forward-delivered" && r.call === call && r.rid2 === e.rid2);
+    if (delivered) { wanted = undefined; continue; } // applied by the child (now the session's model) or refused by it
     if (all.some(r => r.type === "forward" && r.dest === call && (r.envelope as Envelope).kind === "withdraw" && ((r.envelope as Envelope).body as { rids?: string[] }).rids?.includes(String(e.rid2)))) continue;
     const body = (e.envelope as Envelope).body as ModelBody;
-    wanted = { provider: body.provider, id: body.model, ...(body.thinking ? { thinking: body.thinking as Model["thinking"] } : {}) };
+    const m: Model = { provider: body.provider, id: body.model, ...(body.thinking ? { thinking: body.thinking as Model["thinking"] } : {}) };
+    wanted = usedAfter(m, index) ? undefined : m;
   }
   return wanted;
 }
@@ -631,54 +641,67 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             return { action: "apply" } as const;
           }
         }
-        let kind: Request["kind"], body: unknown;
-        if (req.kind === "withdraw") {
-          kind = "withdraw";
-          const targets = (req.body as WithdrawBody).rids;
-          body = { rids: ctx.journal.entries().filter(e => e.type === "forward" && e.dest === dest && targets.includes(String(e.rid))).map(e => String(e.rid2)) };
-        } else if (req.kind === "send") {
-          const send = req.body as SendBody; kind = send.kind;
-          if (kind === "model") {
-            try { const m = parseModel(send.model ?? ""); if (!m.provider) throw new Error("Missing provider"); body = { provider: m.provider, model: m.id, ...(m.thinking ? { thinking: m.thinking } : {}) }; }
-            catch { return { action: "reject", reason: "unknown-model" } as const; }
-          } else body = { message: send.message ?? "" };
-        } else return { action: "reject", reason: "unsupported" } as const;
-        const cond = { ...req.cond }; delete cond.epoch;
-        if (cond.after) {
-          const dependency = ctx.journal.entries().find(e => e.type === "forward" && e.dest === dest && e.rid === cond.after);
-          if (dependency) cond.after = String(dependency.rid2); else delete cond.after;
-        }
-        const envelope: Envelope = { to: dest, kind, body, ...(Object.keys(cond).length ? { cond } : {}) };
-        const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
-        if (kind === "model") {
-          const exec = current(ctx.journal, dest), provider = (body as { provider: string }).provider;
+        /** P12: a model request to this call, recorded with the rid given; a reject has no effect. */
+        const requestModel = async (rid: string, model: string, hash: string, cond?: Envelope["cond"]) => {
+          let body: ModelBody;
+          try { const m = parseModel(model); if (!m.provider) throw new Error("Missing provider"); body = { provider: m.provider, model: m.id, ...(m.thinking ? { thinking: m.thinking } : {}) }; }
+          catch { return { action: "reject", reason: "unknown-model" } as const; }
+          const envelope: Envelope = { to: dest, kind: "model", body, ...(cond && Object.keys(cond).length ? { cond } : {}) };
+          const rid2 = forwardRid(rid, ctx.widRev, ctx.key, hash);
+          const exec = current(ctx.journal, dest), provider = body.provider;
           // P28: with no live execution (not started yet, between executions, hibernated while asking) the model is
           // recorded and the next execution launches on it (`requestedModel`); its slot is acquired then, as for any launch.
           // Launching (`selected`, not `tracked` yet): the child may start on the old model; ask again in a moment.
           const idle = !exec || has(ctx.journal, JT.fenced, exec) || !has(ctx.journal, "selected", exec);
           if (!idle && !has(ctx.journal, "tracked", exec)) return { action: "reject", reason: "call-starting" } as const;
           if (!idle && pendingSwitch(exec!)) return { action: "reject", reason: "switch-pending" } as const;
-          if (idle) {
-            await note(req.rid, (req.body as SendBody).model!, "next-execution");
-            const entry = await ctx.journal.append("forward", { rid: req.rid, rid2, dest, hash, envelope });
-            await replayForward(entry); active.get(dest)?.wake(); wake();
-            return { action: "apply" } as const;
+          if (!idle) {
+            const held = holdings().filter(h => h.exec === exec);
+            if (!held.some(h => h.pool === provider)) {
+              const target = holdings().filter(h => h.pool === provider);
+              if (!capacity({ kind: "provider", holders: target.length, capacity: config.providers?.[provider]?.slots ?? Infinity }))
+                return { action: "reject", reason: "provider-full" } as const;
+              let slot = 0; while (target.some(h => h.slot === slot)) slot++;
+              await orch.append("hold", { pool: provider, slot, exec, reserved: true, rid });
+            }
           }
-          const held = holdings().filter(h => h.exec === exec);
-          if (!held.some(h => h.pool === provider)) {
-            const target = holdings().filter(h => h.pool === provider);
-            if (!capacity({ kind: "provider", holders: target.length, capacity: config.providers?.[provider]?.slots ?? Infinity }))
-              return { action: "reject", reason: "provider-full" } as const;
-            let slot = 0; while (target.some(h => h.slot === slot)) slot++;
-            await orch.append("hold", { pool: provider, slot, exec, reserved: true, rid: req.rid });
+          await note(req.rid, model, idle ? "next-execution" : "next-request");
+          const entry = await ctx.journal.append("forward", { rid, rid2, dest, hash, envelope });
+          await replayForward(entry);
+          if (idle) { active.get(dest)?.wake(); wake(); }
+          return undefined;
+        };
+        let kind: Request["kind"], body: unknown;
+        if (req.kind === "send" && (req.body as SendBody).kind === "follow-up" && (req.body as SendBody).model !== undefined) {
+          // A follow-up naming a model, queued on unfinished work: the model request and the message are recorded in one
+          // section, so a seal cannot come between them (both or neither). A replay finds the model request recorded.
+          const mrid = modelRid(req.rid);
+          if (!ctx.journal.entries().some(e => e.type === "forward" && e.rid === mrid && e.dest === dest)) {
+            const refused = await requestModel(mrid, (req.body as SendBody).model!, contentHash([hash, "model"]));
+            if (refused) return { action: "reject", reason: `model: ${refused.reason}` } as const;
           }
-          await note(req.rid, (req.body as SendBody).model!, "next-request");
         }
+        if (req.kind === "withdraw") {
+          kind = "withdraw";
+          const targets = (req.body as WithdrawBody).rids.flatMap(rid => [rid, modelRid(rid)]);
+          body = { rids: ctx.journal.entries().filter(e => e.type === "forward" && e.dest === dest && targets.includes(String(e.rid))).map(e => String(e.rid2)) };
+        } else if (req.kind === "send") {
+          const send = req.body as SendBody; kind = send.kind;
+          body = kind === "model" ? undefined : { message: send.message ?? "" };
+        } else return { action: "reject", reason: "unsupported" } as const;
+        const cond = { ...req.cond }; delete cond.epoch;
+        if (cond.after) {
+          const dependency = ctx.journal.entries().find(e => e.type === "forward" && e.dest === dest && e.rid === cond.after);
+          if (dependency) cond.after = String(dependency.rid2); else delete cond.after;
+        }
+        if (kind === "model") return (await requestModel(req.rid, (req.body as SendBody).model ?? "", hash, cond)) ?? { action: "apply" } as const;
+        const envelope: Envelope = { to: dest, kind, body, ...(Object.keys(cond).length ? { cond } : {}) };
+        const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
         const entry = await ctx.journal.append("forward", { rid: req.rid, rid2, dest, hash, envelope });
         await replayForward(entry);
         if (kind === "withdraw") {
           const exec = current(ctx.journal, dest), reservation = exec && pendingSwitch(exec);
-          if (reservation && (req.body as WithdrawBody).rids.includes(String(reservation.rid))) active.get(dest)?.wake();
+          if (reservation && (req.body as WithdrawBody).rids.some(rid => rid === reservation.rid || modelRid(rid) === reservation.rid)) active.get(dest)?.wake();
         }
         return { action: "apply" } as const;
       });

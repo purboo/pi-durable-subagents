@@ -91,6 +91,8 @@ export function fatalProviderError(text: string): boolean {
 /** A refusal of the request's content (terms of service, usage or content policy): the same request is refused again,
  *  on this provider and usually on another, so it is reported at once instead of retried as a lost execution. */
 export function refusedByProvider(text: string): boolean {
+  // A content filter that is down ("temporarily unavailable, please retry") is a transient failure, not a refusal.
+  if (/temporar|unavailable|try again|retry|timed? ?out|overloaded/i.test(text)) return false;
   return /terms of service|usage polic(y|ies)|acceptable use|content[_ ]?(policy|filter|management policy)|safety (system|filter)|flagged as (unsafe|harmful)/i.test(text);
 }
 /** P13, C8: Restore the effective provider from the native session's model changes. */
