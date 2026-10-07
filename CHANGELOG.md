@@ -2,10 +2,6 @@
 
 ## 1.0.5
 
-- The package is now `@purboo/pi-durable-subagents`; the unscoped
-  `pi-durable-subagents` is retired. In `~/.pi/agent/settings.json`, replace
-  `npm:pi-durable-subagents` with `npm:@purboo/pi-durable-subagents`. The
-  command name and the state in `~/.pi/durable-subagents` are unchanged.
 - `status` without a wid is brief: what runs, what asks (with the address to
   answer) and what failed, with finished workflows one line each; it used to
   return every call's usage and last line (tens of thousands of tokens on a
