@@ -31,6 +31,7 @@ import { availableMemory } from "./memory.ts";
 import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 import { recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
 import { gateRetired } from "./effects/gate.ts";
+import { worktreeCalls, worktreeLabel, worktreePair, worktreeRoots } from "./worktree.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
 type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean;
@@ -290,7 +291,46 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await t.journal.append(JT.attention, { item: { id, rev: 1, kind: "budget", text: "Workflow budget reached", wid: t.wid } });
     return hit;
   }
+  const roots = worktreeRoots(), reminded = new Set<string>();
+  const origin = (t: CallTicket) => t.journal.entries().find(e => e.type === "wf-created")?.origin ?? orch.entries().find(e => e.type === JT.created && e.wid === t.wid)?.origin;
+  const written = (t: CallTicket) => new Set(t.journal.entries().filter(e => e.type === "wrote" && typeof e.exec === "string" && callOf(e.exec) === t.callId).map(e => String(e.root)));
+  // Serial sections only: wrote and attention are durable before another writer or seal can interleave.
+  async function sharedWorktree(t: CallTicket, root: string) {
+    if (sealed(t.journal, t.callId)) return;
+    for (const { ticket: other } of active.values()) {
+      if (other.callId === t.callId || sealed(other.journal, other.callId)) continue;
+      const id = worktreePair(t.callId, other.callId);
+      if (reminded.has(id) || !written(other).has(root)) continue;
+      // A retry after a partial cross-workflow append keeps the original second writer.
+      const prior = [...journals.values()].flatMap(j => attentionEntries(j.entries(), id)).at(0)?.item;
+      const targets = origin(t) === origin(other) ? [prior?.wid === other.wid ? other : t] : [t, other];
+      const item = prior ?? { id, rev: 1, kind: "conflict" as const, call: t.callId, wid: t.wid,
+        text: `${worktreeLabel(other.callId)} and ${worktreeLabel(t.callId)} both write in ${root} (edit/write seen); assign one owner or move one to its own worktree` };
+      for (const target of targets) if (!attentionEntries(target.journal.entries(), id).length)
+        await target.journal.append(JT.attention, { item: { ...item, wid: target.wid } });
+      reminded.add(id);
+    }
+  }
+  async function wrote(t: CallTicket, exec: string, cwd: string, path: string) {
+    const root = await roots(cwd, path); if (!root) return;
+    await serial(async () => {
+      if (sealed(t.journal, t.callId) || has(t.journal, JT.fenced, exec) || current(t.journal, t.callId) !== exec) return;
+      if (t.journal.entries().some(e => e.type === "wrote" && e.exec === exec && e.root === root)) return;
+      await t.journal.append("wrote", { exec, root });
+      await sharedWorktree(t, root);
+    });
+  }
+  async function resolveWorktrees(call?: string) {
+    for (const journal of journals.values()) for (const { item } of attentionEntries(journal.entries())) {
+      if (item.kind !== "conflict") continue;
+      const pair = worktreeCalls(item.id);
+      const ended = call ? pair.includes(call) : pair.some(c => [...journals.values()].some(j => sealed(j, c)));
+      if (ended && !journal.entries().some(e => e.type === JT.attentionResolved && e.id === item.id && e.rev === item.rev))
+        await journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "ended" });
+    }
+  }
   async function retireAttention(journal: JournalHandle, call: string) {
+    await resolveWorktrees(call);
     for (const { item } of attentionEntries(journal.entries())) {
       if (item.kind === "finished" || item.id === `unknown:${call}` || item.id.startsWith("fence:")) continue;
       if (item.call === call && !journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev))
@@ -623,6 +663,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
               }
             });
           }, recordUsage: values => recordUsage(t, values),
+          wrote: path => wrote(t, exec!, cwd, path),
           switched: event => switched(exec!, journal, event), answered: event => answered(exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
       } finally { await fence(journal, exec, { child, park: a }); }
@@ -640,7 +681,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       journals.set(ticket.wid, ticket.journal);
       const a: Active = { ticket, controller: new AbortController(), stopped: false, wake: () => {}, promise: undefined!, onPark: new Set() };
       active.set(ticket.callId, a);
-      a.promise = execute(a).catch(error => {
+      a.promise = serial(async () => {
+        // Repair a crash between wrote and attention (or between the two origin journals).
+        for (const root of written(ticket)) await sharedWorktree(ticket, root);
+        await resolveWorktrees();
+      }).then(() => execute(a)).catch(error => {
         completed.delete(ticket.callId);
         if (a.retired || ticket.journal.entries().some(e => e.type === "retired" && e.call === ticket.callId)) return buildCallResult({ key: ticket.key, gen: ticket.gen, status: "stopped", output: "", error: "retired" });
         throw error;
@@ -774,6 +819,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     },
     async recover(wid, journal) {
       journals.set(wid, journal);
+      await serial(() => resolveWorktrees());
       await effects.recover(journal);
       for (const e of journal.entries().filter(e => e.type === JT.exec)) {
         // F1: an exec whose fence fails stays unfenced and holding; its call parks until a sweep retires it.
