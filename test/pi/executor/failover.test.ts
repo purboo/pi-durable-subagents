@@ -42,8 +42,9 @@ async function setup(t: TestContext, config: OrchestratorConfig, retry: Record<s
     }
   });
   const requests = async () => (await readFile(join(root, "quota.log"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
-  const exhaust = (on: boolean) => on ? writeFile(join(root, "qa-exhausted"), "") : unlink(join(root, "qa-exhausted"));
-  return { home, orch, journal, executor, ticket, requests, exhaust };
+  const flag = (name: string, on: boolean) => on ? writeFile(join(root, name), "") : unlink(join(root, name));
+  const exhaust = (on: boolean, provider = "qa") => flag(`${provider}-exhausted`, on);
+  return { home, orch, journal, executor, ticket, requests, exhaust, flag };
 }
 const providersOf = (f: Awaited<ReturnType<typeof setup>>, key: string) =>
   f.journal.entries().filter(e => e.type === "selected" && String(e.exec).includes(`/${key}@`)).map(e => (e.model as { provider: string }).provider);
@@ -159,4 +160,31 @@ test("failover: a model send may name a pool: its first model not used up, and t
   const rb = await f.executor.run(b);
   assert.equal(rb.output, "answered by qb");
   assert.deepEqual(f.journal.entries().filter(e => e.type === "selected" && String(e.exec).includes("/b@")).map(e => [(e.model as { provider: string }).provider, e.pool]), [["qb", "top"]]);
+});
+
+test("failover: one execution moved on twice records each used-up provider", { timeout: 60000 }, async t => {
+  const f = await setup(t, { pools: { top: ["qa/m", "qb/m", "qc/m"] } }, PI_RETRY);
+  await f.exhaust(true); await f.exhaust(true, "qb");
+  const a = await f.executor.run(f.ticket("a", "top"));
+  assert.equal(a.output, "answered by qc"); assert.deepEqual(providersOf(f, "a"), ["qa"], "one execution");
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "provider-exhausted").map(e => e.provider), ["qa", "qb"]);
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "forward" && e.failover).map(e => e.failover), ["qa", "qb"]);
+});
+
+test("failover: moving to a provider whose next try is due makes that execution its probe", { timeout: 60000 }, async t => {
+  const f = await setup(t, { pools: { top: ["qa/m", "qb/m"] } }, PI_RETRY);
+  await f.exhaust(true); await f.flag("slow-qb", true);
+  await f.orch.append("provider-exhausted", { provider: "qb", exec: "earlier", since: Date.now() - 10_000, nextTry: Date.now() - 1, error: "No available accounts" });
+  const a = f.executor.run(f.ticket("a", "top"));
+  await until(() => f.journal.entries().some(e => e.type === "forward" && e.failover === "qa"));
+  const exec = String(f.journal.entries().find(e => e.type === "selected")!.exec);
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "provider-probe").map(e => [e.provider, e.exec]), [["qb", exec]]);
+  // Another call wanting qb waits for the probe's outcome instead of probing too.
+  const b = f.executor.run(f.ticket("b", "qb/m"));
+  await delay(1000);
+  assert.deepEqual(providersOf(f, "b"), [], "no second probe");
+  const [ra, rb] = await Promise.all([a, b]);
+  assert.equal(ra.output, "answered by qb"); assert.equal(rb.output, "answered by qb");
+  const log = f.orch.entries(), available = log.findIndex(e => e.type === "provider-available" && e.provider === "qb");
+  assert.ok(available >= 0 && available < log.findIndex(e => e.type === "hold" && e.pool === "qb" && !String(e.exec).includes(exec)), "b admitted after the probe answered");
 });
