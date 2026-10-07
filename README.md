@@ -51,7 +51,7 @@ the npx cache, so `install-service` refuses to run from there.
 | A step runs past its `timeoutMs` (even inside a silent tool) | Stops it cleanly as `timeout`. Only time spent working counts; waiting for you does not. |
 | You quit pi (Ctrl+D, `/quit`, closing the terminal) while subagents run | That session's workflows pause: nothing more is spent, nothing is lost. When you come back, pi says so; `resume` (or `r` in the list) continues them in the same sessions. Set `"onQuit": "continue"` to let them run on instead. |
 | pi crashes or is killed (`kill -9`) while subagents run | The work keeps running. When you come back, the session that started the work is told what needs you. |
-| The machine or the orchestrator dies mid-run | The next pi you open resumes the work. Finished results are kept and nothing runs twice. |
+| The machine or the orchestrator dies mid-run | The next pi you open resumes the work. Finished results are kept and nothing runs twice. The resumed subagent is told that processes its tools had started (background ones included) were stopped, so it checks them instead of waiting for them. |
 | You steer a subagent while it is asking you a question | Your message reaches it, in order. Nothing is rejected or lost. |
 | Two steers arrive out of order and the second replaces the first | Only the second one applies. |
 | A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
@@ -174,7 +174,7 @@ The main agent is interrupted only when there is something to decide:
 
 - a question;
 - a finished workflow;
-- a stalled subagent;
+- a stalled subagent (the alert names the command it is running and for how long, so a long silent command reads differently from a stuck call);
 - an unknown outcome;
 - a reached budget.
 

@@ -27,12 +27,21 @@ type Dependencies = {
   answered?(event: Record<string, unknown>): Promise<void>;
   pendingSwitch(): Entry | undefined;
 };
+/** A tool call's command for a status line: bash's command, else its arguments, on one line and clipped. */
+export function toolCommand(args: unknown): string {
+  const a = args && typeof args === "object" ? args as Record<string, unknown> : {};
+  const text = typeof a.command === "string" ? a.command : Object.keys(a).length ? JSON.stringify(a) : "";
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > 120 ? `${line.slice(0, 119)}…` : line;
+}
 /** P18, P31, P9: Observe slim evidence, decide limits and fence before returning to settlement. */
 export async function observeExecution(d: Dependencies) {
   const { home, config, ticket: t, exec, child, serial } = d;
   const session = callSession(home, t.wid, t.key, t.gen), clock = new ActiveTime(), started = clock.last;
   let progress = started, providerError: string | undefined;
   const tools = new Set<string>();
+  // The tool calls running now, for the stall text: a silent long command and a stuck call read differently.
+  const running = new Map<string, { name: string; command: string; since: number }>();
   const prior = activeTotal(t.journal.entries(), t.callId);
   let size = (await fileStat(session).catch(() => ({ size: 0 }))).size, checkpoint = performance.now();
   let signal!: () => void;
@@ -58,8 +67,14 @@ export async function observeExecution(d: Dependencies) {
     const fresh = items.at(-1)?.exec === exec ? clock.last > Number(items.at(-1)?.horizon) : clock.last > started;
     if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "activity" });
     else if (!open && !clock.asking && performance.now() - clock.last >= (config.k?.stallMs ?? 600000))
-      await t.journal.append(JT.attention, { exec, horizon: clock.last, item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text: `${t.wid}/${t.key}: no execution activity for ${Math.floor((performance.now() - clock.last) / 60000)}m`, wid: t.wid, call: t.callId } });
+      await t.journal.append(JT.attention, { exec, horizon: clock.last, item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text: `${t.wid}/${t.key}: no execution activity for ${Math.floor((performance.now() - clock.last) / 60000)}m` + runningText(), wid: t.wid, call: t.callId } });
   });
+  /** "; running bash `make matrix` for 14m (no output or CPU use seen)": a silent long command, not a stuck model. */
+  const runningText = () => {
+    const now = performance.now(), open = [...running.values()].filter(r => r.name !== "ask");
+    if (!open.length) return "";
+    return "; running " + open.map(r => `${r.name}${r.command ? ` \`${r.command}\`` : ""} for ${Math.floor((now - r.since) / 60000)}m`).join(", ") + " (no output or CPU use seen)";
+  };
   const noProgress = () => serial(async () => {
     const id = `noprogress:${t.callId}`;
     const items = attentionEntries(t.journal.entries(), id), last = items.at(-1)?.item;
@@ -89,8 +104,11 @@ export async function observeExecution(d: Dependencies) {
     const error = event.type === "auto_retry_start" ? event.errorMessage : event.type === "auto_retry_end" ? event.finalError :
       event.type === "message_end" && message?.stopReason === "error" ? message.errorMessage : undefined;
     if (typeof error === "string" && error) providerError = error;
-    if (event.type === "tool_execution_start") tools.add(String(event.toolCallId ?? ""));
-    if (event.type === "tool_execution_end") tools.delete(String(event.toolCallId ?? ""));
+    if (event.type === "tool_execution_start") {
+      tools.add(String(event.toolCallId ?? ""));
+      running.set(String(event.toolCallId ?? ""), { name: String(event.toolName ?? "tool"), command: toolCommand(event.args), since: performance.now() });
+    }
+    if (event.type === "tool_execution_end") { tools.delete(String(event.toolCallId ?? "")); running.delete(String(event.toolCallId ?? "")); }
     // Receipt-time progress is independent of RPC chatter, CPU and session growth; open tools suppress alerts.
     if (event.type === "message_update" || ["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(String(event.type)) ||
       event.type === "message_end" && message?.stopReason !== "error" && (message?.usage?.output ?? 0) > 0) progress = performance.now();
