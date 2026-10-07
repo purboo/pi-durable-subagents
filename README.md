@@ -320,6 +320,17 @@ On load, it checks the pi exports and API methods it uses.
 
 `smoke` runs the same checks inside your pi.
 
+## Updating Durable Subagents
+
+Running work stays on the version it started with: the orchestrator is not
+restarted under it. When the orchestrator runs another version than the one a
+pi session loaded, that pi says so once, and `status` shows the running
+version with a note. The orchestrator exits about 10 s after all work ends,
+and the next start runs the new version. To switch sooner without stopping
+running calls, `drain` (running calls finish, nothing new starts; a call
+waiting for your answer still counts as running) and then `resume`. A pi session started before the update still loads the old version;
+start a new one.
+
 ## What we do not promise
 
 - Call specs are checked strictly when a call is first proposed: an unknown or

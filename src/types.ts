@@ -56,6 +56,10 @@ export interface EntryFields {
   /** The orchestrator settings in effect from here (config.json's orchestrator keys) and their hash. */
   config: { hash: string; config: Record<string, unknown> };
   "config-rejected": { error: string; hash?: string };
+  /** The orchestrator that holds the lock from here: its package version and process. */
+  orchestrator: { version: string; pid: number };
+  /** That orchestrator exits (a crash records nothing; readers check the process too). */
+  "orchestrator-exit": { pid: number };
 }
 export type EntryOf<T extends keyof EntryFields> = Entry<T> & EntryFields[T];
 /** Narrow an entry to its type's fields (their shape is the writer's contract, not checked at runtime). */

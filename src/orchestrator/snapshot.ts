@@ -7,6 +7,7 @@ import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
 import { emptyLedger, foldLedger, type LedgerState } from "./ledger.ts";
+import { packageVersion } from "../version.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
@@ -420,6 +421,8 @@ export interface StatusView {
   paused?: string;
   /** Provider slots held / limit, the settings in effect and a rejected config.json change (see slotsView). */
   slots?: string[]; config?: string; configRejected?: string; exhausted?: string[];
+  /** The orchestrator version running, and a note when it is not the one this process loaded (see orchestratorView). */
+  orchestrator?: string; versionNote?: string;
 }
 export type StatusDetail = WorkflowSnapshot & { scriptLog?: string };
 
@@ -521,6 +524,8 @@ export interface StatusBrief {
   configRejected?: string;
   /** Providers whose usage window is used up: avoided until the next try, then probed by one call (see providers.ts). */
   exhausted?: string[];
+  /** The orchestrator version running, and a note when it is not the one this pi loaded. */
+  orchestrator?: string; versionNote?: string;
   hint: string;
 }
 
@@ -528,7 +533,39 @@ export interface StatusBrief {
  *  the settings in effect (the latest config{hash,config}); config-rejected after it is reported too. */
 // One fold per orchestrator ledger, extended as it grows (ledger.ts; the executor folds the same entries the same way).
 const ledgerStates = new Map<string, LedgerState>();
-export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected" | "exhausted"> {
+/** The orchestrator running now (its last `orchestrator` record, without an exit, whose process lives), and a note when
+ *  its version is not the one this process loaded: running work stays on the version it started with. */
+export function orchestratorView(state: LedgerState, loaded = packageVersion()): { orchestrator?: string; versionNote?: string } {
+  const o = state.orchestrator;
+  if (!o || o.exited || !alive(o.pid)) return {};
+  return { orchestrator: `${o.version} (pid ${o.pid})`, ...(o.version === loaded ? {} : { versionNote: versionNote(o.version, loaded) }) };
+}
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+const parts = (v: string) => v.split(/[.-]/).map(n => Number.parseInt(n, 10) || 0);
+function newer(a: string, b: string): boolean {
+  const x = parts(a), y = parts(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
+  return false;
+}
+export function versionNote(running: string, loaded: string): string {
+  return newer(running, loaded)
+    ? `this pi session loaded durable-subagents ${loaded}, older than the running orchestrator ${running}; start a new pi session to use ${running}`
+    : `the orchestrator runs durable-subagents ${running}, this pi loaded ${loaded}: running work stays on ${running}. ` +
+      `It exits about 10 s after all work ends and starts again on ${loaded}; to switch sooner without stopping running calls, ` +
+      `drain (running calls finish, nothing new starts) and then resume. pi sessions started before the update start ${running} again`;
+}
+
+/** orchestratorView of the home's orchestrator ledger. */
+export function runningOrchestrator(home: string): { orchestrator?: string; versionNote?: string } {
+  const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
+  ledgerStates.set(path, state);
+  return orchestratorView(state);
+}
+
+export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected" | "exhausted" | "orchestrator" | "versionNote"> {
   const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
   ledgerStates.set(path, state);
   const { held, config, rejected } = state, used = state.exhausted;
@@ -539,7 +576,7 @@ export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "sl
   for (const e of held.values()) if (e.pool !== "memory") holders.set(e.pool, (holders.get(e.pool) ?? 0) + 1);
   const names = [...new Set([...Object.keys(limits), ...holders.keys()])].sort();
   const slots = names.map(p => { const n = holders.get(p) ?? 0, limit = limits[p]?.slots; return typeof limit === "number" ? `${p} ${n}/${limit}` : `${p} ${n} (no limit)`; });
-  return { ...(slots.length ? { slots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
+  return { ...orchestratorView(state), ...(slots.length ? { slots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
     ...(exhausted.length ? { exhausted } : {}),
     ...(rejected ? { configRejected: `${clip(rejected.error, 200)} (${age(now - rejected.ts)} ago); ${config ? config.hash : "the start settings"} stay in effect` } : {}) };
 }

@@ -8,6 +8,7 @@ import { OsLock } from '../platform/lock.ts';
 import type { Executor, Ledgers, OrchestratorConfig } from './contract.ts';
 import { Engine, type EngineOptions } from './engine.ts';
 import { configPath, configProblem, configStamp, recordConfig, stampedConfig, watchConfig } from './config.ts';
+import { packageVersion } from '../version.ts';
 
 export interface MainOptions extends EngineOptions {
   home?: string;
@@ -35,6 +36,8 @@ export async function main(options: MainOptions = {}): Promise<void> {
       config = raw as OrchestratorConfig;
     }
     ledgers = { home, config, orch: await openJournal(orchLedger(home)) };
+    // Which version runs is visible to every pi session (status; a notice when it differs from the one pi loaded).
+    await ledgers.orch.append('orchestrator', { version: packageVersion(), pid: process.pid });
     const factory = options.executor ?? (await import(new URL(import.meta.url.endsWith('.ts') ? './executor/index.ts' : './executor/index.js', import.meta.url).href)).default as (ledgers: Ledgers) => Executor;
     const executor = factory(ledgers);
     engine = new Engine(ledgers, executor, options);
@@ -48,7 +51,11 @@ export async function main(options: MainOptions = {}): Promise<void> {
     await engine.recover();
     await engine.loop(options.signal);
   } finally {
-    try { await watcher?.stop(); await engine?.close(); } finally { try { await ledgers?.orch.close(); } finally { await lock.release(); } }
+    try { await watcher?.stop(); await engine?.close(); }
+    finally {
+      try { await ledgers?.orch.append('orchestrator-exit', { pid: process.pid }).catch(() => {}); await ledgers?.orch.close(); }
+      finally { await lock.release(); }
+    }
   }
 }
 
