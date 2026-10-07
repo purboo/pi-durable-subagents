@@ -17,7 +17,7 @@ import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
-import { JT, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
+import { JT, attentionEntries, isEntry, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
@@ -419,7 +419,7 @@ export class Engine {
     this.generations.add(id);
     void this.executor.run(ticket).then(() => this.background(async () => {
       if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);
-      if (!wf.journal.entries().some(e => e.type === JT.attention && (e.item as { id?: string }).id === `finished:${id}`))
+      if (!wf.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`))
         await wf.journal.append(JT.attention, { item: { id: `finished:${id}`, rev: 1, kind: 'finished', wid: wf.wid, call: id, text: finishedText(wf.wid, wf.journal.entries(), id), origin: wf.origin } });
       this.generations.delete(id);
     }), error => {
@@ -542,13 +542,12 @@ export class Engine {
   private async attention(wf: Workflow) {
     const done = this.terminal(wf);
     const rev = wf.journal.entries().filter(e => e.type === JT.done).length;
-    if (done && !wf.journal.entries().some(e => e.type === JT.attention && (e.item as { id: string; rev: number }).id === `finished:${wf.wid}` && (e.item as { rev: number }).rev === rev)) {
+    if (done && !wf.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${wf.wid}` && e.item.rev === rev)) {
       await wf.journal.append(JT.attention, { item: { id: `finished:${wf.wid}`, rev, kind: 'finished', wid: wf.wid, text: finishedText(wf.wid, wf.journal.entries()) } });
     }
   }
   private async resolveFinished(wf: Workflow) {
-    for (const e of wf.journal.entries().filter(e => e.type === JT.attention)) {
-      const item = e.item as { id: string; rev: number; kind: string };
+    for (const { item } of attentionEntries(wf.journal.entries())) {
       if (item.kind === 'finished' && !wf.journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev)) {
         await wf.journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: 'resumed' });
       }

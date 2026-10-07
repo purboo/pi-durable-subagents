@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { stat as fileStat } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
-import { JT, type Entry, type ProcInfo, type Spawned } from "../../types.ts";
+import { JT, attentionEntries, type Entry, type ProcInfo, type Spawned } from "../../types.ts";
 import { callDir, callSession } from "../../paths.ts";
 import { monotoneTime } from "../../kernel/guards.ts";
 import type { CallTicket, OrchestratorConfig } from "../contract.ts";
@@ -53,8 +53,7 @@ export async function observeExecution(d: Dependencies) {
   };
   const stall = () => serial(async () => {
     const id = `stall:${t.callId}`;
-    const items = t.journal.entries().filter(e => e.type === JT.attention && (e.item as { id: string }).id === id);
-    const last = items.at(-1)?.item as { rev: number } | undefined;
+    const items = attentionEntries(t.journal.entries(), id), last = items.at(-1)?.item;
     const open = last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
     const fresh = items.at(-1)?.exec === exec ? clock.last > Number(items.at(-1)?.horizon) : clock.last > started;
     if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "activity" });
@@ -63,8 +62,7 @@ export async function observeExecution(d: Dependencies) {
   });
   const noProgress = () => serial(async () => {
     const id = `noprogress:${t.callId}`;
-    const items = t.journal.entries().filter(e => e.type === JT.attention && (e.item as { id: string }).id === id);
-    const last = items.at(-1)?.item as { rev: number } | undefined;
+    const items = attentionEntries(t.journal.entries(), id), last = items.at(-1)?.item;
     const open = last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
     const fresh = items.at(-1)?.exec === exec ? progress > Number(items.at(-1)?.horizon) : progress > started;
     if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "progress" });

@@ -34,6 +34,37 @@ export interface Entry<T extends string = string> {
   [field: string]: unknown;
 }
 
+/** The fields of the entry types that more than one reader folds (executor admission, `status`, the UI, doctor).
+ *  Readers narrow with `isEntry` instead of casting; an entry of another type keeps the loose `Entry` shape. */
+export interface EntryFields {
+  // journal
+  attention: { item: AttentionItem };
+  "attention-resolved": { id: string; rev: number; resolution?: string };
+  exec: { exec: string; call: string };
+  fenced: { exec: string };
+  "fence-failed": { exec: string; error: string };
+  sealed: { call: string; exec?: string; result: CallResult };
+  // orchestrator.jsonl
+  /** A slot of a provider (pool = provider name) or of memory; `reserved` holds the target of a pending model switch. */
+  hold: { pool: string; slot: number; exec: string; reserved?: true; rid?: string };
+  release: { pool: string; slot: number; exec: string };
+  "switch-observed": { exec: string; rid: string; pool?: string };
+  skip: { pool: string; model: string; until: number };
+  "provider-exhausted": { provider: string; exec: string; since: number; nextTry: number; error: string };
+  "provider-probe": { provider: string; exec: string };
+  "provider-available": { provider: string; exec: string };
+  /** The orchestrator settings in effect from here (config.json's orchestrator keys) and their hash. */
+  config: { hash: string; config: Record<string, unknown> };
+  "config-rejected": { error: string; hash?: string };
+}
+export type EntryOf<T extends keyof EntryFields> = Entry<T> & EntryFields[T];
+/** Narrow an entry to its type's fields (their shape is the writer's contract, not checked at runtime). */
+export function isEntry<T extends keyof EntryFields>(e: Entry, type: T): e is EntryOf<T> { return e.type === type; }
+/** P15: the attention entries of a journal, of one item id when given (each revision of an item is an entry). */
+export function attentionEntries(entries: readonly Entry[], id?: string): EntryOf<"attention">[] {
+  return entries.filter((e): e is EntryOf<"attention"> => isEntry(e, "attention") && (id === undefined || e.item.id === id));
+}
+
 export interface JournalHandle {
   readonly path: string;
   /** All committed entries (torn tail already truncated on open). */

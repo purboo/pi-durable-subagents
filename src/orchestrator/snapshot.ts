@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { compileFanout } from "../compat/fanout.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger, pinnedDir, workflowDir } from "../paths.ts";
-import { JT, type AttentionItem, type CallResult, type Entry } from "../types.ts";
-import { foldExhaustion, type Exhaustion } from "./providers.ts";
+import { JT, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
+import { emptyLedger, foldLedger, type LedgerState } from "./ledger.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
@@ -195,8 +195,8 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         if (usage) sealedUsage.set(String(e.call), usage);
         const call = calls.get(String(e.call)); if (!call) continue;
         call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated; hibernating.delete(call.callId);
-      } else if (e.type === JT.attention) {
-        const item = e.item as AttentionItem;
+      } else if (isEntry(e, JT.attention)) {
+        const item = e.item;
         attention.push(item);
       } else if (e.type === "forward") {
         const envelope = e.envelope as { kind?: string; body?: { provider?: string; model?: string } } | undefined;
@@ -526,26 +526,22 @@ export interface StatusBrief {
 
 /** Provider slots from the orchestrator ledger: holders per provider (hold/release{pool,slot,exec}) and the limits of
  *  the settings in effect (the latest config{hash,config}); config-rejected after it is reported too. */
+// One fold per orchestrator ledger, extended as it grows (ledger.ts; the executor folds the same entries the same way).
+const ledgerStates = new Map<string, LedgerState>();
 export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected" | "exhausted"> {
-  const held = new Map<string, Entry>(), used = new Map<string, Exhaustion>();
-  let config: Entry | undefined, rejected: Entry | undefined;
-  for (const e of readJournalSnapshot(orchLedger(home))) {
-    if (e.type === "hold") held.set(`${e.pool}:${e.slot}`, e);
-    else if (e.type === "release" && held.get(`${e.pool}:${e.slot}`)?.exec === e.exec) held.delete(`${e.pool}:${e.slot}`);
-    else if (e.type === "config") { config = e; rejected = undefined; }
-    else if (e.type === "config-rejected") rejected = e;
-    foldExhaustion(used, e);
-  }
+  const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
+  ledgerStates.set(path, state);
+  const { held, config, rejected } = state, used = state.exhausted;
   const exhausted = [...used].sort(([a], [b]) => a.localeCompare(b)).map(([p, x]) => `${p} exhausted since ${age(now - x.since)} ago (${clip(x.error, 80)}), ` +
     (x.probe ? `probing with ${x.probe.split("#")[0]}` : x.nextTry > now ? `next try in ${age(x.nextTry - now)}` : "next call probes it"));
-  const limits = ((config?.config as { providers?: Record<string, { slots?: number }> } | undefined)?.providers) ?? {};
+  const limits: Record<string, { slots?: number }> = config?.settings.providers ?? {};
   const holders = new Map<string, number>();
-  for (const e of held.values()) if (e.pool !== "memory") holders.set(String(e.pool), (holders.get(String(e.pool)) ?? 0) + 1);
+  for (const e of held.values()) if (e.pool !== "memory") holders.set(e.pool, (holders.get(e.pool) ?? 0) + 1);
   const names = [...new Set([...Object.keys(limits), ...holders.keys()])].sort();
   const slots = names.map(p => { const n = holders.get(p) ?? 0, limit = limits[p]?.slots; return typeof limit === "number" ? `${p} ${n}/${limit}` : `${p} ${n} (no limit)`; });
-  return { ...(slots.length ? { slots } : {}), ...(config ? { config: `${String(config.hash)} since ${age(now - config.ts)} ago` } : {}),
+  return { ...(slots.length ? { slots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
     ...(exhausted.length ? { exhausted } : {}),
-    ...(rejected ? { configRejected: `${clip(String(rejected.error), 200)} (${age(now - rejected.ts)} ago); ${config ? String(config.hash) : "the start settings"} stay in effect` } : {}) };
+    ...(rejected ? { configRejected: `${clip(rejected.error, 200)} (${age(now - rejected.ts)} ago); ${config ? config.hash : "the start settings"} stay in effect` } : {}) };
 }
 
 /** Tool status without a wid: what runs, what waits for an answer and what failed, with finished workflows one line each.
@@ -680,7 +676,7 @@ export function eventsFromEntries(entries: readonly Entry[]): TimelineEvent[] {
         add(e, "sealed", { call: e.call, status: r?.status, ok: r?.ok, usage: nonzero(r?.usage) ? r?.usage : undefined, error: r?.error ? clip(r.error, 300) : undefined });
         break;
       }
-      case JT.attention: { const a = e.item as AttentionItem; add(e, "attention", { kind: a.kind, id: a.id, rev: a.rev, text: clip(a.text, 300) }); break; }
+      case JT.attention: { const a = (e as EntryOf<"attention">).item; add(e, "attention", { kind: a.kind, id: a.id, rev: a.rev, text: clip(a.text, 300) }); break; }
       case JT.attentionResolved: add(e, "attention-resolved", { id: e.id, rev: e.rev, resolution: e.resolution }); break;
       case "resumed": add(e, "resumed", { rid: e.rid, call: e.call }); break;
       case JT.done: add(e, "done", { status: e.status, error: e.error ? clip(String(e.error), 500) : undefined }); break;

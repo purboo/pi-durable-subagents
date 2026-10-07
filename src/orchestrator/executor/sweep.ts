@@ -1,7 +1,7 @@
 // Private entries: skip{pool,model,until} in orchestrator ledger (K7); retired{call} in workflow (P14);
 // fence-failed{exec,error} in workflow: a fence timed out, the call is parked until a sweep proves retirement.
 import type { Containment, JournalHandle, ProcInfo } from "../../types.ts";
-import { JT } from "../../types.ts";
+import { JT, attentionEntries, isEntry } from "../../types.ts";
 import { Containment as PlatformContainment } from "../../platform/containment.ts";
 import { ProcessTable } from "../../platform/proctable.ts";
 import type { Model } from "../../compat/model.ts";
@@ -42,7 +42,7 @@ export function recordFenceFailure(journal: JournalHandle, id: string, call: str
 async function fenceFailure(journal: JournalHandle, id: string, call: string, error: unknown) {
   if (!journal.entries().some(e => e.type === "fence-failed" && e.exec === id)) await journal.append("fence-failed", { exec: id, error: String(error) });
   const item = `fence:${id}`;
-  if (journal.entries().some(e => e.type === JT.attention && (e.item as { id: string }).id === item)) return;
+  if (journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === item)) return;
   const text = id.startsWith("gate:")
     ? `Processes of gate ${id} did not exit after SIGKILL (${String(error)}). Its outcome stays unknown and is recorded once they are gone; check for stuck processes (e.g. blocked I/O).`
     : `Processes of execution ${id} did not exit after SIGKILL (${String(error)}). Call ${call} is paused and starts no new execution until they are gone; check for stuck processes (e.g. blocked I/O).`;
@@ -54,7 +54,7 @@ export function resolveFenceAttention(journal: JournalHandle, id: string) {
 }
 /** The same, inside a `recordOnce` section. */
 export async function fenceAttentionResolved(journal: JournalHandle, id: string) {
-  const item = journal.entries().find(e => e.type === JT.attention && (e.item as { id: string }).id === `fence:${id}`)?.item as { rev: number } | undefined;
+  const item = attentionEntries(journal.entries(), `fence:${id}`)[0]?.item;
   if (item && !journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${id}` && e.rev === item.rev))
     await journal.append(JT.attentionResolved, { id: `fence:${id}`, rev: item.rev, resolution: "fenced" });
 }

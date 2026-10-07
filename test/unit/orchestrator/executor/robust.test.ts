@@ -328,6 +328,19 @@ test("a call waiting for a slot follows a reloaded defaultModel and limit", { ti
   assert.deepEqual(f.journal.entries().find(e => e.type === "selected")?.model, { provider: "q", id: "new" });
 });
 
+test("A4 admission reads the settings recorded in the orchestrator ledger, not the object it was given", { timeout: 10000 }, async t => {
+  const f = await fixture(t, { defaultModel: "p/old", providers: { p: { slots: 0 }, q: { slots: 1 } } });
+  const run = f.executor.run({ ...f.ticket("a"), agent: { ...agent, model: undefined } });
+  await until(() => f.journal.entries().some(e => e.type === JT.exec));
+  await delay(100);
+  assert.equal(count(f.journal.entries(), e => e.type === "selected"), 0, "p has no slot");
+  // Recorded only: the given object still names p/old.
+  await f.executor.reconfigure!(async () => { await f.orch.append("config", { hash: "recorded", config: { defaultModel: "q/new", providers: { p: { slots: 0 }, q: { slots: 1 } } } }); });
+  await run;
+  assert.deepEqual(f.journal.entries().find(e => e.type === "selected")?.model, { provider: "q", id: "new" });
+  assert.equal(f.config.defaultModel, "p/old");
+});
+
 test("a config change waits for an admission in progress instead of changing its limits halfway", { timeout: 10000 }, async t => {
   let measured!: () => void;
   const gate = new Promise<void>(resolve => { measured = resolve; });

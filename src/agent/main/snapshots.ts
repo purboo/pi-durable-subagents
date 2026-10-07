@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readJournalSnapshot } from "../../kernel/journal.ts";
 import { journalPath, orchLedger } from "../../paths.ts";
-import { CT, JT, type AttentionItem, type Entry } from "../../types.ts";
+import { CT, JT, attentionEntries, type AttentionItem, type Entry } from "../../types.ts";
 import { holdOf, ledgerIndex } from "../../orchestrator/snapshot.ts";
 
 /** P15, P25: Read workflow snapshots without modifying another domain's history; a wid with an orchestrator.jsonl
@@ -68,7 +68,7 @@ function unresolved(entries: readonly Entry[]): AttentionItem[] {
   let items = open.get(entries);
   if (items) return items;
   const done = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}\0${e.rev}`));
-  items = entries.filter(e => e.type === JT.attention).map(e => e.item as AttentionItem).filter(item => !done.has(`${item.id}\0${item.rev}`));
+  items = attentionEntries(entries).map(e => e.item).filter(item => !done.has(`${item.id}\0${item.rev}`));
   open.set(entries, items);
   return items;
 }
