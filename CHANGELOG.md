@@ -6,13 +6,15 @@
   (`orchestrator: 1.0.14 (pid …)`), and when it is not the version a pi
   session loaded (after an update, running work stays on the old one), that
   pi says so once and `status` adds a note: the orchestrator switches by
-  itself about 10 s after all work ends; `drain` then `resume` switches
-  sooner without stopping running calls.
+  itself about 10 s after all work ends. To switch sooner without stopping
+  running calls: `drain`, wait until `status` no longer shows the old
+  version, then `resume` from a pi session started after the update.
 - Two subagents editing the same worktree are pointed out. When two calls
   that have not finished both used `edit` or `write` under the same git
   worktree, the main session that started them gets one reminder per pair,
-  and `status` names the other call in `sharedWorktree`. Nothing is blocked;
-  the reminder closes when either call ends. Writes made only through `bash`
+  and `status` names the other call in `sharedWorktree`. A paused call that
+  wrote still counts until it ends. Nothing is blocked; the reminder closes
+  when either call ends. Writes made only through `bash`
   are not seen; calls with `isolation: "worktree"` have their own worktree.
 
 ## 1.0.13
