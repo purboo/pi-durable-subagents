@@ -82,6 +82,7 @@ export function registerChild(pi: ExtensionAPI): void {
       if (mode === 'ask' && (req.kind !== 'steer' || delivered)) return { action: 'defer' };
       if (req.kind === 'model') {
         const body = req.body as ModelBody;
+        if (body?.exec !== undefined && body.exec !== exec) return { action: 'reject', reason: 'stale-execution' };
         return body && ctx.modelRegistry.find(body.provider, body.model) ? { action: 'apply' } : { action: 'reject', reason: 'unknown-model' };
       }
       if (MESSAGES.includes(req.kind)) {

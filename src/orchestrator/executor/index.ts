@@ -555,7 +555,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const probe = folded().exhausted.has(m.provider); // its next try is due (`unavailable` said so): this is its probe
       if (!await reserveSwitch(exec, m.provider, rid)) continue;
       if (probe) await orch.append("provider-probe", { provider: m.provider, exec });
-      const body: ModelBody = { provider: m.provider, model: m.id, ...(m.thinking ? { thinking: m.thinking } : {}) };
+      // Bound to this execution: replayed after it ended, a later execution (which chose its model at launch) refuses it.
+      const body: ModelBody = { provider: m.provider, model: m.id, ...(m.thinking ? { thinking: m.thinking } : {}), exec };
       const envelope: Envelope = { to: t.callId, kind: "model", body }, hash = contentHash(envelope);
       const entry = await t.journal.append("forward", { rid, rid2: forwardRid(rid, t.callId.slice(0, t.callId.indexOf("/")), t.key, hash), dest: t.callId, hash, envelope, failover: provider });
       await replayForward(entry);
