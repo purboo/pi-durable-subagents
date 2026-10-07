@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.11
+
+- A gate whose processes outlive their fence is reported once: when the gate
+  and the background sweep both recorded the failure at the same moment, a
+  workflow could show the same "processes may still run" attention item twice
+  (and the failure, the gate's unknown outcome and the resolution likewise).
+
 ## 1.0.10
 
 - Provider failover for a used-up usage window. An error such as `503 No
