@@ -58,7 +58,8 @@ export function registerCards(pi: ExtensionAPI, home: string): void {
     let last: { key: string; lines: string[] } | undefined;
     const draw = (width: number) => items.flatMap(item => {
       const h = HEAD[item.kind] ?? HEAD.unknown, closed = item.kind === "question" && isResolved(item);
-      const heading = `${h.icon} ${item.kind === "finished" && !item.call ? "Workflow" : `Subagent ${keyOf(item)}`} ${closed ? "— answered" : h.title}`;
+      const title = item.kind === "stall" && item.id.startsWith("noprogress:") ? "no progress" : h.title;
+      const heading = `${h.icon} ${item.kind === "finished" && !item.call ? "Workflow" : `Subagent ${keyOf(item)}`} ${closed ? "— answered" : title}`;
       // v12 §3: a finished digest is first line + dim per-agent lines, clipped; old single-line items read exactly as before.
       const inner = Math.max(1, Math.max(3, Math.floor(width)) - 4);
       const body = item.kind === "finished" && !closed
