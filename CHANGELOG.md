@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.8
+
+- pi stays responsive with a long history: the extension's polling in pi's
+  main thread no longer re-reads it all. Workflow status folds only what a
+  journal appended, the orchestrator ledger is indexed once per change, the
+  attention check reads only this session's workflows, and an open question's
+  card reads only what the child session appended. On a home with 60
+  workflows and 356 calls, the dock refresh went from 4.5 ms to under 1 ms
+  every half second, and an idle pi's busy time from about 4% to 1.5%.
+- Calls finished more than 10 s ago keep their summary only; their transcript
+  is read when shown. pi holds about 100 MB less and garbage collection no
+  longer pauses typing.
+- A change of `config.json` written twice quickly to the same size is no
+  longer missed: the orchestrator compares the file's content.
+
 ## 1.0.7
 
 - Changes to `config.json` (`defaultModel`, `pools`, `providers`, `memory`,

@@ -64,11 +64,12 @@ export class UiData {
   private final = new Map<string, { endedAt: number; path: string; facts: Facts }>();
   /** The transcript of one final call last asked for (the open call view asks on every frame). Keeping every
    *  historical transcript parsed held hundreds of MB and made pi's garbage collection pause typing. */
-  private opened?: { callId: string; entries: SessionEntry[] };
+  private opened?: { callId: string; endedAt: number; entries: SessionEntry[] };
   private transcript(callId: string, sessions: LazyMap<readonly SessionEntry[]>): void {
     const final = this.final.get(callId);
     if (!final) return;
-    if (this.opened?.callId !== callId) this.opened = { callId, entries: sessionBranch(new SessionTail().read(final.path)) };
+    if (this.opened?.callId !== callId || this.opened.endedAt !== final.endedAt)
+      this.opened = { callId, endedAt: final.endedAt, entries: sessionBranch(new SessionTail().read(final.path)) };
     sessions.put(callId, this.opened.entries);
   }
   /** Branch and facts per call, reused while its session tail is unchanged: a finished call's session never grows, and
