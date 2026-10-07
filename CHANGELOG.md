@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.4
+
+- The TUI no longer stalls pi with a long subagent history. Its 500 ms refresh
+  re-read and re-derived every historical call's session and scanned journals
+  once per call, taking over a second per refresh with a few hundred finished
+  calls; it now reuses per-call facts and a journal index (about 5 ms).
+- Main-session polling, attention cards and transcript cards reuse derived
+  state per journal and per width instead of rescanning the session every
+  200 ms, so typing stays responsive in long sessions.
+- Faster startup: thinking summaries no longer use a regex that went
+  quadratic on long unpunctuated thoughts (200 KB took 43 s), and finished
+  calls' sessions are read when first shown or in small idle slices rather
+  than all at startup.
+
 ## 1.0.3
 
 - Recovery delivers a call's task when an earlier execution ended before its
