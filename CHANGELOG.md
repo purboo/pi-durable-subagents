@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.7
+
+- Changes to `config.json` (`defaultModel`, `pools`, `providers`, `memory`,
+  `k`) apply without restarting the orchestrator: it checks the file about
+  once a second and applies a valid change between slot admissions, so a call
+  still waiting for a slot follows the new model, pool or limit. Slots already
+  held are kept when a limit drops. An invalid change is refused and the
+  settings in effect stay; `status` names the error until the file is valid
+  again.
+- `status` marks an asker whose execution hibernated with `hibernated: true`
+  (CLI: "hibernated, no slot"): it holds no provider slot until it is
+  answered. Both `status` forms list provider slots in use against their
+  limits, and the config in effect.
+
 ## 1.0.6
 
 - A follow-up on a finished workflow shows as running work: in the dock, the
