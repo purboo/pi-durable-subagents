@@ -7,8 +7,7 @@
   exceeded), not after pi's retries end. A call from a pool moves to the
   pool's next model that is not used up and has a free slot, in the same
   execution and session, within pi's next retry or two (refused requests use
-  no quota); one with a single model waits
-  for its provider. Before, a call kept retrying the used-up provider for as
+  no quota); one with a single model waits for its provider. Before, a call kept retrying the used-up provider for as
   long as pi's retry settings allowed (over ten minutes with ten retries).
 - `send kind:"model"` and a follow-up's `model` accept a pool's name: the
   first model of the pool that is not used up (for a running call, also with
