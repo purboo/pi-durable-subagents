@@ -94,11 +94,15 @@ export function presentText(item: AttentionItem): string {
 }
 
 /** Resolutions recorded in one immutable journal snapshot, keyed by id and rev. */
-const resolutions = new WeakMap<readonly Entry[], Set<string>>();
-function resolvedIn(entries: readonly Entry[]): Set<string> {
+const resolutions = new WeakMap<readonly Entry[], Map<string, string>>();
+function resolvedIn(entries: readonly Entry[]): Map<string, string> {
   let done = resolutions.get(entries);
-  if (!done) { done = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => JSON.stringify([e.id, e.rev]))); resolutions.set(entries, done); }
+  if (!done) { done = new Map(entries.filter(e => e.type === JT.attentionResolved).map(e => [JSON.stringify([e.id, e.rev]), typeof e.resolution === "string" ? e.resolution : "resolved"])); resolutions.set(entries, done); }
   return done;
+}
+/** Preserve the reason so presentation distinguishes resumed output from a terminated execution. */
+export function attentionResolution(home: string, item: AttentionItem): string | undefined {
+  return resolvedIn(readJournalSnapshot(journalPath(home, item.wid))).get(JSON.stringify([item.id, item.rev]));
 }
 /** Successful `ask` results per child session file, read incrementally: pi renders an open question's card on every
  *  frame, and re-reading and parsing the whole child session each time stalled typing in the main session. */
@@ -151,7 +155,7 @@ function answeredAsks(path: string): Set<string> | undefined {
 }
 /** P15: Refresh a question against durable workflow and child receipts at request time. */
 export function resolved(home: string, item: AttentionItem): boolean {
-  if (resolvedIn(readJournalSnapshot(journalPath(home, item.wid))).has(JSON.stringify([item.id, item.rev]))) return true;
+  if (attentionResolution(home, item) !== undefined) return true;
   if (item.kind !== "question" || !item.session || !item.qid) return false;
   return answeredAsks(item.session)?.has(JSON.stringify([item.qid, item.rev])) ?? false;
 }

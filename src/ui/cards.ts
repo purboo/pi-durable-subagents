@@ -3,7 +3,7 @@
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { CT, type AttentionItem } from "../types.ts";
-import { resolved } from "../agent/main/snapshots.ts";
+import { attentionResolution, resolved } from "../agent/main/snapshots.ts";
 
 type Tone = "accent" | "success" | "warning" | "error" | "muted";
 const HEAD: Record<AttentionItem["kind"], { icon: string; title: string; tone: Tone }> = {
@@ -39,28 +39,35 @@ export function card(theme: Theme, tone: Tone, heading: string, body: readonly s
 }
 
 /** P15, P16: Register renderers for attention presentations and watch-view notes in the main session. */
-export function registerCards(pi: ExtensionAPI, home: string): void {
-  const done = new Set<string>(); // resolution is monotone: once resolved, never re-read
-  // pi renders every visible message on each frame; an open question re-reads its child session at most once a second.
+export function registerCards(pi: ExtensionAPI, home: string): () => boolean {
+  const pending = new Map<string, AttentionItem>();
+  const done = new Map<string, string>(); // resolution is monotone: once resolved, never re-read
+  // pi renders every visible message on each frame; open cards re-read receipts at most once a second.
   const checked = new Map<string, number>();
-  const isResolved = (item: AttentionItem) => {
-    const id = `${item.id}@${item.rev}`;
-    if (done.has(id)) return true;
+  const resolution = (item: AttentionItem): string | undefined => {
+    if (item.kind !== "question" && item.kind !== "stall") return undefined;
+    const id = `${item.wid}:${item.id}@${item.rev}`;
+    if (done.has(id)) { pending.delete(id); return done.get(id); }
     const now = Date.now();
-    if (now - (checked.get(id) ?? -Infinity) < 1000) return false;
+    if (now - (checked.get(id) ?? -Infinity) < 1000) return undefined;
     checked.set(id, now);
-    try { if (resolved(home, item)) { done.add(id); checked.delete(id); return true; } } catch { /* display only */ }
-    return false;
+    try {
+      const reason = item.kind === "question" ? (resolved(home, item) ? "answered" : undefined) : attentionResolution(home, item);
+      if (reason) { done.set(id, reason); checked.delete(id); pending.delete(id); return reason; }
+    } catch { /* display only */ }
+    return undefined;
   };
   pi.registerMessageRenderer<{ items?: AttentionItem[] }>(CT.attention, (message, options, theme) => {
     const items = message.details?.items;
     if (!items?.length) return undefined;
-    // The lines depend only on width, expansion, theme and which questions are answered: reuse them across frames.
+    for (const item of items) if (item.kind === "stall" || item.kind === "question") pending.set(`${item.wid}:${item.id}@${item.rev}`, item);
+    // Reuse lines until width, theme, expansion or an attention resolution changes.
     let last: { key: string; lines: string[] } | undefined;
     const draw = (width: number) => items.flatMap(item => {
-      const h = HEAD[item.kind] ?? HEAD.unknown, closed = item.kind === "question" && isResolved(item);
-      const title = item.kind === "stall" && item.id.startsWith("noprogress:") ? "no progress" : h.title;
-      const heading = `${h.icon} ${item.kind === "finished" && !item.call ? "Workflow" : `Subagent ${keyOf(item)}`} ${closed ? "— answered" : title}`;
+      const h = HEAD[item.kind] ?? HEAD.unknown, reason = resolution(item), closed = !!reason;
+      const title = item.kind === "stall" && item.id.startsWith("noprogress:") ? "awaiting progress" : h.title;
+      const status = item.kind === "question" ? "answered" : reason === "activity" || reason === "progress" ? "recovered" : reason === "ended" || reason === "retired" ? "ended" : "resolved";
+      const heading = `${closed ? "✓" : h.icon} ${item.kind === "finished" && !item.call ? "Workflow" : `Subagent ${keyOf(item)}`} ${closed ? `— ${status}` : title}`;
       // v12 §3: a finished digest is first line + dim per-agent lines, clipped; old single-line items read exactly as before.
       const inner = Math.max(1, Math.max(3, Math.floor(width)) - 4);
       const body = item.kind === "finished" && !closed
@@ -69,7 +76,7 @@ export function registerCards(pi: ExtensionAPI, home: string): void {
       return card(theme, closed ? "muted" : h.tone, heading, body, width, options.expanded);
     });
     return { invalidate() { last = undefined; }, render: (width: number) => {
-      const key = `${width}|${items.map(item => item.kind === "question" && isResolved(item) ? 1 : 0).join("")}`;
+      const key = `${width}|${items.map(item => resolution(item) ?? "").join("|")}`;
       if (last?.key !== key) last = { key, lines: draw(width) };
       return last.lines;
     } };
@@ -82,4 +89,10 @@ export function registerCards(pi: ExtensionAPI, home: string): void {
       return last.lines;
     } };
   });
+  // The existing UI refresh loop repaints receipts even when dock text did not change.
+  return () => {
+    const before = done.size;
+    for (const item of pending.values()) resolution(item);
+    return done.size !== before;
+  };
 }

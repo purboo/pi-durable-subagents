@@ -29,6 +29,40 @@ test("interactive registration and cleanup are idempotent; empty-editor gesture 
   hooks.get("session_shutdown")!(); hooks.get("session_shutdown")!(); assert.equal(removed, 2);
 });
 
+for (const dock of ["line", "off"]) test(`resolved cards request a repaint with an unchanged ${dock} dock`, async t => {
+  const { join } = await import("node:path");
+  const { writeFileSync } = await import("node:fs");
+  const { openJournal } = await import("../../../src/kernel/journal.ts");
+  const { journalPath } = await import("../../../src/paths.ts");
+  const { CT, JT } = await import("../../../src/types.ts");
+  const home = join(root, `repaint-${dock}`), journal = await openJournal(journalPath(home, "run"));
+  t.after(() => journal.close());
+  writeFileSync(join(home, "config.json"), JSON.stringify({ ui: { dock } }));
+  let now = Date.now(), refresh = () => {}, paints = 0;
+  t.mock.method(Date, "now", () => now);
+  const interval = globalThis.setInterval;
+  t.mock.method(globalThis, "setInterval", (fn: () => void) => { refresh = fn; return interval(fn, 1_000_000); });
+  const hooks = new Map<string, Function>(), renderers = new Map<string, Function>();
+  const pi = { on: (name: string, fn: Function) => hooks.set(name, fn), registerMessageRenderer: (name: string, fn: Function) => renderers.set(name, fn) } as unknown as ExtensionAPI;
+  registerUi(pi, { home, submit: async () => {}, presentNote() {} });
+  t.after(() => hooks.get("session_shutdown")!());
+  const tui = { requestRender() { paints++; } }, theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+  const ctx = { mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "test" }, modelRegistry: { find: () => undefined }, ui: {
+    custom: async () => {}, setWidget: (_key: string, factory: unknown) => { if (typeof factory === "function") factory(tui, theme); },
+    getEditorText: () => "", onTerminalInput: () => () => {},
+  } } as unknown as ExtensionContext;
+  hooks.get("session_start")!({}, ctx);
+  const item = { id: "noprogress:run@1/a@1", rev: 1, kind: "stall", wid: "run", call: "run@1/a@1", text: "no output" };
+  const component = renderers.get(CT.attention)!({ details: { items: [item] } }, { expanded: false }, theme);
+  assert.match(component.render(60).join("\n"), /awaiting progress/);
+  refresh(); const before = paints;
+  await journal.append(JT.attentionResolved, { id: item.id, rev: 1, resolution: "progress" });
+  now += 1001; refresh();
+  assert.equal(paints, before + 1);
+  assert.match(component.render(60).join("\n"), /— recovered/);
+  refresh(); assert.equal(paints, before + 1, "no redundant repaint after recovery");
+});
+
 test("\u2193 opens the list only from pi's input editor, not from /model's selector or another overlay", async () => {
   const { join } = await import("node:path");
   const { openJournal } = await import("../../../src/kernel/journal.ts");

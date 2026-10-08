@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.17
+
+- A silent subagent shows one warning instead of separate activity and
+  progress warnings. The message now says that no new output or tool
+  progress has been received and that the model may still be processing;
+  the ten-minute thresholds are unchanged.
+- Warning cards update in place to `recovered` when activity resumes, or
+  `ended` when the execution ends. They refresh even when the status line
+  does not change or the dock is turned off.
+- Execution checkpoints and warnings record the latest received stream
+  update's time and type for diagnosis, without recording its content.
+
 ## 1.0.16
 
 - A used-up usage window is found while pi is still retrying: at the second

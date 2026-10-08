@@ -18,7 +18,7 @@ async function eventually<T>(fn: () => T, ms = 3000): Promise<T> {
   const deadline = Date.now() + ms;
   for (;;) { const value = fn(); if (value || Date.now() > deadline) return value; await delay(10); }
 }
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, stallMs = 600000) {
   let now = 0, wake = () => {}, ready!: () => void;
   t.mock.method(performance, "now", () => now);
   const home = await mkdtemp(join(tmpdir(), "dsa-progress-")), journal = await openJournal(join(home, "journal"));
@@ -28,7 +28,7 @@ async function fixture(t: TestContext) {
   await mkdir(callDir(home, "w", "a", 1), { recursive: true });
   const stdout = new PassThrough(), stdin = new PassThrough(), stderr = new PassThrough();
   const started = new Promise<void>(resolve => { ready = resolve; });
-  const running = observeExecution({ home, config: { k: { trackerMs: 5, progressMs: 600000, stallMs: 600000 } }, ticket, exec: `${ticket.callId}#1.1`,
+  const running = observeExecution({ home, config: { k: { trackerMs: 5, progressMs: 600000, stallMs } }, ticket, exec: `${ticket.callId}#1.1`,
     child: { pid: 1, start: "fixture", stdin, stdout, stderr, exited: new Promise(() => {}) },
     serial: fn => fn(), setWake: fn => { wake = fn; ready(); }, interrupted: () => false, track: async () => [], fence: async () => {},
     questions: async () => {}, recordUsage: async () => {}, switched: async () => {}, pendingSwitch: () => undefined });
@@ -48,7 +48,7 @@ for (const [source, event] of [
   await f.grow(); await f.tick(600001, event);
   const first = (await eventually(() => f.alerts()[0]))!;
   assert.deepEqual(first.item, { id: "noprogress:w@1/a@1", rev: 1, kind: "stall", wid: "w", call: "w@1/a@1",
-    text: "w/a: running but no progress for 10m (no output tokens or tool results); last provider error: " + ("quota exhausted " + "x".repeat(250)).slice(0, 200) });
+    text: "w/a: no new output or tool progress received for 10m; the model may still be processing; last provider error: " + ("quota exhausted " + "x".repeat(250)).slice(0, 200) });
   assert.equal(first.exec, "w@1/a@1#1.1"); assert.equal(first.horizon, 0);
   await f.tick(600002, { type: "message_update" });
   assert.ok(await eventually(() => f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === "noprogress:w@1/a@1" && e.rev === 1 && e.resolution === "progress")));
@@ -83,15 +83,46 @@ test("stall text names the running tool command and how long it has run, not an 
   await f.tick(2, { type: "tool_execution_end", toolCallId: "q", toolName: "ask" });
   await f.tick(60000, { type: "tool_execution_start", toolCallId: "t", toolName: "bash", args: { command: "make   fault-matrix\n  --all" } });
   await f.tick(60000 + 600001); await eventually(() => f.alerts("stall:").length);
-  assert.equal((f.alerts("stall:")[0]!.item as AttentionItem).text, "w/a: no execution activity for 10m; running bash `make fault-matrix --all` for 10m (no output or CPU use seen)");
+  assert.equal((f.alerts("stall:")[0]!.item as AttentionItem).text, "w/a: no execution activity observed for 10m; running bash `make fault-matrix --all` for 10m (no output or CPU use seen)");
   assert.equal(toolCommand({ command: "x".repeat(200) }), "x".repeat(119) + "…");
   assert.equal(toolCommand({ path: "a.ts" }), '{"path":"a.ts"}');
   assert.equal(toolCommand(undefined), "");
 });
 
-test("stall text identifies the call", { timeout: 5000 }, async t => {
-  const f = await fixture(t); await f.tick(600001); await eventually(() => f.alerts("stall:").length);
-  assert.equal((f.alerts("stall:")[0]!.item as AttentionItem).text, "w/a: no execution activity for 10m");
+test("silence emits one warning, thinking resolves it and a later silence re-arms it", { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await f.tick(600001); assert.ok(await eventually(() => f.alerts().length));
+  assert.equal(f.alerts("").length, 1);
+  assert.match((f.alerts()[0]!.item as AttentionItem).text, /w\/a: no new output.*model may still be processing/);
+  await f.tick(900001); assert.equal(f.alerts("").length, 1);
+  await f.tick(900002, { type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "private content" } });
+  assert.ok(await eventually(() => f.journal.entries().some(e => e.type === JT.attentionResolved && e.resolution === "progress")));
+  await f.tick(1500003); assert.ok(await eventually(() => f.alerts().length === 2));
+  assert.equal(f.alerts("").length, 2);
+  assert.deepEqual(f.alerts().map(e => (e.item as AttentionItem).rev), [1, 2]);
+});
+
+test("an earlier activity warning suppresses the later progress warning until recovery", { timeout: 5000 }, async t => {
+  const f = await fixture(t, 300000);
+  await f.tick(300001); assert.ok(await eventually(() => f.alerts("stall:").length));
+  await f.tick(600001); assert.equal(f.alerts("").length, 1);
+  await f.tick(600002, { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
+  assert.ok(await eventually(() => f.journal.entries().some(e => e.type === JT.attentionResolved && e.resolution === "activity")));
+  await f.tick(1200003); assert.ok(await eventually(() => f.alerts().length));
+  assert.equal(f.alerts("").length, 2);
+  assert.equal((f.alerts()[0]!.lastStream as { type: string }).type, "thinking_delta");
+});
+
+for (const type of ["thinking_delta", "text_delta"]) test(`continuous ${type} avoids warnings and checkpoints metadata only`, { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  for (const time of [500000, 1000000, 1500000]) await f.tick(time, { type: "message_update", assistantMessageEvent: { type, delta: "private content" } });
+  assert.equal(f.alerts("").length, 0);
+  const checkpoint = await eventually(() => f.journal.entries().findLast(e => e.type === "time" && e.lastStream));
+  assert.ok(checkpoint);
+  const metadata = checkpoint.lastStream as { type: string; receivedAt: number };
+  assert.equal(metadata.type, type); assert.ok(metadata.receivedAt > 0);
+  assert.deepEqual(Object.keys(metadata).sort(), ["receivedAt", "type"]);
+  assert.equal(JSON.stringify(f.journal.entries()).includes("private content"), false);
 });
 
 test("provider evidence uses only the segment's last assistant error", () => {
