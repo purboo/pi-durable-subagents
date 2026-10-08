@@ -143,12 +143,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   function tracked(journal: JournalHandle, exec: string): ProcInfo[] {
     return trackedState(journal, exec).rows;
   }
+  /** Persist every newly seen identity, tagged or not: a process that later clears its tag and leaves the tree must
+   *  still be fenced after an orchestrator restart. */
   async function track(journal: JournalHandle, exec: string, found?: ProcInfo[]) {
     const known = tracked(journal, exec);
     found ??= (await containment.scan(new Map([[exec, known]]), { maxAgeMs: config.k?.trackerMs ?? 1000 })).get(exec) ?? [];
     await serial(async () => {
       const { ids } = trackedState(journal, exec);
-      for (const p of found) if (p.tag !== exec && p.start && !ids.has(`${p.pid}:${p.start}`)) {
+      for (const p of found) if (p.start && !ids.has(`${p.pid}:${p.start}`)) {
         await journal.append("tracked", { exec, pid: p.pid, start: p.start }); trackedState(journal, exec);
       }
     });
@@ -414,19 +416,28 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   // Writer lock: one call that writes in a worktree runs there at a time. Ownership is durable (writer-hold/-release in
   // the orchestrator ledger) and lasts from the first admission to the call's seal or retirement, across executions,
   // hibernation and orchestrator restarts. Waiters are admitted in the order they first waited.
-  const writerWaits = new Map<string, { root: string; since: number; holder?: string }>();
+  const writerWaits = new Map<string, { root: string; since: number; holder?: string; recovered?: number }>();
+  /** A waiter recovered from the journal keeps its place this long for its call to come back after a restart. */
+  const RECOVERED_WAIT_MS = 60_000;
   async function writerRoot(t: CallTicket, cwd: string): Promise<string | undefined> {
     if (t.spec.isolation === "worktree") return;
     const tools = t.spec.tools ?? t.agent.tools;
     if (!(t.spec.writer ?? (!tools || tools.some(n => n === "edit" || n === "write")))) return;
     return await roots(cwd, "x") ?? await realpath(cwd).catch(() => cwd);
   }
-  /** An owner whose call ended (sealed, retired, revised away, its workflow done or pruned) no longer holds the lock. */
+  /** Whether every execution of `call` was fenced: until then its processes may still write. */
+  function writerFenced(entries: readonly Entry[], call: string): boolean {
+    const fenced = new Set(entries.filter(e => e.type === JT.fenced).map(e => String(e.exec)));
+    return entries.every(e => e.type !== JT.exec || callOf(String(e.exec)) !== call || fenced.has(String(e.exec)));
+  }
+  /** An owner whose call ended (sealed, retired, revised away, its workflow done or pruned) and whose executions were
+   *  all fenced no longer holds the lock. */
   function writerEnded(call: string): boolean {
     if (active.has(call)) return false;
     const { wid } = address(call), rev = Number(/^.*@(\d+)\//.exec(call)?.[1]);
     const journal = journals.get(wid), entries = journal && !journal.closed ? journal.entries() : readJournalSnapshot(journalPath(home, wid));
     if (!entries.length) return true;
+    if (!writerFenced(entries, call)) return false;
     const revised = entries.findLastIndex(e => e.type === "revised");
     if (revised >= 0 && Number(entries[revised]!.revision) > rev) return true;
     return entries.some((e, i) => (e.type === JT.sealed || e.type === "retired") && e.call === call || i > revised && e.type === JT.done);
@@ -440,7 +451,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     if (owner === call) return true;
     const mine = writerWaits.get(call) ?? { root, since: t.journal.entries().find(e => e.type === "writer-wait" && e.call === call)?.ts ?? Date.now() };
     writerWaits.set(call, mine);
-    const earlier = [...writerWaits].filter(([c, w]) => c !== call && w.root === root && w.since < mine.since && active.has(c) && !interrupted(active.get(c)!)).map(([c]) => c);
+    delete mine.recovered;
+    const waiting = (c: string, w: { recovered?: number }) => active.has(c) ? !interrupted(active.get(c)!)
+      : w.recovered !== undefined && Date.now() - w.recovered < RECOVERED_WAIT_MS && !writerEnded(c);
+    const earlier = [...writerWaits].filter(([c, w]) => c !== call && w.root === root && (w.since < mine.since || w.since === mine.since && c < call) && waiting(c, w)).map(([c]) => c);
     const holder = owner ?? earlier[0];
     if (!holder) {
       await orch.append("writer-hold", { root, call });
@@ -842,7 +856,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         try {
           if (exec && await fence(ticket.journal, exec)) await release(exec);
           // The writer lock outlives executions and restarts; it ends with the call (or its retirement).
-          if (sealed(ticket.journal, ticket.callId) || a.retired || ticket.journal.entries().some(e => e.type === "retired" && e.call === ticket.callId)) await writerRelease(ticket.callId);
+          // Not before every execution is fenced: a later sweep proves it, and the next writer's admission releases it.
+          if ((sealed(ticket.journal, ticket.callId) || a.retired || ticket.journal.entries().some(e => e.type === "retired" && e.call === ticket.callId))
+            && writerFenced(ticket.journal.entries(), ticket.callId)) await writerRelease(ticket.callId);
         }
         finally {
           writerWaits.delete(ticket.callId);
@@ -981,6 +997,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       for (const e of journal.entries().filter(e => e.type === JT.exec)) {
         // F1: an exec whose fence fails stays unfenced and holding; its call parks until a sweep retires it.
         const exec = String(e.exec); if (await fence(journal, exec)) await release(exec);
+      }
+      // Writers that waited before the restart keep their order while their calls come back.
+      for (const e of journal.entries()) {
+        const call = String(e.call);
+        if (e.type === "writer-wait" && !writerWaits.has(call)) writerWaits.set(call, { root: String(e.root), since: e.ts, recovered: Date.now() });
+        else if (e.type === "writer-acquired" || e.type === JT.sealed || e.type === "retired") { const w = writerWaits.get(call); if (w?.recovered !== undefined) writerWaits.delete(call); }
       }
       const calls = new Set(journal.entries().filter(e => e.type === JT.exec).map(e => String(e.call)));
       for (const call of calls) {

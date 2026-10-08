@@ -6,7 +6,8 @@
 // and recovery resumes it) — a check without the orchestrator's launch gate, so a launch can slip in between.
 import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
-import { orchLedger } from "../paths.ts";
+import { journalPath, orchLedger } from "../paths.ts";
+import { JT } from "../types.ts";
 import { emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
 import { allWorkflows, liveCalls, processAlive } from "../orchestrator/snapshot.ts";
 
@@ -18,12 +19,21 @@ export function currentOrchestrator(home: string): OrchestratorProcess | undefin
   return o && !o.exited && processAlive(o.pid, o.start) ? { version: o.version, pid: o.pid, ...(o.start ? { start: o.start } : {}), ts: o.ts, ...(o.restart ? { restart: true as const } : {}) } : undefined;
 }
 
-/** Calls whose execution runs per the journals: running, or asking without having hibernated (its child still runs). */
+/** Calls whose execution runs per the journals: running, asking without having hibernated (its child still runs), or
+ *  running a gate (a gate-intent without its outcome; an interrupted gate is not run again). */
 export function journalLiveCalls(home: string, now = Date.now()): string[] {
   const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : `${Math.round(ms / 60_000)}m`;
-  return allWorkflows(home).flatMap(wf => liveCalls(wf)
-    .filter(c => c.phase === "running" || (c.phase === "asking" && c.exec !== undefined && !c.hibernated))
-    .map(c => `${wf.wid}/${c.key}${c.startedAt ? ` ${age(now - c.startedAt)}` : ""}${wf.origin ? ` from ${wf.origin}` : ""}`));
+  return allWorkflows(home).flatMap(wf => {
+    const entries = readJournalSnapshot(journalPath(home, wf.wid));
+    const done = new Set(entries.filter(e => e.type === "gate").map(e => String(e.id)));
+    const sealed = new Set(entries.filter(e => e.type === JT.sealed).map(e => String(e.call)));
+    const gates = new Map(entries.filter(e => e.type === "gate-intent" && !done.has(String(e.id)) && !sealed.has(String(e.call))).map(e => [String(e.call), e.ts]));
+    const where = wf.origin ? ` from ${wf.origin}` : "";
+    const running = liveCalls(wf).filter(c => !gates.has(c.callId) && (c.phase === "running" || (c.phase === "asking" && c.exec !== undefined && !c.hibernated)))
+      .map(c => `${wf.wid}/${c.key}${c.startedAt ? ` ${age(now - c.startedAt)}` : ""}${where}`);
+    const gating = [...gates].map(([call, ts]) => `${wf.wid}/${call.slice(call.indexOf("/") + 1, call.lastIndexOf("@"))} gate ${age(now - ts)}${where}`);
+    return [...running, ...gating];
+  });
 }
 
 /** For an orchestrator without the restart request kind: refuse while calls run (unless forced), else SIGTERM it. */

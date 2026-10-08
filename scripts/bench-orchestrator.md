@@ -10,7 +10,7 @@
 - Linux 已缓存环境的身份只读一次 stat；新身份读取 environ 后仍复查 start token。小型 `/proc/*/stat` 用同步读取，减少 libuv 往返；其他文件读取保持原行为。
 - watcher 仅处理 session.jsonl、inbox 和未知文件名通知，10 ms 合并事件；进程扫描仅由 timer 触发。流式增量只更新接收时钟，完整限制检查最多约 1 秒一次。
 - revision/terminal 使用不可变 entries 视图缓存；executor 的 has、usage、tracked 使用追加索引；sweep 在恢复时建立索引，之后只折叠新增记录。
-- 只持久化不带当前执行标签的 tracked 身份；旧记录仍参与 recovery/fence。已知历史身份先与扫描中的 pid/start 匹配，再建立集合，避免为已消失身份分配字符串。
+- （评审后撤回）原先只持久化不带当前执行标签的 tracked 身份；因清除标签并脱离进程树的进程在重启后会漏 fence，1.0.18 恢复为持久化每个新身份。已知历史身份先与扫描中的 pid/start 匹配，再建立集合，避免为已消失身份分配字符串。
 - 没有更改磁盘格式、版本号、CHANGELOG、其他 worktree 或用户 DSA home。
 
 代码：`src/platform/{proctable,containment}.ts`、`src/types.ts`、`src/orchestrator/store.ts`、`src/orchestrator/executor/{index,indexes,observe,sweep,usage}.ts`。
