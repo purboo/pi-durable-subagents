@@ -1,0 +1,36 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { openJournal } from "../../../../src/kernel/journal.ts";
+import { entriesOf, trackedState, usageIds } from "../../../../src/orchestrator/executor/indexes.ts";
+import { totalUsage } from "../../../../src/orchestrator/executor/usage.ts";
+
+test("A1 incremental indexes preserve prior identities and deduplicated usage across appends and reopen", async t => {
+  const root = await mkdtemp(join(tmpdir(), "dsa-index-")), path = join(root, "journal");
+  let journal = await openJournal(path);
+  t.after(async () => { await journal.close(); await rm(root, { recursive: true, force: true }); });
+  await journal.append("tracked", { exec: "a", pid: 1, start: "old" });
+  const rows = trackedState(journal, "a").rows;
+  await journal.append("tracked", { exec: "b", pid: 2, start: "other" });
+  await journal.append("tracked", { exec: "a", pid: 1, start: "old" });
+  await journal.append("tracked", { exec: "a", pid: 1, start: "reused" });
+  assert.strictEqual(trackedState(journal, "a").rows, rows);
+  assert.deepEqual(rows.map(x => x.start), ["old", "reused"]);
+  const usage = { input: 3, output: 4, costUsd: 0.5 };
+  await journal.append("usage", { call: "a", id: "m", usage });
+  const before = totalUsage(entriesOf(journal, "usage"));
+  await journal.append("usage", { call: "a", id: "m", usage });
+  await journal.append("usage", { call: "b", id: "m", usage });
+  assert.deepEqual(totalUsage(entriesOf(journal, "usage")), { input: 6, output: 8, costUsd: 1 });
+  assert.deepEqual(totalUsage(entriesOf(journal, "usage"), "a"), usage);
+  assert.deepEqual(before, usage, "published usage values must not mutate as the index advances");
+  assert.equal(usageIds(journal, "a").size, 1);
+  await journal.close();
+  await assert.rejects(journal.append("tracked", { exec: "a", pid: 3, start: "failed" }), /Journal closed/);
+  assert.equal(trackedState(journal, "a").ids.has("3:failed"), false);
+  journal = await openJournal(path);
+  assert.deepEqual(trackedState(journal, "a").rows, rows);
+  assert.deepEqual(totalUsage(entriesOf(journal, "usage")), { input: 6, output: 8, costUsd: 1 });
+});

@@ -2,6 +2,7 @@
 // Known-id filtering assumes argv/other values do not impersonate the sole known
 // execution id. Multiple known ids are ambiguous; macOS verification awaits CI.
 import { readFile, readdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ProcInfo, ProcessTable as Table } from "../types.ts";
@@ -9,6 +10,7 @@ import type { ProcInfo, ProcessTable as Table } from "../types.ts";
 const exec = promisify(execFile);
 const vanished = (error: unknown) => ["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "");
 
+type Snapshot = ProcInfo[] | string;
 type Observation = ProcInfo & { ambiguous?: true };
 
 /** C2, C3: Capture only the newly spawned pid; an absent or dead process has no token. */
@@ -40,6 +42,9 @@ export async function captureStart(pid: number): Promise<string> {
 
 /** C2: Observe live process identities, inherited tags and cumulative CPU time. */
 export class ProcessTable implements Table {
+  private pending?: Promise<Snapshot>;
+  private snapshot?: { started: number; value: Snapshot };
+  scans = 0;
   private tags = new Map<string, string | undefined>();
   private ticks?: Promise<number>;
   private platform: NodeJS.Platform;
@@ -53,9 +58,23 @@ export class ProcessTable implements Table {
       { env: { ...process.env, LC_ALL: "C" }, timeout: 10_000, maxBuffer: 32 * 1024 * 1024 })).stdout);
   }
 
-  /** C2: Return a fresh process snapshot, caching Linux environments by identity. */
-  async list(knownExecs: ReadonlySet<string> = new Set()): Promise<Observation[]> {
-    if (this.platform === "darwin") return this.mac(knownExecs);
+  /** C2, F1: Concurrent observations share a scan; fences wait out all pre-request work. */
+  async list(knownExecs: ReadonlySet<string> = new Set(), options: { maxAgeMs?: number; fresh?: boolean } = {}): Promise<Observation[]> {
+    const value = await this.listRaw(options);
+    return typeof value === "string" ? this.mac(value, knownExecs) : value;
+  }
+  private async listRaw(options: { maxAgeMs?: number; fresh?: boolean }): Promise<Snapshot> {
+    if (options.fresh && this.pending) await this.pending.catch(() => {});
+    if (this.pending) return this.pending;
+    if (!options.fresh && this.snapshot && performance.now() - this.snapshot.started < (options.maxAgeMs ?? 0)) return this.snapshot.value;
+    const started = performance.now();
+    this.scans++;
+    const promise = this.read().then(value => { this.snapshot = { started, value }; return value; });
+    this.pending = promise;
+    try { return await promise; } finally { if (this.pending === promise) this.pending = undefined; }
+  }
+  private async read(): Promise<Snapshot> {
+    if (this.platform === "darwin") return this.ps();
     if (this.platform !== "linux") throw new Error(`C2 capability unavailable: ${this.platform}`);
     this.ticks ??= exec("getconf", ["CLK_TCK"], { timeout: 2000 }).then(({ stdout }) => {
       const value = Number(stdout.trim());
@@ -68,7 +87,8 @@ export class ProcessTable implements Table {
     for (const name of await readdir("/proc")) {
       if (!/^\d+$/.test(name)) continue;
       try {
-        const stat = await readFile(`/proc/${name}/stat`, "utf8");
+        // /proc stat is a tiny kernel snapshot; avoid four libuv round trips per cached identity.
+        const stat = readFileSync(`/proc/${name}/stat`, "utf8");
         const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
         // Zombies cannot act and may remain indefinitely under a non-reaping init.
         if (fields[0] === "Z" || fields[0] === "X") continue;
@@ -80,10 +100,10 @@ export class ProcessTable implements Table {
             const env = await readFile(`/proc/${name}/environ`, "utf8");
             tag = env.split("\0").find(value => value.startsWith("DSA_EXEC="))?.slice(9);
           } catch (error) { if (!vanished(error)) throw error; }
+          // Do not attach an old environment to a reused pid; cached identities already include the start token.
+          const check = readFileSync(`/proc/${name}/stat`, "utf8");
+          if (check.slice(check.lastIndexOf(")") + 2).split(" ")[19] !== start) continue;
         }
-        // Do not attach an old environment to a reused pid.
-        const check = await readFile(`/proc/${name}/stat`, "utf8");
-        if (check.slice(check.lastIndexOf(")") + 2).split(" ")[19] !== start) continue;
         cache.set(key, tag);
         result.push({ pid: Number(name), ppid: Number(fields[1]), start, tag,
           cpuMs: (Number(fields[11]) + Number(fields[12])) * 1000 / ticks });
@@ -93,8 +113,7 @@ export class ProcessTable implements Table {
     return result;
   }
 
-  private async mac(knownExecs: ReadonlySet<string>): Promise<Observation[]> {
-    const stdout = await this.ps();
+  private mac(stdout: string, knownExecs: ReadonlySet<string>): Observation[] {
     const result: Observation[] = [];
     for (const line of stdout.split("\n")) {
       const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\w+\s+\w+\s+\d+\s+[\d:]+\s+\d+)\s+([\d:.-]+)\s+(\S+)\s+(.*)$/);
