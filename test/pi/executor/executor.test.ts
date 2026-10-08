@@ -81,8 +81,31 @@ function assertSealed(journal: JournalHandle, call: string, status: string) {
   assert.ok(journal.entries().some(e => e.type === JT.fenced && e.exec === seals[0]!.exec && e.seq < seals[0]!.seq));
 }
 
-test("shared worktree reminder observes real pi writes without blocking either call", { timeout: 60000 }, async t => {
+test("writer lock: a real writer that hibernates keeps its worktree; the next writer runs once it ends", { timeout: 60000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } }, { memory: async () => 1e6 });
+  execFileSync("git", ["init", "--quiet", f.cwd], { timeout: 5000 });
+  const writer = (key: string) => {
+    const ticket = f.ticket(key, script([{ tool: "write", args: { path: `${key}.txt`, content: key } }, { tool: "ask", args: { question: "Keep working?" } }, { text: "done" }]));
+    ticket.spec.tools = ["read", "write"];
+    return ticket;
+  };
+  const a = writer("a"), b = writer("b"), pa = f.executor.run(a);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated" && e.call === a.callId));
+  const pb = f.executor.run(b);
+  await until(() => f.journal.entries().some(e => e.type === "writer-wait" && e.call === b.callId));
+  await delay(300);
+  assert.ok(!f.journal.entries().some(e => e.type === "selected" && String(e.exec).startsWith(`${b.callId}#`)), "b waits while a hibernates");
+  assert.equal(existsSync(join(f.cwd, "b.txt")), false);
+  assert.equal(statusOf(f.journal, f.wid, "b").writerWait?.holder, `${f.wid}/a`);
+  await f.executor.stop({ wid: f.wid, callId: a.callId }); await pa;
+  await until(() => f.journal.entries().some(e => e.type === "hibernated" && e.call === b.callId));
+  assert.equal(await readFile(join(f.cwd, "b.txt"), "utf8"), "b");
+  await f.executor.stop({ wid: f.wid, callId: b.callId }); await pb;
+  assert.ok(!f.orch.entries().some(e => e.type === "writer-hold" && !f.orch.entries().some(r => r.type === "writer-release" && r.call === e.call)));
+});
+
+test("shared worktree reminder (writerLock off) observes real pi writes without blocking either call", { timeout: 60000 }, async t => {
+  const f = await setup(t, { writerLock: "off", k: { hibernateMs: 40, trackerMs: 20 } }, { memory: async () => 1e6 });
   execFileSync("git", ["init", "--quiet", f.cwd], { timeout: 5000 });
   const writer = (key: string) => {
     const ticket = f.ticket(key, script([{ tool: "write", args: { path: `${key}.txt`, content: key } }, { tool: "ask", args: { question: "Keep working?" } }, { text: "done" }]));

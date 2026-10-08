@@ -18,6 +18,8 @@ async function writeFile(path: string, text: string) { await write(`${path}.tmp`
 test("configProblem accepts pi-side keys and names the first invalid orchestrator setting", () => {
   assert.equal(configProblem({ ui: { dock: "line" }, onQuit: "pause", providers: { a: { slots: 0 } }, pools: { p: ["a/b:low"] }, k: { trackerMs: 50, lossBound: 0 }, memory: { reserveMb: 0 } }), undefined);
   assert.equal(configProblem([]), "config.json must be a JSON object");
+  assert.equal(configProblem({ writerLock: "off" }), undefined);
+  assert.equal(configProblem({ writerLock: "block" }), 'writerLock must be "queue" or "off"');
   assert.equal(configProblem({ providers: { a: { slots: -1 } } }), "providers.a.slots must be a nonnegative integer");
   assert.equal(configProblem({ providers: { a: 3 } }), "providers.a.slots must be a nonnegative integer");
   assert.equal(configProblem({ pools: { p: [] } }), 'pools.p must be a nonempty list of "provider/id[:thinking]"');

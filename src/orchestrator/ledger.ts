@@ -6,6 +6,7 @@
 //   config{hash,config}: the orchestrator settings in effect from here; config-rejected{error,hash?}: a change of
 //     config.json refused, while the earlier settings stay (cleared by the next config record).
 //   orchestrator{version,pid} / orchestrator-exit{pid}: the orchestrator running (its package version) and its exit.
+//   writer-hold/writer-release{root,call}: the writer lock of a worktree root, held by one call until it ends.
 import { foldExhaustion, type Exhaustion } from "./providers.ts";
 import type { OrchestratorConfig } from "./contract.ts";
 import { isEntry, type Entry, type EntryOf } from "../types.ts";
@@ -15,6 +16,8 @@ export interface LedgerState {
   seen: number;
   last?: Entry;
   held: Map<string, EntryOf<"hold">>;
+  /** Writer lock owner per worktree root. */
+  writers: Map<string, { call: string; ts: number }>;
   observed: Set<string>;
   skips: Map<string, number>;
   exhausted: Map<string, Exhaustion>;
@@ -25,7 +28,7 @@ export interface LedgerState {
 }
 
 export function emptyLedger(): LedgerState {
-  return { seen: 0, held: new Map(), observed: new Set(), skips: new Map(), exhausted: new Map() };
+  return { seen: 0, held: new Map(), writers: new Map(), observed: new Set(), skips: new Map(), exhausted: new Map() };
 }
 
 /** Apply one orchestrator ledger entry. */
@@ -37,6 +40,8 @@ export function applyLedger(state: LedgerState, e: Entry): void {
   else if (isEntry(e, "config")) { state.config = { hash: String(e.hash), settings: e.config as OrchestratorConfig, ts: e.ts }; delete state.rejected; }
   else if (isEntry(e, "config-rejected")) state.rejected = { error: String(e.error), ts: e.ts };
   else if (isEntry(e, "orchestrator")) state.orchestrator = { version: String(e.version), pid: Number(e.pid), ...(e.start ? { start: String(e.start) } : {}), ts: e.ts, ...(e.restart === true ? { restart: true as const } : {}) };
+  else if (e.type === "writer-hold") { if (!state.writers.has(String(e.root))) state.writers.set(String(e.root), { call: String(e.call), ts: e.ts }); }
+  else if (e.type === "writer-release") { if (state.writers.get(String(e.root))?.call === e.call) state.writers.delete(String(e.root)); }
   else if (isEntry(e, "orchestrator-exit")) { if (state.orchestrator?.pid === e.pid) state.orchestrator.exited = true; }
   foldExhaustion(state.exhausted, e);
 }

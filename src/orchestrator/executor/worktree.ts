@@ -87,7 +87,7 @@ export class WorktreeIndex {
       this.callRoots.delete(call);
     }
     else if (e.type === "wf-created") this.origins.set(journal, e.origin);
-    else if (isEntry(e, JT.attention) && e.item?.kind === "conflict") {
+    else if (isEntry(e, JT.attention) && e.item?.kind === "conflict" && String(e.item.id).startsWith("worktree:")) {
       const held = this.reminders.get(e.item.id) ?? new Map();
       this.reminders.set(e.item.id, held);
       if (!held.has(journal)) held.set(journal, { item: e.item, open: true });

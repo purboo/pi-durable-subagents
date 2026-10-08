@@ -7,12 +7,13 @@
 // session-corrupt{call,line}: a malformed native session line was skipped (once per line, E4).
 // fence-failed{exec,error} is documented in sweep.ts. The orchestrator ledger owns hold/release{pool,slot,exec}
 // and mem{available,admitted,exec} (every admission; a repeated refusal at most every 30 s per call). All transitions are serialized before publication.
-import { mkdir, open, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CT, JT, attentionEntries, isEntry, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
-import { callDir, callInbox, callSession, outboxRoot } from "../../paths.ts";
+import { callDir, callInbox, callSession, journalPath, outboxRoot } from "../../paths.ts";
+import { readJournalSnapshot } from "../../kernel/journal.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, forwardRid } from "../../kernel/ids.ts";
 import { capacity, seal } from "../../kernel/guards.ts";
@@ -410,15 +411,80 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     }
     if (!interrupted(a)) a.live = { exec, since: Date.now(), phase };
   }
+  // Writer lock: one call that writes in a worktree runs there at a time. Ownership is durable (writer-hold/-release in
+  // the orchestrator ledger) and lasts from the first admission to the call's seal or retirement, across executions,
+  // hibernation and orchestrator restarts. Waiters are admitted in the order they first waited.
+  const writerWaits = new Map<string, { root: string; since: number; holder?: string }>();
+  async function writerRoot(t: CallTicket, cwd: string): Promise<string | undefined> {
+    if (t.spec.isolation === "worktree") return;
+    const tools = t.spec.tools ?? t.agent.tools;
+    if (!(t.spec.writer ?? (!tools || tools.some(n => n === "edit" || n === "write")))) return;
+    return await roots(cwd, "x") ?? await realpath(cwd).catch(() => cwd);
+  }
+  /** An owner whose call ended (sealed, retired, revised away, its workflow done or pruned) no longer holds the lock. */
+  function writerEnded(call: string): boolean {
+    if (active.has(call)) return false;
+    const { wid } = address(call), rev = Number(/^.*@(\d+)\//.exec(call)?.[1]);
+    const journal = journals.get(wid), entries = journal && !journal.closed ? journal.entries() : readJournalSnapshot(journalPath(home, wid));
+    if (!entries.length) return true;
+    const revised = entries.findLastIndex(e => e.type === "revised");
+    if (revised >= 0 && Number(entries[revised]!.revision) > rev) return true;
+    return entries.some((e, i) => (e.type === JT.sealed || e.type === "retired") && e.call === call || i > revised && e.type === JT.done);
+  }
+  /** Serial sections only: whether `a` may write in `root` now; records the wait (durably, for status) when not. */
+  async function writerAdmit(a: Active, root: string): Promise<boolean> {
+    if ((settings().writerLock ?? "queue") === "off") return true;
+    const t = a.ticket, call = t.callId;
+    let owner = folded().writers.get(root)?.call;
+    if (owner && owner !== call && writerEnded(owner)) { await orch.append("writer-release", { root, call: owner, ended: true }); owner = undefined; }
+    if (owner === call) return true;
+    const mine = writerWaits.get(call) ?? { root, since: t.journal.entries().find(e => e.type === "writer-wait" && e.call === call)?.ts ?? Date.now() };
+    writerWaits.set(call, mine);
+    const earlier = [...writerWaits].filter(([c, w]) => c !== call && w.root === root && w.since < mine.since && active.has(c) && !interrupted(active.get(c)!)).map(([c]) => c);
+    const holder = owner ?? earlier[0];
+    if (!holder) {
+      await orch.append("writer-hold", { root, call });
+      writerWaits.delete(call);
+      const waited = t.journal.entries().findLast(e => (e.type === "writer-wait" || e.type === "writer-acquired") && e.call === call);
+      if (waited?.type === "writer-wait") {
+        await t.journal.append("writer-acquired", { call, root });
+        const item = attentionEntries(t.journal.entries()).find(x => x.item.id === `writer:${call}`)?.item;
+        if (item && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === item.id && e.rev === item.rev))
+          await t.journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "acquired" });
+      }
+      return true;
+    }
+    const last = t.journal.entries().findLast(e => (e.type === "writer-wait" || e.type === "writer-acquired") && e.call === call);
+    if (mine.holder !== holder && !(last?.type === "writer-wait" && last.holder === holder && last.root === root)) {
+      await t.journal.append("writer-wait", { call, root, holder, ...(owner ? {} : { queued: true }) });
+    }
+    mine.holder = holder;
+    const id = `writer:${call}`;
+    if (!t.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === id)) {
+      const h = address(holder);
+      const text = `${worktreeLabel(call)} waits for the writer lock of ${root}: ${h.wid}/${h.key} ${owner ? "holds it" : "waits for it first"}. ` +
+        `It starts when that call ends. To run it now: stop one of them, run it with writer:false (when it does not write there) or isolation:"worktree"`;
+      await t.journal.append(JT.attention, { item: { id, rev: 1, kind: "conflict", text, wid: t.wid, call } });
+    }
+    return false;
+  }
+  async function writerRelease(call: string) {
+    await serial(async () => {
+      writerWaits.delete(call);
+      for (const [root, owner] of folded().writers) if (owner.call === call) await orch.append("writer-release", { root, call });
+    });
+    wake();
+  }
   /** Wait for a slot. The candidates are decided again on every attempt, inside the serial section that also applies
    *  config.json changes: a queued call follows a reloaded defaultModel, pool or limit, never a mix of two versions. */
-  async function acquire(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>): Promise<{ model?: Model; continuation: boolean }> {
+  async function acquire(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>, writer?: string): Promise<{ model?: Model; continuation: boolean }> {
     let continuation = false;
     for (;;) {
       let signal!: () => void;
       const changed = new Promise<void>(resolve => { signal = resolve; waiters.add(resolve); });
       const chosen = await serial(async () => {
         if (interrupted(a) || await workflowReached(a.ticket)) return;
+        if (writer && !await writerAdmit(a, writer)) return;
         const decision = await decide(), models = decision.candidates, pool = decision.pool;
         continuation = decision.continuation;
         for (const model of models) {
@@ -611,7 +677,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const t = a.ticket, journal = t.journal;
     const session = callSession(home, t.wid, t.key, t.gen), dir = callDir(home, t.wid, t.key, t.gen);
     const makeResult = (status: CallResult["status"], output = "", error?: string) => buildCallResult({ key: t.key, gen: t.gen, status, output, ...(error ? { error } : {}) });
-    let cwd = t.cwd;
+    let cwd = t.cwd, writer: string | undefined;
     if (sealed(journal, t.callId)) { const result = sealed(journal, t.callId)!; await effects.afterSeal(t, result); return result; }
     try {
       await continueSession(home, t, session);
@@ -685,7 +751,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (await serial(() => workflowReached(t))) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", "workflow budget reached")); }
       let decision: Awaited<ReturnType<typeof acquire>>;
       try {
-        decision = await acquire(a, exec, () => launchModel(t, entries, previous));
+        decision = await acquire(a, exec, () => launchModel(t, entries, previous), writer ??= await writerRoot(t, cwd));
       } catch (error) {
         await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
       }
@@ -773,8 +839,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         throw error;
       }).finally(async () => {
         const exec = current(ticket.journal, ticket.callId);
-        try { if (exec && await fence(ticket.journal, exec)) await release(exec); }
+        try {
+          if (exec && await fence(ticket.journal, exec)) await release(exec);
+          // The writer lock outlives executions and restarts; it ends with the call (or its retirement).
+          if (sealed(ticket.journal, ticket.callId) || a.retired || ticket.journal.entries().some(e => e.type === "retired" && e.call === ticket.callId)) await writerRelease(ticket.callId);
+        }
         finally {
+          writerWaits.delete(ticket.callId);
           active.delete(ticket.callId); collected.delete(ticket.callId); for (const e of inUse.keys()) if (callOf(e) === ticket.callId) inUse.delete(e);
           for (const e of refusals.keys()) if (callOf(e) === ticket.callId) refusals.delete(e); forgetSession(callSession(home, ticket.wid, ticket.key, ticket.gen)); wake();
         }

@@ -1,6 +1,6 @@
 import { schemaProblems } from "../agent/child/schema.ts";
 
-const fields = new Set(["agent", "task", "model", "cwd", "timeoutMs", "output", "schema", "gate", "isolation", "context", "budget", "once", "tools", "skills", "key"]);
+const fields = new Set(["agent", "task", "model", "cwd", "timeoutMs", "output", "schema", "gate", "isolation", "context", "budget", "once", "tools", "skills", "key", "writer"]);
 type Spec = Record<string, unknown>;
 const isObject = (v: unknown): v is Spec => v !== null && typeof v === "object" && !Array.isArray(v);
 const positive = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
@@ -47,6 +47,7 @@ export function validateCallSpec(spec: unknown, options: { fanout?: boolean } = 
   if (has("context") && s.context !== "fresh" && s.context !== "fork") errors.push(`context must be "fresh" or "fork"${got(s.context)}`);
   if (has("budget")) errors.push(...budget(s.budget));
   if (has("once") && typeof s.once !== "boolean") errors.push(`once must be a boolean${got(s.once)}`);
+  if (has("writer") && typeof s.writer !== "boolean") errors.push(`writer must be a boolean${got(s.writer)}`);
   for (const k of ["tools", "skills"]) if (has(k) && (!Array.isArray(s[k]) || !(s[k] as unknown[]).every(v => typeof v === "string"))) errors.push(`${k} must be an array of strings${got(s[k])}`);
   if (options.fanout && has("key") && !text(s.key)) errors.push("key must be a non-empty string");
   return errors;

@@ -11,7 +11,7 @@ import type { JournalHandle } from "../types.ts";
 import type { OrchestratorConfig } from "./contract.ts";
 
 /** The keys the orchestrator reads; config.json also holds pi-side settings (ui, onQuit) that it ignores. */
-const KEYS = ["defaultModel", "pools", "providers", "memory", "k"] as const;
+const KEYS = ["defaultModel", "pools", "providers", "memory", "writerLock", "k"] as const;
 const K = ["lossBound", "checkpointMs", "stallMs", "progressMs", "switchTimeoutMs", "idleExitMs", "trackerMs", "hibernateMs", "spawnBudget", "probeMs"];
 
 export const configPath = (home: string) => join(home, "config.json");
@@ -28,7 +28,8 @@ const count = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >
 /** What is wrong with a parsed config.json for the orchestrator, or undefined. Unknown keys are allowed. */
 export function configProblem(raw: unknown): string | undefined {
   if (!record(raw)) return "config.json must be a JSON object";
-  const { defaultModel, pools, providers, memory, k } = raw;
+  const { defaultModel, pools, providers, memory, writerLock, k } = raw;
+  if (writerLock !== undefined && writerLock !== "queue" && writerLock !== "off") return 'writerLock must be "queue" or "off"';
   if (defaultModel !== undefined && typeof defaultModel !== "string") return "defaultModel must be a string";
   if (pools !== undefined) {
     if (!record(pools)) return "pools must map names to model lists";

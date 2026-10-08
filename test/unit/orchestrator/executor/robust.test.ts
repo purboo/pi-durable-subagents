@@ -14,6 +14,7 @@ import createExecutor from "../../../../src/orchestrator/executor/index.ts";
 import createEffects from "../../../../src/orchestrator/executor/effects/index.ts";
 import { serialContainment } from "../../../../src/orchestrator/executor/sweep.ts";
 import { compactWorkflow, snapshotFromEntries, statusBrief } from "../../../../src/orchestrator/snapshot.ts";
+import { emptyLedger, foldLedger } from "../../../../src/orchestrator/ledger.ts";
 import { renderStatus, renderView } from "../../../../src/cli/main.ts";
 
 // A containment without processes: spawning fails (or, with `exits`, yields a child that exits at once), fences of
@@ -41,7 +42,8 @@ async function fixture(t: TestContext, config: OrchestratorConfig = {}, options:
   const orch = await openJournal(orchLedger(home)), journal = await openJournal(journalPath(home, wid));
   const errors: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args.map(String).join(" ")); });
-  const ledgers = { home, orch, config: { k: { trackerMs: 20 }, ...config } }, { realEffects, containment = fake, ...rest } = options;
+  // These calls write in one directory; the writer lock is tested on its own (it would serialize them).
+  const ledgers = { home, orch, config: { k: { trackerMs: 20 }, writerLock: "off" as const, ...config } }, { realEffects, containment = fake, ...rest } = options;
   const make = () => createExecutor(ledgers, { effects: realEffects ? createEffects(ledgers, containment) : effects, containment, memory: async () => 1e6, sweepMs: 40, ...rest });
   let executor = make();
   t.after(async () => { try { await executor.shutdown(); } finally { await journal.close(); await orch.close(); await rm(home, { recursive: true, force: true }); } });
@@ -76,6 +78,73 @@ async function writingChildren(t: TestContext, f: Awaited<ReturnType<typeof fixt
     streams.get(ticket.callId)!.write(JSON.stringify({ type: "tool_execution_start", toolCallId: ulid(), toolName, args: { path } }) + "\n");
   };
 }
+
+test("writer lock: one writer call per worktree in order, kept across a restart, released when its owner ends", { timeout: 15000 }, async t => {
+  const f = await fixture(t, { writerLock: "queue" }), a = f.ticket("a"), b = f.ticket("b"), c = f.ticket("c");
+  const reviewer: CallTicket = { ...f.ticket("r"), spec: { agent: "test", task: "task", writer: false } };
+  const isolated: CallTicket = { ...f.ticket("i"), spec: { agent: "test", task: "task", isolation: "worktree" } };
+  const reader: CallTicket = { ...f.ticket("n"), agent: { ...agent, tools: ["read", "bash"] } };
+  await mkdir(join(f.home, ".git"));
+  for (const ticket of [a, b, c, reviewer, isolated, reader]) await f.journal.append("call", { key: ticket.key, gen: 1, spec: ticket.spec });
+  await writingChildren(t, f);
+  const launches = (x: CallTicket) => count(f.journal.entries(), e => e.type === "selected" && String(e.exec).startsWith(`${x.callId}#`));
+  const waits = (x: CallTicket) => f.journal.entries().some(e => e.type === "writer-wait" && e.call === x.callId);
+  const writers = () => [...foldLedger(emptyLedger(), f.orch.entries()).writers].map(([root, o]) => [root, o.call]);
+  const pa = f.executor.run(a); await until(() => launches(a) === 1);
+  assert.deepEqual(writers(), [[f.home, a.callId]]);
+  const pb = f.executor.run(b); await until(() => waits(b));
+  const pc = f.executor.run(c); await until(() => waits(c));
+  const others = [reviewer, isolated, reader].map(x => f.executor.run(x));
+  await until(() => [reviewer, isolated, reader].every(x => launches(x) === 1));
+  assert.equal(launches(b) + launches(c), 0, "a second writer does not launch");
+  const snap = snapshotFromEntries(f.wid, f.journal.entries());
+  assert.deepEqual(snap.calls.filter(x => x.writerWait).map(x => [x.key, x.writerWait]), [["b", { root: f.home, holder: `${f.wid}/a` }], ["c", { root: f.home, holder: `${f.wid}/a` }]]);
+  assert.match(renderStatus(snap), new RegExp(`b@1 queued .*\\(waiting for writer lock: ${f.home} held by ${f.wid}/a\\)`));
+  assert.deepEqual(statusBrief(f.home).active[0]!.calls.find(x => x.key === "b")!.writerWait, { root: f.home, holder: `${f.wid}/a` });
+  const attention = () => f.journal.entries().filter(e => e.type === JT.attention && item(e).id === `writer:${b.callId}`);
+  assert.equal(attention().length, 1); assert.equal(item(attention()[0]!).kind, "conflict");
+  assert.match(String((attention()[0]!.item as { text: string }).text), /writer:false .*isolation:"worktree"/);
+  assert.equal(count(f.journal.entries(), e => e.type === JT.attention && item(e).id.startsWith("worktree:")), 0);
+  // A restart keeps the owner, whatever order the calls recover in; the waiters keep their order.
+  const pending = Promise.allSettled([pa, pb, pc, ...others]);
+  await f.restart(); await pending;
+  await f.executor.recover(f.wid, f.journal);
+  await writingChildren(t, f);
+  const rc = f.executor.run(c), rb = f.executor.run(b), ra = f.executor.run(a);
+  await until(() => launches(a) === 2);
+  await delay(100);
+  assert.equal(launches(b) + launches(c), 0);
+  assert.deepEqual(writers(), [[f.home, a.callId]]);
+  await f.executor.stop({ wid: f.wid, callId: a.callId }); await ra;
+  await until(() => launches(b) === 1);
+  assert.equal(launches(c), 0, "the first waiter goes first");
+  assert.ok(f.journal.entries().some(e => e.type === "writer-acquired" && e.call === b.callId));
+  assert.equal(count(f.journal.entries(), e => e.type === JT.attentionResolved && e.id === `writer:${b.callId}` && e.resolution === "acquired"), 1);
+  assert.equal(snapshotFromEntries(f.wid, f.journal.entries()).calls.find(x => x.key === "b")!.writerWait, undefined);
+  await f.executor.stop({ wid: f.wid, callId: b.callId }); await rb;
+  await until(() => launches(c) === 1);
+  await f.executor.stop({ wid: f.wid, callId: c.callId }); await rc;
+  assert.deepEqual(writers(), []);
+});
+
+test("writer lock: an owner whose call ended while no orchestrator ran is released; off lets writers run together", { timeout: 15000 }, async t => {
+  const f = await fixture(t, { writerLock: "queue" }), a = f.ticket("a"), b = f.ticket("b");
+  await mkdir(join(f.home, ".git"));
+  for (const ticket of [a, b]) await f.journal.append("call", { key: ticket.key, gen: 1, spec: ticket.spec });
+  // A crash between the seal and the release leaves a hold of an ended call.
+  await f.orch.append("writer-hold", { root: f.home, call: a.callId });
+  await f.journal.append(JT.sealed, { call: a.callId, exec: `${a.callId}#1.1`, result: { key: "a", gen: 1, status: "ok", ok: true, output: "" } });
+  await writingChildren(t, f);
+  const launched = (x: CallTicket) => f.journal.entries().some(e => e.type === "selected" && String(e.exec).startsWith(`${x.callId}#`));
+  const pb = f.executor.run(b); await until(() => launched(b));
+  assert.ok(f.orch.entries().some(e => e.type === "writer-release" && e.call === a.callId && e.ended === true));
+  assert.ok(!f.journal.entries().some(e => e.type === "writer-wait"));
+  const c = f.ticket("c"); await f.journal.append("call", { key: "c", gen: 1, spec: c.spec });
+  f.config.writerLock = "off";
+  const pc = f.executor.run(c); await until(() => launched(c));
+  await f.executor.stop({ wid: f.wid, callId: b.callId }); await f.executor.stop({ wid: f.wid, callId: c.callId });
+  await Promise.all([pb, pc]);
+});
 
 test("shared worktree: observed writes remind once, survive recovery, and either seal resolves status", { timeout: 15000 }, async t => {
   const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b");

@@ -56,7 +56,7 @@ the npx cache, so `install-service` refuses to run from there.
 | Two steers arrive out of order and the second replaces the first | Only the second one applies. |
 | A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
 | A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded) | Found at the second refusal in a row, while pi is still retrying. A call in a pool continues **in the same session** on the pool's next model (within pi's next retry or two); new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
-| Two subagents edit the same worktree | A reminder names both calls; neither is blocked or locked. Only observed `edit`/`write` calls count (bash-only writes are not seen). Calls with `isolation: "worktree"` have their own worktrees. |
+| Two subagents would write in the same worktree | Only one runs there at a time. A call that can write (its tools include `edit` or `write`, which pi's default tools do) holds its git worktree's writer lock from its launch until it ends, also while it waits for an answer. Another writer for that worktree waits in order, and status shows `waiting for writer lock: <root> held by <wid>/<key>`. `writer: false` (a call that does not write there), `isolation: "worktree"` and `"writerLock": "off"` opt out. |
 | A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. |
 
 ## Use it
@@ -126,7 +126,9 @@ single file: it cannot `import` or `require` other modules.
 - `timeoutMs` (active time), `output` (a relative path becomes an artifact);
 - `schema` (a structured `report`);
 - `gate` (a command, or `{command, output: "json", schema, timeoutMs}`);
-- `isolation: "worktree"`, `context: "fork"`, `budget`.
+- `isolation: "worktree"`, `context: "fork"`, `budget`;
+- `writer` (`false`: the call does not write in its cwd's worktree, so it does
+  not take that worktree's writer lock; `true`: it does, whatever its tools).
 
 The result has `ok`, `status`, the full `output` text and the structured
 `data`.
@@ -177,7 +179,8 @@ The main agent is interrupted only when there is something to decide:
 - a finished workflow;
 - a stalled subagent (the alert names the command it is running and for how long, so a long silent command reads differently from a stuck call);
 - an unknown outcome;
-- two unfinished calls observed editing the same worktree (a reminder, never a block);
+- a call waiting for another call's writer lock on its worktree (once, with the holder);
+- two unfinished calls observed editing the same worktree when one of them does not take the writer lock (a reminder);
 - a reached budget.
 
 Each one arrives once. A reminder that was already resolved is shown as
@@ -270,7 +273,8 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   "onQuit": "pause",
   "pools": { "fast": ["anthropic/claude-haiku-4-5", "openai/gpt-5-mini"] },
   "providers": { "anthropic": { "slots": 4 } },
-  "memory": { "reserveMb": 2048, "perChildMb": 300 }
+  "memory": { "reserveMb": 2048, "perChildMb": 300 },
+  "writerLock": "queue"
 }
 ```
 
@@ -287,6 +291,11 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   progress.
 - **Memory:** new subagents wait while memory is short. Running ones are
   never stopped for memory.
+- **Writer lock:** `"queue"` (default) runs one writing call per git
+  worktree (outside git: per directory) at a time; the others wait in order.
+  `"off"` lets them run together and only reminds you of edits seen in the same
+  worktree. Writes that do not go through a writing call (your own, or a
+  `writer: false` call's bash) are not constrained.
 - **onQuit:** `"pause"` (default) pauses a session's running workflows when
   you quit that pi; `"continue"` lets them run on in the background.
 - **Changes apply without a restart:** the orchestrator re-reads the file

@@ -4,7 +4,7 @@ import type { CallSpec, Conditions, Entry, RequestKind, RunBody } from "../../ty
 import { validateCallSpec } from "../../compat/spec.ts";
 import { compileFanout } from "../../compat/fanout.ts";
 
-const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, schema?, gate?, isolation?, context?, budget?, once?, tools?, skills?, key?}; " +
+const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, schema?, gate?, isolation?, context?, budget?, once?, tools?, skills?, writer?, key?}; " +
   "each call is addressed as '<wid>/<key>', where key is the step's own unique key or else 'tasks:<i>' / 'chain:<i>'.";
 
 export const parameters = Type.Object({
@@ -27,7 +27,7 @@ export const parameters = Type.Object({
 }, { additionalProperties: true });
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
-export const stepDefaults = ["model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once"];
+export const stepDefaults = ["model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once", "writer"];
 
 type Args = Record<string, unknown>;
 function string(args: Args, name: string): string {

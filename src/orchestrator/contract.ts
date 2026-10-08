@@ -14,6 +14,9 @@ export interface OrchestratorConfig {
   providers?: Record<string, { slots: number }>;
   memory?: { reserveMb?: number; perChildMb?: number };
   /** K-parameters overrides (ms / counts). */
+  /** Writer lock: "queue" (default) runs one writer call per git worktree at a time; "off" only reminds of observed
+   *  shared writes. */
+  writerLock?: "queue" | "off";
   k?: Partial<Record<"lossBound" | "checkpointMs" | "stallMs" | "progressMs" | "switchTimeoutMs" | "idleExitMs" | "trackerMs" | "hibernateMs" | "spawnBudget" | "probeMs", number>>;
 }
 
