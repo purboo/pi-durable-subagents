@@ -7,6 +7,8 @@ import { ENV, type Wid } from "./types.ts";
 export const dsaHome = (env: NodeJS.ProcessEnv = process.env) => env[ENV.home] || path.join(os.homedir(), ".pi", "durable-subagents");
 export const orchLedger = (home: string) => path.join(home, "orchestrator.jsonl");
 export const orchLock = (home: string) => path.join(home, "orchestrator.lock");
+/** Executables for subagents: the orchestrator writes a `pi-durable-subagents` shim here and children get it on PATH. */
+export const binDir = (home: string) => path.join(home, "bin");
 /** Drop box for requests addressed to the orchestrator. */
 export const orchInbox = (home: string) => path.join(home, "inbox");
 /** Sender outboxes live under this root (kernel Outbox.open(root, ...)). */

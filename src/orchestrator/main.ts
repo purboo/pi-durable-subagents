@@ -3,7 +3,8 @@ import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { dsaHome, orchLedger, orchLock } from '../paths.ts';
+import { binDir, dsaHome, orchLedger, orchLock } from '../paths.ts';
+import { writeShim } from '../platform/lease.ts';
 import { openJournal } from '../kernel/journal.ts';
 import { OsLock } from '../platform/lock.ts';
 import { captureStart } from '../platform/proctable.ts';
@@ -43,6 +44,9 @@ export async function main(options: MainOptions = {}): Promise<{ restart?: true 
     // `start` (Linux) tells this process from a later one given the same pid after a crash.
     const start = await captureStart(process.pid).catch(() => '');
     await ledgers.orch.append('orchestrator', { version: packageVersion(), pid: process.pid, ...(start ? { start } : {}), restart: true });
+    // Subagents reach `pi-durable-subagents hold …` through this shim (executor puts its directory first on PATH).
+    try { writeShim(binDir(home), process.execPath, fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../cli/main.ts' : '../cli/main.js', import.meta.url))); }
+    catch (error) { console.error(`durable-subagents: cannot write ${binDir(home)}: ${String(error)}`); }
     const factory = options.executor ?? (await import(new URL(import.meta.url.endsWith('.ts') ? './executor/index.ts' : './executor/index.js', import.meta.url).href)).default as (ledgers: Ledgers) => Executor;
     const executor = factory(ledgers);
     engine = new Engine(ledgers, executor, options);

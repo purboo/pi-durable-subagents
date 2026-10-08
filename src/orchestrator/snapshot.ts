@@ -9,6 +9,7 @@ import { JT, isEntry, type AttentionItem, type CallResult, type Entry, type Entr
 import { emptyLedger, foldLedger, type LedgerState } from "./ledger.ts";
 import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
+import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
@@ -415,6 +416,8 @@ export interface StatusCall {
   hibernated?: true;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
+  /** Resource leases (`pi-durable-subagents hold`): "holds lease machine" / "waiting for lease machine 3m". */
+  lease?: string;
 }
 export interface StatusWorkflow {
   wid: string; name?: string; origin?: string; status: WorkflowSnapshot["status"]; rev: number;
@@ -438,13 +441,15 @@ export interface StatusView {
   paused?: string;
   /** Provider slots held / limit, the settings in effect and a rejected config.json change (see slotsView). */
   slots?: string[]; config?: string; configRejected?: string; exhausted?: string[];
+  /** Resource leases held or waited for, one line per resource (see leaseLines). */
+  leases?: string[];
   /** The orchestrator version running, and a note when it is not the one this process loaded (see orchestratorView). */
   orchestrator?: string; versionNote?: string;
 }
 export type StatusDetail = WorkflowSnapshot & { scriptLog?: string };
 
 /** P25, T10: Compact one workflow snapshot: per-call one-line facts, usage, open attention; no outputs or entries. */
-export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
+export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, string>): StatusWorkflow {
   const progress = progressOf(wf); // v12 §4
   return {
     wid: wf.wid, ...(wf.name ? { name: wf.name } : {}), ...(wf.origin ? { origin: wf.origin } : {}), status: wf.status, rev: wf.rev,
@@ -457,7 +462,7 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
-        ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}) };
+        ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
     ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}),
@@ -486,14 +491,14 @@ function snapshots(home: string, origin?: string): { all: WorkflowSnapshot[]; si
 /** P25, T10: Compact status of all workflows: own session first, then newest first; finished ones beyond the first `keep` collapse into a count. */
 export function statusView(home: string, options: { origin?: string; keep?: number } = {}): StatusView {
   const keep = options.keep ?? 10;
-  const { all, since } = snapshots(home, options.origin);
+  const { all, since } = snapshots(home, options.origin), leases = leaseState(home), byCall = leaseCalls(leases);
   let finished = 0;
   const shown = all.filter(w => !settled(w) || ++finished <= keep);
   const hidden = all.length - shown.length;
   const paused = all.filter(w => w.paused).length;
-  return { workflows: shown.map(compactWorkflow), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
+  return { workflows: shown.map(w => compactWorkflow(w, byCall)), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
     ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused (stop-all, drain or a quit pi) since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}),
-    ...slotsView(home) };
+    ...slotsView(home), ...(leases.length ? { leases: leaseLines(leases) } : {}) };
 }
 
 const FINAL = ["done", "failed", "stopped"];
@@ -515,6 +520,8 @@ export interface BriefCall {
   hibernated?: true;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
+  /** Resource leases (`pi-durable-subagents hold`): "holds lease machine" / "waiting for lease machine 3m". */
+  lease?: string;
   /** `model` is the model in use; `switching` one requested and not answering yet; `switchFailed` a refused request. */
   switching?: string; switchFailed?: string;
 }
@@ -546,6 +553,8 @@ export interface StatusBrief {
   configRejected?: string;
   /** Providers whose usage window is used up: avoided until the next try, then probed by one call (see providers.ts). */
   exhausted?: string[];
+  /** Resource leases held or waited for (`pi-durable-subagents hold`), one line per resource. */
+  leases?: string[];
   /** The orchestrator version running, and a note when it is not the one this pi loaded. */
   orchestrator?: string; versionNote?: string;
   hint: string;
@@ -613,7 +622,7 @@ export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "sl
  *  The full view (every call's last line and usage) ran to tens of thousands of tokens on a busy home. */
 export function statusBrief(home: string, options: { origin?: string; keep?: number; now?: number } = {}): StatusBrief {
   const keep = options.keep ?? 5, now = options.now ?? Date.now(), origin = options.origin;
-  const { all } = snapshots(home, origin);
+  const { all } = snapshots(home, origin), leases = leaseState(home), byCall = leaseCalls(leases, now);
   const mine = (w: WorkflowSnapshot) => !origin || w.origin === origin;
   const line = (w: WorkflowSnapshot) => {
     const p = progressOf(w), notOk = latestCalls(w).filter(c => c.result && !c.result.ok).length;
@@ -631,6 +640,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
         ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
         ...(c.hibernated ? { hibernated: true as const } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
+        ...(live && byCall.get(c.callId) ? { lease: byCall.get(c.callId) } : {}),
         ...(live && c.switching ? { switching: c.switching } : {}), ...(live && c.switchFailed ? { switchFailed: c.switchFailed } : {}) };
     });
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
@@ -649,7 +659,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
   return {
     active: active.filter(mine).map(brief), ...(others.length ? { otherSessions: others.slice(0, 10).map(line) } : {}),
     finished: finished.slice(0, keep).map(line), ...(finished.length > keep ? { olderFinished: finished.length - keep } : {}),
-    ...(paused ? { paused } : {}), ...slotsView(home, now),
+    ...(paused ? { paused } : {}), ...slotsView(home, now), ...(leases.length ? { leases: leaseLines(leases, now) } : {}),
     hint: "status wid=<wid> shows one workflow (outputs clipped); add key=<key> for one call's full result, or full:true for everything",
   };
 }
