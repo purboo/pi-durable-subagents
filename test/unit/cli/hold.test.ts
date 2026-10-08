@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseHold } from '../../../src/cli/hold.ts';
 import { main, renderView } from '../../../src/cli/main.ts';
-import { blockers, leaseCalls, leaseDir, leaseLines, leaseState, readTickets, writeShim, type LeaseTicket } from '../../../src/platform/lease.ts';
+import { blockers, groupAlive, leaseCalls, leaseDir, leaseLines, leaseState, orphaned, readTickets, writeShim, type LeaseTicket } from '../../../src/platform/lease.ts';
 import { statusBrief, statusView } from '../../../src/orchestrator/snapshot.ts';
 
 const cli = fileURLToPath(new URL('../../../src/cli/main.ts', import.meta.url));
@@ -127,6 +127,26 @@ test('hold: when the wrapper is killed and the command has ended, its leftovers 
   assert.throws(() => process.kill(leftover, 0), /ESRCH/, 'the waiter ended the leftover before running');
   assert.match(b.stderr(), /hold: ending processes left by pid \d+/);
   assert.deepEqual(log(file), ['a start', 'b start']);
+});
+
+test('hold: leftovers are the command\'s group only: zombies do not hold a lease, a reused pid is never taken for it', { skip: process.platform !== 'linux' }, async t => {
+  // A parent that never reaps: its child leads a new process group and exits (a zombie leader), optionally leaving a
+  // sleeping member in the group.
+  const zombie = async (member: boolean) => {
+    const py = spawn('python3', ['-c', `import os,time\npid=os.fork()\nif pid==0:\n  os.setpgid(0,0)\n  if ${member ? 'True' : 'False'} and os.fork()==0:\n    time.sleep(30); os._exit(0)\n  os._exit(0)\nprint(pid,flush=True)\ntime.sleep(30)`], { stdio: ['ignore', 'pipe', 'inherit'] });
+    const pid = await new Promise<number>(resolve => py.stdout!.once('data', d => resolve(Number(String(d).trim()))));
+    await until(() => { try { return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]!.startsWith('Z'); } catch { return false; } });
+    t.after(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } py.kill('SIGKILL'); });
+    const start = readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]!.split(' ')[19]!;
+    return { pid, start };
+  };
+  const ticket = (command: { pid: number; start: string }): LeaseTicket => ({ seq: 1, resource: 'm', mode: 'exclusive', wrapper: { pid: 999_999_99 }, command, argv: ['x'], cwd: '/', since: 0, grantedAt: 0 });
+  const alone = await zombie(false);
+  assert.equal(orphaned(ticket(alone)), false, 'a zombie leader alone holds nothing');
+  const group = await zombie(true);
+  await until(() => groupAlive(group.pid));
+  assert.equal(orphaned(ticket(group)), true, 'its own zombie leader with a running member: leftovers');
+  assert.equal(orphaned(ticket({ pid: group.pid, start: '1' })), false, 'another start token: a reused pid, not the command');
 });
 
 test('hold: dead tickets are reclaimed; leases and status show holders and waiters', async t => {

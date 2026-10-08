@@ -40,15 +40,29 @@ export function alive(p: LeaseProcess | undefined): boolean {
     return rest[0] !== "Z" && rest[0] !== "X" && rest[19] === p.start;
   } catch { return false; }
 }
-/** Whether process group `pgid` still has a member (a zombie leader alone does not count on Linux). */
+/** Whether process group `pgid` still has a member that can run (Linux: zombies, which no signal ends, do not count). */
 export function groupAlive(pgid: number): boolean {
-  try { process.kill(-pgid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+  try { process.kill(-pgid, 0); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "EPERM") return false; }
+  if (process.platform !== "linux") return true;
+  let pids: string[];
+  try { pids = readdirSync("/proc").filter(n => /^\d+$/.test(n)); } catch { return true; }
+  for (const pid of pids) {
+    try {
+      const fields = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const rest = fields.slice(fields.lastIndexOf(")") + 2).split(" ");
+      if (Number(rest[2]) === pgid && rest[0] !== "Z" && rest[0] !== "X") return true;
+    } catch { /* exited meanwhile */ }
+  }
+  return false;
 }
 /**
  * Whether the command's process group outlives both the wrapper and the command (a killed wrapper cannot end what the
  * command left behind). The command was spawned as its group's leader, so the group id is its pid. A pid stays
- * allocated while a group uses it as its id, so a group with that id is the command's own unless a live process now owns
- * that pid: then the original group emptied and the pid was reused (on Linux told apart by the start token).
+ * allocated while a group uses it as its id, so with the leader gone a group with that id is the command's own. While a
+ * process owns the pid it must be the command itself (on Linux the start token, zombie or not); any other owner means
+ * the original group emptied and the pid was reused. macOS has no start token here: a reused pid that is alive there
+ * counts as the command (the lease waits for it), never as leftovers to end.
  */
 export function orphaned(t: LeaseTicket): boolean {
   const c = t.command;
@@ -56,8 +70,8 @@ export function orphaned(t: LeaseTicket): boolean {
   if (process.platform === "linux") {
     try {
       const fields = readFileSync(`/proc/${c.pid}/stat`, "utf8");
-      const state = fields.slice(fields.lastIndexOf(")") + 2).split(" ")[0];
-      if (state !== "Z" && state !== "X") return false;
+      const rest = fields.slice(fields.lastIndexOf(")") + 2).split(" ");
+      if (!c.start || rest[19] !== c.start) return false;
     } catch { /* the leader is gone: only its group can remain */ }
   } else {
     try { process.kill(c.pid, 0); return false; } catch { /* the leader is gone */ }
