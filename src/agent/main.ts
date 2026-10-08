@@ -15,6 +15,8 @@ import { attention, presentText, presented, resolved, unfinishedWorkflow } from 
 import { isLive, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
 import { parameters, request, sendReceipt } from "./main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
+import { currentOrchestrator, legacyRestart, waitExit, type OrchestratorProcess } from "../cli/restart.ts";
+import { packageVersion } from "../version.ts";
 
 /** Capabilities the UI (U1) receives from the main agent; every action goes through the same durable outbox. */
 export interface UiDeps {
@@ -231,6 +233,18 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     // P33: any call of the run may fork the origin context, so the origin branch is always offered for pinning.
     const sessionFile = ctx?.sessionManager.getSessionFile();
     if (normalized.kind === "run" && sessionFile) (normalized.body as RunBody).origin = { sessionFile, leafId: ctx!.sessionManager.getLeafId() };
+    if (normalized.kind === "restart") {
+      // Only an orchestrator that decides restarts is sent one (an older one would keep it as an invalid inbox file).
+      const previous = currentOrchestrator(home), force = args.force === true;
+      if (!previous) return { applied: true, note: "no orchestrator is running; the next one starts on the installed version when work is submitted" };
+      if (!previous.restart) {
+        const legacy = legacyRestart(home, previous, force);
+        if (!legacy.applied) return { applied: false, reason: legacy.reason };
+        // It does not start its successor; this session does once it has exited (or its next periodic check would).
+        void waitExit(previous, 60_000).then(exited => exited ? serial(() => starter()) : undefined).catch(() => {});
+        return { applied: true, note: restartNote(previous) };
+      }
+    }
     const sent = await serial(async () => {
       if (!outbox || stopped) throw new Error("Main session is not active");
       signal?.throwIfAborted();
@@ -260,6 +274,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     }
     return { submitted: { rid: sent.rid } };
   }
+  const restartNote = (previous: OrchestratorProcess) => `orchestrator ${previous.version} (pid ${previous.pid}) exits; the installed version (this pi loaded ${packageVersion()}) starts in its place and resumes every workflow`;
   ui?.(pi, { home, presentNote, submit: args => submit({ ...args, by: "user" }, ctx?.cwd ?? process.cwd(), undefined, false) });
   // The model must name a real agent; list the ones this project can use (names are checked again per run).
   let agents = "";
@@ -272,7 +287,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       "run (action optional for exactly one launch form): agent+task; tasks:[call specs] parallel; chain:[call specs] sequential ({previous}); workflow:'./script.js' or source (runs.run(key,spec), runs.all([...]), emit(value), args, runs.input(name)). Optional name, cwd, usageBudget, maxCalls, inputs. With tasks/chain, top-level model, timeoutMs, budget, isolation, context, tools, skills, once are defaults for every step (a step's own value wins); a workflow/source script sets them per runs.run call. timeoutMs is milliseconds of active time (a number); omit it unless a hard limit is needed. Explicit unknown agents are rejected BEFORE creation, with available names; unknown script agents fail only their call.",
       "agents: list names, descriptions, default models and source for this cwd; use these names for run.",
       "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); a steer to a call waiting on its question interrupts the question and the subagent usually asks again — use answer to answer it; sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn; follow-up model:'provider/id' or a pool name runs that generation on it. answer: give the qid (or just the call, or nothing when one question is open); to and rev are filled in. A question that needs the user's decision goes to the user; if you answer one yourself, tell the user what you chose. model ('provider/id' or a pool name — its first model not used up): a running call switches at its next provider request; an asking, hibernated or queued call launches on it when it runs again; the reply's model/effect (next-request|next-execution|next-generation) says which. status model = model actually used by the last request; switching = requested, not used yet; switchFailed = refused. A provider content refusal (ToS/usage policy) fails the call at once, not retried. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
-      "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); a sealed call → already-sealed:<status>, a finished workflow → terminal:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. status: without wid, what runs, asks (with its answer address; hibernated:true holds no slot) or failed, sharedWorktree names calls sharing observed edit/write roots (reminder only), finished workflows one line each, provider slots held/limit, the config in effect and providers whose usage window is used up (avoided until a probe finds them answering again), and the orchestrator version (versionNote when it differs from the loaded one); wid: one workflow, outputs clipped; wid+key: one call's full result; full:true: everything. A run's rid from {submitted:{rid}} works wherever a wid is expected. revise wid + workflow/source/args starts a revision.",
+      "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); a sealed call → already-sealed:<status>, a finished workflow → terminal:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. restart (after an update) replaces the orchestrator with the installed version: refused with busy:<running executions> while any runs, unless force:true (they are fenced and resume); hibernated askers and queued calls do not block it. Never kill the orchestrator process. status: without wid, what runs, asks (with its answer address; hibernated:true holds no slot) or failed, sharedWorktree names calls sharing observed edit/write roots (reminder only), finished workflows one line each, provider slots held/limit, the config in effect and providers whose usage window is used up (avoided until a probe finds them answering again), and the orchestrator version (versionNote when it differs from the loaded one); wid: one workflow, outputs clipped; wid+key: one call's full result; full:true: everything. A run's rid from {submitted:{rid}} works wherever a wid is expected. revise wid + workflow/source/args starts a revision.",
       "Control replies are {applied:true,rid} or {applied:false,reason,rid} when decided; otherwise {submitted:{rid}} after 10s.",
       ...(agents ? [`Available agents: ${agents}.`] : []),
       "User sees a summary line above the editor; ↓ on an empty editor (or /subagents) opens the list, Enter watches live OR finished calls (finished transcripts remain on disk) and expands finished workflows. List keys: s steer (paste-capable input), x stop (confirm y), m model, a answer when asked, f follow-up on finished calls; action feedback appears in footer.",

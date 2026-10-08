@@ -16,6 +16,9 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
     };
   }
   const pending = new Map<string, Promise<CallResult>>();
+  // Restart: a call is live from its fake-run to its end; while paused none starts running.
+  const live = new Set<string>(), unpaused = new Set<() => void>(), since = Date.now();
+  let paused = false;
   const active = new Map<string, { ticket: CallTicket; end: (reason: string) => void }>();
   async function execute(ticket: CallTicket) {
     let end!: (reason: string) => void;
@@ -26,6 +29,8 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
       await ticket.journal.append('fake-invoke', { call: ticket.callId, key: ticket.key, workflowBudget: ticket.workflowBudget });
       const old = ticket.journal.entries().find(e => e.type === JT.sealed && e.call === ticket.callId);
       if (old) return old.result as CallResult;
+      while (paused) await new Promise<void>(resolve => { unpaused.add(resolve); });
+      live.add(ticket.callId);
       await ticket.journal.append('fake-run', { call: ticket.callId, key: ticket.key });
       const ready = new Promise<string>(resolve => {
         if (ticket.key !== opts.hold) timer = setTimeout(() => resolve('ready'), opts.delay?.(ticket.key) ?? 0);
@@ -36,7 +41,7 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
         ...(reason === 'retired' ? { error: 'retired' } : {}) };
       if (reason !== 'retired') await ticket.journal.append(JT.sealed, { call: ticket.callId, exec: `${ticket.callId}#1.1`, result });
       return result;
-    } finally { clearTimeout(timer); active.delete(ticket.callId); pending.delete(ticket.callId); }
+    } finally { clearTimeout(timer); live.delete(ticket.callId); active.delete(ticket.callId); pending.delete(ticket.callId); }
   }
   return {
     run(ticket) { let run = pending.get(ticket.callId); if (!run) { run = execute(ticket); pending.set(ticket.callId, run); } return run; },
@@ -54,6 +59,11 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
       await Promise.allSettled(runs);
     },
     busy: () => active.size > 0,
+    quiesce() {
+      paused = true;
+      return { live: [...live].map(call => { const t = active.get(call)!.ticket; return { wid: t.wid, key: t.key, gen: t.gen, callId: call, exec: `${call}#1.1`, since, phase: 'child' as const }; }),
+        resume: () => { paused = false; for (const fn of unpaused) fn(); unpaused.clear(); } };
+    },
     async suspend(only?: (wid: string) => boolean) {
       await ledgers.orch.append('fake-suspend', only ? { scoped: true } : {});
       const runs: Promise<CallResult>[] = [];

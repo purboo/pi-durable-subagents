@@ -8,7 +8,7 @@ const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, sc
   "each call is addressed as '<wid>/<key>', where key is the step's own unique key or else 'tasks:<i>' / 'chain:<i>'.";
 
 export const parameters = Type.Object({
-  action: Type.Optional(Type.Union(["run", "agents", "send", "stop", "revise", "status", "resume", "drain"].map(v => Type.Literal(v)))),
+  action: Type.Optional(Type.Union(["run", "agents", "send", "stop", "revise", "status", "resume", "drain", "restart"].map(v => Type.Literal(v)))),
   workflow: Type.Optional(Type.String()), source: Type.Optional(Type.String()), args: Type.Optional(Type.Unknown()),
   tasks: Type.Optional(Type.Array(Type.Any(), { description: `Parallel calls. ${stepsDoc}` })),
   chain: Type.Optional(Type.Array(Type.Any(), { description: `Sequential calls ({previous} = previous output). ${stepsDoc}` })),
@@ -23,6 +23,7 @@ export const parameters = Type.Object({
   timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number). Omit unless a hard limit is needed; prefer budgets." })),
   key: Type.Optional(Type.String({ description: "A single agent/task run: the call's key. status with wid: that call's full result." })),
   full: Type.Optional(Type.Boolean({ description: "status: with wid, the complete workflow detail including every output." })),
+  force: Type.Optional(Type.Boolean({ description: "restart: fence running executions instead of refusing (they resume on the new orchestrator)." })),
 }, { additionalProperties: true });
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
@@ -54,7 +55,7 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   const launchForms = [args.agent !== undefined || args.task !== undefined, args.tasks !== undefined,
     args.chain !== undefined, args.workflow !== undefined, args.source !== undefined];
   const action = args.action === undefined && launchForms.filter(Boolean).length === 1 ? "run" : args.action;
-  if (typeof action !== "string" || !action) throw new Error("action is required: run, agents, send, stop, revise, status, resume, drain");
+  if (typeof action !== "string" || !action) throw new Error("action is required: run, agents, send, stop, revise, status, resume, drain, restart");
   if (action === "run") {
     const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, by: _by, ...spec } = args;
     const choices = [workflow, source, tasks, chain, spec.agent === undefined && spec.task === undefined ? undefined : spec];
@@ -118,5 +119,6 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     ...(args.source === undefined ? {} : { source: string(args, "source") }), ...(args.args === undefined ? {} : { args: args.args }) } };
   if (action === "resume") return { kind: "resume", body: args.wid !== undefined ? { wid: string(args, "wid") } : typeof args.origin === "string" ? { origin: args.origin } : {} };
   if (action === "drain") return { kind: "drain", body: {} };
-  throw new Error(`Unsupported action: ${action}; use run, agents, send, stop, revise, status, resume, or drain`);
+  if (action === "restart") return { kind: "restart", body: args.force === true ? { force: true } : {} };
+  throw new Error(`Unsupported action: ${action}; use run, agents, send, stop, revise, status, resume, drain, or restart`);
 }

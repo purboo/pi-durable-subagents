@@ -324,23 +324,35 @@ On load, it checks the pi exports and API methods it uses.
 
 ## Updating Durable Subagents
 
-Running work stays on the version it started with: the orchestrator is not
-restarted under it. When the orchestrator runs another version than the one a
-pi session loaded, that pi says so once, and `status` shows the running
-version with a note. The orchestrator exits about 10 s after all work ends,
-and the next start runs the new version. To switch sooner without stopping
-running calls:
+Running work stays on the version it started with until you restart the
+orchestrator. When the orchestrator runs another version than the one a pi
+session loaded, that pi says so once, and `status` shows the running version
+with a note. The orchestrator exits about 10 s after all work ends, and the
+next start runs the new version. To switch sooner:
 
-1. `drain`: running calls finish and nothing new starts in existing
-   workflows. A call waiting for your answer still counts as running, and a
-   workflow started after the drain is not held.
-2. Wait until `status` no longer shows the old version (about 10 s after the
-   last call ends).
-3. `resume` from a pi session started after the update.
+```sh
+pi-durable-subagents restart          # or the subagents tool: action "restart"
+```
 
-A `resume` before the old orchestrator exits keeps it running the old
-version, and a pi session started before the update still starts the old
-version; start a new one.
+The orchestrator refuses while any execution runs (a subagent process, or a
+gate before a call's seal) and names each one with its session and age; no new
+execution starts while it decides, so nothing slips in between. Calls waiting
+for your answer (hibernated), waiting for a provider slot, or held by a drain
+do not block it. Otherwise it exits and its successor starts at once from the
+installed files and resumes every workflow: an asker keeps its question, a
+queued call launches on the new version. `restart --force` (tool:
+`force: true`) fences running executions instead of refusing; they resume on
+the new version from their sessions, like after a crash, so a tool call that
+was running is repeated or reported as interrupted.
+
+To restart only when the machine is quiet, `drain` first (running calls finish
+and nothing new starts in existing workflows), retry `restart` until it is
+accepted, then `resume`. Never kill the orchestrator process: other sessions'
+running calls would be interrupted without a check. An orchestrator from 1.0.17
+or earlier does not know the restart request; `restart` then checks the
+journals itself and ends it with SIGTERM, which is not atomic: a call launched
+in between is fenced and resumes. A pi session started before the update still
+loads the old extension; start a new one.
 
 ## What we do not promise
 

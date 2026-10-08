@@ -35,7 +35,9 @@ import { WorktreeIndex, worktreeCalls, worktreeLabel, worktreePair, worktreeRoot
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
 type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean;
-  parking?: string; onPark: Set<() => void>; refusedAt?: number };
+  parking?: string; onPark: Set<() => void>; refusedAt?: number;
+  /** Restart: set while its execution's child runs (from the launch gate to the fence) or its gates run before the seal. */
+  live?: { exec: string; since: number; phase: "child" | "gate" } };
 const MEM_RECORD_MS = 30000;
 /** A4, P29: A child admitted within this window may not show in MemAvailable yet; its share is reserved explicitly. */
 const MEM_WARMUP_MS = 30000;
@@ -361,9 +363,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       };
       let checking = Promise.resolve();
       const timer = setInterval(() => { checking = checking.then(check); }, config.k?.trackerMs ?? 1000);
-      try { await check(); result = await effects.beforeSeal(a.ticket, exec, result, { signal: a.controller.signal }); await check(); }
+      try {
+        await check(); await launchGate(a, exec, "gate");
+        if (!interrupted(a)) result = await effects.beforeSeal(a.ticket, exec, result, { signal: a.controller.signal });
+        await check();
+      }
       catch (error) { result = buildCallResult({ key: result.key, gen: result.gen, status: "failed", output: result.output, error: String(error) }); }
-      finally { clearInterval(timer); await checking; }
+      finally { clearInterval(timer); await checking; a.live = undefined; }
     }
     const value = await serial(async () => {
       const old = sealed(journal, call);
@@ -390,6 +396,20 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   const stopped = (a: Active) => a.stopped || entriesFor(a.ticket.journal, a.ticket.callId).some(e => e.type === "stop-intent");
   const interrupted = (a: Active) => closed || a.suspended || a.retired || stopped(a);
+  // Restart (RestartBody): while one is decided no execution passes this gate, so the executions it finds live are all
+  // there are; one that passes is live until its fence (or the end of its gates). Synchronous from the check to the mark.
+  let paused = false;
+  const unpaused = new Set<() => void>();
+  async function launchGate(a: Active, exec: string, phase: "child" | "gate") {
+    while (paused && !interrupted(a)) {
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(done, config.k?.trackerMs ?? 1000);
+        function done() { clearTimeout(timer); unpaused.delete(done); resolve(); }
+        unpaused.add(done); a.wake = done;
+      });
+    }
+    if (!interrupted(a)) a.live = { exec, since: Date.now(), phase };
+  }
   /** Wait for a slot. The candidates are decided again on every attempt, inside the serial section that also applies
    *  config.json changes: a queued call follows a reloaded defaultModel, pool or limit, never a mix of two versions. */
   async function acquire(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>): Promise<{ model?: Model; continuation: boolean }> {
@@ -698,13 +718,15 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       else if (unresolved && !receipt) await sender.send(t.callId, "continue", { message: String(unresolved.message) }, { qid: String(unresolved.qid), rev: Number(unresolved.rev) }, { rid: String(unresolved.rid2) });
       else if (previous) await sender.send(t.callId, "continue", { message: continueMessage(dangling) }, undefined, { rid: contentHash([exec, "dispatch"]) });
       else await sender.send(t.callId, "task", { message: t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
+      await launchGate(a, exec, "child");
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       let child: Spawned;
       try {
         child = await containment.spawn({ exec, command: "pi", args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
           env: { DSA_HOME: home, DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
       } catch (error) {
-        await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
+        await fence(journal, exec, { park: a }); a.live = undefined;
+        return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
       }
       try {
         await track(journal, exec, [{ pid: child.pid, start: child.start, ppid: process.pid }]);
@@ -726,7 +748,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           wrote: path => wrote(t, exec!, cwd, path),
           switched: event => switched(exec!, journal, event), answered: event => answered(t, exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
-      } finally { await fence(journal, exec, { child, park: a }); }
+      } finally { await fence(journal, exec, { child, park: a }); a.live = undefined; }
     }
   }
   async function replayForward(e: Entry) {
@@ -920,6 +942,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       }
     },
     busy: () => active.size > 0,
+    quiesce() {
+      paused = true;
+      const live = [...active.values()].filter(a => a.live).map(a => ({ wid: a.ticket.wid, key: a.ticket.key, gen: a.ticket.gen, callId: a.ticket.callId, ...a.live! }));
+      return { live, resume: () => { paused = false; for (const fn of [...unpaused]) fn(); } };
+    },
     suspend(only?: (wid: string) => boolean) {
       if (only) { // scoped (one session's quit, one workflow): other workflows keep running and dispatching
         const targets = [...active.values()].filter(a => only(a.ticket.wid));

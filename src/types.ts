@@ -86,7 +86,7 @@ export interface JournalHandle {
 
 export type RequestKind =
   // to orchestrator from main/cli
-  | "run" | "send" | "stop" | "revise" | "resume" | "drain" | "prune"
+  | "run" | "send" | "stop" | "revise" | "resume" | "drain" | "prune" | "restart"
   // orchestrator to child (forwarded or own)
   | "task" | "steer" | "follow-up" | "answer" | "model" | "continue" | "withdraw"
   // evaluator to orchestrator
@@ -217,6 +217,11 @@ export interface PruneBody { wid?: Wid; olderThanDays?: number }
  *  that pi quits) or one workflow (`wid`): no new dispatch and no continuation until `resume`. Running calls finish,
  *  unless `fence` (stop-all, quit): then their executions are fenced WITHOUT sealing, so journals stay resumable. */
 export interface DrainBody { fence?: boolean; origin?: string; wid?: Wid }
+/** kind "restart": exit the orchestrator so the installed version takes over (its successor starts at once and recovers
+ *  every workflow). Refused with `busy: …` while a call has a live execution (a child process, or a gate running before
+ *  its seal) unless `force`: those executions are then fenced and resume on the successor. Calls waiting for a slot,
+ *  for an answer (hibernated) or held by a drain do not block it; no new execution launches while it is decided. */
+export interface RestartBody { force?: boolean }
 
 // Request bodies addressed to a child (to: CallId), written by the orchestrator (own requests or P7 forwards).
 /** kinds "task" | "steer" | "follow-up" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */

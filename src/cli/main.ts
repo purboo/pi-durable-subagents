@@ -12,10 +12,11 @@ import { resolution, start, startOrchestrator, submit, type Control } from "./co
 import { doctor, renderDoctor, size } from "./doctor.ts";
 import { smoke } from "./smoke.ts";
 import { serviceFiles, manageService, type ServiceRunner } from "./service.ts";
+import { currentOrchestrator, legacyRestart, waitExit, waitSuccessor } from "./restart.ts";
 
-const commands = ["smoke", "tail", "status", "events", "start", "resume", "drain", "stop", "stop-all", "prune", "doctor", "install-service", "uninstall-service", "help"] as const;
+const commands = ["smoke", "tail", "status", "events", "start", "resume", "drain", "stop", "stop-all", "prune", "restart", "doctor", "install-service", "uninstall-service", "help"] as const;
 type Command = typeof commands[number];
-export interface Arguments { command: Command; target?: string; json: boolean; dryRun?: boolean; olderThanDays?: number }
+export interface Arguments { command: Command; target?: string; json: boolean; dryRun?: boolean; olderThanDays?: number; force?: boolean }
 /** P25: Reject ambiguous CLI arguments before any durable action. */
 export function parseArgs(args: string[]): Arguments {
   if (!args.length || (args.length === 1 && ["-h", "--help"].includes(args[0]!))) return { command: "help", json: false };
@@ -29,6 +30,10 @@ export function parseArgs(args: string[]): Arguments {
     if (value === undefined || !/^\d+(\.\d+)?$/.test(value)) throw new Error("--older-than needs a number of days");
     olderThanDays = Number(value); rest = [...rest.slice(0, at), ...rest.slice(at + 2)];
   }
+  const force = rest.includes("--force");
+  if (force && command !== "restart") throw new Error("--force is only supported by restart");
+  if (rest.filter(a => a === "--force").length > 1) throw new Error("Unknown or repeated option");
+  rest = rest.filter(a => a !== "--force");
   const json = rest.includes("--json"), dryRun = rest.includes("--dry-run");
   if (dryRun && !["install-service", "uninstall-service"].includes(command)) throw new Error("--dry-run requires a service command");
   if (json && !["status", "events", "tail", "doctor"].includes(command)) throw new Error("--json is only supported by status, events, tail and doctor");
@@ -40,7 +45,7 @@ export function parseArgs(args: string[]): Arguments {
   const target = targets[0];
   if (target && command !== "stop" && (!/^[^/\\\0]+$/.test(target) || target === "." || target === "..")) throw new Error("Invalid workflow id");
   if (target && olderThanDays !== undefined) throw new Error("prune takes a workflow id or --older-than, not both");
-  return { command, json, ...(dryRun ? { dryRun } : {}), ...(target ? { target } : {}), ...(olderThanDays !== undefined ? { olderThanDays } : {}) };
+  return { command, json, ...(force ? { force } : {}), ...(dryRun ? { dryRun } : {}), ...(target ? { target } : {}), ...(olderThanDays !== undefined ? { olderThanDays } : {}) };
 }
 const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
 /** P25, T10: Render journal-derived status (one line per call, last output line only) without live orchestrator memory. */
@@ -87,11 +92,35 @@ export function serviceEntryError(entry: string): string | undefined {
   if (/[/\\]_npx[/\\]/.test(entry)) return `install-service refuses to run from an npx cache (${entry}); the cache can be pruned and the service would break. Install the CLI with \`npm i -g pi-durable-subagents\` and run \`pi-durable-subagents install-service\` again.`;
   return undefined;
 }
-export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | prune [wid] [--older-than <days>] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
+export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | prune [wid] [--older-than <days>] | restart [--force] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
+/** Restart: the orchestrator exits when no execution runs (or `force`) and the installed version takes over. */
+async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line: string) => void, options: { force: boolean; starter?: typeof startOrchestrator; waitMs?: number }): Promise<number> {
+  const starter = options.starter ?? startOrchestrator, old = currentOrchestrator(home);
+  if (!old) {
+    write(await start(home, env, starter) ? "restart: no orchestrator was running; started one for the pending work" : "restart: no orchestrator is running (one starts when work is submitted)");
+    return 0;
+  }
+  const waitMs = options.waitMs ?? 30_000;
+  if (!old.restart) {
+    // An orchestrator older than the restart request: check its journals here and end it with SIGTERM.
+    const legacy = legacyRestart(home, old, options.force);
+    if (!legacy.applied) { write(`restart refused: ${legacy.reason}`); return 1; }
+  } else {
+    const [req] = await submit(home, "restart", undefined, env, { force: options.force });
+    const outcome = await resolution(home, req!.rid, waitMs);
+    if (!outcome) { write(`submitted restart ${req!.rid}; not resolved within ${Math.round(waitMs / 1000)} s (see: pi-durable-subagents doctor)`); return 1; }
+    if (outcome.type === "rejected") { write(`restart refused: ${outcome.reason}`); return 1; }
+  }
+  if (!await waitExit(old, Math.max(waitMs, 60_000))) { write(`restart: orchestrator ${old.version} (pid ${old.pid}) is still shutting down; see: pi-durable-subagents status`); return 1; }
+  await starter(home, env);
+  const next = await waitSuccessor(home, old, 15_000);
+  write(next ? `restarted: orchestrator ${old.version} (pid ${old.pid}) → ${next.version} (pid ${next.pid})` : `restart: orchestrator ${old.version} (pid ${old.pid}) exited; the next one starts when work is pending`);
+  return 0;
+}
 /** P1, P21, P25, P38: Dispatch the public CLI using durable requests and read-only snapshots. */
 export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string; waitMs?: number; now?: number } = {}): Promise<number> {
   if (args[0] === "chaos") return (await import("./chaos/index.ts")).chaos(args.slice(1), options.env ?? process.env, options.write);
-  const { command, target, json, dryRun, olderThanDays } = parseArgs(args), env = options.env ?? process.env;
+  const { command, target, json, dryRun, olderThanDays, force } = parseArgs(args), env = options.env ?? process.env;
   const home = dsaHome(env), write = options.write ?? (line => console.log(line));
   if (command === "help") { write(HELP); return 0; }
   // Quiet when idle: the optional service runs this every K1 and must not fill the system log.
@@ -144,6 +173,7 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     for (const e of pruned) write(`  ${String(e.wid)}`);
     return 0;
   }
+  if (command === "restart") return restartCommand(home, env, write, { force: force === true, starter: options.starter, waitMs: options.waitMs });
   for (const req of await submit(home, command as Control, target, env)) write(`submitted ${req.kind} ${req.rid}`);
   return 0;
 }
