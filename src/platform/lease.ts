@@ -76,7 +76,12 @@ export function orphaned(t: LeaseTicket): boolean {
   } else {
     try { process.kill(c.pid, 0); return false; } catch { /* the leader is gone */ }
   }
-  return groupAlive(c.pid);
+  if (groupAlive(c.pid)) return true;
+  // One /proc listing is not atomic: a member can fork and exit between reading the directory and reading the stats, so
+  // "no running member" is not proof. Whatever the group still holds is leftovers of a holder that is gone (which the
+  // waiters would end anyway), so end it: a group signal reaches every member at once, a newborn included; zombies stay.
+  try { process.kill(-c.pid, "SIGKILL"); } catch { /* the group is gone */ }
+  return false;
 }
 /** A ticket is live while its wrapper, its command, or processes the command left in its group run. */
 export const live = (t: LeaseTicket) => alive(t.wrapper) || alive(t.command) || orphaned(t);
