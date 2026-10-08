@@ -121,6 +121,9 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
       if (groupAlive(c.pid)) { try { process.kill(-c.pid, "SIGKILL"); } catch { /* gone */ } }
       for (let i = 0; i < 40 && groupAlive(c.pid); i++) await new Promise(r => setTimeout(r, 25));
     }
+    // A /proc listing is not atomic (a member can fork and exit while it is read): a last group signal ends any member
+    // the checks missed, a newborn included. The group id is still ours while it has members.
+    if (c.pid) { try { process.kill(-c.pid, "SIGKILL"); } catch { /* gone */ } }
     removeTicket(home, ticket);
     return status;
   } finally {
