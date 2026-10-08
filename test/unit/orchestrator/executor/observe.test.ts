@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, appendFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, appendFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -8,8 +8,34 @@ import { setTimeout as delay } from "node:timers/promises";
 import { openJournal } from "../../../../src/kernel/journal.ts";
 import { ulid } from "../../../../src/kernel/ids.ts";
 import { callDir, callSession } from "../../../../src/paths.ts";
-import { observeExecution } from "../../../../src/orchestrator/executor/observe.ts";
+import { observeExecution, sessionChanged } from "../../../../src/orchestrator/executor/observe.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
+
+test("watcher accepts session and inbox growth and ignores live/temp traffic", () => {
+  for (const name of [null, "session.jsonl", "inbox", Buffer.from("session.jsonl")]) assert.equal(sessionChanged(name), true);
+  for (const name of ["live.json", "live.json.tmp", ".live.json.123.tmp", "stderr.log", "session.jsonl.tmp"]) assert.equal(sessionChanged(name), false);
+});
+
+test("watch notifications read session growth promptly without process-table scans", { timeout: 5000 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-watch-")), wid = ulid(), journal = await openJournal(join(home, "journal"));
+  const ticket: CallTicket = { wid, widRev: `${wid}@1`, key: "a", gen: 1, callId: `${wid}@1/a@1`, cwd: home, journal,
+    spec: { agent: "test", task: "test" }, agent: { name: "test", description: "test", body: "test", sourcePath: "fixture", source: "project", systemPromptMode: "replace", inheritProjectContext: false, inheritSkills: false } };
+  const dir = callDir(home, wid, "a", 1); await mkdir(dir, { recursive: true });
+  const stdout = new PassThrough(), stdin = new PassThrough(), stderr = new PassThrough(), ready = deferred(), changed = deferred();
+  let wake = () => {}, scans = 0, reads = 0;
+  const running = observeExecution({ home, config: {}, ticket, exec: `${ticket.callId}#1.1`,
+    child: { pid: 1, start: "fixture", stdin, stdout, stderr, exited: new Promise(() => {}) },
+    serial: fn => fn(), setWake: fn => { wake = fn; ready.resolve(); }, interrupted: () => false,
+    track: async () => { scans++; return []; }, fence: async () => {},
+    questions: async () => { reads++; changed.resolve(); }, recordUsage: async () => {}, switched: async () => {}, pendingSwitch: () => undefined });
+  t.after(async () => { wake(); await running; stdout.destroy(); stdin.destroy(); stderr.destroy(); await journal.close(); await rm(home, { recursive: true, force: true }); });
+  await ready.promise;
+  await writeFile(join(dir, "live.json"), "{}"); await writeFile(join(dir, "live.json.tmp"), "{}");
+  await delay(40); assert.equal(reads, 0); assert.equal(scans, 0);
+  await Promise.all(Array.from({ length: 10 }, () => appendFile(callSession(home, wid, "a", 1), "{}\n")));
+  await Promise.race([changed.promise, delay(500).then(() => { throw new Error("Session notification was not prompt"); })]);
+  assert.equal(scans, 0); assert.equal(reads, 1, "a session notification burst is coalesced");
+});
 
 function deferred() {
   let resolve!: () => void;

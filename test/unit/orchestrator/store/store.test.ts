@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { openJournal } from "../../../../src/kernel/journal.ts";
 import { publishRequest } from "../../../../src/kernel/mailbox.ts";
 import { orchInbox, orchLedger } from "../../../../src/paths.ts";
-import { Store } from "../../../../src/orchestrator/store.ts";
+import { Store, revisionEntries, terminalEntry } from "../../../../src/orchestrator/store.ts";
 import { Engine } from "../../../../src/orchestrator/engine.ts";
 import type { EvaluatorTransport } from "../../../../src/orchestrator/evaluator-client.ts";
 import { JT, type Request, type RunBody } from "../../../../src/types.ts";
@@ -29,6 +29,24 @@ async function fixture(t: TestContext) {
   const warnings = async (rid: string) => JSON.parse(await readFile(join(home, "staging", rid, "snapshot.json"), "utf8")).warnings as string[] | undefined;
   return { home, cwd, agents, ledgers, store, discovery, run, warnings, staging: (rid: string) => join(home, "staging", rid) };
 }
+test("A1 terminal memoization follows done, resume and revision appends", async t => {
+  const f = await fixture(t), req = f.run("cache", { source: "return 1;" });
+  await f.store.stage(req, f.discovery); const wf = await f.store.create(req);
+  t.after(() => f.store.close());
+  const initial = revisionEntries(wf);
+  assert.strictEqual(revisionEntries(wf), initial); assert.equal(terminalEntry(initial), undefined);
+  const done = await wf.journal.append(JT.done, { result: 1 });
+  const complete = revisionEntries(wf); assert.notStrictEqual(complete, initial);
+  assert.deepEqual(terminalEntry(complete), done); assert.strictEqual(terminalEntry(complete), terminalEntry(complete));
+  await wf.journal.append("resumed", {}); assert.equal(terminalEntry(revisionEntries(wf)), undefined);
+  await wf.journal.append(JT.done, { result: 2 }); assert.ok(terminalEntry(revisionEntries(wf)));
+  const revised = await wf.journal.append("revised", { revision: 2 });
+  const revisedView = revisionEntries(wf);
+  assert.deepEqual(revisedView, [revised]); assert.strictEqual(revisionEntries(wf), revisedView);
+  assert.equal(terminalEntry(revisedView), undefined);
+  assert.deepEqual(terminalEntry(complete), done, "prior immutable views retain their meaning");
+});
+
 const root = process.getuid?.() === 0;
 
 test("E3 an agent diagnostic is a warning unless the run could use its name", async t => {

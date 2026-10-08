@@ -23,13 +23,19 @@ export function sessionUsage(entries: SessionEntry[], call: string) {
   });
 }
 /** P31: Sum deduplicated committed message usage across executions, optionally across a whole workflow. */
+const totals = new WeakMap<readonly Entry[], { count: number; seen: Set<string>; total: Usage; calls: Map<string, Usage> }>();
 export function totalUsage(entries: readonly Entry[], call?: string): Usage {
-  const seen = new Set<string>(), total = { input: 0, output: 0, costUsd: 0 };
-  for (const e of entries) if (e.type === "usage" && (call === undefined || e.call === call)) {
-    const id = `${e.call}:${e.id}`; if (seen.has(id)) continue; seen.add(id);
-    const u = e.usage as Usage; total.input += u.input; total.output += u.output; total.costUsd += u.costUsd;
+  let state = totals.get(entries);
+  if (!state) { state = { count: 0, seen: new Set(), total: { input: 0, output: 0, costUsd: 0 }, calls: new Map() }; totals.set(entries, state); }
+  while (state.count < entries.length) {
+    const e = entries[state.count++]!;
+    if (e.type !== "usage") continue;
+    const id = `${e.call}:${e.id}`; if (state.seen.has(id)) continue; state.seen.add(id);
+    const key = String(e.call), total = state.calls.get(key) ?? { input: 0, output: 0, costUsd: 0 }, u = e.usage as Usage;
+    state.calls.set(key, total);
+    for (const target of [total, state.total]) { target.input += u.input; target.output += u.output; target.costUsd += u.costUsd; }
   }
-  return total;
+  return { ...(call === undefined ? state.total : state.calls.get(call) ?? { input: 0, output: 0, costUsd: 0 }) };
 }
 /** V8: Reached means either configured limit has been consumed, including truthful overshoot. */
 export function reached(usage: Usage, budget?: { tokens?: number; costUsd?: number }): boolean {

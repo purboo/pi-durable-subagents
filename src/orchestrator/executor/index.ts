@@ -26,10 +26,11 @@ import { hibernation, openQuestion } from "./hibernate.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
+import { entriesOf, trackedState, usageIds } from "./indexes.ts";
 import { observeExecution } from "./observe.ts";
 import { availableMemory } from "./memory.ts";
 import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
-import { recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
+import { indexSweep, recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
 import { gateRetired } from "./effects/gate.ts";
 import { WorktreeIndex, worktreeCalls, worktreeLabel, worktreePair, worktreeRoots, type WorktreeWrite } from "./worktree.ts";
 
@@ -48,7 +49,7 @@ const extension = fileURLToPath(new URL(`../../agent/extension.${import.meta.url
 const entriesFor = (journal: JournalHandle, call: string) => journal.entries().filter(e => e.call === call);
 const current = (journal: JournalHandle, call: string) => entriesFor(journal, call).findLast(e => e.type === JT.exec)?.exec as string | undefined;
 const sealed = (journal: JournalHandle, call: string) => entriesFor(journal, call).find(e => e.type === JT.sealed)?.result as CallResult | undefined;
-const has = (journal: JournalHandle, type: string, exec: string) => journal.entries().some(e => e.type === type && e.exec === exec);
+const has = (journal: JournalHandle, type: string, exec: string) => entriesOf(journal, type, exec).length > 0;
 /** The rid of the model request a follow-up naming a model makes (P12): derived, so withdrawing or replacing the
  *  follow-up withdraws its model request too. */
 export const modelRid = (rid: string) => contentHash([rid, "model"]);
@@ -137,15 +138,15 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     wake();
   }
   function tracked(journal: JournalHandle, exec: string): ProcInfo[] {
-    return journal.entries().filter(e => e.type === "tracked" && e.exec === exec).map(e => ({ pid: Number(e.pid), ppid: 0, start: String(e.start) }));
+    return trackedState(journal, exec).rows;
   }
   async function track(journal: JournalHandle, exec: string, found?: ProcInfo[]) {
     const known = tracked(journal, exec);
-    found ??= (await containment.scan(new Map([[exec, known]]))).get(exec) ?? [];
+    found ??= (await containment.scan(new Map([[exec, known]]), { maxAgeMs: config.k?.trackerMs ?? 1000 })).get(exec) ?? [];
     await serial(async () => {
-      const ids = new Set(tracked(journal, exec).map(p => `${p.pid}:${p.start}`));
-      for (const p of found) if (p.start && !ids.has(`${p.pid}:${p.start}`)) {
-        await journal.append("tracked", { exec, pid: p.pid, start: p.start }); ids.add(`${p.pid}:${p.start}`);
+      const { ids } = trackedState(journal, exec);
+      for (const p of found) if (p.tag !== exec && p.start && !ids.has(`${p.pid}:${p.start}`)) {
+        await journal.append("tracked", { exec, pid: p.pid, start: p.start }); trackedState(journal, exec);
       }
     });
     return found;
@@ -283,14 +284,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   async function recordUsage(t: CallTicket, values: { id: string; usage: Usage }[]) {
     await serial(async () => {
-      const recorded = new Set(t.journal.entries().filter(e => e.type === "usage" && e.call === t.callId).map(e => e.id));
-      for (const u of values) if (!recorded.has(u.id)) { await t.journal.append("usage", { call: t.callId, ...u }); recorded.add(u.id); }
+      for (const u of values) if (!usageIds(t.journal, t.callId).has(u.id)) await t.journal.append("usage", { call: t.callId, ...u });
       await workflowReached(t);
     });
   }
   async function workflowReached(t: CallTicket) {
-    const hit = reached(totalUsage(t.journal.entries()), t.workflowBudget), id = `budget:${t.wid}`;
-    if (hit && !t.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === id))
+    const hit = reached(totalUsage(entriesOf(t.journal, "usage")), t.workflowBudget), id = `budget:${t.wid}`;
+    if (hit && !entriesOf(t.journal, JT.attention).some(e => isEntry(e, JT.attention) && e.item.id === id))
       await t.journal.append(JT.attention, { item: { id, rev: 1, kind: "budget", text: "Workflow budget reached", wid: t.wid } });
     return hit;
   }
@@ -882,6 +882,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     },
     async recover(wid, journal) {
       journals.set(wid, journal);
+      indexSweep(journal);
       await serial(() => resolveWorktrees());
       await effects.recover(journal);
       for (const e of journal.entries().filter(e => e.type === JT.exec)) {
