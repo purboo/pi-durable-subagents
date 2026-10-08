@@ -7,7 +7,7 @@ const check = (extra: Record<string, unknown>, fanout = false) => validateCallSp
 
 test("T2: a complete valid spec has no errors; undefined fields count as absent", () => {
   const full = { model: "p/m:high", cwd: "sub", timeoutMs: 1000, output: "out.md", schema: { type: "object" }, isolation: "worktree", context: "fork",
-    budget: { tokens: 10 }, once: true, tools: ["read"], skills: [], gate: { command: "true", output: "json", schema: true, timeoutMs: 5 } };
+    budget: { tokens: 10 }, once: true, writer: false, tools: ["read"], skills: [], gate: { command: "true", output: "json", schema: true, timeoutMs: 5 } };
   assert.deepEqual(check(full), []);
   assert.deepEqual(check({ isolation: "none", context: "fresh", gate: "npm test", budget: { costUsd: 0.5 }, model: undefined }), []);
   assert.deepEqual(check({ key: "a" }, true), []);
@@ -25,6 +25,7 @@ test("T2: every rule reports its exact message", () => {
     [{ ...base, isolation: "docker" }, ['isolation must be "none" or "worktree" (got "docker")']],
     [{ ...base, context: "inherit" }, ['context must be "fresh" or "fork" (got "inherit")']],
     [{ ...base, once: "yes" }, ['once must be a boolean (got "yes")']],
+    [{ ...base, writer: "no" }, ['writer must be a boolean (got "no")']],
     [{ ...base, tools: "read", skills: [1] }, ['tools must be an array of strings (got "read")', "skills must be an array of strings (got [1])"]],
     [{ ...base, budget: 5 }, ["budget must be an object {tokens?, costUsd?}"]],
     [{ ...base, budget: {} }, ["budget needs tokens or costUsd"]],

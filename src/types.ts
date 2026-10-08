@@ -270,6 +270,9 @@ export interface CallSpec {
   once?: boolean;
   tools?: string[];
   skills?: string[];
+  /** Writer lock: whether the call writes in its cwd's worktree. Default: its tools include edit or write (pi's default
+   *  tools do). One writer per worktree runs at a time; false opts out (e.g. a reviewer writing its report elsewhere). */
+  writer?: boolean;
 }
 
 export type CallStatus =

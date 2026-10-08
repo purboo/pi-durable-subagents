@@ -48,6 +48,8 @@ export interface CallSnapshot {
   afterEnd?: true;
   /** P28: asking and hibernated: its execution is fenced and holds no provider slot until the answer arrives. */
   hibernated?: true;
+  /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
+  writerWait?: { root: string; holder: string };
 }
 export interface WorkflowSnapshot {
   wid: string; rev: number; name?: string; origin?: string; cwd?: string;
@@ -167,6 +169,10 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         // (otherwise a call still waiting for a slot reads "thinking · 2m").
         call.exec = String(e.exec); call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
         delete call.hibernated; hibernating.delete(call.callId);
+      } else if (e.type === "writer-wait" || e.type === "writer-acquired") {
+        const call = calls.get(String(e.call)), holder = String(e.holder ?? "");
+        if (call && e.type === "writer-wait") call.writerWait = { root: String(e.root), holder: holder.includes("/") ? `${holder.split("@")[0]}/${holder.split("/")[1]!.split("@")[0]}` : holder };
+        else if (call) delete call.writerWait;
       } else if (e.type === "hibernated") {
         // The decision to hibernate precedes the fence; the slot is released only once the execution is fenced.
         const call = calls.get(String(e.call)); if (call?.exec && call.exec === e.exec) hibernating.set(call.callId, call.exec);
@@ -198,7 +204,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         const usage = (e.result as CallResult | undefined)?.usage;
         if (usage) sealedUsage.set(String(e.call), usage);
         const call = calls.get(String(e.call)); if (!call) continue;
-        call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated; hibernating.delete(call.callId);
+        call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated; delete call.writerWait; hibernating.delete(call.callId);
       } else if (isEntry(e, JT.attention)) {
         const item = e.item;
         attention.push(item);
@@ -407,6 +413,8 @@ export interface StatusCall {
   lastLine?: string; error?: string;
   /** Asking and hibernated: no provider slot is held while it waits (P28). */
   hibernated?: true;
+  /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
+  writerWait?: { root: string; holder: string };
 }
 export interface StatusWorkflow {
   wid: string; name?: string; origin?: string; status: WorkflowSnapshot["status"]; rev: number;
@@ -448,7 +456,8 @@ export function compactWorkflow(wf: WorkflowSnapshot): StatusWorkflow {
       return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...(r ? { status: r.status, ok: r.ok } : {}),
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
-        ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}) };
+        ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
+        ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
     ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}),
@@ -504,6 +513,8 @@ export interface BriefCall {
   tokens?: string; status?: CallResult["status"]; error?: string;
   /** Asking and hibernated: it holds no provider slot while it waits (P28). */
   hibernated?: true;
+  /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
+  writerWait?: { root: string; holder: string };
   /** `model` is the model in use; `switching` one requested and not answering yet; `switchFailed` a refused request. */
   switching?: string; switchFailed?: string;
 }
@@ -619,7 +630,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
         ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
         ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
-        ...(c.hibernated ? { hibernated: true as const } : {}),
+        ...(c.hibernated ? { hibernated: true as const } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
         ...(live && c.switching ? { switching: c.switching } : {}), ...(live && c.switchFailed ? { switchFailed: c.switchFailed } : {}) };
     });
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
