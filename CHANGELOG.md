@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.19
+
+- The orchestrator no longer keeps every workflow's pinned origin branch (the
+  parent session copied for `context: "fork"`) and input bytes in memory; they
+  are read from the pinned files when needed. With about 110 workflows of
+  history, the orchestrator heap had grown to 3.7 GB; on a copy of that
+  history it now stays near 120 MB.
+
 ## 1.0.18
 
 - The orchestrator uses far less CPU. Running calls share one process-table
