@@ -290,7 +290,10 @@ pi-durable-subagents hold machine --max-wait 600 --note "frame phase" -- ./measu
   before the lease passes on.
 - The lease lives as long as the `hold` process or its command lives, so a
   killed `hold` does not hand the machine over while the command still
-  runs. State is one small file per request under
+  runs. If `hold` is killed and its command has exited, processes the
+  command left in its group still hold the lease; the next waiter ends them
+  (on macOS, a process that took over the command's pid is waited for, not
+  ended). State is one small file per request under
   `$DSA_HOME/leases/<resource>/`; no orchestrator is needed, and the user's
   own shell can take part.
 - Subagents find the command on their `PATH` (the orchestrator puts a shim
