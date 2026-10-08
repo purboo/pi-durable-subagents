@@ -17,9 +17,9 @@ import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
-import { JT, attentionEntries, isEntry, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
+import { JT, attentionEntries, isEntry, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type RestartBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
-import type { CallTicket, Executor, Ledgers } from './contract.ts';
+import type { CallTicket, Executor, Ledgers, LiveExecution } from './contract.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
 import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
@@ -94,6 +94,7 @@ export class Engine {
   private queue: Promise<void> = Promise.resolve();
   private failure?: unknown;
   private closed = false;
+  private restarting = false;
   private generations = new Set<string>();
   // wid -> executor runs whose follow-up has not run yet (prune never closes a journal they may still append to).
   private running = new Map<string, number>();
@@ -368,10 +369,30 @@ export class Engine {
         await this.executor.suspend(scoped ? w => this.held(w) : undefined);
         for (const st of this.states.values()) if (!scoped || this.held(st.wf.wid)) st.running.clear();
       }
+    } else if (req.kind === 'restart') {
+      // A replay (the restart was recorded, then the process ended before its resolution) applies without restarting again.
+      if (!this.ledgers.orch.entries().some(e => e.type === 'restart' && e.rid === req.rid)) {
+        const force = (req.body as RestartBody | null)?.force === true;
+        const gate = this.executor.quiesce?.() ?? { live: [], resume() {} };
+        if (gate.live.length && !force) { gate.resume(); return { action: 'reject', reason: this.busyReason(gate.live) }; }
+        await this.ledgers.orch.append('restart', { rid: req.rid, force, live: gate.live.map(l => l.exec) });
+        this.restarting = true;
+      }
     } else if (req.kind === 'prune') return this.prune(req as Request<PruneBody>);
     else return { action: 'reject', reason: 'unsupported-kind' };
     return { action: 'apply' };
   }
+  /** Restart refused: which executions run now, whose they are and for how long, and the way to proceed. */
+  private busyReason(live: LiveExecution[]): string {
+    const now = Date.now(), minutes = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : `${Math.round(ms / 60_000)}m`;
+    const shown = live.slice(0, 8).map(l => {
+      const origin = this.store.workflows.get(l.wid)?.origin;
+      return `${l.wid}/${l.key}${l.phase === 'gate' ? ' gate' : ''} ${minutes(now - l.since)}${origin ? ` from ${origin}` : ''}`;
+    });
+    return `busy: ${live.length} running execution${live.length === 1 ? '' : 's'}: ${shown.join('; ')}${live.length > shown.length ? `; +${live.length - shown.length} more` : ''} — retry when they finish (or drain first), or force to fence them; they resume on the new orchestrator`;
+  }
+  /** Set by an applied restart: the loop ends and the process exits; its successor recovers every workflow. */
+  get restartRequested(): boolean { return this.restarting; }
   /** A1, housekeeping: Prune finished workflows (named, or all ended more than olderThanDays ago); a replay of a
    *  committed prune is applied again and continues with the workflows still eligible. */
   private async prune(req: Request<PruneBody>): Promise<Decision> {
@@ -581,7 +602,7 @@ export class Engine {
     this.poll = setInterval(() => this.background(() => this.consume()), 1000);
     let idleSince = performance.now();
     try {
-      while (!signal?.aborted && !this.closed) {
+      while (!signal?.aborted && !this.closed && !this.restarting) {
         await this.queue;
         if (this.failure) throw this.failure;
         const files = await readdir(inbox);

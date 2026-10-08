@@ -59,6 +59,9 @@ export interface CallEffects {
   recover(journal: JournalHandle): Promise<void>;
 }
 
+/** An execution whose child (or gate before its seal) runs now. */
+export interface LiveExecution { wid: Wid; key: string; gen: number; callId: CallId; exec: string; since: number; phase: "child" | "gate" }
+
 export interface Executor {
   /** Start, or resume after recovery, one call. Idempotent per callId: a second call returns the same promise.
    *  Resolves only after JT.sealed is committed (V2); never rejects for model/tool failures (those seal). */
@@ -80,6 +83,9 @@ export interface Executor {
    *  WITHOUT sealing; their run() promises reject with an Error named "ExecutorShutdown"; the executor stays open and a
    *  later run() continues the call. */
   suspend(only?: (wid: string) => boolean): Promise<void>;
+  /** Restart: stop launching executions (children and gates before a seal) and report those running now; `resume()`
+   *  lets launches continue when the restart is refused. */
+  quiesce?(): { live: LiveExecution[]; resume(): void };
   /** Orchestrator exit: suspend(), then close the outbox. */
   shutdown(): Promise<void>;
   /** Apply a config.json change between slot admissions (never inside one), then let waiting calls retry. */

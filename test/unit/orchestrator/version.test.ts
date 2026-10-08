@@ -38,7 +38,7 @@ test("a running orchestrator of another version is shown with a note; a dead one
   const older = foldLedger(emptyLedger(), entries(["orchestrator", { version: "1.0.9", pid: process.pid }]));
   const view = orchestratorView(older, "1.0.13");
   assert.equal(view.orchestrator, `1.0.9 (pid ${process.pid})`);
-  assert.match(String(view.versionNote), /^the orchestrator runs durable-subagents 1\.0\.9, this pi loaded 1\.0\.13: running work stays on 1\.0\.9\. .*drain .*resume/);
+  assert.match(String(view.versionNote), /^the orchestrator runs durable-subagents 1\.0\.9, this pi loaded 1\.0\.13: running work stays on 1\.0\.9\. .*restart/);
   assert.match(String(orchestratorView(older, "1.0.8").versionNote), /^this pi session loaded durable-subagents 1\.0\.8, older than the running orchestrator 1\.0\.9; start a new pi session/);
   assert.match(versionNote("1.0.10", "1.0.9"), /^this pi session loaded .* 1\.0\.9, older than/, "versions compare by number, not text");
   const dead = spawnSync(process.execPath, ["-e", ""]).pid!;

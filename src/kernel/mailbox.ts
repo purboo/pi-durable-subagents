@@ -39,7 +39,7 @@ function isRequest(value: unknown): value is Request {
   const r = value as Request;
   // A3, C11: request identities are short and path-safe, so every derived path (staging, receipts) is valid.
   return typeof r.rid === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(r.rid) && typeof r.from === 'string' && typeof r.to === 'string' && Number.isSafeInteger(r.sseq) && r.sseq > 0 &&
-    ['run','send','stop','revise','resume','drain','prune','task','steer','follow-up','answer','model','continue','withdraw','call','emit'].includes(r.kind) && Object.hasOwn(r, 'body');
+    ['run','send','stop','revise','resume','drain','prune','restart','task','steer','follow-up','answer','model','continue','withdraw','call','emit'].includes(r.kind) && Object.hasOwn(r, 'body');
 }
 /** P3: Scan immutable requests, reporting invalid files without admitting them. */
 export async function scanInbox(inboxDir: string, report: (path: string, error: unknown) => void = (path, error) => console.warn(path, error)): Promise<Request[]> {

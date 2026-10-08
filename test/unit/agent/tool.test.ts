@@ -11,7 +11,7 @@ test("v12 §2: omitted action infers only a single launch form; invalid omission
     { chain: [{ agent: "worker", task: "work" }] }, { workflow: "flow.js" }, { source: "return 1" },
   ]) assert.equal(request(args, "/w").kind, "run");
   for (const args of [{}, { agent: "a", task: "work", source: "return 1" }, { tasks: [], chain: [] }, { to: "w/k", kind: "steer", message: "hi" }]) {
-    assert.throws(() => request(args, "/w"), /action is required: run, agents, send, stop, revise, status, resume, drain/);
+    assert.throws(() => request(args, "/w"), /action is required: run, agents, send, stop, revise, status, resume, drain, restart/);
   }
   assert.throws(() => request({ action: "impossible" }, "/w"), /Unsupported action: impossible; use run, agents/);
 });
