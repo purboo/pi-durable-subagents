@@ -40,6 +40,8 @@ export async function observeExecution(d: Dependencies) {
   const { home, config, ticket: t, exec, child, serial } = d;
   const session = callSession(home, t.wid, t.key, t.gen), clock = new ActiveTime(), started = clock.last;
   let progress = started, providerError: string | undefined;
+  // Diagnostic metadata only: checkpoint the latest received stream update, never its content.
+  let lastStream: { type: string; receivedAt: number } | undefined;
   const tools = new Set<string>();
   // The tool calls running now, for the stall text: a silent long command and a stuck call read differently.
   const running = new Map<string, { name: string; command: string; since: number }>();
@@ -53,7 +55,7 @@ export async function observeExecution(d: Dependencies) {
   const saveTime = () => serial(async () => {
     const previous = t.journal.entries().findLast(e => e.type === "time" && e.exec === exec);
     if (!monotoneTime({ active: Number(previous?.active ?? 0) }, { active: clock.active })) throw new Error("Nonmonotone active time");
-    await t.journal.append("time", { exec, active: clock.active });
+    await t.journal.append("time", { exec, active: clock.active, ...(lastStream ? { lastStream } : {}) });
   });
   const limits = async () => {
     if (t.spec.timeoutMs !== undefined && prior + clock.active >= t.spec.timeoutMs) {
@@ -61,14 +63,19 @@ export async function observeExecution(d: Dependencies) {
     }
     if (reached(totalUsage(t.journal.entries(), t.callId), t.spec.budget)) signal();
   };
+  const openAlert = (id: string) => {
+    const last = attentionEntries(t.journal.entries(), id).at(-1)?.item;
+    return last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
+  };
+  const progressDue = () => !clock.asking && !tools.size && performance.now() - progress >= (config.k?.progressMs ?? 600000);
   const stall = () => serial(async () => {
     const id = `stall:${t.callId}`;
     const items = attentionEntries(t.journal.entries(), id), last = items.at(-1)?.item;
     const open = last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
     const fresh = items.at(-1)?.exec === exec ? clock.last > Number(items.at(-1)?.horizon) : clock.last > started;
     if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "activity" });
-    else if (!open && !clock.asking && performance.now() - clock.last >= (config.k?.stallMs ?? 600000))
-      await t.journal.append(JT.attention, { exec, horizon: clock.last, item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text: `${t.wid}/${t.key}: no execution activity for ${Math.floor((performance.now() - clock.last) / 60000)}m` + runningText(), wid: t.wid, call: t.callId } });
+    else if (!open && !clock.asking && !progressDue() && !openAlert(`noprogress:${t.callId}`) && performance.now() - clock.last >= (config.k?.stallMs ?? 600000))
+      await t.journal.append(JT.attention, { exec, horizon: clock.last, ...(lastStream ? { lastStream } : {}), item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text: `${t.wid}/${t.key}: no execution activity observed for ${Math.floor((performance.now() - clock.last) / 60000)}m` + runningText(), wid: t.wid, call: t.callId } });
   });
   /** "; running bash `make matrix` for 14m (no output or CPU use seen)": a silent long command, not a stuck model. */
   const runningText = () => {
@@ -82,10 +89,10 @@ export async function observeExecution(d: Dependencies) {
     const open = last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
     const fresh = items.at(-1)?.exec === exec ? progress > Number(items.at(-1)?.horizon) : progress > started;
     if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "progress" });
-    else if (!open && !clock.asking && !tools.size && performance.now() - progress >= (config.k?.progressMs ?? 600000)) {
-      const text = `${t.wid}/${t.key}: running but no progress for ${Math.floor((performance.now() - progress) / 60000)}m (no output tokens or tool results)` +
+    else if (!open && progressDue() && !openAlert(`stall:${t.callId}`)) {
+      const text = `${t.wid}/${t.key}: no new output or tool progress received for ${Math.floor((performance.now() - progress) / 60000)}m; the model may still be processing` +
         (providerError ? `; last provider error: ${providerError.slice(0, 200)}` : "");
-      await t.journal.append(JT.attention, { exec, horizon: progress, item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text, wid: t.wid, call: t.callId } });
+      await t.journal.append(JT.attention, { exec, horizon: progress, ...(lastStream ? { lastStream } : {}), item: { id, rev: (last?.rev ?? 0) + 1, kind: "stall", text, wid: t.wid, call: t.callId } });
     }
   });
   child.stdin.on("error", () => {});
@@ -101,6 +108,10 @@ export async function observeExecution(d: Dependencies) {
     // P18: Apply RPC boundaries at receipt, before any in-flight scan can resume.
     // Durable observations remain queued; clock transitions never wait on I/O.
     clock.event(event, performance.now());
+    if (event.type === "message_update") {
+      const type = (event.assistantMessageEvent as { type?: unknown } | undefined)?.type;
+      lastStream = { type: typeof type === "string" && /^(thinking|text|toolcall)_(start|delta|end)$/.test(type) ? type : "message_update", receivedAt: Date.now() };
+    }
     const message = event.message as { stopReason?: string; errorMessage?: string; usage?: { output?: number } } | undefined;
     const error = event.type === "auto_retry_start" ? event.errorMessage : event.type === "auto_retry_end" ? event.finalError :
       event.type === "message_end" && message?.stopReason === "error" ? message.errorMessage : undefined;

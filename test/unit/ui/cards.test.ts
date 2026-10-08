@@ -2,7 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { card, digestLines, registerCards } from "../../../src/ui/cards.ts";
-import { CT } from "../../../src/types.ts";
+import { CT, JT } from "../../../src/types.ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { openJournal } from "../../../src/kernel/journal.ts";
+import { journalPath } from "../../../src/paths.ts";
 
 const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as never;
 const ansiTheme = { fg: (c: string, t: string) => c === "dim" ? `\u001b[2m${t}\u001b[22m` : t, bold: (t: string) => t } as never;
@@ -11,7 +16,32 @@ test("no-progress attention cards use a distinct heading", () => {
   registerCards({ registerMessageRenderer: (type: string, r: never) => renderers.set(type, r) } as never, "/nonexistent");
   const items = [{ id: "noprogress:w@1/a@1", rev: 1, kind: "stall", text: "no output", wid: "w", call: "w@1/a@1" }];
   const out = renderers.get(CT.attention)!({ details: { items } }, { expanded: false }, theme)!.render(60).join("\n");
-  assert.match(out, /Subagent a no progress/);
+  assert.match(out, /Subagent a awaiting progress/);
+});
+
+for (const [reason, label] of [["progress", "recovered"], ["activity", "recovered"], ["ended", "ended"], ["retired", "ended"]]) test(`stall card updates in place on ${reason}`, async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-cards-"));
+  const journal = await openJournal(journalPath(home, "w"));
+  t.after(async () => { await journal.close(); await rm(home, { recursive: true, force: true }); });
+  let now = 10000;
+  t.mock.method(Date, "now", () => now);
+  const renderers = new Map<string, (m: unknown, o: unknown, t: unknown) => { render(w: number): string[] }>();
+  const refresh = registerCards({ registerMessageRenderer: (type: string, r: never) => renderers.set(type, r) } as never, home);
+  const item = { id: "noprogress:w@1/a@1", rev: 1, kind: "stall", text: "no output received", wid: "w", call: "w@1/a@1" };
+  const component = renderers.get(CT.attention)!({ details: { items: [item] } }, { expanded: false }, ansiTheme);
+  const first = component.render(60);
+  assert.match(first.join("\n"), /awaiting progress/);
+  await journal.append(JT.attentionResolved, { id: item.id, rev: 2, resolution: reason });
+  now += 1001; assert.equal(refresh(), false, "another revision cannot resolve this card");
+  assert.equal(component.render(60), first);
+  await journal.append(JT.attentionResolved, { id: item.id, rev: 1, resolution: reason });
+  now += 1001; assert.equal(refresh(), true, "request a repaint even with an unchanged dock");
+  const after = component.render(60);
+  assert.match(after.join("\n"), new RegExp(`— ${label}`));
+  assert.ok(after.join("\n").includes("\u001b[2mno output received"));
+  assert.notEqual(after, first);
+  assert.equal(component.render(60), after);
+  assert.equal(refresh(), false);
 });
 
 test("UI §1: interaction cards are framed to the exact width and cap long bodies", () => {

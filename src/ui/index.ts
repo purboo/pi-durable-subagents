@@ -10,7 +10,7 @@ import { toolRenderers } from "./tool.ts";
 
 /** UI §1–3, P16, P21: Register journal-backed list/watch surfaces only in interactive pi. */
 export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
-  if (typeof pi.registerMessageRenderer === "function") registerCards(pi, deps.home); // P21: cards are optional
+  const refreshCards = typeof pi.registerMessageRenderer === "function" ? registerCards(pi, deps.home) : () => false; // P21: cards are optional
   // UI §5: compact tool calls and results (optional surface; without it pi shows the raw JSON).
   if (typeof pi.registerToolRenderer === "function") pi.registerToolRenderer((name, next) => {
     const n = next();
@@ -34,12 +34,12 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     const state: ViewState = { folded: new Set(), done: new Map(), viewed: new Set(), finished: false };
     let screen: SubagentScreen | undefined, opening = false, stopped = false, closeScreen: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined, timer: ReturnType<typeof setInterval> | undefined;
-    let dockRows: (width: number) => string[] = () => [], dockAt: "above" | "below" | undefined | null = null, dockTui: { requestRender(): void } | undefined, lastDock = "";
+    let dockRows: (width: number) => string[] = () => [], dockAt: "above" | "below" | undefined | null = null, lastDock = "";
     // ↓ opens the list only from pi's own input editor. Another surface — /model's selector, a dialog, another
     // extension's overlay — has the focus instead, and its ↓ belongs to it. pi's editor (and any editor built on
     // CustomEditor) carries the app action map; the TUI comes from the dock widget, so without a dock the check
     // falls back to the editor text alone.
-    let keysTui: object | undefined;
+    let keysTui: { getFocusedComponent?(): unknown; requestRender?(): void } | undefined;
     const editorFocused = () => {
       const focus = (keysTui as { getFocusedComponent?(): unknown } | undefined)?.getFocusedComponent;
       if (typeof focus !== "function") return true;
@@ -69,11 +69,11 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
         // it on every refresh pushed it under such bars and rebuilt the whole widget area twice a second.
         const at = dock === "off" ? undefined : data.dockAt;
         if (at !== dockAt) {
-          dockAt = at; dockTui = undefined;
+          dockAt = at;
           // With the dock off, an empty widget below the editor still lends the TUI to the ↓ focus check; pi adds no
           // spacer for it, so it takes no line.
           ctx.ui.setWidget("durable-subagents", !at ? tui => { keysTui = tui; return { invalidate() {}, render: () => [] }; } : (tui, theme) => {
-            dockTui = tui; keysTui = tui;
+            keysTui = tui;
             return {
               invalidate() {},
               render(width) {
@@ -88,7 +88,8 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
           }, { placement: at === "above" ? "aboveEditor" : "belowEditor" });
         }
         const shown = dockRows(200).join("\n");
-        if (shown !== lastDock) { lastDock = shown; dockTui?.requestRender(); }
+        const cardsChanged = refreshCards();
+        if (shown !== lastDock || cardsChanged) { lastDock = shown; keysTui?.requestRender?.(); }
         screen?.refresh();
       } catch { /* P21: journal or UI unavailability must not interrupt the main agent. */ }
     };
