@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.0.18
+
+- The orchestrator uses far less CPU. Running calls share one process-table
+  scan instead of each rescanning `/proc` whenever its call directory
+  changed, streamed output no longer triggers whole-journal checks for every
+  event, and status/idle checks reuse cached journal views. In a benchmark
+  with four streaming calls and 200 other processes, CPU fell from about
+  1.9 cores to 0.07; with 100 workflows of history, from about 1.1 cores to
+  0.03.
+- `pi-durable-subagents restart [--force]` (and the `restart` tool action)
+  replaces the orchestrator with the installed version. It refuses while an
+  execution is running and lists them (`<wid>/<key>`, age, origin); calls
+  waiting for a slot or an answer do not block it. `--force` fences the
+  running executions, which resume on the new orchestrator. No execution
+  starts between the check and the restart. Against an orchestrator from
+  1.0.17 or earlier, the CLI checks the journals itself and then stops the
+  old process. Use it instead of killing the orchestrator.
+- One writer call per worktree is now enforced. A call whose tools include
+  `edit` or `write` holds its git worktree from its first execution until it
+  ends, also while waiting for an answer and across orchestrator restarts.
+  Another writer in that worktree waits in order; its status line shows
+  `(waiting for writer lock: <root> held by <wid>/<key>)` and its origin gets
+  one `conflict` notice. `writer:false` on a call, `isolation:"worktree"`, or
+  `writerLock: "off"` in config.json opt out.
+- `pi-durable-subagents hold <resource> [--shared] [--max-wait s] -- <cmd>`
+  runs a command under a resource lease, such as `machine` for benchmarks:
+  exclusive holders run one at a time, shared holders together, strictly in
+  request order. The lease lasts as long as the command, even if the `hold`
+  process is killed, and the command's leftover processes end before it is
+  released. Subagents find the command on their PATH; it also works from
+  your own shell without an orchestrator. `leases` and status show holders
+  and waiters, and a call's status line shows the lease it holds or waits for.
+
 ## 1.0.17
 
 - A silent subagent shows one warning instead of separate activity and
