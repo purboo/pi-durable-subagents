@@ -58,11 +58,15 @@ test('hold: blockers are strict FIFO; an exclusive waiter keeps later shared req
 
 test('hold: exclusive holders run one after another in request order; exit codes pass through', async t => {
   const home = await root(t), file = join(home, 'log');
-  const a = run(home, ['machine', '--', ...step(file, 'a', 0.6)]);
+  // A holds until the test lets it go, so B and C queue behind it however slowly they start.
+  const go = join(home, 'go');
+  const a = run(home, ['machine', '--', 'sh', '-c', `echo "a start" >> ${file}; while [ ! -f ${go} ]; do sleep 0.05; done; echo "a end" >> ${file}`]);
   await until(() => granted(home, 'machine', a.child.pid!));
   const b = run(home, ['machine', '--', ...step(file, 'b', 0.1)]);
-  await until(() => queued(home, 'machine', b.child.pid!));
+  await until(() => /1 ahead/.test(b.stderr()), 20_000);
   const c = run(home, ['machine', '--', 'sh', '-c', `echo "c start" >> ${file}; exit 7`]);
+  await until(() => /2 ahead/.test(c.stderr()), 20_000);
+  await writeFile(go, '');
   assert.deepEqual(await Promise.all([a.exit, b.exit, c.exit]), [0, 0, 7]);
   assert.deepEqual(log(file), ['a start', 'a end', 'b start', 'b end', 'c start']);
   assert.match(b.stderr(), /hold: waiting for machine \(exclusive\) — held by pid \d+ `sh -c .*` \(exclusive, \d+s\); 1 ahead/);
@@ -89,12 +93,11 @@ test('hold: shared holders run together; an exclusive request waits for them and
 
 test('hold: --max-wait gives up with 75 without running the command', async t => {
   const home = await root(t), file = join(home, 'log');
-  const a = run(home, ['machine', '--', ...step(file, 'a', 1.5)]);
+  const a = run(home, ['machine', '--', ...step(file, 'a', 5)]);
   await until(() => granted(home, 'machine', a.child.pid!));
-  const started = performance.now();
   const b = run(home, ['machine', '--max-wait', '0.3', '--', ...step(file, 'b', 0)]);
   assert.equal(await b.exit, 75);
-  assert.ok(performance.now() - started < 1400, 'gave up before the holder finished');
+  assert.deepEqual(log(file), ['a start'], 'gave up while the holder still ran');
   assert.match(b.stderr(), /still held by pid \d+ .* not running the command \(exit 75\)/);
   assert.equal(await a.exit, 0);
   assert.deepEqual(log(file), ['a start', 'a end']);
