@@ -10,8 +10,11 @@ import { callDir, callSession } from "../../paths.ts";
 import { monotoneTime } from "../../kernel/guards.ts";
 import type { CallTicket, OrchestratorConfig } from "../contract.ts";
 import { readSession, type SessionEntry } from "./session.ts";
+import { entriesOf } from "./indexes.ts";
 import { ActiveTime, activeTotal } from "./time.ts";
 import { observation, reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
+
+export const sessionChanged = (name: string | Buffer | null) => name === null || String(name) === "session.jsonl" || String(name) === "inbox";
 
 type Dependencies = {
   home: string; config: OrchestratorConfig; ticket: CallTicket; exec: string; child: Spawned;
@@ -50,10 +53,10 @@ export async function observeExecution(d: Dependencies) {
   let signal!: () => void;
   const boundary = new Promise<void>(resolve => { signal = resolve; d.setWake(resolve); });
   let failure: unknown, pending: Promise<unknown> = Promise.resolve(), ending = false;
-  const has = (type: string) => t.journal.entries().some(e => e.type === type && e.exec === exec);
+  const has = (type: string) => entriesOf(t.journal, type, exec).length > 0;
   const enqueue = (fn: () => Promise<unknown>) => { if (!ending) pending = pending.then(fn).catch(error => { failure = error; signal(); }); };
   const saveTime = () => serial(async () => {
-    const previous = t.journal.entries().findLast(e => e.type === "time" && e.exec === exec);
+    const previous = entriesOf(t.journal, "time", exec).at(-1);
     if (!monotoneTime({ active: Number(previous?.active ?? 0) }, { active: clock.active })) throw new Error("Nonmonotone active time");
     await t.journal.append("time", { exec, active: clock.active, ...(lastStream ? { lastStream } : {}) });
   });
@@ -61,17 +64,17 @@ export async function observeExecution(d: Dependencies) {
     if (t.spec.timeoutMs !== undefined && prior + clock.active >= t.spec.timeoutMs) {
       await serial(async () => { if (!has("timeout-intent")) await t.journal.append("timeout-intent", { exec, call: t.callId }); }); signal();
     }
-    if (reached(totalUsage(t.journal.entries(), t.callId), t.spec.budget)) signal();
+    if (reached(totalUsage(entriesOf(t.journal, "usage"), t.callId), t.spec.budget)) signal();
   };
   const openAlert = (id: string) => {
-    const last = attentionEntries(t.journal.entries(), id).at(-1)?.item;
-    return last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
+    const last = attentionEntries(entriesOf(t.journal, JT.attention), id).at(-1)?.item;
+    return last && !entriesOf(t.journal, JT.attentionResolved).some(e => e.id === id && e.rev === last.rev);
   };
   const progressDue = () => !clock.asking && !tools.size && performance.now() - progress >= (config.k?.progressMs ?? 600000);
   const stall = () => serial(async () => {
     const id = `stall:${t.callId}`;
-    const items = attentionEntries(t.journal.entries(), id), last = items.at(-1)?.item;
-    const open = last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
+    const items = attentionEntries(entriesOf(t.journal, JT.attention), id), last = items.at(-1)?.item;
+    const open = last && !entriesOf(t.journal, JT.attentionResolved).some(e => e.id === id && e.rev === last.rev);
     const fresh = items.at(-1)?.exec === exec ? clock.last > Number(items.at(-1)?.horizon) : clock.last > started;
     if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "activity" });
     else if (!open && !clock.asking && !progressDue() && !openAlert(`noprogress:${t.callId}`) && performance.now() - clock.last >= (config.k?.stallMs ?? 600000))
@@ -85,8 +88,8 @@ export async function observeExecution(d: Dependencies) {
   };
   const noProgress = () => serial(async () => {
     const id = `noprogress:${t.callId}`;
-    const items = attentionEntries(t.journal.entries(), id), last = items.at(-1)?.item;
-    const open = last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev);
+    const items = attentionEntries(entriesOf(t.journal, JT.attention), id), last = items.at(-1)?.item;
+    const open = last && !entriesOf(t.journal, JT.attentionResolved).some(e => e.id === id && e.rev === last.rev);
     const fresh = items.at(-1)?.exec === exec ? progress > Number(items.at(-1)?.horizon) : progress > started;
     if (open && fresh) await t.journal.append(JT.attentionResolved, { id, rev: last!.rev, resolution: "progress" });
     else if (!open && progressDue() && !openAlert(`stall:${t.callId}`)) {
@@ -124,6 +127,8 @@ export async function observeExecution(d: Dependencies) {
     // Receipt-time progress is independent of RPC chatter, CPU and session growth; open tools suppress alerts.
     if (event.type === "message_update" || ["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(String(event.type)) ||
       event.type === "message_end" && message?.stopReason !== "error" && (message?.usage?.output ?? 0) > 0) progress = performance.now();
+    // Stream deltas already updated receipt-time clocks; periodic checks bound decision latency.
+    if (event.type === "message_update" || event.type === "tool_execution_update") return;
     enqueue(async () => {
       const args = event.args as { path?: unknown } | undefined;
       if (event.type === "tool_execution_start" && (event.toolName === "edit" || event.toolName === "write") && typeof args?.path === "string") await d.wrote?.(args.path);
@@ -139,16 +144,16 @@ export async function observeExecution(d: Dependencies) {
       }
     });
   });
-  let scanning = false, failingSince: number | undefined;
-  const scan = () => {
-    if (scanning) return;
+  let scanning = false, sessionDirty = false, failingSince: number | undefined;
+  const scan = (processes = true) => {
+    if (scanning) { if (!processes) sessionDirty = true; return; }
     scanning = true;
     enqueue(async () => { try {
       // One failed process-table scan is no evidence, not a reason to fence a live child: on macOS `ps` can miss its
       // 2 s deadline right after the orchestrator was stopped or the machine slept (seen on CI as a spurious loss and
       // a rerun). Only a scan that keeps failing for a minute ends the observation.
       // Measured in elapsed time: the scan period is fixed at start while k.trackerMs can be reloaded.
-      try { clock.scan(await d.track()); failingSince = undefined; }
+      try { if (processes) { clock.scan(await d.track()); failingSince = undefined; } }
       catch (error) { failingSince ??= performance.now(); if (performance.now() - failingSince >= 60_000) throw error; }
       const nextSize = (await fileStat(session).catch(() => ({ size: 0 }))).size;
       if (nextSize > size) { clock.evidence(); size = nextSize; }
@@ -158,10 +163,14 @@ export async function observeExecution(d: Dependencies) {
       if (performance.now() - checkpoint >= (config.k?.checkpointMs ?? 10000)) { await saveTime(); checkpoint = performance.now(); }
       const reservation = d.pendingSwitch();
       if (reservation && Date.now() - reservation.ts >= (config.k?.switchTimeoutMs ?? 300000)) signal();
-    } finally { scanning = false; } });
+    } finally { scanning = false; if (sessionDirty) { sessionDirty = false; scan(false); } } });
   };
-  const timer = setInterval(scan, config.k?.trackerMs ?? 1000);
-  const watcher = watch(callDir(home, t.wid, t.key, t.gen), scan);
+  const timer = setInterval(() => scan(), Math.min(config.k?.trackerMs ?? 1000, 1000));
+  let notification: ReturnType<typeof setTimeout> | undefined;
+  const watcher = watch(callDir(home, t.wid, t.key, t.gen), (_event, name) => {
+    if (!sessionChanged(name) || notification) return;
+    notification = setTimeout(() => { notification = undefined; scan(false); }, 10);
+  });
   watcher.on("error", () => {});
   try {
     if (d.interrupted()) signal();
@@ -174,7 +183,7 @@ export async function observeExecution(d: Dependencies) {
       clearTimeout(timer);
     }
   } finally {
-    watcher.close(); clearInterval(timer); d.setWake(() => {}); ending = true; await pending;
+    watcher.close(); clearTimeout(notification); clearInterval(timer); d.setWake(() => {}); ending = true; await pending;
     await d.fence(); await saveTime();
     lines.close(); child.stdout.resume();
   }

@@ -5,7 +5,10 @@ import { performance } from "node:perf_hooks";
 import type { Containment as Contract, ExecId, ProcInfo, ProcessTable as Table, Spawned, SpawnSpec } from "../types.ts";
 import { captureStart, ProcessTable } from "./proctable.ts";
 
-type KnownTable = { list(knownExecs?: ReadonlySet<string>): ReturnType<Table["list"]> };
+// One table per orchestrator process, including evaluator and gate observers.
+const sharedTable = new ProcessTable();
+
+type KnownTable = { list(knownExecs?: ReadonlySet<string>, options?: { maxAgeMs?: number; fresh?: boolean }): ReturnType<Table["list"]> };
 
 const identity = (p: Pick<ProcInfo, "pid" | "start">) => `${p.pid}:${p.start}`;
 
@@ -13,7 +16,7 @@ const identity = (p: Pick<ProcInfo, "pid" | "start">) => `${p.pid}:${p.start}`;
 export class Containment implements Contract {
   private table: KnownTable;
   private launched = new Map<ExecId, ProcInfo[]>();
-  constructor(table: KnownTable = new ProcessTable()) { this.table = table; }
+  constructor(table: KnownTable = sharedTable) { this.table = table; }
 
   /** C1, C3: Inject the execution tag and capture the direct child's start token. */
   async spawn(spec: SpawnSpec): Promise<Spawned> {
@@ -48,14 +51,16 @@ export class Containment implements Contract {
   }
 
   /** P22: Find tagged processes and the live descendants of known identities. */
-  async scan(known: ReadonlyMap<ExecId, readonly ProcInfo[]>): Promise<Map<ExecId, ProcInfo[]>> {
+  async scan(known: ReadonlyMap<ExecId, readonly ProcInfo[]>, options: { maxAgeMs?: number; fresh?: boolean } = {}): Promise<Map<ExecId, ProcInfo[]>> {
     const execs = new Set([...known.keys(), ...this.launched.keys()]);
-    const all = await this.table.list(execs);
+    const all = await this.table.list(execs, options);
     for (const p of all) if (p.tag !== undefined) execs.add(p.tag);
-    const result = new Map<ExecId, ProcInfo[]>();
+    const result = new Map<ExecId, ProcInfo[]>(), liveStarts = new Map(all.map(p => [p.pid, p.start]));
     for (const exec of execs) {
-      const ids = new Set([...(known.get(exec) ?? []), ...(this.launched.get(exec) ?? [])]
-        .filter(p => p.start !== "").map(identity));
+      // Historical identities cannot select an absent/reused pid. Avoid allocating a string/Set entry for each one.
+      const ids = new Set<string>();
+      for (const group of [known.get(exec) ?? [], this.launched.get(exec) ?? []])
+        for (const p of group) if (p.start !== "" && liveStarts.get(p.pid) === p.start) ids.add(identity(p));
       const selected = new Map(all.filter(p => p.tag === exec || ids.has(identity(p))).map(p => [p.pid, p]));
       let changed = true;
       while (changed) {
@@ -79,7 +84,7 @@ export class Containment implements Contract {
       const remaining = deadline - performance.now();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const live = await Promise.race([
-        this.scan(new Map([[exec, [...known.values()]]])),
+        this.scan(new Map([[exec, [...known.values()]]]), { fresh: true }),
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`Fence timeout: ${exec}`)), Math.max(0, remaining)); }),
       ]).finally(() => clearTimeout(timer));
       const targets = live.get(exec) ?? [];
