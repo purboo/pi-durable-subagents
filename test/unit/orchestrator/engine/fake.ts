@@ -26,7 +26,7 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
     active.set(ticket.callId, { ticket, end });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await ticket.journal.append('fake-invoke', { call: ticket.callId, key: ticket.key, workflowBudget: ticket.workflowBudget });
+      await ticket.journal.append('fake-invoke', { call: ticket.callId, key: ticket.key, workflowBudget: ticket.workflowBudget, ...(ticket.originSession ? { originSession: ticket.originSession } : {}) });
       const old = ticket.journal.entries().find(e => e.type === JT.sealed && e.call === ticket.callId);
       if (old) return old.result as CallResult;
       while (paused) await new Promise<void>(resolve => { unpaused.add(resolve); });
