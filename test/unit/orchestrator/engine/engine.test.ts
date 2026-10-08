@@ -432,6 +432,33 @@ test('real evaluator continues past a refusal and returns its failed result', as
   assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 0);
 });
 
+test('origin branch and input bytes stay on disk, not in memory, across revision and recovery', async t => {
+  const evaluator = new ManualEvaluator(), { home, run, engine, ledgers } = await fixture(t, evaluator);
+  const session = join(home, 'origin.jsonl'), input = join(home, 'doc');
+  await writeFile(session, [{ type: 'session', version: 3, id: 'origin' }, { type: 'message', id: 'a', parentId: null, message: { role: 'user', content: 'x'.repeat(1000) } }].map(e => JSON.stringify(e)).join('\n') + '\n');
+  await writeFile(input, 'bytes');
+  const wf = await run('source', { origin: { sessionFile: session }, inputs: { doc: input } });
+  const pinned = join(pinnedDir(home, wf.wid), 'origin.jsonl');
+  assert.equal(wf.pins.origin, undefined); assert.deepEqual(wf.pins.inputs, {});
+  assert.equal(wf.originPath, pinned);
+  assert.deepEqual((await readFile(pinned, 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l).id), ['origin', 'a']);
+  assert.equal(await readFile(wf.inputs.doc!, 'utf8'), 'bytes');
+  propose(evaluator, 0, 'c'); idle(evaluator, 0);
+  const invoked = await until(() => wf.journal.entries().find(e => e.type === 'fake-invoke'));
+  assert.equal(invoked.originSession, pinned, 'the call ticket reads the pinned file');
+  await writeFile(session, 'changed after admission');
+  await submit(engine, home, 'revise', { wid: wf.wid, source: 'new source' });
+  assert.equal(wf.revision, 2); assert.equal(wf.pins.origin, undefined);
+  assert.equal(wf.originPath, join(pinnedDir(home, wf.wid), 'r2', 'origin.jsonl'));
+  assert.equal(await readFile(wf.originPath!, 'utf8'), await readFile(pinned, 'utf8'), 'a revision keeps the pinned origin');
+  const again = new Engine(ledgers, fakeExecutor(ledgers), { discovery: { home, agentDir: join(home, 'config'), globalNpmRoot: null } });
+  await again.store.recover();
+  const recovered = again.store.workflows.get(wf.wid)!;
+  assert.equal(recovered.pins.origin, undefined); assert.deepEqual(recovered.pins.inputs, {});
+  assert.equal(recovered.revision, 2); assert.equal(recovered.originPath, wf.originPath);
+  await again.store.close();
+});
+
 test('revision re-pins inputs, reuses matching seals, allocates changed generations and rejects stale requests', async t => {
   const evaluator = new ManualEvaluator(), { home, run, engine, ledgers } = await fixture(t, evaluator);
   const input = join(home, 'document'); await writeFile(input, 'before');

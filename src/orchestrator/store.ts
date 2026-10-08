@@ -22,7 +22,9 @@ export interface Pins {
   source: string; args: unknown; agents: AgentDefinition[]; inputs: Record<string, string>;
   inputSources?: Record<string, string>; origin?: string; usageBudget?: RunBody['usageBudget']; maxCalls?: number;
 }
-export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string> }
+/** `pins` in memory carry neither the origin branch nor input bytes (both can be tens of MB per workflow); they are read
+ *  from the published files: `originPath` (pinned origin.jsonl, when the run has an origin) and `inputs`. */
+export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string>; originPath?: string }
 type SnapshotRef = { path: string; hash: string };
 type Snapshot = { hash: string; pins?: Pins; error?: string; warnings?: string[] };
 
@@ -163,7 +165,10 @@ export class Store {
         } else body = req.body as RunBody;
         snapshot = { hash: contentHash(req), pins: await prepareRun({ ...body, maxCalls: body.maxCalls ?? this.ledgers.config.k?.spawnBudget ?? 300 }, discovery, warnings),
           ...(warnings.length ? { warnings } : {}) };
-        if (req.kind === 'revise') snapshot.pins!.origin = this.workflows.get((req.body as ReviseBody).wid)?.pins.origin;
+        if (req.kind === 'revise') {
+          const prior = this.workflows.get((req.body as ReviseBody).wid)?.originPath;
+          snapshot.pins!.origin = prior === undefined ? undefined : await readFile(prior, 'utf8');
+        }
       } catch (error) {
         if (transient(error)) throw error;
         snapshot = { hash: contentHash(req), error: String(error) };
@@ -241,7 +246,8 @@ export class Store {
       inputs[name] = join(dir, 'inputs', file);
     }
     await publish(dir, 'inputs.json', JSON.stringify(inputs));
-    return { pins, scriptPath: join(dir, 'script.js'), inputs };
+    const { origin, inputs: _bytes, ...kept } = pins;
+    return { pins: { ...kept, inputs: {} }, scriptPath: join(dir, 'script.js'), inputs, originPath: origin === undefined ? undefined : join(dir, 'origin.jsonl') };
   }
   /** P14, A2: Publish a new revision only after the engine has retired its predecessor. */
   async revise(intent: Entry): Promise<void> {

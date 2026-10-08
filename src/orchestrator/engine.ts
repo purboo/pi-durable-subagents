@@ -460,7 +460,7 @@ export class Engine {
     if (!agent) throw new Error(`Unknown pinned agent: ${spec.agent}`);
     return { wid: st.wf.wid, widRev: `${st.wf.wid}@${st.wf.revision}`, key: entry.key as string, gen: entry.gen as number,
       callId: `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`, spec, agent, workflowBudget: st.wf.pins.usageBudget, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal,
-      ...(st.wf.pins.origin !== undefined ? { originSession: join(pinnedDir(this.ledgers.home, st.wf.wid), ...(st.wf.revision === 1 ? [] : [`r${st.wf.revision}`]), 'origin.jsonl') } : {}),
+      ...(st.wf.originPath !== undefined ? { originSession: st.wf.originPath } : {}),
       ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}),
       ...(entry.type === 'generation' && typeof entry.model === 'string' ? { model: entry.model } : {}) };
   }
