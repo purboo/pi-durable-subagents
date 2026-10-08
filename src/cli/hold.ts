@@ -6,7 +6,7 @@ import { watch, type FSWatcher } from "node:fs";
 import { constants } from "node:os";
 import { dsaHome } from "../paths.ts";
 import { captureStart } from "../platform/proctable.ts";
-import { blockers, enqueue, leaseDir, liveTickets, removeTicket, RESOURCE, who, writeTicket, type LeaseMode, type LeaseTicket } from "../platform/lease.ts";
+import { blockers, enqueue, groupAlive, leaseDir, liveTickets, orphaned, removeTicket, RESOURCE, who, writeTicket, type LeaseMode, type LeaseTicket } from "../platform/lease.ts";
 
 export const HOLD_USAGE = "usage: pi-durable-subagents hold <resource> [--shared] [--max-wait <seconds>] [--note <text>] -- <command> [args…]";
 /** Exit status when --max-wait expires before the lease is granted (EX_TEMPFAIL). */
@@ -42,7 +42,6 @@ export function parseHold(args: string[]): HoldArgs {
 
 const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`;
 const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
-const groupAlive = (pgid: number) => { try { process.kill(-pgid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 
 export interface HoldOptions { env?: NodeJS.ProcessEnv; stderr?: (line: string) => void; pollMs?: number; graceMs?: number }
 
@@ -70,11 +69,20 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
     const deadline = args.maxWaitMs !== undefined ? ticket.since + args.maxWaitMs : undefined;
     try { watcher = watch(leaseDir(home, args.resource), () => wake()); watcher.on("error", () => {}); } catch { /* polling suffices */ }
     let shown: string | undefined;
+    const ended = new Map<number, number>();
     for (;;) {
       if (interrupted) { removeTicket(home, ticket); return 128 + (constants.signals[interrupted] ?? 1); }
       const ahead = blockers(ticket, liveTickets(home, args.resource));
       if (!ahead.length) break;
       const now = Date.now();
+      // A holder whose wrapper was killed after its command ended can leave processes in the command's group; the
+      // wrapper would have ended them before releasing, so a waiter does: TERM, then KILL after the grace period.
+      for (const t of ahead.filter(orphaned)) {
+        const first = ended.get(t.seq);
+        if (first === undefined) say(`hold: ending processes left by ${who(t)} (its hold process is gone)`);
+        try { process.kill(-t.command!.pid, first !== undefined && now - first >= graceMs ? "SIGKILL" : "SIGTERM"); } catch { /* gone */ }
+        if (first === undefined) ended.set(t.seq, now);
+      }
       if (deadline !== undefined && now >= deadline) {
         removeTicket(home, ticket);
         say(`hold: ${args.resource} still held by ${ahead.filter(t => t.grantedAt !== undefined).map(who).join(", ") || who(ahead[0]!)} after ${age(now - ticket.since)}; not running the command (exit ${WAIT_EXPIRED})`);

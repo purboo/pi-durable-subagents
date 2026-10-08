@@ -3,7 +3,8 @@
 // strictly increasing and never reused. Grants are strict FIFO by number: an exclusive request needs no earlier live
 // ticket, a shared one no earlier live exclusive ticket. Whether a request is grantable depends only on earlier tickets,
 // which can only disappear, so a grant needs no lock once the ticket exists. A ticket is live while its wrapper or its
-// command (pid + start token) lives; anyone may delete a dead ticket. No orchestrator is involved.
+// command (pid + start token) lives, or processes the command left in its group remain; a waiter next in line ends such
+// leftovers of a killed wrapper. Anyone may delete a dead ticket. No orchestrator is involved.
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -39,7 +40,32 @@ export function alive(p: LeaseProcess | undefined): boolean {
     return rest[0] !== "Z" && rest[0] !== "X" && rest[19] === p.start;
   } catch { return false; }
 }
-export const live = (t: LeaseTicket) => alive(t.wrapper) || alive(t.command);
+/** Whether process group `pgid` still has a member (a zombie leader alone does not count on Linux). */
+export function groupAlive(pgid: number): boolean {
+  try { process.kill(-pgid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+/**
+ * Whether the command's process group outlives both the wrapper and the command (a killed wrapper cannot end what the
+ * command left behind). The command was spawned as its group's leader, so the group id is its pid. A pid stays
+ * allocated while a group uses it as its id, so a group with that id is the command's own unless a live process now owns
+ * that pid: then the original group emptied and the pid was reused (on Linux told apart by the start token).
+ */
+export function orphaned(t: LeaseTicket): boolean {
+  const c = t.command;
+  if (!c || alive(t.wrapper) || alive(c)) return false;
+  if (process.platform === "linux") {
+    try {
+      const fields = readFileSync(`/proc/${c.pid}/stat`, "utf8");
+      const state = fields.slice(fields.lastIndexOf(")") + 2).split(" ")[0];
+      if (state !== "Z" && state !== "X") return false;
+    } catch { /* the leader is gone: only its group can remain */ }
+  } else {
+    try { process.kill(c.pid, 0); return false; } catch { /* the leader is gone */ }
+  }
+  return groupAlive(c.pid);
+}
+/** A ticket is live while its wrapper, its command, or processes the command left in its group run. */
+export const live = (t: LeaseTicket) => alive(t.wrapper) || alive(t.command) || orphaned(t);
 
 /** The tickets of one resource in request order (unreadable or half-written files are skipped). */
 export function readTickets(home: string, resource: string): LeaseTicket[] {

@@ -112,6 +112,23 @@ test('hold: a killed wrapper keeps the lease until its command ends; leftovers e
   assert.throws(() => process.kill(leftover, 0), /ESRCH/, 'the background process the command left is ended');
 });
 
+test('hold: when the wrapper is killed and the command has ended, its leftovers keep the lease until a waiter ends them', async t => {
+  const home = await root(t), file = join(home, 'log'), pidFile = join(home, 'bg.pid');
+  const a = run(home, ['machine', '--', 'sh', '-c', `sleep 30 & echo $! > ${pidFile}; echo "a start" >> ${file}; sleep 0.5`]);
+  const ticket = await until(() => { const x = granted(home, 'machine', a.child.pid!); return x?.command && existsSync(pidFile) ? x : undefined; });
+  a.child.kill('SIGKILL'); await a.exit;
+  process.kill(ticket.command!.pid, 'SIGKILL');
+  const leftover = Number(readFileSync(pidFile, 'utf8'));
+  await until(() => { try { process.kill(ticket.command!.pid, 0); return false; } catch { return true; } });
+  assert.doesNotThrow(() => process.kill(leftover, 0), 'the leftover still runs');
+  assert.equal(leaseState(home).length, 1, 'the ticket stays live while its group has members');
+  const b = run(home, ['machine', '--', 'sh', '-c', `echo "b start" >> ${file}`]);
+  assert.equal(await b.exit, 0);
+  assert.throws(() => process.kill(leftover, 0), /ESRCH/, 'the waiter ended the leftover before running');
+  assert.match(b.stderr(), /hold: ending processes left by pid \d+/);
+  assert.deepEqual(log(file), ['a start', 'b start']);
+});
+
 test('hold: dead tickets are reclaimed; leases and status show holders and waiters', async t => {
   const home = await root(t), file = join(home, 'log');
   await mkdir(leaseDir(home, 'machine'), { recursive: true });

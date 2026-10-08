@@ -16,6 +16,7 @@ import { serialContainment } from "../../../../src/orchestrator/executor/sweep.t
 import { compactWorkflow, snapshotFromEntries, statusBrief } from "../../../../src/orchestrator/snapshot.ts";
 import { emptyLedger, foldLedger } from "../../../../src/orchestrator/ledger.ts";
 import { renderStatus, renderView } from "../../../../src/cli/main.ts";
+import { journalLiveCalls } from "../../../../src/cli/restart.ts";
 
 // A containment without processes: spawning fails (or, with `exits`, yields a child that exits at once), fences of
 // `stuck` execs time out, scans may fail transiently.
@@ -146,7 +147,63 @@ test("writer lock: an owner whose call ended while no orchestrator ran is releas
   await Promise.all([pb, pc]);
 });
 
-test("tracking persists untagged identities once and omits identities carrying this execution tag", { timeout: 10000 }, async t => {
+test("writer lock: a retired owner whose execution is not fenced keeps the lock until a fence succeeds", { timeout: 10000 }, async t => {
+  const f = await fixture(t, { writerLock: "queue" }, { sweepMs: 100 }), a = f.ticket("a"), b = f.ticket("b"), exec = `${a.callId}#1.1`;
+  await mkdir(join(f.home, ".git"));
+  await f.journal.append(JT.exec, { call: a.callId, exec });
+  await f.journal.append("retired", { call: a.callId });
+  await f.orch.append("writer-hold", { root: f.home, call: a.callId });
+  f.containment.stuck.add(exec);
+  await f.executor.recover(f.wid, f.journal);
+  await writingChildren(t, f);
+  const launched = () => f.journal.entries().some(e => e.type === "selected" && String(e.exec).startsWith(`${b.callId}#`));
+  const pb = f.executor.run(b);
+  await until(() => f.journal.entries().some(e => e.type === "writer-wait" && e.call === b.callId));
+  await delay(300);
+  assert.equal(launched(), false, "B does not start while A's processes may still write");
+  f.containment.stuck.delete(exec);
+  await until(launched);
+  assert.ok(f.journal.entries().some(e => e.type === JT.fenced && e.exec === exec));
+  await f.executor.stop({ wid: f.wid, callId: b.callId }); await pb;
+});
+
+test("writer lock: waiters recovered from the journal keep their order after a restart", { timeout: 10000 }, async t => {
+  const f = await fixture(t, { writerLock: "queue" }), a = f.ticket("a"), b = f.ticket("b"), c = f.ticket("c");
+  await mkdir(join(f.home, ".git"));
+  for (const ticket of [a, b, c]) await f.journal.append("call", { key: ticket.key, gen: 1, spec: ticket.spec });
+  await f.orch.append("writer-hold", { root: f.home, call: a.callId });
+  await f.journal.append(JT.sealed, { call: a.callId, exec: `${a.callId}#1.1`, result: { key: "a", gen: 1, status: "ok", ok: true, output: "" } });
+  await f.journal.append("writer-wait", { call: b.callId, root: f.home, holder: a.callId });
+  await delay(5);
+  await f.journal.append("writer-wait", { call: c.callId, root: f.home, holder: a.callId });
+  await f.executor.recover(f.wid, f.journal);
+  await writingChildren(t, f);
+  const launched = (x: CallTicket) => f.journal.entries().some(e => e.type === "selected" && String(e.exec).startsWith(`${x.callId}#`));
+  const pc = f.executor.run(c);
+  await delay(300);
+  assert.equal(launched(c), false, "C waits for B, which waited first");
+  const pb = f.executor.run(b);
+  await until(() => launched(b));
+  assert.equal(launched(c), false);
+  await f.executor.stop({ wid: f.wid, callId: b.callId }); await pb;
+  await until(() => launched(c));
+  await f.executor.stop({ wid: f.wid, callId: c.callId }); await pc;
+});
+
+test("legacy restart check counts a call whose gate runs", { timeout: 5000 }, async t => {
+  const f = await fixture(t), a = f.ticket("a"), exec = `${a.callId}#1.1`;
+  await f.journal.append("wf-created", { wid: f.wid, revision: 1, cwd: f.home, origin: "main:o" });
+  await f.journal.append("call", { key: "a", gen: 1, pos: 0, spec: a.spec });
+  await f.journal.append(JT.exec, { call: a.callId, exec });
+  await f.journal.append("selected", { exec, model: { provider: "probe", id: "scripted" } });
+  await f.journal.append(JT.fenced, { exec });
+  await f.journal.append("gate-intent", { call: a.callId, id: `gate:${a.callId}#1`, exec });
+  assert.deepEqual(journalLiveCalls(f.home).map(x => x.replace(/\d+s/, "Ns")), [`${f.wid}/a gate Ns from main:o`]);
+  await f.journal.append("gate", { id: `gate:${a.callId}#1`, exit: 0 });
+  assert.deepEqual(journalLiveCalls(f.home), []);
+});
+
+test("tracking persists every identity once, tagged or not", { timeout: 10000 }, async t => {
   const f = await fixture(t), ticket = f.ticket("tracking");
   const send = await writingChildren(t, f);
   t.mock.method(f.containment, "scan", async (known: ReadonlyMap<string, readonly ProcInfo[]>) => {
@@ -159,8 +216,8 @@ test("tracking persists untagged identities once and omits identities carrying t
   });
   const run = f.executor.run(ticket); void run.catch(() => {});
   await send(ticket, "bash");
-  await until(() => f.containment.scans >= 3 && f.journal.entries().filter(e => e.type === "tracked").length >= 2);
-  assert.deepEqual(f.journal.entries().filter(e => e.type === "tracked").map(e => e.pid).sort(), [102, 103]);
+  await until(() => f.containment.scans >= 3 && f.journal.entries().filter(e => e.type === "tracked").length >= 3);
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "tracked").map(e => e.pid).sort(), [101, 102, 103]);
   await f.executor.shutdown(); await run.catch(() => {});
 });
 
