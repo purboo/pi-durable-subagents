@@ -9,13 +9,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { FAUX, PI_BIN, REPO, script, settled, startPi, tempRoot, detachedSleep } from "../../harness/pi.ts";
 import { parseAgent } from "../../../src/compat/agents.ts";
-import { callDir, callInbox, callSession, journalPath, orchLedger, outboxRoot } from "../../../src/paths.ts";
+import { binDir, callDir, callInbox, callSession, journalPath, orchLedger, outboxRoot } from "../../../src/paths.ts";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { scanInbox } from "../../../src/kernel/mailbox.ts";
 import { contentHash, forwardRid, ulid } from "../../../src/kernel/ids.ts";
 import { CT, JT, type Containment, type JournalHandle, type Request } from "../../../src/types.ts";
 import type { CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
+import { writeShim } from "../../../src/platform/lease.ts";
 import createExecutor, { modelRid, requestedModel } from "../../../src/orchestrator/executor/index.ts";
 import { availableMemory } from "../../../src/orchestrator/executor/memory.ts";
 import { evidence } from "../../../src/orchestrator/executor/session.ts";
@@ -647,6 +648,15 @@ test("C1 SIGKILL during a tool fences its detached orphan and continues", { time
   assert.match((continuation.body as { message: string }).message, /unknown.*bash/);
   // Restart feedback: the continued model is told its processes are gone, so it does not wait for them.
   assert.match((continuation.body as { message: string }).message, /^Your previous execution was interrupted.*background ones included\) were stopped with it: do not wait for them/);
+});
+
+test("leases: a child reaches `pi-durable-subagents hold` through the shim on its PATH, tagged with its call", { timeout: 30000 }, async t => {
+  const f = await setup(t);
+  writeShim(binDir(f.home), process.execPath, join(REPO, "src/cli/main.ts"));
+  const ticket = f.ticket("a", script([{ tool: "bash", args: { command: `pi-durable-subagents hold machine -- sh -c 'echo "leased $DSA_CALL"'` } }, { text: "done" }]));
+  await f.executor.run(ticket);
+  assertSealed(f.journal, ticket.callId, "ok");
+  assert.match(await readFile(callSession(f.home, f.wid, "a", 1), "utf8"), new RegExp(`leased ${ticket.callId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 });
 
 test("C1 forwarded steer then withdraw is consumed with child receipts", { timeout: 30000 }, async t => {

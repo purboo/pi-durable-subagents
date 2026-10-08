@@ -12,9 +12,10 @@ import { resolution, start, startOrchestrator, submit, type Control } from "./co
 import { doctor, renderDoctor, size } from "./doctor.ts";
 import { smoke } from "./smoke.ts";
 import { serviceFiles, manageService, type ServiceRunner } from "./service.ts";
+import { leaseLines, leaseState } from "../platform/lease.ts";
 import { currentOrchestrator, legacyRestart, waitExit, waitSuccessor } from "./restart.ts";
 
-const commands = ["smoke", "tail", "status", "events", "start", "resume", "drain", "stop", "stop-all", "prune", "restart", "doctor", "install-service", "uninstall-service", "help"] as const;
+const commands = ["smoke", "tail", "status", "events", "start", "resume", "drain", "stop", "stop-all", "prune", "restart", "leases", "doctor", "install-service", "uninstall-service", "help"] as const;
 type Command = typeof commands[number];
 export interface Arguments { command: Command; target?: string; json: boolean; dryRun?: boolean; olderThanDays?: number; force?: boolean }
 /** P25: Reject ambiguous CLI arguments before any durable action. */
@@ -36,7 +37,7 @@ export function parseArgs(args: string[]): Arguments {
   rest = rest.filter(a => a !== "--force");
   const json = rest.includes("--json"), dryRun = rest.includes("--dry-run");
   if (dryRun && !["install-service", "uninstall-service"].includes(command)) throw new Error("--dry-run requires a service command");
-  if (json && !["status", "events", "tail", "doctor"].includes(command)) throw new Error("--json is only supported by status, events, tail and doctor");
+  if (json && !["status", "events", "tail", "doctor", "leases"].includes(command)) throw new Error("--json is only supported by status, events, tail, leases and doctor");
   if (rest.filter(a => a === "--json").length > 1 || rest.filter(a => a === "--dry-run").length > 1 || rest.some(a => a.startsWith("-") && a !== "--json" && a !== "--dry-run")) throw new Error("Unknown or repeated option");
   const targets = rest.filter(a => a !== "--json" && a !== "--dry-run");
   const optional = ["status", "tail", "resume", "prune"].includes(command);
@@ -62,11 +63,11 @@ export function renderStatus(wf: WorkflowSnapshot & { scriptLog?: string }): str
 /** P25, T10: Render the compact status projection shared with the `subagents` tool. */
 export function renderView(view: StatusView): string {
   const lines = view.workflows.map(w => [`${w.wid}@${w.rev}${w.name ? ` ${w.name}` : ""}: ${w.status}${w.followUps ? " (follow-up running)" : ""}${w.error ? ` (${clip(w.error, 200)})` : ""} · ${w.done}/${w.planned ?? w.calls.length}${w.planned === undefined && w.status === "running" ? "+" : ""} done${w.usage.input || w.usage.output || w.usage.costUsd ? ` · ${formatUsage(w.usage)}` : ""}`,
-    ...w.calls.map(c => `  ${c.key}@${c.gen} ${c.status ?? c.phase}${c.hibernated ? " (hibernated, no slot)" : ""}${c.model ? ` ${c.model}` : ""}${c.switching ? ` → ${c.switching} (requested)` : ""}${c.switchFailed ? ` (switch refused: ${c.switchFailed})` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage ? ` ${formatUsage(c.usage)}` : ""}${c.lastLine ? ` ${JSON.stringify(c.lastLine)}` : c.error ? ` (${c.error})` : ""}${c.sharedWorktree ? ` (shares worktree with ${c.sharedWorktree.join(", ")})` : ""}${c.writerWait && c.phase !== "sealed" ? ` (waiting for writer lock: ${c.writerWait.root} held by ${c.writerWait.holder})` : ""}`),
+    ...w.calls.map(c => `  ${c.key}@${c.gen} ${c.status ?? c.phase}${c.hibernated ? " (hibernated, no slot)" : ""}${c.model ? ` ${c.model}` : ""}${c.switching ? ` → ${c.switching} (requested)` : ""}${c.switchFailed ? ` (switch refused: ${c.switchFailed})` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage ? ` ${formatUsage(c.usage)}` : ""}${c.lastLine ? ` ${JSON.stringify(c.lastLine)}` : c.error ? ` (${c.error})` : ""}${c.sharedWorktree ? ` (shares worktree with ${c.sharedWorktree.join(", ")})` : ""}${c.writerWait && c.phase !== "sealed" ? ` (waiting for writer lock: ${c.writerWait.root} held by ${c.writerWait.holder})` : ""}${c.lease && c.phase !== "sealed" ? ` (${c.lease})` : ""}`),
     ...w.attention.map(a => `  ${a.kind}: ${JSON.stringify(a.text.split("\n")[0])}`)].join("\n"));
   if (view.paused) lines.unshift(`${view.paused} (pi-durable-subagents resume)`);
   if (view.olderFinished) lines.push(`(+${view.olderFinished} older finished workflows; status <wid> shows one in detail)`);
-  const footer = [view.slots?.length ? `slots: ${view.slots.join(", ")}` : "", view.config ? `config: ${view.config}` : "", view.configRejected ? `config.json rejected: ${view.configRejected}` : "", view.orchestrator ? `orchestrator: ${view.orchestrator}` : "", ...(view.exhausted ?? []), view.versionNote ? `note: ${view.versionNote}` : ""].filter(Boolean);
+  const footer = [view.slots?.length ? `slots: ${view.slots.join(", ")}` : "", view.config ? `config: ${view.config}` : "", view.configRejected ? `config.json rejected: ${view.configRejected}` : "", view.orchestrator ? `orchestrator: ${view.orchestrator}` : "", ...(view.leases ?? []).map(l => `lease: ${l}`), ...(view.exhausted ?? []), view.versionNote ? `note: ${view.versionNote}` : ""].filter(Boolean);
   if (!lines.length) lines.push("No workflows");
   return [...lines, ...footer].join("\n");
 }
@@ -92,7 +93,7 @@ export function serviceEntryError(entry: string): string | undefined {
   if (/[/\\]_npx[/\\]/.test(entry)) return `install-service refuses to run from an npx cache (${entry}); the cache can be pruned and the service would break. Install the CLI with \`npm i -g pi-durable-subagents\` and run \`pi-durable-subagents install-service\` again.`;
   return undefined;
 }
-export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | prune [wid] [--older-than <days>] | restart [--force] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
+export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | prune [wid] [--older-than <days>] | restart [--force] | hold <resource> [--shared] [--max-wait <s>] [--note <text>] -- <command…> | leases [--json] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
 /** Restart: the orchestrator exits when no execution runs (or `force`) and the installed version takes over. */
 async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line: string) => void, options: { force: boolean; starter?: typeof startOrchestrator; waitMs?: number }): Promise<number> {
   const starter = options.starter ?? startOrchestrator, old = currentOrchestrator(home);
@@ -119,6 +120,7 @@ async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line
 }
 /** P1, P21, P25, P38: Dispatch the public CLI using durable requests and read-only snapshots. */
 export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string; waitMs?: number; now?: number } = {}): Promise<number> {
+  if (args[0] === "hold") { const { hold, parseHold } = await import("./hold.ts"); return hold(parseHold(args.slice(1)), { env: options.env ?? process.env }); }
   if (args[0] === "chaos") return (await import("./chaos/index.ts")).chaos(args.slice(1), options.env ?? process.env, options.write);
   const { command, target, json, dryRun, olderThanDays, force } = parseArgs(args), env = options.env ?? process.env;
   const home = dsaHome(env), write = options.write ?? (line => console.log(line));
@@ -171,6 +173,11 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     const pruned = readJournalSnapshot(orchLedger(home)).filter(e => e.type === "pruned" && e.rid === req!.rid);
     write(`pruned ${pruned.length} workflow${pruned.length === 1 ? "" : "s"}, freed ${size(pruned.reduce((n, e) => n + (Number(e.bytes) || 0), 0))}`);
     for (const e of pruned) write(`  ${String(e.wid)}`);
+    return 0;
+  }
+  if (command === "leases") {
+    const state = leaseState(home);
+    write(json ? JSON.stringify(state, null, 2) : state.length ? leaseLines(state).join("\n") : "No leases held or waited for");
     return 0;
   }
   if (command === "restart") return restartCommand(home, env, write, { force: force === true, starter: options.starter, waitMs: options.waitMs });

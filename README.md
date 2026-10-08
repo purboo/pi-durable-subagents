@@ -242,6 +242,10 @@ pi-durable-subagents stop-all           pause every existing workflow now; journ
                                         (runs you start afterwards are not held)
 pi-durable-subagents prune [wid] [--older-than <days>]
                                         delete finished workflows (done, failed, stopped); prints count and bytes freed
+pi-durable-subagents restart [--force]  switch to the installed version (see "Updating Durable Subagents")
+pi-durable-subagents hold <resource> [--shared] [--max-wait <s>] [--note <text>] -- <command…>
+                                        run one command while holding a resource lease (see below)
+pi-durable-subagents leases [--json]    who holds and who waits for each resource
 pi-durable-subagents doctor [--json]    read-only health check; exits 1 when something needs you
 pi-durable-subagents install-service    optional: run `start` at login and every 30 s (systemd / launchd)
 pi-durable-subagents uninstall-service
@@ -261,6 +265,42 @@ why. The ledger keeps a one-line record of each pruned workflow, and it
 never comes back. `doctor` shows disk use, workflows by status, the largest
 journals, parked work, old open questions, and leftovers; each finding
 comes with one command to fix it.
+
+### Resource leases
+
+Benchmarks, timing measurements and big builds need the machine to
+themselves. Instead of each subagent polling for an idle machine, wrap the
+command:
+
+```sh
+pi-durable-subagents hold machine -- make bench          # exclusive
+pi-durable-subagents hold machine --shared -- npm test   # with other shared holders, never with an exclusive one
+pi-durable-subagents hold machine --max-wait 600 --note "frame phase" -- ./measure.sh
+```
+
+- The lease covers one command, not a whole call: a subagent that thinks
+  or waits for an answer holds nothing.
+- Requests are served strictly in order. An exclusive request waits for
+  everything before it, and keeps later shared requests out (no starvation).
+  A waiting `hold` prints who holds the resource; `--max-wait` gives up with
+  exit 75 without running the command.
+- The command runs without a shell (write `-- sh -c '…'` for one) in its
+  own process group; signals to `hold` go to it and its exit status is
+  returned. When it exits, whatever it left in its process group is ended
+  before the lease passes on.
+- The lease lives as long as the `hold` process or its command lives, so a
+  killed `hold` does not hand the machine over while the command still
+  runs. State is one small file per request under
+  `$DSA_HOME/leases/<resource>/`; no orchestrator is needed, and the user's
+  own shell can take part.
+- Subagents find the command on their `PATH` (the orchestrator puts a shim
+  in `$DSA_HOME/bin`), and their leases are tagged with their call:
+  `status` shows `lease: machine held by <wid>/<key> …; waiting: …` and
+  `(holds lease machine)` / `(waiting for lease machine 3m)` on call lines.
+  Tell a subagent in its task to run measurements under
+  `pi-durable-subagents hold machine -- …`.
+- Leases are cooperative: processes started without `hold` are not held
+  back, and a daemon that leaves the process group is not covered.
 
 ## Configuration
 
