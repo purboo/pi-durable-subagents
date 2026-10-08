@@ -146,6 +146,24 @@ test("writer lock: an owner whose call ended while no orchestrator ran is releas
   await Promise.all([pb, pc]);
 });
 
+test("tracking persists untagged identities once and omits identities carrying this execution tag", { timeout: 10000 }, async t => {
+  const f = await fixture(t), ticket = f.ticket("tracking");
+  const send = await writingChildren(t, f);
+  t.mock.method(f.containment, "scan", async (known: ReadonlyMap<string, readonly ProcInfo[]>) => {
+    f.containment.scans++;
+    return new Map([...known.keys()].map(exec => [exec, [
+      { pid: 101, ppid: 0, start: "tagged", tag: exec },
+      { pid: 102, ppid: 101, start: "untagged" },
+      { pid: 103, ppid: 101, start: "other", tag: "different-exec" },
+    ]]));
+  });
+  const run = f.executor.run(ticket); void run.catch(() => {});
+  await send(ticket, "bash");
+  await until(() => f.containment.scans >= 3 && f.journal.entries().filter(e => e.type === "tracked").length >= 2);
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "tracked").map(e => e.pid).sort(), [102, 103]);
+  await f.executor.shutdown(); await run.catch(() => {});
+});
+
 test("shared worktree: observed writes remind once, survive recovery, and either seal resolves status", { timeout: 15000 }, async t => {
   const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b");
   await mkdir(join(f.home, ".git"));

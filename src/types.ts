@@ -356,7 +356,7 @@ export interface Containment {
   /** Direct spawn (C3) with DSA_EXEC=<exec> injected (C1). */
   spawn(spec: SpawnSpec): Promise<Spawned>;
   /** One tracker scan: processes per exec (tagged, or descendants of known ones). Caller persists new ones. */
-  scan(known: ReadonlyMap<ExecId, readonly ProcInfo[]>): Promise<Map<ExecId, ProcInfo[]>>;
+  scan(known: ReadonlyMap<ExecId, readonly ProcInfo[]>, options?: { maxAgeMs?: number; fresh?: boolean }): Promise<Map<ExecId, ProcInfo[]>>;
   /** Kill tagged + tracked processes of `exec`, rescan until empty. Resolves only when empty (or rejects on timeout). */
   fence(exec: ExecId, tracked: readonly ProcInfo[], opts?: { timeoutMs?: number }): Promise<void>;
 }

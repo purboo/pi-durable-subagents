@@ -1,15 +1,16 @@
 // Private entries: skip{pool,model,until} in orchestrator ledger (K7); retired{call} in workflow (P14);
 // fence-failed{exec,error} in workflow: a fence timed out, the call is parked until a sweep proves retirement.
-import type { Containment, JournalHandle, ProcInfo } from "../../types.ts";
+import type { Containment, Entry, JournalHandle, ProcInfo } from "../../types.ts";
 import { JT, attentionEntries, isEntry } from "../../types.ts";
 import { Containment as PlatformContainment } from "../../platform/containment.ts";
 import { ProcessTable } from "../../platform/proctable.ts";
 import type { Model } from "../../compat/model.ts";
 
-/** C2, F4: A containment whose process-table snapshots never overlap (ProcessTable.list is not reentrant). */
-export function serialContainment(table: Pick<ProcessTable, "list"> = new ProcessTable()): PlatformContainment {
+/** C2, F4: Real observers share snapshots; injected tables retain serialized access. */
+export function serialContainment(table?: Pick<ProcessTable, "list">): PlatformContainment {
+  if (!table || table instanceof ProcessTable) return new PlatformContainment(table);
   let queue: Promise<unknown> = Promise.resolve();
-  return new PlatformContainment({ list(known) { const next = queue.then(() => table.list(known)); queue = next.catch(() => {}); return next; } });
+  return new PlatformContainment({ list(known, options) { const next = queue.then(() => table.list(known, options)); queue = next.catch(() => {}); return next; } });
 }
 
 /** K7: Three consecutive losses for a candidate within its pool suspend it for ten minutes. */
@@ -65,29 +66,43 @@ type SweepHooks = {
   fenced?: (journal: JournalHandle, exec: string, call: string, wasFenced: boolean) => Promise<void>;
   failed?: (journal: JournalHandle, exec: string, call: string, error: unknown) => Promise<void>;
 };
+const sweeps = new WeakMap<JournalHandle, { count: number; fenced: Set<unknown>; retired: Set<unknown>; failed: Set<unknown>; gated: Set<unknown>; tracked: Map<string, ProcInfo[]>; execs: Entry[]; gates: Entry[] }>();
+
+/** A1: Fold old history during recovery, so the first sweep does not allocate it on the timer path. */
+export function indexSweep(journal: JournalHandle) {
+  let state = sweeps.get(journal);
+  if (!state) { state = { count: 0, fenced: new Set(), retired: new Set(), failed: new Set(), gated: new Set(), tracked: new Map(), execs: [], gates: [] }; sweeps.set(journal, state); }
+  const { fenced, retired, failed, gated, tracked, execs, gates } = state, entries = journal.entries();
+  while (state.count < entries.length) {
+    const e = entries[state.count++]!;
+    if (e.type === JT.exec) execs.push(e);
+    else if (e.type === "gate-intent") gates.push(e);
+    else if (e.type === JT.fenced) fenced.add(e.exec);
+    else if (e.type === "retired") retired.add(e.call);
+    else if (e.type === "fence-failed") failed.add(e.exec);
+    else if (e.type === "gate") gated.add(e.id);
+    else if (e.type === "tracked" || e.type === "gate-tracked") {
+      const id = String(e.type === "tracked" ? e.exec : e.id), list = tracked.get(id) ?? [];
+      if (!tracked.has(id)) tracked.set(id, list);
+      list.push(e.type === "tracked" ? { pid: Number(e.pid), ppid: 0, start: String(e.start) } : e.process as ProcInfo);
+    }
+  }
+  return state;
+}
+
 /** P23, F1, F2: Every K1 re-fence retired identities and retry failed fences (executions and gates without an outcome)
  *  with one shared scan; a failing identity is reported through `failed` and never stops the sweep of the others. */
 export async function sweepExecutions(journals: Iterable<JournalHandle>, containment: Pick<Containment, "scan" | "fence">, hooks: SweepHooks = {}) {
   const targets: { journal: JournalHandle; exec: string; call: string; fenced: boolean; failed: boolean; tracked: ProcInfo[] }[] = [];
   for (const journal of journals) {
-    const fenced = new Set<unknown>(), retired = new Set<unknown>(), failed = new Set<unknown>(), gated = new Set<unknown>(), tracked = new Map<string, ProcInfo[]>();
-    const entries = journal.entries();
-    for (const e of entries) {
-      if (e.type === JT.fenced) fenced.add(e.exec);
-      else if (e.type === "retired") retired.add(e.call);
-      else if (e.type === "fence-failed") failed.add(e.exec);
-      else if (e.type === "gate") gated.add(e.id);
-      else if (e.type === "tracked") tracked.set(String(e.exec), [...tracked.get(String(e.exec)) ?? [], { pid: Number(e.pid), ppid: 0, start: String(e.start) }]);
-      else if (e.type === "gate-tracked") tracked.set(String(e.id), [...tracked.get(String(e.id)) ?? [], e.process as ProcInfo]);
-    }
+    const { fenced, retired, failed, gated, tracked, execs, gates } = indexSweep(journal);
     // A gate whose recovery fence failed has no outcome yet; it is retried here until its processes are gone.
-    for (const e of entries) {
+    for (const e of gates) {
       const id = String(e.id);
       if (e.type === "gate-intent" && !gated.has(id) && (failed.has(id) || hooks.failing?.(id)))
         targets.push({ journal, exec: id, call: String(e.call), fenced: false, failed: true, tracked: tracked.get(id) ?? [] });
     }
-    for (const e of entries) {
-      if (e.type !== JT.exec) continue;
+    for (const e of execs) {
       const exec = String(e.exec), isFailed = failed.has(exec) || !!hooks.failing?.(exec);
       if (fenced.has(exec) || retired.has(e.call) || isFailed)
         targets.push({ journal, exec, call: String(e.call), fenced: fenced.has(exec), failed: isFailed, tracked: tracked.get(exec) ?? [] });

@@ -100,15 +100,22 @@ export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, wa
 }
 
 /** A1, A5: Reduce only the current revision, retaining all history for seals and allocation. */
+const revisions = new WeakMap<readonly Entry[], readonly Entry[]>();
+const terminals = new WeakMap<readonly Entry[], Entry | undefined>();
 export function revisionEntries(wf: Workflow): readonly Entry[] {
-  const entries = wf.journal.entries(), start = entries.findLastIndex(e => e.type === 'revised');
-  return entries.slice(Math.max(0, start));
+  const entries = wf.journal.entries();
+  let view = revisions.get(entries);
+  if (!view) { const start = entries.findLastIndex(e => e.type === 'revised'); view = start < 0 ? entries : entries.slice(start); revisions.set(entries, view); }
+  return view;
 }
 
 /** A1, A5: A resume supersedes a terminal observation without deleting history. */
 export function terminalEntry(entries: readonly Entry[]): Entry | undefined {
+  if (terminals.has(entries)) return terminals.get(entries);
   const last = entries.findLast(e => e.type === JT.done || (e.type === 'resumed' && !e.call) || e.type === 'revised');
-  return last?.type === JT.done ? last : undefined;
+  const terminal = last?.type === JT.done ? last : undefined;
+  terminals.set(entries, terminal);
+  return terminal;
 }
 
 /** Housekeeping: bytes under a path (files counted once by lstat; a missing path is 0). */
