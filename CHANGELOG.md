@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.24
+
+- `events --all [--since <cursor>] [--limit <n>]`: one durable log of
+  milestones across all workflows (`submitted`, `started`, `asking` with the
+  full question, `answered` without the text, `sealed` with status and data,
+  `fenced` with the reason of an interruption, `workflow-done`), read with an
+  `<epoch>:<seq>` cursor in pages of at most 1000. Delivery is at least once
+  without gaps, also across `kill -9` and restarts (re-derived events keep
+  their `id`); events are kept at least 7 days and never while their workflow
+  is unfinished or asking; an older cursor gets `cursor-expired` (exit 4). A
+  prune whose events cannot be logged first is rejected (`event-log: …`).
+- `run --labels <json>` (tool: `labels`): caller labels, part of the spec
+  digest, returned by `describe` and echoed on every event of the run.
+- Why a call does not move (R7): `describe` adds `reason`, `detail` and
+  `since` to each waiting call, and the event log gets `waiting`/`moving`
+  when the reason changes: `unconfirmed-stop`, `provider-exhausted`,
+  `writer-lock`, `lease`, `slot`, `silent`.
+- README: the subagent force-restart guard is a rail against accidents, not a
+  security boundary.
+
 ## 1.0.23
 
 - An asker cut off by a restart (also `restart --force`) now hibernates and
