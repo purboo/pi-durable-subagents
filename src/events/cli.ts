@@ -1,4 +1,4 @@
-// R2: `events --all [--since <cursor>] [--limit <n>] [--json] [--wait-ms <n>]` — read the cross-workflow event log.
+// `events --all [--since <cursor>] [--limit <n>] [--json] [--wait-ms <n>]` — read the cross-workflow event log.
 // Output is JSON lines (with or without --json). Without --since: `{"head","more":false}`. With --since: the events
 // after the cursor (at most --limit, default and max EVENTS_PAGE_MAX), then `{"head","more"}`: more:true → head is the
 // cursor of the last event printed; more:false → the log head. Exit 0; 4 cursor-expired (other epoch, seq below

@@ -1,4 +1,4 @@
-// R7: whyWaiting per reason and precedence, the journal fold, the tracker's transitions, startR7 with a fake sink, the
+// WhyWaiting per reason and precedence, the journal fold, the tracker's transitions, startWaiting with a fake sink, the
 // orchestrator collector on synthetic journals (and its agreement with `describe` from disk), and its cost per tick.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +10,7 @@ import { openJournal } from '../../../src/kernel/journal.ts';
 import { journalPath, orchLedger } from '../../../src/paths.ts';
 import { describe } from '../../../src/cli/requests.ts';
 import { emptyLedger, foldLedger } from '../../../src/orchestrator/ledger.ts';
-import { R7Tracker, SLOT_GRACE_MS, foldWaits, r7Collector, startR7, waitsOf, whyWaiting, type R7Collected, type Wait, type WaitInput, type WaitMeta } from '../../../src/events/r7.ts';
+import { WaitTracker, SLOT_GRACE_MS, foldWaits, waitCollector, startWaiting, waitsOf, whyWaiting, type WaitsCollected, type Wait, type WaitInput, type WaitMeta } from '../../../src/events/waiting.ts';
 import { WAIT_REASONS, type EventDraft } from '../../../src/events/types.ts';
 import type { Exhaustion } from '../../../src/orchestrator/providers.ts';
 import type { Entry } from '../../../src/types.ts';
@@ -18,7 +18,7 @@ import type { Entry } from '../../../src/types.ts';
 const NOW = 1_000_000;
 const used = (entries: Record<string, Partial<Exhaustion>>) => new Map(Object.entries(entries).map(([p, x]) => [p, { since: 100, nextTry: NOW + 60_000, error: 'quota', ...x } as Exhaustion]));
 
-test('R7 whyWaiting: each reason from its source; asking, sealed and moving calls have none', () => {
+test('whyWaiting: each reason from its source; asking, sealed and moving calls have none', () => {
   const queued = { exec: { id: 'w@1/a@1#1.1', since: 500, selected: false } }, running = { exec: { id: 'w@1/a@1#1.1', since: 500, selected: true } };
   assert.equal(whyWaiting({}, NOW), undefined, 'not dispatched');
   assert.equal(whyWaiting(running, NOW), undefined, 'running');
@@ -54,7 +54,7 @@ test('R7 whyWaiting: each reason from its source; asking, sealed and moving call
   assert.equal(whyWaiting({ ...queued, sealed: true }, NOW), undefined);
 });
 
-test('R7 whyWaiting precedence follows WAIT_REASONS: removing the winner exposes the next', () => {
+test('whyWaiting precedence follows WAIT_REASONS: removing the winner exposes the next', () => {
   const fence = { id: 'fence:x', kind: 'unknown', text: 'stuck', since: 1 }, stall = { id: 'stall:x', kind: 'stall', text: 'silent', since: 2 };
   const exhausted = used({ p: {} });
   // A queued call: unconfirmed-stop > provider-exhausted > writer-lock > slot.
@@ -88,7 +88,7 @@ function journal(initial: Entry[] = []) {
 }
 const call = (wid: string, key: string, gen = 1) => `${wid}@1/${key}@${gen}`;
 
-test('R7 fold: writer-wait → slot (since the acquisition) → moving; stall and fence items; asking; seal, revision and workflow end', () => {
+test('wait fold: writer-wait → slot (since the acquisition) → moving; stall and fence items; asking; seal, revision and workflow end', () => {
   const wid = 'W1', a = call(wid, 'a'), b = call(wid, 'b'), j = journal();
   const env = () => ({ now: NOW, ledger: emptyLedger() });
   const reasons = () => Object.fromEntries([...waitsOf(foldWaits(wid, j.entries()), env())].map(([c, w]) => [c.split('/')[1], w.reason]));
@@ -121,7 +121,7 @@ test('R7 fold: writer-wait → slot (since the acquisition) → moving; stall an
   assert.deepEqual(reasons(), {});
   j.add('attention-resolved', { id: `q:${a}:1`, rev: 1, resolution: 'answered' });
   assert.deepEqual(reasons(), { 'a@1': 'unconfirmed-stop' });
-  // A fenced execution waits for nothing the R7 sources name (a drain, a hibernation) until its next exec.
+  // A fenced execution waits for nothing the wait sources name (a drain, a hibernation) until its next exec.
   j.add('attention-resolved', { id: `fence:${a}#1.1`, rev: 1, resolution: 'fenced' });
   j.add('fenced', { exec: `${a}#1.1` });
   assert.deepEqual(reasons(), {});
@@ -143,7 +143,7 @@ test('R7 fold: writer-wait → slot (since the acquisition) → moving; stall an
   assert.equal(foldWaits(wid, j.entries(), f).calls.size, 0, 'a revision retires the earlier calls');
 });
 
-test('R7 env: pool candidates, an agent\'s pinned model and the configured default decide a queued call\'s providers', () => {
+test('wait env: pool candidates, an agent\'s pinned model and the configured default decide a queued call\'s providers', () => {
   const wid = 'W2', a = call(wid, 'a'), j = journal();
   j.add('wf-created', { revision: 1 });
   j.add('call', { pos: 0, key: 'a', gen: 1, spec: { agent: 'pinned' } });
@@ -161,10 +161,10 @@ test('R7 env: pool candidates, an agent\'s pinned model and the configured defau
   assert.equal(wait(undefined)?.reason, 'provider-exhausted');
 });
 
-test('R7 tracker: appear, change, clear, seal while waiting, unchanged detail → nothing; seed suppresses a repeated waiting', () => {
+test('wait tracker: appear, change, clear, seal while waiting, unchanged detail → nothing; seed suppresses a repeated waiting', () => {
   const meta = (key: string): WaitMeta => ({ wid: 'W', key, gen: 1, call: `W@1/${key}@1`, request: 'run-1', labels: { node: 'n' } });
   const metas = new Map([meta('a'), meta('b')].map(m => [m.call, m]));
-  const A = 'W@1/a@1', B = 'W@1/b@1', tracker = new R7Tracker();
+  const A = 'W@1/a@1', B = 'W@1/b@1', tracker = new WaitTracker();
   const slot: Wait = { reason: 'slot', detail: 'waiting for a slot: p 1/1', since: 10 };
   let drafts = tracker.diff(100, new Map([[A, slot]]), metas);
   assert.deepEqual(drafts, [{ id: `${A}:waiting:slot:100`, ts: 100, type: 'waiting', wid: 'W', request: 'run-1', key: 'a', gen: 1, call: A, labels: { node: 'n' }, reason: 'slot', detail: slot.detail, since: 10 }]);
@@ -182,18 +182,18 @@ test('R7 tracker: appear, change, clear, seal while waiting, unchanged detail �
   const again = [...tracker.diff(700, new Map([[A, slot]]), metas), ...tracker.diff(800, new Map(), metas), ...tracker.diff(900, new Map([[A, slot]]), metas)];
   assert.equal(new Set(again.map(d => d.id)).size, 3);
   // After a restart: seeded from the log's latest waiting/moving per call, an unchanged wait repeats nothing.
-  const restarted = new R7Tracker();
+  const restarted = new WaitTracker();
   restarted.seed(new Map([[A, { type: 'waiting', reason: 'slot', since: 10, detail: 'x', wid: 'W', key: 'a', gen: 1, call: A }], [B, { type: 'moving', wid: 'W', key: 'b', gen: 1, call: B }]]));
   assert.deepEqual(restarted.diff(1000, new Map([[A, slot]]), metas), []);
   assert.deepEqual([...restarted.waiting().keys()], [A]);
   assert.deepEqual(restarted.diff(1100, new Map([[B, slot]]), metas).map(d => [d.type, d.call]), [['moving', A], ['waiting', B]]);
-  const fresh = new R7Tracker();
+  const fresh = new WaitTracker();
   assert.equal(fresh.diff(1000, new Map([[A, slot]]), metas).length, 1, 'without the seed it would repeat');
 });
 
-test('startR7: ticks never overlap; an emit failure is retried first on the next tick with the same drafts, nothing lost', async () => {
+test('startWaiting: ticks never overlap; an emit failure is retried first on the next tick with the same drafts, nothing lost', async () => {
   const A = 'W@1/a@1', meta = new Map([[A, { wid: 'W', key: 'a', gen: 1, call: A }]]);
-  const states: R7Collected[] = [
+  const states: WaitsCollected[] = [
     { current: new Map([[A, { reason: 'slot', detail: 's', since: 1 }]]), meta },
     { current: new Map([[A, { reason: 'writer-lock', detail: 'w', since: 2 }]]), meta },
     { current: new Map(), meta },
@@ -203,36 +203,36 @@ test('startR7: ticks never overlap; an emit failure is retried first on the next
   const collect = async () => { active++; if (active > 1) overlap = true; await delay(30); active--; return states[Math.min(n++, states.length - 1)]!; };
   const sink = { async emit(drafts: readonly EventDraft[]) { attempts.push(drafts.map(d => d.id)); if (failNext) { failNext = false; throw new Error('disk full'); } logged.push(...drafts); } };
   let clock = 1000;
-  const r7 = startR7({ collect, sink, intervalMs: 60_000, now: () => clock++, log: line => lines.push(line) });
+  const waiter = startWaiting({ collect, sink, intervalMs: 60_000, now: () => clock++, log: line => lines.push(line) });
   try {
-    await Promise.all([r7.tick(), r7.tick(), r7.tick()]);
+    await Promise.all([waiter.tick(), waiter.tick(), waiter.tick()]);
     assert.equal(overlap, false); assert.equal(n, 1, 'concurrent ticks join the running one');
     assert.deepEqual(logged.map(d => d.type), ['waiting']);
     failNext = true;
-    await r7.tick();
-    assert.equal(logged.length, 1); assert.match(lines.join('\n'), /1 R7 event\(s\) not logged, retried next tick: Error: disk full/);
-    await r7.tick();
+    await waiter.tick();
+    assert.equal(logged.length, 1); assert.match(lines.join('\n'), /1 waiting\/moving event\(s\) not logged, retried next tick: Error: disk full/);
+    await waiter.tick();
     assert.deepEqual(logged.map(d => [d.type, 'reason' in d ? d.reason : 'after' in d ? d.after : '']), [['waiting', 'slot'], ['waiting', 'writer-lock'], ['moving', 'writer-lock']]);
     assert.deepEqual(attempts[2], attempts[1]!.concat(attempts[2]!.slice(1)), 'the failed drafts are re-emitted first, with their ids');
     assert.equal(attempts[1]![0], attempts[2]![0]);
     // A collection failure is logged; the next tick works again.
-    const broken = startR7({ collect: () => { throw new Error('boom'); }, sink, intervalMs: 60_000, log: line => lines.push(line) });
+    const broken = startWaiting({ collect: () => { throw new Error('boom'); }, sink, intervalMs: 60_000, log: line => lines.push(line) });
     await broken.tick(); await broken.stop();
-    assert.match(lines.at(-1)!, /R7 collection failed: Error: boom/);
-  } finally { await r7.stop(); }
+    assert.match(lines.at(-1)!, /wait collection failed: Error: boom/);
+  } finally { await waiter.stop(); }
   // The timer runs it on its own.
   let ticks = 0;
-  const timed = startR7({ collect: () => { ticks++; return { current: new Map(), meta: new Map() }; }, sink, intervalMs: 10 });
+  const timed = startWaiting({ collect: () => { ticks++; return { current: new Map(), meta: new Map() }; }, sink, intervalMs: 10 });
   await delay(100); await timed.stop();
   const after = ticks; await delay(40);
   assert.ok(ticks >= 3, String(ticks)); assert.equal(ticks, after, 'stopped');
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-test('R7 collector: in-memory journals and ledger → waits with request id and labels; folds only what changed; skips finished workflows', () => {
+test('wait collector: in-memory journals and ledger → waits with request id and labels; folds only what changed; skips finished workflows', () => {
   const orch = journal();
   orch.add('config', { hash: 'h', config: { providers: { probe: { slots: 1 } } } });
-  orch.add('request', { request: { rid: 'req:job-1', kind: 'run', body: { cwd: '/w', labels: { owed_node: 'n1' } } } });
+  orch.add('request', { request: { rid: 'req:job-1', kind: 'run', body: { cwd: '/w', labels: { node: 'n1' } } } });
   orch.add('created', { rid: 'req:job-1', wid: 'W1' });
   orch.add('request', { request: { rid: '01ULID', kind: 'run', body: { cwd: '/w' } } });
   orch.add('created', { rid: '01ULID', wid: 'W2' });
@@ -243,10 +243,10 @@ test('R7 collector: in-memory journals and ledger → waits with request id and 
   done.add('sealed', { call: call('W3', 'a'), result: { status: 'ok' } }); done.add('workflow-done', { status: 'done' });
   let leaseReads = 0;
   const workflows = [{ wid: 'W1', journal: w1 }, { wid: 'W2', journal: w2 }, { wid: 'W3', journal: done }];
-  const collect = r7Collector({ home: '/nonexistent', workflows: () => workflows, orch, leases: () => { leaseReads++; return [{ resource: 'machine', holders: [], waiters: [{ seq: 1, resource: 'machine', mode: 'exclusive', wrapper: { pid: 1 }, argv: ['make'], cwd: '/', since: 900, call: call('W2', 'a') }] }]; } });
+  const collect = waitCollector({ home: '/nonexistent', workflows: () => workflows, orch, leases: () => { leaseReads++; return [{ resource: 'machine', holders: [], waiters: [{ seq: 1, resource: 'machine', mode: 'exclusive', wrapper: { pid: 1 }, argv: ['make'], cwd: '/', since: 900, call: call('W2', 'a') }] }]; } });
   let got = collect(NOW);
   assert.deepEqual(got.current.get(call('W1', 'a')), { reason: 'slot', detail: 'waiting for a slot: probe 1/1', since: 100 });
-  assert.deepEqual(got.meta.get(call('W1', 'a')), { wid: 'W1', key: 'a', gen: 1, call: call('W1', 'a'), request: 'job-1', labels: { owed_node: 'n1' } });
+  assert.deepEqual(got.meta.get(call('W1', 'a')), { wid: 'W1', key: 'a', gen: 1, call: call('W1', 'a'), request: 'job-1', labels: { node: 'n1' } });
   assert.deepEqual(got.current.get(call('W2', 'a')), { reason: 'lease', detail: 'waiting for lease machine 17m', since: 900 });
   assert.deepEqual(got.meta.get(call('W2', 'a')), { wid: 'W2', key: 'a', gen: 1, call: call('W2', 'a') }, 'no request id for a ULID rid, no labels');
   assert.equal(got.current.has(call('W3', 'a')), false); assert.equal(leaseReads, 1);
@@ -270,9 +270,9 @@ test('R7 collector: in-memory journals and ledger → waits with request id and 
   assert.equal(leaseReads, before);
 });
 
-test('R7: describe (CLI, disk snapshots) and the collector (orchestrator memory) agree on the same journals', async t => {
-  const home = await mkdtemp(join(tmpdir(), 'dsa-r7-')); t.after(() => rm(home, { recursive: true, force: true }));
-  const orch = await openJournal(orchLedger(home)), wid = '01R7AGREE', j = await openJournal(journalPath(home, wid));
+test('Describe (CLI, disk snapshots) and the collector (orchestrator memory) agree on the same journals', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-waiting-')); t.after(() => rm(home, { recursive: true, force: true }));
+  const orch = await openJournal(orchLedger(home)), wid = '01WTAGREE', j = await openJournal(journalPath(home, wid));
   t.after(async () => { await j.close(); await orch.close(); });
   await orch.append('config', { hash: 'h', config: { providers: { probe: { slots: 1 } } } });
   await orch.append('request', { request: { rid: 'req:agree', kind: 'run', from: 'cli:x', to: 'orch', sseq: 1, body: { cwd: home, labels: { role: 'r' } } } });
@@ -285,7 +285,7 @@ test('R7: describe (CLI, disk snapshots) and the collector (orchestrator memory)
   await j.append('selected', { exec: `${a}#1.1`, model: { provider: 'probe', id: 'm' } });
   await orch.append('hold', { pool: 'probe', slot: 0, exec: `${a}#1.1` });
   await j.append('writer-wait', { call: b, root: home, holder: a });
-  const collect = r7Collector({ home, workflows: () => [{ wid, journal: j }], orch });
+  const collect = waitCollector({ home, workflows: () => [{ wid, journal: j }], orch });
   const compare = async () => {
     const now = Date.now(), d = await describe(home, { request: 'agree' }, now), mem = collect(now);
     for (const c of d.calls!) {
@@ -303,7 +303,7 @@ test('R7: describe (CLI, disk snapshots) and the collector (orchestrator memory)
   assert.equal((await compare()).calls![0]!.waiting!.reason, 'silent');
 });
 
-test('R7 collector cost: 30 finished and 3 running workflows in memory, per tick', t => {
+test('wait collector cost: 30 finished and 3 running workflows in memory, per tick', t => {
   const orch = journal(), workflows: { wid: string; journal: ReturnType<typeof journal> }[] = [];
   for (let i = 0; i < 2000; i++) orch.add(i % 2 ? 'release' : 'hold', { pool: 'probe', slot: 0, exec: `x${i >> 1}#1.1` });
   const big = (wid: string, finished: boolean) => {
@@ -317,7 +317,7 @@ test('R7 collector cost: 30 finished and 3 running workflows in memory, per tick
   };
   for (let i = 0; i < 30; i++) big(`F${i}`, true);
   const running = [0, 1, 2].map(i => big(`R${i}`, false));
-  const collect = r7Collector({ home: '/nonexistent', workflows: () => workflows, orch, leases: () => [] });
+  const collect = waitCollector({ home: '/nonexistent', workflows: () => workflows, orch, leases: () => [] });
   collect(); // first fold of every journal (startup)
   const measure = (viewed: boolean) => {
     const ticks = 500;
@@ -336,7 +336,7 @@ test('R7 collector cost: 30 finished and 3 running workflows in memory, per tick
   assert.ok(viewed < 5 && copying < 5, `${viewed} / ${copying} ms per tick`);
 });
 
-test('R7 silent: only for a working (selected, not fenced) current execution; an old stall item of a drained call is no wait', () => {
+test('wait silent: only for a working (selected, not fenced) current execution; an old stall item of a drained call is no wait', () => {
   const wid = 'WS', a = call(wid, 'a'), j = journal();
   const env = { now: NOW, ledger: emptyLedger() };
   j.add('wf-created', { revision: 1 }); j.add('call', { pos: 0, key: 'a', gen: 1, spec: { agent: 'x', model: 'probe/m' } });
@@ -355,7 +355,7 @@ test('R7 silent: only for a working (selected, not fenced) current execution; an
   assert.equal(whyWaiting({ attention: [stall] }, NOW), undefined);
 });
 
-test('R7 asking: only a question raised in the current execution; an answered asker relaunched waits like any call', () => {
+test('wait asking: only a question raised in the current execution; an answered asker relaunched waits like any call', () => {
   const wid = 'WQ', a = call(wid, 'a'), j = journal();
   const held = foldLedger(emptyLedger(), [entry('config', { hash: 'h', config: { providers: { probe: { slots: 1 } } } }), entry('hold', { pool: 'probe', slot: 0, exec: 'other#1.1' })]);
   const env = { now: NOW, ledger: held };

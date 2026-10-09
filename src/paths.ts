@@ -7,7 +7,7 @@ import { ENV, type Wid } from "./types.ts";
 export const dsaHome = (env: NodeJS.ProcessEnv = process.env) => env[ENV.home] || path.join(os.homedir(), ".pi", "durable-subagents");
 export const orchLedger = (home: string) => path.join(home, "orchestrator.jsonl");
 export const orchLock = (home: string) => path.join(home, "orchestrator.lock");
-/** R2: the cross-workflow event log (single writer: the orchestrator; read by `events --all`). */
+/** The cross-workflow event log (single writer: the orchestrator; read by `events --all`). */
 export const eventsLog = (home: string) => path.join(home, "events.jsonl");
 /** Executables for subagents: the orchestrator writes a `pi-durable-subagents` shim here and children get it on PATH. */
 export const binDir = (home: string) => path.join(home, "bin");

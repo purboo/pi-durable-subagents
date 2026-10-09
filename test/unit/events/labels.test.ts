@@ -1,4 +1,4 @@
-// R6: label validation (one function for the CLI, the tool and admission), `run --labels` exit codes, labels in the spec
+// Label validation (one function for the CLI, the tool and admission), `run --labels` exit codes, labels in the spec
 // digest (request-conflict on other labels), admission rejection of a hand-written request, and describe's labels
 // (running and after prune).
 import test from 'node:test';
@@ -19,8 +19,8 @@ import { JT, type EvalToOrch, type OrchToEval, type Request } from '../../../src
 import type { EvaluatorTransport } from '../../../src/orchestrator/evaluator-client.ts';
 import { fakeExecutor } from '../orchestrator/engine/fake.ts';
 
-test('R6: labels are a flat object of at most 32 keys [A-Za-z0-9_.:-]{1,64} with string values ≤ 256 units, ≤ 4096 bytes of JSON', () => {
-  assert.equal(labelsProblem({ owed_node: 'n1', 'attempt.no': '2', 'a:b-c': '' }), undefined);
+test('Labels are a flat object of at most 32 keys [A-Za-z0-9_.:-]{1,64} with string values ≤ 256 units, ≤ 4096 bytes of JSON', () => {
+  assert.equal(labelsProblem({ node: 'n1', 'attempt.no': '2', 'a:b-c': '' }), undefined);
   assert.equal(labelsProblem({}), undefined);
   for (const bad of [null, [], 'x', 3, ['a']]) assert.match(String(labelsProblem(bad)), /JSON object/);
   assert.match(String(labelsProblem(new Map())), /plain JSON object/);
@@ -44,9 +44,9 @@ test('R6: labels are a flat object of at most 32 keys [A-Za-z0-9_.:-]{1,64} with
   assert.deepEqual(parseLabels('{"a":"b"}'), { a: 'b' });
 });
 
-test('R6: the tool normalizer passes valid labels into the run body and refuses invalid ones; {} is no labels', () => {
-  const run = request({ agent: 'echo', task: 't', labels: { owed_node: 'n1' } }, '/w');
-  assert.deepEqual(run.body, { cwd: '/w', call: { agent: 'echo', task: 't' }, labels: { owed_node: 'n1' } });
+test('The tool normalizer passes valid labels into the run body and refuses invalid ones; {} is no labels', () => {
+  const run = request({ agent: 'echo', task: 't', labels: { node: 'n1' } }, '/w');
+  assert.deepEqual(run.body, { cwd: '/w', call: { agent: 'echo', task: 't' }, labels: { node: 'n1' } });
   const tasks = request({ tasks: [{ agent: 'echo', task: 't' }], labels: { role: 'impl' } }, '/w');
   assert.deepEqual((tasks.body as { labels?: unknown }).labels, { role: 'impl' });
   assert.deepEqual(request({ agent: 'echo', task: 't', labels: {} }, '/w').body, { cwd: '/w', call: { agent: 'echo', task: 't' } });
@@ -97,7 +97,7 @@ const until = async <T>(get: () => T | undefined | false, ms = 10_000): Promise<
   for (;;) { const v = get(); if (v) return v; if (Date.now() > end) throw new Error('timeout'); await delay(20); }
 };
 
-test('R6: run --labels — invalid JSON, invalid labels and labels in the spec exit 1 and submit nothing; valid ones are hashed into spec_digest', async t => {
+test('Run --labels — invalid JSON, invalid labels and labels in the spec exit 1 and submit nothing; valid ones are hashed into spec_digest', async t => {
   const f = await fixture(t), path = await f.spec('a.json', { agent: 'echo', task: 'hello' });
   const notJson = await f.cli(['run', '--request', 'L', '--spec', path, '--labels', '{node', '--json']);
   assert.equal(notJson.code, 1); assert.equal(JSON.parse(notJson.out).applied, false); assert.match(JSON.parse(notJson.out).reason, /--labels is not JSON/);
@@ -111,7 +111,7 @@ test('R6: run --labels — invalid JSON, invalid labels and labels in the spec e
   assert.deepEqual(await f.inbox(), [], 'nothing was published');
   assert.equal(JSON.parse((await f.cli(['describe', '--key', 'L', '--json'])).out).state, 'absent');
   // Valid labels: published in the body, part of the digest; the same labels retry, other labels conflict (3).
-  const labels = { owed_node: 'n1', owed_attempt: '2' };
+  const labels = { node: 'n1', attempt: '2' };
   const first = await f.cli(['run', '--request', 'L', '--spec', path, '--labels', JSON.stringify(labels), '--json']);
   assert.equal(first.code, 75, first.out);
   const published = JSON.parse(await readFile(join(orchInbox(f.home), 'req:L.json'), 'utf8')) as Request;
@@ -121,9 +121,9 @@ test('R6: run --labels — invalid JSON, invalid labels and labels in the spec e
   const pending = JSON.parse((await f.cli(['describe', '--key', 'L', '--json'])).out);
   assert.deepEqual(pending, { state: 'pending', request: 'L', kind: 'run', spec_digest: specDigest(published), labels });
   // Key order does not matter (the digest hashes canonical JSON).
-  const same = await f.cli(['run', '--request', 'L', '--spec', path, '--labels', JSON.stringify({ owed_attempt: '2', owed_node: 'n1' }), '--json']);
+  const same = await f.cli(['run', '--request', 'L', '--spec', path, '--labels', JSON.stringify({ attempt: '2', node: 'n1' }), '--json']);
   assert.equal(same.code, 75, same.out);
-  for (const other of [{ owed_node: 'n1', owed_attempt: '3' }, undefined]) {
+  for (const other of [{ node: 'n1', attempt: '3' }, undefined]) {
     const conflict = await f.cli(['run', '--request', 'L', '--spec', path, ...(other ? ['--labels', JSON.stringify(other)] : []), '--json']);
     assert.equal(conflict.code, 3, conflict.out);
     assert.deepEqual(JSON.parse(conflict.out), { request: 'L', error: 'request-conflict', spec_digest: specDigest(published), state: 'pending' });
@@ -134,7 +134,7 @@ test('R6: run --labels — invalid JSON, invalid labels and labels in the spec e
   assert.deepEqual((await f.inbox()).sort(), ['req:L.json', 'req:U.json']);
 });
 
-test('R6: decided runs — same labels get the first outcome, other labels conflict; describe echoes labels, also after prune', async t => {
+test('Decided runs — same labels get the first outcome, other labels conflict; describe echoes labels, also after prune', async t => {
   const f = await fixture(t), { finish } = await f.boot();
   const path = await f.spec('a.json', { agent: 'echo', task: 'hello' }), labels = { role: 'impl' };
   const first = await f.cli(['run', '--request', 'D', '--spec', path, '--labels', JSON.stringify(labels), '--json'], { waitMs: 5000 });
@@ -163,7 +163,7 @@ test('R6: decided runs — same labels get the first outcome, other labels confl
   assert.equal(JSON.parse((await f.cli(['describe', '--key', 'P', '--json'])).out).labels, undefined);
 });
 
-test('R6: the orchestrator rejects a hand-written run request with invalid labels at admission, with the reason', async t => {
+test('The orchestrator rejects a hand-written run request with invalid labels at admission, with the reason', async t => {
   const f = await fixture(t);
   await f.boot();
   const outbox = await Outbox.open(outboxRoot(f.home), 'main:hand', () => orchInbox(f.home));

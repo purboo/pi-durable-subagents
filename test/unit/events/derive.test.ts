@@ -1,4 +1,4 @@
-// R2: the deriver maps journal / ledger entries to event drafts; ids are pure functions of the source entry.
+// The deriver maps journal / ledger entries to event drafts; ids are pure functions of the source entry.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -13,12 +13,12 @@ const all = (entries: Entry[], orch: Entry[] = [], id = {}) => entries.flatMap((
 const types = (events: EventDraft[]) => events.map(e => e.type);
 const orchEntry = (seq: number, type: string, fields: Record<string, unknown> = {}, ts = seq) => ({ seq, ts, type, ...fields }) as Entry;
 
-test('R2 deriver: call ids split into key and gen (a key may contain / and @)', () => {
+test('deriver: call ids split into key and gen (a key may contain / and @)', () => {
   assert.deepEqual(callParts(`${W}@2/x/y@z@3`), { key: 'x/y@z', gen: 3 });
   assert.equal(callParts('nonsense'), undefined);
 });
 
-test('R2 deriver: started once per call (generation), with exec; a second generation starts again', () => {
+test('deriver: started once per call (generation), with exec; a second generation starts again', () => {
   const entries = journal(['wf-created'], [JT.exec, { call: C, exec: `${C}#1.1` }], ['settled', { exec: `${C}#1.1` }], [JT.fenced, { exec: `${C}#1.1` }],
     [JT.exec, { call: C, exec: `${C}#1.2` }], [JT.exec, { call: `${W}@1/a@2`, exec: `${W}@1/a@2#1.1` }]);
   const events = all(entries, [], { request: 'R', labels: { node: 'n1' } });
@@ -28,7 +28,7 @@ test('R2 deriver: started once per call (generation), with exec; a second genera
   ], 'settled before the fence: the second execution of a@1 is no fenced event');
 });
 
-test('R2 deriver: fenced follows the lastFence classification (interrupted vs settled vs hibernated vs once-unknown)', () => {
+test('deriver: fenced follows the lastFence classification (interrupted vs settled vs hibernated vs once-unknown)', () => {
   const x1 = `${C}#1.1`, x2 = `${C}#1.2`;
   const interrupted = journal([JT.exec, { call: C, exec: x1 }], [JT.fenced, { exec: x1 }], ['loss', { exec: x1 }], [JT.exec, { call: C, exec: x2 }]);
   const clean = [orchEntry(1, 'orchestrator', { pid: 1 }, 0), orchEntry(2, 'orchestrator-exit', { pid: 1 }, 0), orchEntry(3, 'orchestrator', { pid: 2 }, 0)];
@@ -55,7 +55,7 @@ test('R2 deriver: fenced follows the lastFence classification (interrupted vs se
   assert.deepEqual(events[1], { id: `${W}:3:sealed`, ts: 1002, wid: W, type: 'sealed', key: 'a', gen: 1, call: C, status: 'unknown', error: 'Unknown tool outcomes: bash' });
 });
 
-test('R2 deriver: fenced reads only entries before the new exec (a later settle or seal does not change it)', () => {
+test('deriver: fenced reads only entries before the new exec (a later settle or seal does not change it)', () => {
   const x1 = `${C}#1.1`, x2 = `${C}#1.2`;
   const base = journal([JT.exec, { call: C, exec: x1 }], [JT.fenced, { exec: x1 }], [JT.exec, { call: C, exec: x2 }]);
   const later = [...base, ...journal(['settled', { exec: x1 }], [JT.sealed, { call: C, exec: x1, result: { status: 'ok' } }]).map((e, i) => ({ ...e, seq: 4 + i }))];
@@ -63,7 +63,7 @@ test('R2 deriver: fenced reads only entries before the new exec (a later settle 
   assert.equal(deriveEntry(W, base, 2, [], {})[0]!.type, 'fenced');
 });
 
-test('R2 deriver: asking carries the full question, qid, rev and answer address; answered carries sender, sha256 and UTF-16 length', () => {
+test('deriver: asking carries the full question, qid, rev and answer address; answered carries sender, sha256 and UTF-16 length', () => {
   const question = `Which? ${'long '.repeat(200)}`;
   const item = { id: `q:${C}:Q1`, rev: 2, kind: 'question', text: question, wid: W, call: C, qid: 'Q1' };
   const answer = 'blue 🎨';
@@ -88,7 +88,7 @@ test('R2 deriver: asking carries the full question, qid, rev and answer address;
   assert.deepEqual(all(journal([JT.attention, { item: { ...item, kind: 'stall' } }], [JT.attentionResolved, { id: item.id, rev: 2, resolution: 'activity' }])), []);
 });
 
-test('R2 deriver: sealed inlines small data and reports the size of large data; workflow-done; stable ids on re-derivation', () => {
+test('deriver: sealed inlines small data and reports the size of large data; workflow-done; stable ids on re-derivation', () => {
   const small = { colour: 'blue' }, large = { blob: 'x'.repeat(EVENT_DATA_INLINE_MAX) };
   const entries = journal([JT.sealed, { call: C, result: { status: 'ok', ok: true, output: 'o', data: small } }],
     [JT.sealed, { call: `${W}@1/b@1`, result: { status: 'failed', ok: false, output: '', error: 'E'.repeat(5000), data: large } }],
@@ -102,14 +102,14 @@ test('R2 deriver: sealed inlines small data and reports the size of large data; 
   assert.deepEqual(all(entries), events, 'same entries, same events and ids');
 });
 
-test('R2 deriver: submitted from the ledger created entry, with request id, name and labels', () => {
+test('deriver: submitted from the ledger created entry, with request id, name and labels', () => {
   const orch = [orchEntry(1, 'create-intent', { rid: 'req:X', wid: W, name: 'nightly' }), orchEntry(2, JT.created, { rid: 'req:X', wid: W, origin: 'cli:x' }, 77)];
   assert.deepEqual(deriveCreated(orch, 1, { labels: { role: 'writer' } }), { id: `${W}:submitted`, ts: 77, type: 'submitted', wid: W, request: 'X', labels: { role: 'writer' }, name: 'nightly' });
   const plain = [orchEntry(1, JT.created, { rid: '01ULID', wid: W })];
   assert.deepEqual(deriveCreated(plain, 0, {}), { id: `${W}:submitted`, ts: 1, type: 'submitted', wid: W });
 });
 
-test('R6 deriver: empty labels are no labels (as describe and the R7 collector treat them)', () => {
+test('deriver: empty labels are no labels (as describe and the wait collector treat them)', () => {
   assert.equal(labelsOf({ labels: {} }), undefined);
   assert.deepEqual(labelsOf({ labels: { a: 'b' } }), { a: 'b' });
   assert.equal(labelsOf({ labels: { a: 1 } }), undefined);

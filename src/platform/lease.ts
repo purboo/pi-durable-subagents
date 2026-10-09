@@ -162,12 +162,15 @@ export const callAddress = (call: string) => { const m = /^([^@/]+)@\d+\/(.+)@\d
 /** Who holds or waits: the subagent call when there is one, else the pid and command. */
 export const who = (t: LeaseTicket) => t.call ? callAddress(t.call) : `pid ${t.wrapper.pid} \`${clip(t.argv.join(" "), 60)}\``;
 
+/** A granted ticket's mode, how long it has been held, the command (unless `who` already names it) and the note:
+ *  "exclusive, 12m, `make bench`, nightly". */
+export const holdDetail = (t: LeaseTicket, now = Date.now(), command = !!t.call) =>
+  `${t.mode}, ${age(now - (t.grantedAt ?? t.since))}${command ? `, \`${clip(t.argv.join(" "), 60)}\`` : ""}${t.note ? `, ${clip(t.note, 80)}` : ""}`;
+
 /** One status line per resource: "machine held by <who> (exclusive, 12m, `make bench`); waiting: <who> 3m, …". */
 export function leaseLines(state: ReturnType<typeof leaseState>, now = Date.now()): string[] {
   return state.map(({ resource, holders, waiters }) => {
-    const held = holders.length
-      ? `held by ${holders.map(t => `${who(t)} (${t.mode}, ${age(now - (t.grantedAt ?? t.since))}${t.call ? `, \`${clip(t.argv.join(" "), 60)}\`` : ""}${t.note ? `, ${clip(t.note, 80)}` : ""})`).join(", ")}`
-      : "free";
+    const held = holders.length ? `held by ${holders.map(t => `${who(t)} (${holdDetail(t, now)})`).join(", ")}` : "free";
     return `${resource} ${held}${waiters.length ? `; waiting: ${waiters.map(t => `${who(t)} ${t.mode === "shared" ? "shared " : ""}${age(now - t.since)}`).join(", ")}` : ""}`;
   });
 }

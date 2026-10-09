@@ -1,4 +1,4 @@
-// R2: the event log file (append, reopen with the start skip, torn tail, corruption kept aside, compaction) and the pump
+// The event log file (append, reopen with the start skip, torn tail, corruption kept aside, compaction) and the pump
 // (backfill, watermark resume, retention keeps unfinished workflows, prune).
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,7 +20,7 @@ async function home(t: TestContext) {
 const draft = (n: number, wid = 'W'): EventDraft => ({ id: `${wid}:${n}:sealed`, ts: n, type: 'sealed', wid, status: 'ok' });
 const seqs = (path: string, since = 0) => readPage(path, since, 1000)!.events.map(e => Number(e.cursor.split(':')[1]));
 
-test('R2 log: append is durable and ordered; every open skips EVENT_SEQ_SKIP ahead; the epoch stays', async t => {
+test('event log: append is durable and ordered; every open skips EVENT_SEQ_SKIP ahead; the epoch stays', async t => {
   const path = eventsLog(await home(t));
   const first = await EventLog.open(path);
   assert.equal(first.created, true); assert.match(first.log.epoch, /^[0-9a-f]{16}$/);
@@ -47,7 +47,7 @@ test('R2 log: append is durable and ordered; every open skips EVENT_SEQ_SKIP ahe
   await third.log.close();
 });
 
-test('R2 log: a torn final line is ignored by readers and cut by the next open; corruption before the end is kept aside', async t => {
+test('event log: a torn final line is ignored by readers and cut by the next open; corruption before the end is kept aside', async t => {
   const dir = await home(t), path = eventsLog(dir);
   const { log } = await EventLog.open(path);
   await log.append([draft(1), draft(2)]); await log.close();
@@ -70,7 +70,7 @@ test('R2 log: a torn final line is ignored by readers and cut by the next open; 
   assert.deepEqual(seqs(path), []);
 });
 
-test('R2 log: compaction drops only selected events, keeps marks and head, and dropped is monotone', async t => {
+test('event log: compaction drops only selected events, keeps marks and head, and dropped is monotone', async t => {
   const path = eventsLog(await home(t));
   const { log } = await EventLog.open(path);
   await log.append([draft(1, 'A'), draft(2, 'B'), draft(3, 'A'), draft(4, 'B')], new Map([['A', 9], ['B', 7]]));
@@ -88,7 +88,7 @@ test('R2 log: compaction drops only selected events, keeps marks and head, and d
   await again.log.close();
 });
 
-test('R2 log: a large log pages from any cursor (byte-offset search) exactly like a full scan', async t => {
+test('event log: a large log pages from any cursor (byte-offset search) exactly like a full scan', async t => {
   const path = eventsLog(await home(t));
   let { log } = await EventLog.open(path);
   const pad = 'p'.repeat(200);
@@ -135,7 +135,7 @@ const C = (wid: string, key = 'a', gen = 1) => `${wid}@1/${key}@${gen}`;
 const read = (path: string, since = 0) => readPage(path, since, 1000)!.events;
 async function until(fn: () => boolean, ms = 5000) { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw new Error('timeout'); await new Promise(r => setTimeout(r, 10)); } }
 
-test('R2 pump: a new log backfills everything on disk; appends are derived promptly; labels and request echo', async t => {
+test('event pump: a new log backfills everything on disk; appends are derived promptly; labels and request echo', async t => {
   const s = await sources(t);
   const a = await s.add('A', 'req:ra', { node: 'n1' });
   await a.append(JT.exec, { call: C('A'), exec: `${C('A')}#1.1` });
@@ -150,14 +150,14 @@ test('R2 pump: a new log backfills everything on disk; appends are derived promp
   await until(() => read(s.path).some(e => e.wid === 'B' && e.type === 'workflow-done'));
   const events = read(s.path);
   assert.deepEqual(events.filter(e => e.wid === 'B').map(e => [e.type, e.request, e.labels]), [['submitted', undefined, undefined], ['workflow-done', undefined, undefined]]);
-  // R7 drafts go through the same sink; labels and request are echoed when the draft has none.
+  // Waiting/moving drafts go through the same sink; labels and request are echoed when the draft has none.
   await p.emit([{ id: 'A:w1', ts: 5, type: 'waiting', wid: 'A', key: 'a', gen: 1, call: C('A'), reason: 'slot', detail: 'probe 1/1', since: 5 }]);
   assert.deepEqual(read(s.path).at(-1)!.labels, { node: 'n1' });
   await p.close();
   assert.equal(new Set(read(s.path).map(e => e.id)).size, read(s.path).length, 'no duplicates');
 });
 
-test('R2 pump: a restart resumes after the watermarks (nothing derived twice), and derives what came while it was down', async t => {
+test('event pump: a restart resumes after the watermarks (nothing derived twice), and derives what came while it was down', async t => {
   const s = await sources(t);
   const a = await s.add('A');
   await a.append(JT.exec, { call: C('A'), exec: `${C('A')}#1.1` });
@@ -174,7 +174,7 @@ test('R2 pump: a restart resumes after the watermarks (nothing derived twice), a
   await second.close();
 });
 
-test('R2 pump: a crash after events but before their watermark re-derives them with the same ids (at least once, no gap)', async t => {
+test('event pump: a crash after events but before their watermark re-derives them with the same ids (at least once, no gap)', async t => {
   const s = await sources(t);
   const a = await s.add('A');
   const p = s.pump(); await p.open();
@@ -190,7 +190,7 @@ test('R2 pump: a crash after events but before their watermark re-derives them w
   assert.equal(started.length, 2); assert.equal(started[0]!.id, started[1]!.id);
 });
 
-test('R2 pump: retention drops old events of quiet or pruned workflows only; unsealed, asking and parked ones stay', async t => {
+test('event pump: retention drops old events of quiet or pruned workflows only; unsealed, asking and parked ones stay', async t => {
   const s = await sources(t);
   const done = await s.add('DONE'), asking = await s.add('ASK'), running = await s.add('RUN'), parked = await s.add('PARK'), gone = await s.add('GONE');
   await done.append('call', { pos: 0, key: 'a', gen: 1 });
@@ -221,7 +221,7 @@ test('R2 pump: retention drops old events of quiet or pruned workflows only; uns
   assert.equal(readHead(s.path)!.dropped, head.dropped, 'dropped is monotone across starts');
 });
 
-test('R2 pump: flush derives a workflow before it is pruned; a pruned workflow is forgotten', async t => {
+test('event pump: flush derives a workflow before it is pruned; a pruned workflow is forgotten', async t => {
   const s = await sources(t);
   const a = await s.add('A');
   const p = s.pump(); await p.open();
@@ -239,9 +239,9 @@ test('R2 pump: flush derives a workflow before it is pruned; a pruned workflow i
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Failure paths (batch 2 review).
+// Failure paths.
 // ---------------------------------------------------------------------------------------------------------------------
-test('R2 log: failed writes never spend more than EVENT_SEQ_SKIP seqs past the durable head (no seq reuse after reopen)', async t => {
+test('event log: failed writes never spend more than EVENT_SEQ_SKIP seqs past the durable head (no seq reuse after reopen)', async t => {
   const dir = await home(t);
   /** Partial writes then ENOSPC (the complete lines are visible to a reader until the writer cuts them); `only` picks
    *  the writes that fail. Returns the highest seq a reader saw. */
@@ -280,7 +280,7 @@ test('R2 log: failed writes never spend more than EVENT_SEQ_SKIP seqs past the d
   }
 });
 
-test('R2 log: a compaction that fails after its rename leaves the log broken (appends throw); open removes stale temp files', async t => {
+test('event log: a compaction that fails after its rename leaves the log broken (appends throw); open removes stale temp files', async t => {
   const dir = await home(t), path = eventsLog(dir);
   await writeFile(`${path}.0badc0de.tmp`, 'stale');
   const { log } = await EventLog.open(path);
@@ -296,7 +296,7 @@ test('R2 log: a compaction that fails after its rename leaves the log broken (ap
   assert.deepEqual(seqs(path), [2]);
 });
 
-test('R2 pump: flush rejects when the pass could not log what it derived; the retry logs it', async t => {
+test('event pump: flush rejects when the pass could not log what it derived; the retry logs it', async t => {
   const s = await sources(t);
   const a = await s.add('A');
   const p = s.pump(); await p.open();
@@ -311,7 +311,7 @@ test('R2 pump: flush rejects when the pass could not log what it derived; the re
   assert.ok(read(s.path).some(e => e.type === 'workflow-done'));
 });
 
-test('R2 pump: after a compaction broke the log, the next pass reopens it and logs to the live file', async t => {
+test('event pump: after a compaction broke the log, the next pass reopens it and logs to the live file', async t => {
   const s = await sources(t);
   const a = await s.add('A'), b = await s.add('B');
   await a.append(JT.done, { status: 'done' });
@@ -327,7 +327,7 @@ test('R2 pump: after a compaction broke the log, the next pass reopens it and lo
   assert.ok(Number(read(s.path).at(-1)!.cursor.split(':')[1]) > EVENT_SEQ_SKIP, 'the reopen applied the start skip');
 });
 
-test('R2 pump: a pass appends in chunks of at most EVENT_SEQ_SKIP with partial watermarks; a failed chunk is re-derived', async t => {
+test('event pump: a pass appends in chunks of at most EVENT_SEQ_SKIP with partial watermarks; a failed chunk is re-derived', async t => {
   const s = await sources(t);
   // A large backfill: one workflow whose journal derives more than two chunks of events (a plain array journal).
   const entries: Entry[] = [{ seq: 1, ts: 1, type: 'wf-created' } as Entry];

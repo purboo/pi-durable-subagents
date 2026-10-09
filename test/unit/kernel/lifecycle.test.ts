@@ -118,7 +118,7 @@ test('planning and a mutating domain decider cannot mutate input or lifecycle st
   planDecisions([], [req], (r, state) => { r.body = 'mutated'; (state.admitted as Map<string, unknown>).clear(); return apply(); });
   assert.deepEqual(req, original);
 });
-test('R1: a conflicting duplicate of a resolved rid records nothing and never replaces the resolution', () => {
+test('A conflicting duplicate of a resolved rid records nothing and never replaces the resolution', () => {
   const original = request('req:job', 1, { kind: 'run', body: { spec: 1 } });
   const records = planDecisions([], [original], apply);
   assert.deepEqual(records.map(r => r.type), ['admitted', 'applied']);

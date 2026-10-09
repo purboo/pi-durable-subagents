@@ -102,13 +102,16 @@ test('engine: force guards — grouped refusal with lease and token, stale token
   await until(() => [wid1, wid2].every(w => readJournalSnapshot(journalPath(home, w)).some(e => e.type === 'fake-run')));
   // A lease held by wid1's call is annotated on its line.
   await mkdir(leaseDir(home, 'machine'), { recursive: true });
-  await writeTicket(home, { seq: 1, resource: 'machine', mode: 'exclusive', wrapper: { pid: process.pid }, argv: ['sim'], cwd: home, since: Date.now(), grantedAt: Date.now(), call: `${wid1}@1/a@1` });
+  await writeTicket(home, { seq: 1, resource: 'machine', mode: 'exclusive', wrapper: { pid: process.pid }, argv: ['sim', '--long'], cwd: home, since: Date.now(), grantedAt: Date.now(), note: 'nightly', call: `${wid1}@1/a@1` });
+  // A shared lease held outside any call (a shell or a unit) is listed apart: the restart does not end it.
+  await writeTicket(home, { seq: 2, resource: 'machine', mode: 'shared', wrapper: { pid: process.pid }, argv: ['./measure.sh'], cwd: home, since: Date.now() - 1_260_000, grantedAt: Date.now() - 1_200_000 });
   const reason = (rid: string) => String((decision(home, rid) as { reason?: string } | undefined)?.reason);
   const ask = async (rid: string, body: unknown) => { await publishRequest(orchInbox(home), request('restart', body, rid)); await engine.intake(); await until(() => decision(home, rid)); return reason(rid); };
   const listed = await ask('list', {});
   const token = restartToken([{ exec: `${wid1}@1/a@1#1.1` }, { exec: `${wid2}@1/a@1#1.1` }]);
-  const line = (w: string) => `  ${w}/a \\d+s${w === wid1 ? ' holds lease machine' : ''}`;
-  assert.match(listed, new RegExp(`^busy: 2 running executions — fencing them interrupts these sessions:\\nmain:other:\\n${line(wid2)}\\ntest:\\n${line(wid1)}\\ntoken: ${token}\\nto fence exactly these: pi-durable-subagents restart --force ${token} --reason "<why>"$`));
+  const line = (w: string) => `  ${w}/a \\d+s${w === wid1 ? ' holds lease machine \\(exclusive, \\d+s, `sim --long`, nightly\\)' : ''}`;
+  const outside = `not fenced \\(a restart leaves these leases held\\):\\n  machine held by pid ${process.pid} \`\\./measure\\.sh\` \\(shared, 20m\\)`;
+  assert.match(listed, new RegExp(`^busy: 2 running executions — fencing them interrupts these sessions:\\nmain:other:\\n${line(wid2)}\\ntest:\\n${line(wid1)}\\n${outside}\\ntoken: ${token}\\nto fence exactly these: pi-durable-subagents restart --force ${token} --reason "<why>"$`));
   assert.match(await ask('stale', { token: '0123456789ab', reason: 'upgrade' }), new RegExp(`^the running executions changed since 0123456789ab\\nbusy: 2 running executions[^]*\\ntoken: ${token}\\n`));
   assert.match(await ask('noreason', { token }), /^restart reason must be non-empty/);
   assert.match(await ask('long', { token, reason: 'x'.repeat(501) }), /^restart reason must be non-empty and at most 500/);

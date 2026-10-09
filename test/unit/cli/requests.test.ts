@@ -1,4 +1,4 @@
-// R1–R3 unit paths of `run|send|stop --request` and `describe` over an isolated home: no orchestrator process (the
+// Unit paths of `run|send|stop --request` and `describe` over an isolated home: no orchestrator process (the
 // starter is a no-op) or an in-process engine with the fake executor.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -58,7 +58,7 @@ async function fixture(t: test.TestContext) {
   return { root, home, cwd, env, cli, spec, inbox, boot, defer, pump };
 }
 
-test('R1: ids are validated; spec_digest hashes kind, body and cond but not a run origin', () => {
+test('Ids are validated; spec_digest hashes kind, body and cond but not a run origin', () => {
   assert.equal(requestRid('a'), 'req:a'); assert.equal(requestRid('A'.repeat(124)).length, 128);
   for (const bad of ['', '-a', 'a/b', 'a b', 'A'.repeat(125), '.x']) assert.throws(() => requestRid(bad), /invalid request id/);
   const run = { kind: 'run' as const, body: { cwd: '/w', call: { agent: 'echo', task: 't' } } };
@@ -68,7 +68,7 @@ test('R1: ids are validated; spec_digest hashes kind, body and cond but not a ru
   assert.notEqual(specDigest({ ...answer, cond: { qid: 'q1', rev: 1 } }), specDigest({ ...answer, cond: { qid: 'q1', rev: 2 } }));
 });
 
-test('R2: run --request without a decision is pending (75); retries reuse the envelope; other content conflicts (3) and publishes nothing', async t => {
+test('Run --request without a decision is pending (75); retries reuse the envelope; other content conflicts (3) and publishes nothing', async t => {
   const f = await fixture(t), path = await f.spec('a.json', { agent: 'echo', task: 'hello' });
   const first = await f.cli(['run', '--request', 'job-1', '--spec', path, '--json']);
   assert.equal(first.code, 75); assert.deepEqual(JSON.parse(first.out), { request: 'job-1', pending: true });
@@ -97,7 +97,7 @@ test('R2: run --request without a decision is pending (75); retries reuse the en
   assert.deepEqual(JSON.parse((await f.cli(['describe', '--key', 'nope', '--json'])).out), { state: 'absent', request: 'nope' });
 });
 
-test('R2: invalid run specs fail before publication (fork, unknown agent, bad JSON, request field, bad id)', async t => {
+test('Invalid run specs fail before publication (fork, unknown agent, bad JSON, request field, bad id)', async t => {
   const f = await fixture(t);
   const cases: [unknown, RegExp][] = [
     [{ agent: 'echo', task: 't', context: 'fork' }, /context "fork"/],
@@ -114,7 +114,7 @@ test('R2: invalid run specs fail before publication (fork, unknown agent, bad JS
   assert.deepEqual(await f.inbox(), []);
 });
 
-test('R2: a decided run answers created once, then existing; cwd resolution; stop --request and send to a pending run', async t => {
+test('A decided run answers created once, then existing; cwd resolution; stop --request and send to a pending run', async t => {
   const f = await fixture(t), engine = await f.boot();
   await mkdir(join(f.cwd, 'sub/.pi/agents'), { recursive: true });
   await writeFile(join(f.cwd, 'sub/.pi/agents/echo.md'), '---\nname: echo\ndescription: echo\n---\nEcho.');
@@ -155,7 +155,7 @@ test('R2: a decided run answers created once, then existing; cwd resolution; sto
   assert.match((await f.cli(['stop', reply.wid])).out, /^submitted stop /);
 });
 
-test('R3: lastFence names restart-force, orchestrator-crash or process-died from the journals (best effort)', () => {
+test('LastFence names restart-force, orchestrator-crash or process-died from the journals (best effort)', () => {
   const e = (seq: number, type: string, extra: Record<string, unknown> = {}) => ({ seq, ts: seq * 10, type, ...extra });
   const journal = [e(1, JT.exec, { exec: 'x1' }), e(5, JT.fenced, { exec: 'x1' })];
   assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' })], []), undefined);
@@ -169,7 +169,7 @@ test('R3: lastFence names restart-force, orchestrator-crash or process-died from
   assert.equal(lastFence(journal, [...clean, e(3, 'restart', { force: false, live: ['x1'] })])?.reason, 'process-died');
 });
 
-test('R2: with --json a refused run or send answers {request, applied:false, reason, spec_digest?}; nothing is recorded', async t => {
+test('With --json a refused run or send answers {request, applied:false, reason, spec_digest?}; nothing is recorded', async t => {
   const f = await fixture(t);
   const unknown = await f.cli(['run', '--request', 'U', '--spec', await f.spec('u.json', { agent: 'nobody', task: 't' }), '--json']);
   assert.equal(unknown.code, 1);
@@ -186,7 +186,7 @@ test('R2: with --json a refused run or send answers {request, applied:false, rea
   assert.deepEqual(await f.inbox(), [], 'nothing was published');
 });
 
-test('R2: a retry of a recorded run, or a failure after submission, is pending (75), never a refusal', async t => {
+test('A retry of a recorded run, or a failure after submission, is pending (75), never a refusal', async t => {
   const f = await fixture(t);
   const path = await f.spec('r.json', { agent: 'echo', task: 't' });
   assert.equal((await f.cli(['run', '--request', 'R', '--spec', path, '--json'])).code, 75);
@@ -214,7 +214,7 @@ test('R2: a retry of a recorded run, or a failure after submission, is pending (
   assert.ok(!text.out.startsWith('{'), text.out);
 });
 
-test('R3: an execution that settled, hibernated or was sealed ended normally: its fence is not reported', () => {
+test('An execution that settled, hibernated or was sealed ended normally: its fence is not reported', () => {
   const e = (seq: number, type: string, extra: Record<string, unknown> = {}) => ({ seq, ts: seq * 10, type, ...extra });
   const orch = [e(0, 'orchestrator', { pid: 1 })];
   for (const end of ['settled', 'hibernated'])
@@ -234,7 +234,7 @@ test('R3: an execution that settled, hibernated or was sealed ended normally: it
   assert.deepEqual(lastFence(journal, orch), { at: 20, exec: 'x1', reason: 'process-died' });
 });
 
-test('R1: the subagents tool shares request ids with the CLI: same content → same wid, other content → request-conflict', async t => {
+test('The subagents tool shares request ids with the CLI: same content → same wid, other content → request-conflict', async t => {
   const f = await fixture(t), engine = await f.boot();
   f.pump(engine);
   const keys = ['HOME', 'DSA_HOME', 'PI_CODING_AGENT_DIR', 'PI_OFFLINE', 'DSA_ORCHESTRATOR_ENTRY'] as const;
@@ -276,7 +276,7 @@ test('R1: the subagents tool shares request ids with the CLI: same content → s
   assert.ok(!readJournalSnapshot(orchLedger(f.home)).some(e => e.type === 'orchestrator'), 'no orchestrator process was started');
 });
 
-test('R2: a failure after the envelope is recorded, or a busy lock, is pending (75), not a rejection (1)', async t => {
+test('A failure after the envelope is recorded, or a busy lock, is pending (75), not a rejection (1)', async t => {
   const f = await fixture(t), path = await f.spec('a.json', { agent: 'echo', task: 'hello' });
   const lines: string[] = [];
   const code = await main(['run', '--request', 'boom', '--spec', path, '--json'], { env: f.env, cwd: f.cwd, write: line => lines.push(line), waitMs: 0,
@@ -297,7 +297,7 @@ test('R2: a failure after the envelope is recorded, or a busy lock, is pending (
   } finally { await held!.release(); }
 });
 
-test('R1: an envelope another sender recorded but never published is published by a retry with the same content', async t => {
+test('An envelope another sender recorded but never published is published by a retry with the same content', async t => {
   const f = await fixture(t);
   const dead = await Outbox.open(outboxRoot(f.home), 'main:dead-session', () => orchInbox(f.home));
   const body = { cwd: f.cwd, call: { agent: 'echo', task: 'hello' } };

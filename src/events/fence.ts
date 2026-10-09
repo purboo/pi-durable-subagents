@@ -1,11 +1,11 @@
-// R2/R3: which fences interrupted work, shared by `describe` (lastFence) and the event deriver (`fenced`). Read-only over
+// Which fences interrupted work, shared by `describe` (lastFence) and the event deriver (`fenced`). Read-only over
 // committed journal entries; `limit` restricts the view to the first `limit` entries (the deriver may read only entries
 // before the one it derives, so a re-derivation after a crash sees the same history).
 import { JT, type Entry } from "../types.ts";
 
 export type FenceReason = "restart-force" | "orchestrator-crash" | "process-died";
 
-/** R3: Executions whose fence did NOT interrupt work: every execution ends with a fence; one interrupted work only when
+/** Executions whose fence did NOT interrupt work: every execution ends with a fence; one interrupted work only when
  *  the execution neither settled (its turn ended) before it nor hibernated (it waits for an answer), and was not sealed
  *  on purpose: a seal ends an execution on purpose unless its outcome is `unknown` (a `once` call cut off in a tool) or
  *  the execution was recorded as lost (the loss bound sealed it), which are interruptions themselves. A seal for an
@@ -28,7 +28,7 @@ export function endedExecs(journal: readonly Entry[], limit = journal.length): S
   return ended;
 }
 
-/** R3, best effort: why `fence` (a `fenced` entry that interrupted work) happened. restart-force: a forced restart listed
+/** Best effort: why `fence` (a `fenced` entry that interrupted work) happened. restart-force: a forced restart listed
  *  the execution as live; orchestrator-crash: the execution was launched before an orchestrator start that is not
  *  preceded by a clean exit and fenced after it (startup recovery); otherwise process-died (the child or its host went
  *  away, or a drain fenced it). */
@@ -45,7 +45,7 @@ export function fenceReason(journal: readonly Entry[], orch: readonly Entry[], f
   return "process-died";
 }
 
-/** R2: the fence of `exec` among the first `limit` entries when it interrupted work, else undefined. */
+/** The fence of `exec` among the first `limit` entries when it interrupted work, else undefined. */
 export function interruptingFence(journal: readonly Entry[], exec: string, limit = journal.length): Entry | undefined {
   let fence: Entry | undefined;
   for (let i = limit - 1; i >= 0 && !fence; i--) { const e = journal[i]!; if (e.type === JT.fenced && e.exec === exec) fence = e; }

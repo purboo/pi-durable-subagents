@@ -167,7 +167,7 @@ test('prune: a crash between pruned and removal is finished on recovery and the 
   assert.equal(unfinishedWorkflow(dir), false);
 });
 
-test('R1 tombstone: pruned records the final status and, for a request-id run, its request and spec_digest', async t => {
+test('request-id tombstone: pruned records the final status and, for a request-id run, its request and spec_digest', async t => {
   const { dir, boot } = await home(t), b = await boot();
   const body = { cwd: join(dir, 'project'), source: 'unused' } satisfies RunBody;
   await request(b, 'run', body, 'req:job-1');

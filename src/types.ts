@@ -78,9 +78,9 @@ export interface JournalHandle {
   close(): Promise<void>;
   /** True once close() was called; owners that outlive a workflow (the executor sweep) skip closed handles. */
   readonly closed?: boolean;
-  /** R2: the committed entries without a copy (the live, append-only array; read it, never change it). */
+  /** The committed entries without a copy (the live, append-only array; read it, never change it). */
   committed?(): readonly Entry[];
-  /** R2: called after each durable append (one listener: the orchestrator's event pump). */
+  /** Called after each durable append (one listener: the orchestrator's event pump). */
   onAppend?: (() => void) | undefined;
 }
 
@@ -197,7 +197,7 @@ export interface RunBody {
   maxCalls?: number;
   /** Origin session for `context: "fork"` (P33): its branch up to `leafId` is pinned at admission. */
   origin?: { sessionFile: string; leafId?: string | null };
-  /** R6: caller labels (flat string map), part of the spec digest and echoed on every event of the workflow. */
+  /** Caller labels (flat string map), part of the spec digest and echoed on every event of the workflow. */
   labels?: Record<string, string>;
 }
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */

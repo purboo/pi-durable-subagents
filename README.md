@@ -422,7 +422,7 @@ When an unsealed call does not move, its `waiting` in `describe` adds
 probe 1/1`) and `since` (ms: when that cause started). The event log has the
 same: `waiting {reason, detail, since}` when the reason appears or changes,
 `moving {after}` when it clears (also when the call ends), checked every
-`k.r7Ms` (default 5 s; read when the orchestrator starts, unlike the other
+`k.waitCheckMs` (default 5 s; read when the orchestrator starts, unlike the other
 `k` settings a `config.json` change does not apply it until a restart); a
 change of detail alone is no event. The first reason
 that applies wins:
@@ -464,7 +464,7 @@ command:
 ```sh
 pi-durable-subagents hold machine -- make bench          # exclusive
 pi-durable-subagents hold machine --shared -- npm test   # with other shared holders, never with an exclusive one
-pi-durable-subagents hold machine --max-wait 600 --note "frame phase" -- ./measure.sh
+pi-durable-subagents hold machine --max-wait 600 --note "profile" -- ./measure.sh
 ```
 
 - The lease covers one command, not a whole call: a subagent that thinks
@@ -485,6 +485,10 @@ pi-durable-subagents hold machine --max-wait 600 --note "frame phase" -- ./measu
   ended). State is one small file per request under
   `$DSA_HOME/leases/<resource>/`; no orchestrator is needed, and the user's
   own shell can take part.
+- A lease taken outside any call (your shell, a `systemd-run --user` unit)
+  does not depend on the orchestrator: a restart, forced or not, leaves it
+  held, and it is released when its `hold` and command end. A lease taken
+  inside a call ends with that call's processes when the call is fenced.
 - Subagents find the command on their `PATH` (the orchestrator puts a shim
   in `$DSA_HOME/bin`), and their leases are tagged with their call:
   `status` shows `lease: machine held by <wid>/<key> …; waiting: …` and
@@ -580,7 +584,9 @@ pi-durable-subagents restart          # or the subagents tool: action "restart"
 
 The orchestrator refuses while any execution runs (a subagent process, or a
 gate before a call's seal). The refusal groups executions by session with ages,
-lease annotations and a token for that exact set; no new execution starts while
+the leases each one holds (mode, how long, command, note: what a fence would cut
+short) and a token for that exact set. Leases held outside those executions are
+listed apart, since the restart leaves them held; no new execution starts while
 it decides, so nothing slips in between. Calls waiting
 for your answer (hibernated), waiting for a provider slot, or held by a drain
 do not block it. Otherwise it exits and its successor starts at once from the
@@ -606,6 +612,14 @@ boundary — a subagent runs as the same OS user and could signal the
 orchestrator anyway. Force fences running
 executions; they resume on the new version from their sessions, like after a
 crash, so a tool call that was running is repeated or reported as interrupted.
+A running execution cannot be handed over to the new orchestrator: each
+subagent is a pi process the orchestrator drives over its stdin and stdout, and
+those pipes end with the old process. A crash is no different: the successor
+fences every execution that still runs (an execution that had already ended is
+not counted as interrupted). Work that must survive a forced restart, such as a
+long measurement, belongs outside the subagent's processes (for example
+`systemd-run --user … pi-durable-subagents hold machine -- …`), with the
+subagent only watching it.
 The restart ledger records the reason and initiator; after the next start,
 `status` shows who forced it and why for 24 hours.
 

@@ -79,7 +79,7 @@ test('intake FIFO, gap holding, immutable identity and pin copies', async t => {
   await publishRequest(orchInbox(home), { ...one, body: { source: 'different' } }); await engine.intake();
   assert.equal(ledgers.orch.entries().filter(e => e.type === JT.created).length, 1);
   assert.equal(ledgers.orch.entries().filter(e => e.type === JT.applied && e.rid === 'one').length, 1);
-  // R1: 'one' is already resolved, so its conflicting duplicate is dropped without a decision record; its file goes.
+  // 'one' is already resolved, so its conflicting duplicate is dropped without a decision record; its file goes.
   assert.ok(!ledgers.orch.entries().some(e => e.type === JT.rejected && e.reason === 'identity-conflict'));
   assert.ok(!existsSync(join(orchInbox(home), 'one.json')));
 });

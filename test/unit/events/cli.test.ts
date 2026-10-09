@@ -1,4 +1,4 @@
-// R2: `events --all`: head, paging with more, cursor-expired (exit 4), malformed input (exit 1), and a missing log
+// `events --all`: head, paging with more, cursor-expired (exit 4), malformed input (exit 1), and a missing log
 // (start the orchestrator, wait, else 75). Through the CLI entry with an isolated DSA_HOME.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,7 +24,7 @@ async function cli(t: TestContext) {
 }
 const draft = (n: number): EventDraft => ({ id: `W:${n}:sealed`, ts: n, type: 'sealed', wid: 'W', status: 'ok' });
 
-test('R2 CLI: events --all prints the head; --since pages with --limit and more; the last page ends at the log head', async t => {
+test('events CLI: events --all prints the head; --since pages with --limit and more; the last page ends at the log head', async t => {
   const s = await cli(t);
   const { log } = await EventLog.open(s.path);
   const e = log.epoch;
@@ -50,7 +50,7 @@ test('R2 CLI: events --all prints the head; --since pages with --limit and more;
   assert.equal(s.starts(), 0, 'never starts the orchestrator when the log exists');
 });
 
-test('R2 CLI: cursor-expired for another epoch, a seq below dropped or beyond the head (exit 4, head and oldest)', async t => {
+test('events CLI: cursor-expired for another epoch, a seq below dropped or beyond the head (exit 4, head and oldest)', async t => {
   const s = await cli(t);
   const { log } = await EventLog.open(s.path);
   const e = log.epoch;
@@ -67,7 +67,7 @@ test('R2 CLI: cursor-expired for another epoch, a seq below dropped or beyond th
   assert.deepEqual(oldest.json.map(x => x.cursor ?? x), [`${e}:3`, { head: `${e}:3`, more: false }]);
 });
 
-test('R2 CLI: malformed cursor or options exit 1; a missing log starts the orchestrator and waits, else 75 pending', async t => {
+test('events CLI: malformed cursor or options exit 1; a missing log starts the orchestrator and waits, else 75 pending', async t => {
   const s = await cli(t);
   for (const args of [['--all', '--since', 'abc'], ['--all', '--since', 'ABCDEF0123456789:1'], ['--all', '--since', '0123456789abcdef:-1'],
     ['--all', '--limit', '0'], ['--all', '--limit', String(EVENTS_PAGE_MAX + 1)], ['--all', '--bogus'], ['--all', 'wid'], ['--all', '--since']]) {
@@ -85,7 +85,7 @@ test('R2 CLI: malformed cursor or options exit 1; a missing log starts the orche
   await assert.rejects(main(['events', 'nope'], { env: { DSA_HOME: s.home }, write: () => {} }), /Unknown workflow/);
 });
 
-test('R2 CLI: an unreadable log prints {"error":"log-unreadable","message"} and exits 1', async t => {
+test('events CLI: an unreadable log prints {"error":"log-unreadable","message"} and exits 1', async t => {
   const s = await cli(t);
   const { log } = await EventLog.open(s.path);
   const e = log.epoch;

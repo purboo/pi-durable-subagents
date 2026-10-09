@@ -89,7 +89,7 @@ export async function submit(home: string, command: Control, target?: string, en
     return requests;
   });
 }
-/** R1: Submit a request named by a caller-chosen id through the CLI sender: a retry with the same content republishes
+/** Submit a request named by a caller-chosen id through the CLI sender: a retry with the same content republishes
  *  (or reuses) the recorded envelope, other content is a conflict and publishes nothing. Starts the orchestrator
  *  unless the request conflicts. */
 export async function submitIdentified(home: string, rid: string, kind: RequestKind, body: unknown, cond: Conditions | undefined, env: NodeJS.ProcessEnv = process.env,
