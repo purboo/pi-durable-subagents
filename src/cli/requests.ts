@@ -14,6 +14,7 @@ import { checkAgents, request } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { JT, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
 import { startOrchestrator, submitIdentified } from "./control.ts";
+import { endedExecs, fenceReason } from "../events/fence.ts";
 
 export const EXIT = { ok: 0, rejected: 1, conflict: 3, pending: 75 } as const;
 export interface Context { home: string; env: NodeJS.ProcessEnv; write: (line: string) => void; starter?: typeof startOrchestrator; waitMs?: number; cwd?: string; stdin?: () => Promise<string> }
@@ -109,37 +110,12 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   return { state, wid, ...(id ? { request: id } : {}), ...(admitted ? { spec_digest: specDigest(admitted) } : {}), status: wf.status, ...(wf.error ? { error: wf.error } : {}),
     calls, ...(questions.length ? { questions } : {}), ...(attention.length ? { attention } : {}), ...(fence ? { lastFence: fence } : {}) };
 }
-/** R3, best effort: why the latest fence that interrupted work happened. Every execution ends with a fence; one interrupted
- *  work only when the execution neither settled (its turn ended) before it nor hibernated (it waits for an answer), and
- *  was not sealed on purpose: a seal ends an execution on purpose unless its outcome is `unknown` (a `once` call cut off
- *  in a tool) or the execution was recorded as lost (the loss bound sealed it), which are interruptions themselves.
- *  A seal for an execution that never ran (a launch failure) or that the call's stop, timeout or budget ended is on
- *  purpose. restart-force: a forced restart listed the execution as live;
- *  orchestrator-crash: the execution was launched before an orchestrator start that is not preceded by a clean exit and
- *  fenced after it (startup recovery); otherwise process-died (the child or its host went away, or a drain fenced it). */
+/** R3, best effort: why the latest fence that interrupted work happened. The per-execution classification and the
+ *  reason are shared with the event log's `fenced` events (src/events/fence.ts). */
 export function lastFence(journal: readonly Entry[], orch: readonly Entry[]): Description["lastFence"] {
-  const lost = new Set(journal.filter(e => e.type === "loss").map(e => String(e.exec)));
-  const fencedAt = new Map(journal.filter(e => e.type === JT.fenced).map(e => [String(e.exec), Number(e.seq)]));
-  const ended = new Set(journal.filter(e => {
-    const exec = String(e.exec);
-    // Recovery records `hibernated` after the fence for an execution cut off while only its question's ask ran (P28):
-    // it was waiting, not working, so that is no interruption either.
-    if (e.type === "hibernated") return true;
-    if (e.type === "settled") return Number(e.seq) < (fencedAt.get(exec) ?? Infinity);
-    return e.type === JT.sealed && (e.result as { status?: string } | undefined)?.status !== "unknown" && !lost.has(exec);
-  }).map(e => String(e.exec)));
+  const ended = endedExecs(journal);
   const fence = journal.findLast(e => e.type === JT.fenced && !ended.has(String(e.exec)));
-  if (!fence) return undefined;
-  const exec = String(fence.exec), at = Number(fence.ts);
-  if (orch.some(e => e.type === "restart" && e.force === true && Array.isArray(e.live) && e.live.includes(exec))) return { at, exec, reason: "restart-force" };
-  const launched = journal.find(e => e.type === JT.exec && e.exec === exec), starts = orch.filter(e => e.type === "orchestrator");
-  const recovery = starts.findLast(s => Number(s.ts) <= at);
-  if (launched && recovery && Number(launched.ts) < Number(recovery.ts)) {
-    const prior = orch.filter(e => Number(e.seq) < Number(recovery.seq));
-    const lastStart = prior.findLast(e => e.type === "orchestrator"), cleanExit = lastStart && prior.some(e => e.type === "orchestrator-exit" && Number(e.seq) > Number(lastStart.seq));
-    if (!cleanExit) return { at, exec, reason: "orchestrator-crash" };
-  }
-  return { at, exec, reason: "process-died" };
+  return fence ? { at: Number(fence.ts), exec: String(fence.exec), reason: fenceReason(journal, orch, fence) } : undefined;
 }
 export function renderDescription(d: Description): string {
   const lines = [`${d.request ?? d.wid}: ${d.state}${d.reason ? ` (${d.reason})` : ""}${d.wid && d.request ? ` — ${d.wid}` : ""}${d.status && d.state !== d.status ? ` · ${d.status}` : ""}`];

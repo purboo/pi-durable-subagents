@@ -154,6 +154,8 @@ export async function diskUsage(path: string): Promise<number> {
 /** A1, P11: Own shared workflow handles and reconcile create intents after a crash. */
 export class Store {
   readonly workflows = new Map<string, Workflow>();
+  /** R2: called after each append to a workflow journal (the event pump derives from it). */
+  appended?: (wid: string) => void;
   private ledgers: Ledgers;
   constructor(ledgers: Ledgers) { this.ledgers = ledgers; }
   private stagePath(rid: string) {
@@ -364,6 +366,7 @@ export class Store {
     if (this.pruned().has(wid)) throw new Error(`Workflow ${wid} was pruned`);
     const files = await this.pinnedFiles(wid, 1, intent);
     const journal = await openJournal(journalPath(this.ledgers.home, wid));
+    journal.onAppend = () => this.appended?.(wid);
     const wf: Workflow = { wid, revision: 1, origin: intent.origin as string, cwd: intent.cwd as string, journal, ...files };
     this.workflows.set(wid, wf);
     if (!journal.entries().length) await journal.append('wf-created', { rid: intent.rid, origin: intent.origin, cwd: intent.cwd, revision: 1,
