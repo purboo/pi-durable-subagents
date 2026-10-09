@@ -43,7 +43,8 @@ export function planDecisions(records: readonly DecisionRecord[], candidates: re
     const bound = view.admitted.get(req.rid);
     if (bound) {
       if (bound.hash === hash) envelopes.set(req.rid, req);
-      else if (!conflicts.has(req.rid)) { conflicts.add(req.rid); emit({ type: 'rejected', rid: req.rid, reason: 'identity-conflict' }); }
+      // A1, R1: a conflicting duplicate of a resolved rid is only dropped (its file still goes); it never records a decision.
+      else if (!view.resolved.has(req.rid) && !conflicts.has(req.rid)) { conflicts.add(req.rid); emit({ type: 'rejected', rid: req.rid, reason: 'identity-conflict' }); }
       continue;
     }
     if (req.sseq !== (view.high.get(req.from) ?? 0) + 1) continue;

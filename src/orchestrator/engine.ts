@@ -7,8 +7,10 @@
 // its seal has a finished attention independent of workflow completion.
 // resumed {rid,n} supersedes a terminal park. emit {pos,value} records script outputs.
 // stop-requested {rid,call?} marks a call or workflow stop as taking effect, so its replay is applied, not already-sealed.
-// Orch entry pruned {rid,wid,endedAt,bytes} is the decisive record of a prune: appended before the journal handle is
-// closed and w/<wid> and its staging dirs are removed (bytes = footprint measured just before). Nothing is rewritten (A1).
+// Orch entry pruned {rid,wid,endedAt,bytes,status,request?,spec_digest?} is the decisive record of a prune: appended before
+// the journal handle is closed and w/<wid> and its staging dirs are removed (bytes = footprint measured just before;
+// status = the final workflow status; request/spec_digest when the workflow was created by a request id, R1 tombstone).
+// Nothing is rewritten (A1): the admitted request and created entries stay, so a retried id still resolves to this wid.
 import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readdir, unlink } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
@@ -17,6 +19,7 @@ import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
+import { requestId, specDigest } from '../requests.ts';
 import { JT, attentionEntries, isEntry, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type RestartBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
@@ -426,7 +429,11 @@ export class Engine {
   /** A1, housekeeping: The pruned entry commits first; then the handle closes and the files go (recovery finishes them). */
   private async pruneWorkflow(rid: string, wf: Workflow) {
     const bytes = await this.store.footprint(wf.wid);
-    await this.ledgers.orch.append('pruned', { rid, wid: wf.wid, endedAt: this.terminal(wf)!.ts, bytes });
+    const done = this.terminal(wf)!, entries = this.ledgers.orch.entries();
+    const createdBy = String(entries.find(e => e.type === JT.created && e.wid === wf.wid)?.rid ?? '');
+    const admitted = requestId(createdBy) !== undefined ? entries.find(e => e.type === 'request' && (e.request as Request).rid === createdBy)?.request as Request | undefined : undefined;
+    const identity = admitted ? { request: requestId(createdBy), spec_digest: specDigest(admitted) } : {};
+    await this.ledgers.orch.append('pruned', { rid, wid: wf.wid, endedAt: done.ts, bytes, status: String(done.status), ...identity });
     this.states.delete(wf.wid);
     await this.store.drop(wf.wid);
     try { await this.store.remove(wf.wid); }
