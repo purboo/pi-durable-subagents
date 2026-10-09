@@ -6,7 +6,8 @@
   without ever being queued: the decision is made under the resource's lock
   and a refused request writes nothing, so `leases`, `status` and other
   waiters never see it. Before, `--max-wait 0` queued a ticket, checked, and
-  removed it.
+  removed it. A no-wait request also no longer ends processes left by a
+  killed holder (a queued waiter still does); it is refused while they remain.
 
 ## 1.0.26
 
