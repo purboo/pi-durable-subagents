@@ -109,11 +109,14 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   return { state, wid, ...(id ? { request: id } : {}), ...(admitted ? { spec_digest: specDigest(admitted) } : {}), status: wf.status, ...(wf.error ? { error: wf.error } : {}),
     calls, ...(questions.length ? { questions } : {}), ...(attention.length ? { attention } : {}), ...(fence ? { lastFence: fence } : {}) };
 }
-/** R3, best effort: why the latest execution fence happened. restart-force: a forced restart listed the execution as live;
+/** R3, best effort: why the latest fence that interrupted work happened. Every execution ends with a fence; one interrupted
+ *  work only when the execution neither settled (its turn ended), nor hibernated (it waits for an answer), nor was sealed
+ *  (a stop or a timeout ends the call on purpose). restart-force: a forced restart listed the execution as live;
  *  orchestrator-crash: the execution was launched before an orchestrator start that is not preceded by a clean exit and
- *  fenced after it (startup recovery); otherwise process-died (the child or its host went away, or a drain/stop fenced it). */
+ *  fenced after it (startup recovery); otherwise process-died (the child or its host went away, or a drain fenced it). */
 export function lastFence(journal: readonly Entry[], orch: readonly Entry[]): Description["lastFence"] {
-  const fence = journal.findLast(e => e.type === JT.fenced);
+  const ended = new Set(journal.filter(e => e.type === "settled" || e.type === "hibernated" || e.type === JT.sealed).map(e => String(e.exec)));
+  const fence = journal.findLast(e => e.type === JT.fenced && !ended.has(String(e.exec)));
   if (!fence) return undefined;
   const exec = String(fence.exec), at = Number(fence.ts);
   if (orch.some(e => e.type === "restart" && e.force === true && Array.isArray(e.live) && e.live.includes(exec))) return { at, exec, reason: "restart-force" };
@@ -200,12 +203,27 @@ async function submitAndWait(ctx: Context, id: string, kind: "run" | "send" | "s
   if (admitted && specDigest(admitted) !== sent.digest) return { code: await conflict(ctx, id, specDigest(admitted), json) };
   return { sent, outcome: result, earlier };
 }
+type Seen = { digest?: string };
+/** R2: with --json, a request refused before anything was recorded for it (a usage error, an invalid spec, an unknown
+ *  agent, no open question) answers in the documented shape `{request, applied:false, reason, spec_digest?}` with exit 1;
+ *  spec_digest is present once the content was complete enough to hash. Nothing is recorded: `describe` stays absent. */
+async function refusable(args: string[], ctx: Context, run: (args: string[], ctx: Context, seen: Seen) => Promise<number>): Promise<number> {
+  const seen: Seen = {};
+  try { return await run(args, ctx, seen); }
+  catch (error) {
+    if (!args.includes("--json")) throw error;
+    const at = args.indexOf("--request"), id = at >= 0 && at + 1 < args.length ? args[at + 1] : args.find(a => a.startsWith("--request="))?.slice(10);
+    ctx.write(JSON.stringify({ request: id ?? null, applied: false, reason: error instanceof Error ? error.message : String(error), ...(seen.digest ? { spec_digest: seen.digest } : {}) }));
+    return EXIT.rejected;
+  }
+}
 const forks = (spec: Record<string, unknown>) => [spec, ...["tasks", "chain"].flatMap(k => Array.isArray(spec[k]) ? spec[k] as unknown[] : [])]
   .some(s => s && typeof s === "object" && (s as { context?: unknown }).context === "fork");
 
 /** R2: `run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]`. The spec is the `subagents` run
  *  form ({agent,task,…} or {tasks|chain:[…],…}); it is validated by the tool's own normalizer and agent check. */
-export async function runCommand(args: string[], ctx: Context): Promise<number> {
+export const runCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, runRequest);
+async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", spec: "value", cwd: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), file = text(values, "spec"), json = values.json === true, wait = waitMs(values, ctx);
   if (!id || !file || positionals.length) throw new Error("usage: run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]");
@@ -221,6 +239,7 @@ export async function runCommand(args: string[], ctx: Context): Promise<number> 
   const base = resolve(ctx.cwd ?? process.cwd(), text(values, "cwd") ?? "."), dir = typeof spec.cwd === "string" && spec.cwd ? resolve(base, spec.cwd) : base;
   const normalized = request({ ...spec, action: "run", ...(typeof spec.cwd === "string" && spec.cwd ? { cwd: dir } : {}) }, dir);
   const body = normalized.body as RunBody;
+  seen.digest = specDigest({ kind: "run", body });
   checkAgents(body, () => discoverAgents(dir, { home: ctx.env.HOME || undefined, agentDir: ctx.env.PI_CODING_AGENT_DIR || undefined }).agents.map(a => a.name));
   const done = await submitAndWait(ctx, id, "run", body, undefined, wait, json);
   if ("code" in done) return done.code;
@@ -256,7 +275,8 @@ async function target(home: string, to: string, call: string | undefined, prior:
   throw new Error(`${to} has ${keys.length ? `calls ${keys.join(", ")}` : "no calls yet"}; name one with --call <key> or --to <wid>/<key>`);
 }
 /** R2: `send --request <id> --to <…> --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>]`. */
-export async function sendCommand(args: string[], ctx: Context): Promise<number> {
+export const sendCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, sendRequest);
+async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", to: "value", call: "value", kind: "value", qid: "value", rev: "value", message: "value", model: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), to = text(values, "to"), kind = text(values, "kind"), json = values.json === true, wait = waitMs(values, ctx);
   if (!id || !to || !kind || positionals.length) throw new Error("usage: send --request <id> --to <run-id|wid/key> --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]");
@@ -278,12 +298,14 @@ export async function sendCommand(args: string[], ctx: Context): Promise<number>
   }
   const normalized = request({ action: "send", to: where.to, kind, ...(message !== undefined ? { message } : {}), ...(text(values, "model") !== undefined ? { model: text(values, "model") } : {}),
     ...(qid !== undefined ? { qid } : {}), ...(revision !== undefined ? { rev: revision } : {}) }, ctx.cwd ?? process.cwd());
+  seen.digest = specDigest({ kind: "send", body: normalized.body, cond: normalized.cond });
   const done = await submitAndWait(ctx, id, "send", normalized.body, normalized.cond, wait, json);
   if ("code" in done) return done.code;
   return decided(ctx, id, done, json);
 }
 /** R2: `stop --request <id> <run-id|wid|wid/key|callId>`. */
-export async function stopCommand(args: string[], ctx: Context): Promise<number> {
+export const stopCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, stopRequest);
+async function stopRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), json = values.json === true, wait = waitMs(values, ctx);
   if (!id || positionals.length !== 1) throw new Error("usage: stop --request <id> <run-id|wid|wid/key> [--json]");
@@ -292,6 +314,7 @@ export async function stopCommand(args: string[], ctx: Context): Promise<number>
   const resolved = raw.includes("@") ? { wid: head } : await widOf(ctx.home, head);
   if ("pending" in resolved) return pending(ctx, id, json, `run ${head} has no workflow yet`);
   const normalized = request({ action: "stop", target: raw.includes("@") ? raw : `${resolved.wid}${raw.slice(head.length)}` }, ctx.cwd ?? process.cwd());
+  seen.digest = specDigest({ kind: "stop", body: normalized.body });
   const done = await submitAndWait(ctx, id, "stop", normalized.body, undefined, wait, json);
   if ("code" in done) return done.code;
   return decided(ctx, id, done, json);

@@ -13,7 +13,8 @@ import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.t
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
 import { isLive, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
-import { checkAgents, parameters, request, sendReceipt } from "./main/tool.ts";
+import { checkAgents, request, sendReceipt } from "./main/tool.ts";
+import { parameters } from "./main/schema.ts";
 import { findRequest, requestRid, sendIdentified, type Identified } from "../requests.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { restartInputError } from "../orchestrator/restart.ts";

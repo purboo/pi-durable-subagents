@@ -129,6 +129,7 @@ test("E2E R2/R3: describe states, full questions, answers by run id, and 10 conc
   const sealed = await s.until(async () => { const d = await s.describe("D"); return d.state === "sealed" && d; }, "sealed");
   assert.equal(sealed.status, "done"); assert.deepEqual(sealed.calls[0].data, { colour: "blue" }); assert.equal(sealed.calls[0].ok, true);
   assert.equal(sealed.questions, undefined, "no open question once answered");
+  assert.equal(sealed.lastFence, undefined, "every execution ended normally (settled or hibernated): no interruption to report");
   // Ten concurrent follow-ups with one id on the sealed call: exactly one new generation.
   const follow = script([{ text: "again" }]);
   const sends = await Promise.all(Array.from({ length: 10 }, () => s.cli(["send", "--request", "F", "--to", "D", "--kind", "follow-up", "--message", follow, "--json"])));
