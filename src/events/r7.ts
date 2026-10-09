@@ -258,6 +258,8 @@ export class R7Tracker {
     }
   }
   /** Calls with a `waiting` emitted and not yet followed by `moving`. */
+  /** Forget every emitted state (a new log epoch: its readers start from nothing, so current waits are emitted again). */
+  reset(): void { this.last.clear(); }
   waiting(): ReadonlyMap<string, Wait> { return new Map([...this.last].map(([call, v]) => [call, v.wait])); }
   /** Drafts for the transitions from the last state to `current` (calls absent from it move). */
   diff(now: number, current: ReadonlyMap<string, Wait | undefined>, meta: ReadonlyMap<string, WaitMeta>): EventDraft[] {
@@ -282,11 +284,18 @@ export interface R7Collected { current: ReadonlyMap<string, Wait | undefined>; m
 /** Every `intervalMs` (k.r7Ms, default 5000): collect, diff, emit. Never overlaps itself; an emit failure is logged and
  *  its drafts are emitted first on the next tick (in order, same ids), so no transition is lost. `tick()` runs one now
  *  (or joins the one running). */
-export function startR7(options: { collect: () => R7Collected | Promise<R7Collected>; sink: EventSink; intervalMs?: number; tracker?: R7Tracker; now?: () => number; log?: (line: string) => void }): { stop(): Promise<void>; tick(): Promise<void> } {
+export function startR7(options: { collect: () => R7Collected | Promise<R7Collected>; sink: EventSink; intervalMs?: number; tracker?: R7Tracker; now?: () => number; log?: (line: string) => void;
+  /** The sink's log epoch: when it changes (a broken log reopened as a new one), the tracker resets, so the new log gets
+   *  every current wait again. */
+  epoch?: () => string | undefined }): { stop(): Promise<void>; tick(): Promise<void> } {
   const tracker = options.tracker ?? new R7Tracker(), now = options.now ?? Date.now, log = options.log ?? (line => console.error(line));
-  let pending: EventDraft[] = [], running: Promise<void> | undefined, stopped = false, timer: ReturnType<typeof setTimeout> | undefined;
+  let pending: EventDraft[] = [], running: Promise<void> | undefined, stopped = false, timer: ReturnType<typeof setTimeout> | undefined, epoch = options.epoch?.();
   const once = async () => {
-    try { const at = now(), { current, meta } = await options.collect(); pending.push(...tracker.diff(at, current, meta)); }
+    try {
+      const at = now(), { current, meta } = await options.collect(), seen = options.epoch?.();
+      if (seen !== epoch) { epoch = seen; tracker.reset(); }
+      pending.push(...tracker.diff(at, current, meta));
+    }
     catch (error) { log(`durable-subagents: R7 collection failed: ${String(error)}`); }
     while (pending.length) {
       const batch = pending.slice(0, EVENT_SEQ_SKIP);

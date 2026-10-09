@@ -153,7 +153,9 @@ export class EventLog {
       if (scan.end !== (await file.stat()).size) { await file.truncate(scan.end); await file.sync(); }
     } finally { await file.close(); }
     const log = new EventLog(path, await open(path, "a"), scan);
-    await log.write(frameLine(JSON.stringify({ k: "head", seq: log.head + EVENT_SEQ_SKIP })), log.head + EVENT_SEQ_SKIP);
+    // The pump retries a broken log's reopen every second: a failed start skip must not leak the handle.
+    try { await log.write(frameLine(JSON.stringify({ k: "head", seq: log.head + EVENT_SEQ_SKIP })), log.head + EVENT_SEQ_SKIP); }
+    catch (error) { await log.file.close().catch(() => {}); throw error; }
     log.head += EVENT_SEQ_SKIP; log.redundant++;
     return { log, created: false, marks: scan.marks };
   }

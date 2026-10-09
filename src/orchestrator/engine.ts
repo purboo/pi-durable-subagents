@@ -197,7 +197,7 @@ export class Engine {
     }
     const tracker = new R7Tracker(); tracker.seed(latest);
     const collect = r7Collector({ home: this.ledgers.home, workflows: () => this.store.workflows.values(), orch: this.ledgers.orch, config: this.ledgers.config });
-    this.r7 = startR7({ collect: () => collect(), sink: this.events, intervalMs: this.ledgers.config.k?.r7Ms, tracker });
+    this.r7 = startR7({ collect: () => collect(), sink: this.events, intervalMs: this.ledgers.config.k?.r7Ms, tracker, epoch: () => this.events.head?.epoch });
   }
   private async startHost() {
     await this.evaluator.start(message => this.background(() => this.message(message)), () => this.background(async () => {
