@@ -114,8 +114,10 @@ export function liveTickets(home: string, resource: string): LeaseTicket[] {
 
 /** The live tickets that keep `t` waiting (empty when it may run). For an exclusive or shared request these are earlier
  *  tickets; a counted one is kept by earlier waiters and exclusive tickets, else, when all its slots are taken, by every
- *  granted ticket (a granted shared one may be later). `tickets` is the resource's live list, `t` itself ignored. */
-export function blockers(t: Pick<LeaseTicket, "seq" | "mode" | "slots">, tickets: LeaseTicket[]): LeaseTicket[] {
+ *  granted ticket (a granted shared one may be later). `tickets` is the resource's live list, `t` itself ignored. A
+ *  granted ticket is never blocked again: later grants (shared, or counted with a larger N) must not take it back. */
+export function blockers(t: Pick<LeaseTicket, "seq" | "mode" | "slots" | "grantedAt">, tickets: LeaseTicket[]): LeaseTicket[] {
+  if (t.grantedAt !== undefined) return [];
   if (t.mode !== "counted") return tickets.filter(o => o.seq < t.seq && (t.mode === "exclusive" || o.mode === "exclusive"));
   const ahead = tickets.filter(o => o.seq < t.seq && (o.grantedAt === undefined || o.mode === "exclusive"));
   if (ahead.length) return ahead;
