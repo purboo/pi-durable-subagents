@@ -8,7 +8,7 @@ import { openJournal } from '../../../../src/kernel/journal.ts';
 import { journalPath, orchLedger, pinnedDir } from '../../../../src/paths.ts';
 import { compileFanout } from '../../../../src/compat/fanout.ts';
 import { finishedText } from '../../../../src/orchestrator/engine.ts';
-import { compactWorkflow, eventsFromEntries, plannedFromScript, progressOf, renderEvent, snapshotFromEntries, pausedElsewhere, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid, workflowSnapshot, outputSelect, writerWaits } from '../../../../src/orchestrator/snapshot.ts';
+import { compactWorkflow, eventsFromEntries, plannedFromScript, progressOf, renderEvent, snapshotFromEntries, pausedElsewhere, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid, workflowSnapshot, outputSelect, selectLines, writerWaits } from '../../../../src/orchestrator/snapshot.ts';
 import { JT, type Entry } from '../../../../src/types.ts';
 
 const e = (seq: number, type: string, f: Record<string, unknown> = {}) => ({ seq, ts: 1_700_000_000_000 + seq, type, ...f }) as Entry;
@@ -353,6 +353,13 @@ test('status wid with tail/grep: each call\'s selected lines, unclipped up to a 
   const capped = pick([100, undefined]).big!;
   assert.match(capped, /^\[\d+ earlier chars clipped\]\.\.\./); assert.ok(capped.endsWith(`99 ${'q'.repeat(80)}`));
   assert.equal(capped.length - capped.indexOf('...') - 3, 4000);
+  // grep tests only the first 2000 characters of a line (the matched line is returned whole) and the last 5000 lines.
+  const longLine = `${'a'.repeat(2500)}END`;
+  assert.equal(selectLines(longLine, { grep: 'END' }), '', 'a match past 2000 characters is not tested');
+  assert.equal(selectLines(longLine, { grep: '^a{2000}' }), longLine);
+  const many = Array.from({ length: 6000 }, (_, i) => `L${i}`).join('\n');
+  assert.equal(selectLines(many, { grep: '^L(0|5999)$' }), '[1000 earlier lines not searched]\nL5999');
+  assert.equal(selectLines(many, { tail: 1 }), 'L5999', 'tail alone scans nothing');
   assert.throws(() => outputSelect(undefined, '(unclosed'), /grep is not a valid regular expression/);
   for (const tail of [0, -1, 1.5, '3']) assert.throws(() => outputSelect(tail, undefined), /tail must be a positive integer/);
   assert.equal(outputSelect(undefined, undefined), undefined);
