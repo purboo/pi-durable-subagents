@@ -12,6 +12,7 @@ import type { Exhaustion } from "./providers.ts";
 import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
 import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
+import { readStats, type OrchestratorStats } from "./stats.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
@@ -447,6 +448,8 @@ export interface StatusView {
   leases?: string[];
   /** The orchestrator version running, and a note when it is not the one this process loaded (see orchestratorView). */
   orchestrator?: string; versionNote?: string;
+  /** What the running orchestrator costs (see stats.ts), when it published it. */
+  orchestratorStats?: OrchestratorStats;
 }
 export type StatusDetail = WorkflowSnapshot & { scriptLog?: string };
 
@@ -500,7 +503,14 @@ export function statusView(home: string, options: { origin?: string; keep?: numb
   const paused = all.filter(w => w.paused).length;
   return { workflows: shown.map(w => compactWorkflow(w, byCall)), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
     ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused (stop-all, drain or a quit pi) since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}),
-    ...slotsView(home), ...(leases.length ? { leases: leaseLines(leases) } : {}) };
+    ...slotsView(home), ...(leases.length ? { leases: leaseLines(leases) } : {}), ...runningStats(home) };
+}
+/** The stats the running orchestrator published (none when no orchestrator runs). */
+export function runningStats(home: string): { orchestratorStats?: OrchestratorStats } {
+  const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
+  ledgerStates.set(path, state);
+  const o = state.orchestrator, stats = o && !o.exited && processAlive(o.pid, o.start) ? readStats(home, o.pid) : undefined;
+  return stats ? { orchestratorStats: stats } : {};
 }
 
 const FINAL = ["done", "failed", "stopped"];

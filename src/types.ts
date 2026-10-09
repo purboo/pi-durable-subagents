@@ -82,6 +82,11 @@ export interface JournalHandle {
   committed?(): readonly Entry[];
   /** Called after each durable append (one listener: the orchestrator's event pump). */
   onAppend?: (() => void) | undefined;
+  /** Set by the owner when it expects no appends soon (a finished workflow): the descriptor closes shortly after the
+   *  last append and the next append reopens it. Entries stay readable either way. */
+  resting?: boolean;
+  /** Whether the handle holds its file descriptor now. */
+  readonly descriptorOpen?: boolean;
 }
 
 // ---------------------------------------------------------------------------
