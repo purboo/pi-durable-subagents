@@ -116,7 +116,7 @@ test('engine: force guards — grouped refusal with lease and token, stale token
   await publishRequest(orchInbox(home), other('restart', { token, reason: 'upgrade', initiator: { call: `${wid2}@1/a@1` } }, 'submain'));
   await engine.intake(); await until(() => decision(home, 'submain'));
   assert.equal(reason('submain'), subagentRestartError, 'a main sender does not hide a subagent caller');
-  assert.match(await ask('bare', { force: true, reason: 'old client' }), /^force without a token is refused; first show the user the running executions\nbusy: 2/);
+  assert.match(await ask('bare', { force: true }), /^force without a token is refused; first show the user the running executions\nbusy: 2/);
   for (const rid of ['list', 'stale', 'noreason', 'long', 'sub', 'bare']) assert.equal(decision(home, rid)!.type, 'rejected', rid);
   assert.equal(orch.entries().filter(e => e.type === 'restart').length, 0, 'refusals record nothing');
   assert.equal(engine.restartRequested, false);
@@ -137,6 +137,19 @@ test('engine: an idle restart is accepted without force and replayed once', { ti
   assert.equal(engine.restartRequested, true);
   await engine.loop();
   assert.deepEqual(orch.entries().filter(e => e.type === 'restart').map(e => [e.rid, e.force, e.live]), [['idle', false, []]]);
+});
+
+for (const body of [{ token: '0123456789ab', reason: 'upgrade' }, { force: true }]) test(`engine: an idle restart sent as ${JSON.stringify(body)} fences nothing and is not recorded as a force`, { timeout: 15_000 }, async t => {
+  const home = await root(t), orch = await openJournal(orchLedger(home)), request = sender();
+  const ledgers = { home, orch, config: { k: { idleExitMs: 60_000 } } };
+  const engine = new Engine(ledgers, fakeExecutor(ledgers), { discovery: { home, agentDir: join(home, 'agent'), globalNpmRoot: null } });
+  t.after(async () => { await engine.close(); await orch.close(); });
+  await engine.recover();
+  await publishRequest(orchInbox(home), request('restart', body, 'idle'));
+  await engine.intake();
+  await until(() => decision(home, 'idle'));
+  assert.equal(decision(home, 'idle')?.type, 'applied');
+  assert.deepEqual(orch.entries().filter(e => e.type === 'restart').map(e => [e.force, e.live]), [[false, []]]);
 });
 
 test('CLI restart: refused while a call runs, --force replaces the orchestrator process and the call resumes', { timeout: 30_000 }, async t => {

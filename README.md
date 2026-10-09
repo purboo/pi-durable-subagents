@@ -504,9 +504,11 @@ loads the old extension; start a new one.
   idempotent, or mark the step `once: true`: when an execution is cut off
   while a tool call is running (its result never arrived), the step then
   ends as `unknown` instead of repeating it. Cut off between tool calls, a
-  `once` step continues like any other (nothing was left half done), and a
-  step waiting for your answer is never `unknown` — it keeps waiting and
-  resumes with the answer. A follow-up on an `unknown` step continues the
+  `once` step continues like any other (nothing was left half done). A
+  step cut off while its only unfinished tool call is the question it asked
+  is not `unknown` either: it keeps waiting and resumes with the answer, also
+  an answer given while dsa restarted. If it was cut off while another tool
+  call ran beside the question, a `once` step still ends as `unknown`. A follow-up on an `unknown` step continues the
   same session as its next generation.
 - After a crash, the model call that was in flight is paid for again.
 - Process containment uses process tags plus a 1-second tracker. A process

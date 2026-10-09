@@ -13,7 +13,9 @@ export const isForceRestart = (body: RestartBody): boolean => body.token !== und
 export function restartInputError(body: RestartBody, subagent = false): string | undefined {
   const force = isForceRestart(body);
   if (force && (subagent || body.initiator && "call" in body.initiator)) return subagentRestartError;
-  if ((force || body.reason !== undefined) && (typeof body.reason !== "string" || !body.reason.trim() || body.reason.length > 500)) return "restart reason must be non-empty and at most 500 characters (force requires --reason)";
+  // An old client's bare `force: true` carries no reason: it is never a force (no token) and is refused with the
+  // list of running executions, so it is not rejected for the missing reason first.
+  if ((body.token !== undefined || body.reason !== undefined) && (typeof body.reason !== "string" || !body.reason.trim() || body.reason.length > 500)) return "restart reason must be non-empty and at most 500 characters (force requires --reason)";
   if (body.token !== undefined && (typeof body.token !== "string" || !/^[a-f0-9]{12}$/.test(body.token))) return "restart force needs the 12-hex token from a refused restart; first show the user the running executions";
   return undefined;
 }

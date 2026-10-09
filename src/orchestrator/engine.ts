@@ -379,13 +379,14 @@ export class Engine {
     } else if (req.kind === 'restart') {
       // A replay (the restart was recorded, then the process ended before its resolution) applies without restarting again.
       if (!this.ledgers.orch.entries().some(e => e.type === 'restart' && e.rid === req.rid)) {
+        // Only a restart that fenced something is recorded as a force (a token with nothing running fences nothing).
         const body = (req.body as RestartBody | null) ?? {}, force = isForceRestart(body);
         // A claimed subagent call only restricts (it cannot force); otherwise the main session's sender is authoritative.
         const initiator = body.initiator && 'call' in body.initiator ? body.initiator : req.from.startsWith('main:') ? { origin: req.from } : body.initiator ?? { origin: req.from };
         const gate = this.executor.quiesce?.() ?? { live: [], resume() {} };
         const reason = restartRefusal(this.ledgers.home, gate.live.map(l => ({ ...l, origin: this.store.workflows.get(l.wid)?.origin })), body, req.from.startsWith('main:'));
         if (reason) { gate.resume(); return { action: 'reject', reason }; }
-        try { await this.ledgers.orch.append('restart', { rid: req.rid, force, reason: body.reason, initiator, from: req.from, live: gate.live.map(l => l.exec) }); }
+        try { await this.ledgers.orch.append('restart', { rid: req.rid, force: force && gate.live.length > 0, reason: body.reason, initiator, from: req.from, live: gate.live.map(l => l.exec) }); }
         catch (error) { gate.resume(); throw error; }
         this.restarting = true;
       }
