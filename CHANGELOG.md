@@ -9,11 +9,16 @@
   import reachable from the CLI, orchestrator or evaluator, and `pack:smoke`
   drives a run by request id from a package directory that cannot see pi.
 - `describe` reports `lastFence` only for an execution that was cut off; an
-  execution that ended its turn, hibernated, or was stopped or timed out is
-  not an interruption.
+  execution that ended its turn, hibernated, or was stopped, timed out or
+  over budget is not an interruption. A `once` call sealed `unknown` and a call
+  sealed after repeated losses still name their fence.
 - With `--json`, a `run`/`send`/`stop` refused before submission (unknown
   agent, invalid spec, usage) answers `{request, applied: false, reason,
-  spec_digest?}` instead of plain text; exit code 1 as before.
+  spec_digest?}` instead of plain text; exit code 1 as before. A failure after
+  submission, and a retry of a recorded run whose agent has since gone, are
+  pending (75), never a refusal.
+- The import check parses with TypeScript and follows the executor, which the
+  orchestrator loads through `import(new URL(…))`.
 
 ## 1.0.21
 

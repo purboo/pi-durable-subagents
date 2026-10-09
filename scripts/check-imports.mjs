@@ -15,22 +15,51 @@ function check(p) {
 }
 for (const r of roots) walk(r);
 
-// The CLI, orchestrator and evaluator run from the package directory, where the optional pi peer packages need not
-// resolve: no value import (static or dynamic) reachable from them may name one. Type-only imports are erased. The
-// chaos command is a test tool that needs pi and is exempt.
-const entries = ["src/cli/main.ts", "src/orchestrator/main.ts", "src/evaluator/worker.ts", "src/evaluator/host.ts"];
+// The CLI, orchestrator (with its executor) and evaluator run from the package directory, where the optional pi peer
+// packages need not resolve: no value import reachable from them may name one. The walk parses with TypeScript:
+// static imports and re-exports (type-only ones are erased) and import() of a literal path or of
+// new URL("./x.ts", import.meta.url). A dynamic import whose path is not a literal cannot be followed and fails the check. The chaos command
+// is a test tool that needs pi and is exempt.
+const ts = (await import("typescript")).default;
+const entries = ["src/cli/main.ts", "src/orchestrator/main.ts", "src/orchestrator/executor/index.ts", "src/evaluator/worker.ts", "src/evaluator/host.ts"];
 const exempt = new Set([join("src", "cli", "chaos", "index.ts")]);
-const local = /(?:^|[;\n])\s*(?:import|export)\s+(type\s+)?(?:[^"';]*?\s+from\s+)?["'](\.{1,2}\/[^"']+)["']|import\s*\(\s*["'](\.{1,2}\/[^"']+)["']\s*\)/g;
-const peer = /(?:^|[;\n])\s*(?:import|export)\s+(?!type\s)(?:[^"';]*?\s+from\s+)?["'](@earendil-works\/[^"']+)["']|import\s*\(\s*["'](@earendil-works\/[^"']+)["']\s*\)/g;
+const literals = node => ts.isStringLiteralLike(node) ? [node.text] : ts.isConditionalExpression(node) ? [...literals(node.whenTrue), ...literals(node.whenFalse)]
+  : ts.isParenthesizedExpression(node) ? literals(node.expression) : undefined;
+/** import(new URL("./x.ts" or cond ? "./x.ts" : "./x.js", import.meta.url).href): the .ts paths. */
+const urlLiterals = node => {
+  const url = ts.isPropertyAccessExpression(node) && node.name.text === "href" ? node.expression : node;
+  if (!ts.isNewExpression(url) || url.expression.getText() !== "URL" || url.arguments?.length !== 2 || !/import\.meta\.url/.test(url.arguments[1].getText())) return undefined;
+  const paths = literals(url.arguments[0])?.filter(p => p.endsWith(".ts"));
+  return paths?.length ? paths : undefined;
+};
+function references(file) {
+  const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true), found = [];
+  const typeOnly = clause => clause.isTypeOnly || (!clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings)
+    && clause.namedBindings.elements.length > 0 && clause.namedBindings.elements.every(e => e.isTypeOnly));
+  const visitNode = node => {
+    if (ts.isImportDeclaration(node) && !(node.importClause && typeOnly(node.importClause))) found.push(node.moduleSpecifier.text);
+    else if (ts.isExportDeclaration(node) && node.moduleSpecifier && !node.isTypeOnly) found.push(node.moduleSpecifier.text);
+    else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const arg = node.arguments[0], paths = arg && (literals(arg) ?? urlLiterals(arg));
+      if (paths) found.push(...paths);
+      else bad.push(`${file}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}: dynamic import with a computed path cannot be checked`);
+    }
+    ts.forEachChild(node, visitNode);
+  };
+  visitNode(source);
+  return found;
+}
 const seen = new Map();
+const chain = function* (file) { for (let f = file; f; f = seen.get(f)) yield f; };
 const visit = (file, via) => {
   if (seen.has(file) || exempt.has(file)) return;
   seen.set(file, via);
-  const src = readFileSync(file, "utf8");
-  for (const m of src.matchAll(peer)) bad.push(`${file}: imports ${m[1] ?? m[2]} (reached from ${[...chain(file)].reverse().join(" -> ")})`);
-  for (const m of src.matchAll(local)) if (!m[1]) visit(join(file, "..", m[2] ?? m[3]), file);
+  for (const spec of references(file)) {
+    if (/^@earendil-works\//.test(spec)) bad.push(`${file}: imports ${spec} (reached from ${[...chain(file)].reverse().join(" -> ")})`);
+    else if (spec.startsWith(".")) visit(join(file, "..", spec), file);
+  }
 };
-const chain = function* (file) { for (let f = file; f; f = seen.get(f)) yield f; };
 for (const e of entries) visit(e, undefined);
+if (seen.size < 40) bad.push(`the import walk reached only ${seen.size} files from ${entries.join(", ")}: the walk itself is broken`);
 if (bad.length) { console.error("Forbidden pi imports:\n" + bad.join("\n")); process.exit(1); }
 console.log("imports ok");
