@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { Type } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from '@earendil-works/pi-coding-agent';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
-import { CT, ENV, JT, type MessageBody, type ModelBody } from '../types.ts';
+import { ASK_CUT, CT, ENV, JT, type MessageBody, type ModelBody } from '../types.ts';
 import { readJournalSnapshot } from '../kernel/journal.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { contentHash } from '../kernel/ids.ts';
@@ -197,7 +197,7 @@ export function registerChild(pi: ExtensionAPI): void {
     });
   });
   pi.on('session_shutdown', async () => {
-    active = false; watcher?.close(); blocked?.reject(new Error('Session shut down')); blocked = undefined; await queue;
+    active = false; watcher?.close(); blocked?.reject(new Error(ASK_CUT.shutdown)); blocked = undefined; await queue;
   });
   pi.registerTool({
     name: 'ask', label: 'Ask supervisor', description: 'Ask a question and wait for an answer or steering message.',
@@ -207,11 +207,11 @@ export function registerChild(pi: ExtensionAPI): void {
       const result = new Promise<Delivery>((yes, no) => { resolve = yes; reject = no; });
       // Attach immediately so abort during the queued intake never produces an unhandled rejection.
       void result.catch(() => {});
-      const abort = () => { void serial(async () => { if (blocked?.resolve === resolve) blocked = undefined; reject(new Error('Ask aborted')); }); };
+      const abort = () => { void serial(async () => { if (blocked?.resolve === resolve) blocked = undefined; reject(new Error(ASK_CUT.aborted)); }); };
       signal?.addEventListener('abort', abort, { once: true });
       try {
         await serial(async () => {
-          if (!active || signal?.aborted) throw new Error('Ask aborted');
+          if (!active || signal?.aborted) throw new Error(ASK_CUT.aborted);
           if (blocked) throw new Error('Another question is already blocked');
           const qid = contentHash({ exec, question }), rev = (state.questions.get(qid)?.rev ?? 0) + 1;
           const q = { qid, rev, question }; state.questions.set(qid, q); pi.appendEntry(CT.question, q);

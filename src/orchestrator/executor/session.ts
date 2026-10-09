@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
-import { CT } from "../../types.ts";
+import { ASK_CUT, CT } from "../../types.ts";
 import type { Model } from "../../compat/model.ts";
 
 interface Block { type?: string; text?: string; id?: string; name?: string }
-interface Message { role?: string; content?: string | Block[]; stopReason?: string; errorMessage?: string; toolCallId?: string; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
+interface Message { role?: string; content?: string | Block[]; stopReason?: string; errorMessage?: string; toolCallId?: string; isError?: boolean; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
 export interface SessionEntry {
   type: string; id?: string; customType?: string; data?: Record<string, unknown>; message?: Message;
   provider?: string; modelId?: string; details?: Record<string, unknown>;
@@ -58,6 +58,12 @@ export function receiptId(entry: SessionEntry): string | undefined {
     (entry.type === "custom" && [CT.rejected, CT.withdrawn, CT.model].includes(entry.customType as typeof CT.rejected) ? entry.data?.rid : undefined);
   return typeof rid === "string" ? rid : undefined;
 }
+/** P28: an `ask` result the child wrote because its session shut down or its run was aborted, which is no answer. */
+export function cutAskResult(m: Message | undefined): boolean {
+  if (m?.role !== "toolResult" || !m.isError) return false;
+  const text = typeof m.content === "string" ? m.content : (m.content ?? []).map(b => b.text ?? "").join("");
+  return text === ASK_CUT.shutdown || text === ASK_CUT.aborted;
+}
 /** P9: Derive evidence only after this execution's own launch receipt. */
 export function evidence(entries: SessionEntry[], exec: string) {
   const start = entries.findLastIndex(e => e.type === "custom" && e.customType === CT.exec && e.data?.exec === exec);
@@ -77,7 +83,8 @@ export function evidence(entries: SessionEntry[], exec: string) {
       }
       usage.input += m.usage?.input ?? 0; usage.output += m.usage?.output ?? 0; usage.costUsd += m.usage?.cost?.total ?? 0;
     }
-    if (m?.role === "toolResult" && m.toolCallId) tools.delete(m.toolCallId);
+    // P28: an ask cut off by shutdown or abort keeps an unknown outcome, like one with no result.
+    if (m?.role === "toolResult" && m.toolCallId && !(tools.get(m.toolCallId) === "ask" && cutAskResult(m))) tools.delete(m.toolCallId);
   }
   const budget = segment.some(e => e.type === "custom" && e.customType === CT.budget && e.data?.exec === exec);
   const last = segment.findLast(e => e.message?.role === "assistant")?.message;

@@ -124,6 +124,9 @@ export type Resolution =
 // customType values written by the session agent. All carry details/data as below.
 // ---------------------------------------------------------------------------
 
+/** P28: the errors the child's own `ask` ends with when its session shuts down or its run is aborted. Such a result is
+ *  no answer: recovery treats the ask as cut off while waiting, like one with no result. */
+export const ASK_CUT = { shutdown: "Session shut down", aborted: "Ask aborted" } as const;
 export const CT = {
   admitted: "dsa-admitted",    // custom: { rid, from, sseq, hash, kind } — lifecycle admission record (kernel DecisionRecord)
   exec: "dsa-exec",            // custom: { exec } — start of an execution segment
