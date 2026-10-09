@@ -233,6 +233,8 @@ unchanged, with zero edited lines.
 ```text
 pi-durable-subagents smoke              check this machine and this pi (offline, < 60 s)
 pi-durable-subagents chaos              run the fault suite (offline, about 2 minutes)
+pi-durable-subagents drill failover [--keep] [--json]
+                                        rehearse pool failover in a temporary home (offline, about 15 s)
 pi-durable-subagents status [wid] [--json]
 pi-durable-subagents events <wid> [--json]   the meaningful timeline of one workflow
 pi-durable-subagents events --all [--since <cursor>] [--limit <n>] [--json]
@@ -532,6 +534,17 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   another provider stays there for the rest of its generation (switching back
   mid-task would lose the prompt cache); a follow-up starts on the first
   candidate again. `status` lists each used-up provider with its next try.
+- **Rehearsing failover:** `pi-durable-subagents drill failover` runs the
+  real CLI, orchestrator and subagent pi processes in a temporary home, with
+  two offline providers in a pool: the first refuses with a used-up window
+  (`503 ... No available accounts`), the second answers. It checks, step by
+  step, that a call moves to the second provider, that `status` lists the
+  first with its next try, that a second call starts on the second provider,
+  that after the probe interval (10 s here) the next call probes the first
+  provider and finds it available, and that this call ends on it. Each step
+  prints pass/fail and its time; the exit code is 0 only when all pass. Your
+  home, providers and credentials are not used. `--json` prints the result as
+  one object; `--keep` keeps the temporary directory and prints its path.
 - **Provider slots:** never exceeded, including while a model switch is in
   progress.
 - **Memory:** new subagents wait while memory is short. Running ones are
