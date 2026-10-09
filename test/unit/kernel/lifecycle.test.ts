@@ -118,3 +118,18 @@ test('planning and a mutating domain decider cannot mutate input or lifecycle st
   planDecisions([], [req], (r, state) => { r.body = 'mutated'; (state.admitted as Map<string, unknown>).clear(); return apply(); });
   assert.deepEqual(req, original);
 });
+test('R1: a conflicting duplicate of a resolved rid records nothing and never replaces the resolution', () => {
+  const original = request('req:job', 1, { kind: 'run', body: { spec: 1 } });
+  const records = planDecisions([], [original], apply);
+  assert.deepEqual(records.map(r => r.type), ['admitted', 'applied']);
+  // Same rid, other content (even from another sender): no rejected{identity-conflict}, before or after a restart replay.
+  const duplicates = [request('req:job', 1, { kind: 'run', body: { spec: 2 } }), request('req:job', 4, { from: 'other', kind: 'stop', body: {} })];
+  assert.deepEqual(planDecisions(records, [original, ...duplicates], apply), []);
+  assert.deepEqual(planDecisions(records, duplicates, () => ({ action: 'reject', reason: 'never' })), []);
+  assert.deepEqual(reduceLifecycle(records).resolved.get('req:job'), { type: 'applied', rid: 'req:job' });
+  // While the original is still unresolved the conflict is reported once, as before, and does not resolve it either.
+  const admittedOnly = planDecisions([], [original], defer);
+  const conflict = planDecisions(admittedOnly, duplicates, defer);
+  assert.deepEqual(conflict, [{ type: 'rejected', rid: 'req:job', reason: 'identity-conflict' }]);
+  assert.equal(reduceLifecycle([...admittedOnly, ...conflict]).resolved.has('req:job'), false);
+});

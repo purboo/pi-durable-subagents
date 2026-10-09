@@ -240,6 +240,13 @@ pi-durable-subagents start              start the orchestrator if work is pendin
 pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)
 pi-durable-subagents drain              hold existing workflows: running calls finish, nothing new starts in them
 pi-durable-subagents stop <wid|call>
+pi-durable-subagents run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]
+                                        start a run under a caller-chosen id; safe to retry (see below)
+pi-durable-subagents send --request <id> --to <run-id|wid/key> --kind follow-up|answer|steer|model
+                         [--call <key>] [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]
+pi-durable-subagents stop --request <id> <run-id|wid|wid/key|call> [--json]
+pi-durable-subagents describe --key <run-id> | <wid> [--json]
+                                        full read-only state of one run (never starts the orchestrator)
 pi-durable-subagents stop-all           pause every existing workflow now; journals stay resumable
                                         (runs you start afterwards are not held)
 pi-durable-subagents prune [wid] [--older-than <days>]
@@ -256,6 +263,57 @@ pi-durable-subagents uninstall-service
 The service only runs `start`: it never resumes work you drained or
 stopped. Install the CLI globally (`npm i -g pi-durable-subagents`) before
 `install-service`.
+
+### Driving dsa from a program
+
+A program (a CI job, a script, another agent) should name its requests with
+`--request <id>`: 1–124 characters `[A-Za-z0-9][A-Za-z0-9._:-]*`, unique per
+`DSA_HOME` across `run`, `send` and `stop`. The id is the identity: the first
+submission under an id is decided once and every retry with **the same
+content** gets that first outcome; a retry never starts a second workflow or
+a second follow-up. The run id is also the workflow key: `send --to <run-id>`
+and `describe --key <run-id>` find the workflow without knowing its wid.
+
+The content is hashed into `spec_digest` (the request kind, its body and, for
+answers, the question id and revision). Persist the exact spec bytes you
+submit and retry with those bytes: the run's `cwd` is part of the content
+(`spec.cwd`, else `--cwd`, else the current directory, made absolute), so
+retry from the same place or pass it explicitly. The `spec` file is the
+`subagents` tool's run form (`{agent, task, model?, schema?, …}` or
+`{tasks: […], name?, usageBudget?, maxCalls?}`); `context: "fork"` needs a pi
+session and is rejected.
+
+| exit | meaning | `--json` reply |
+| --- | --- | --- |
+| 0 | decided and applied (a retry gets the same answer) | run: `{request, wid, created, spec_digest}`; send/stop: `{request, applied, generation?, call?, spec_digest}` |
+| 1 | decided and rejected (`reason`), or a usage error | `{request, applied: false, reason, spec_digest}` |
+| 3 | `request-conflict`: the id already names other content; nothing was sent | `{request, error, wid?, spec_digest, state}` (the original's digest and state) |
+| 75 | submitted but not decided in `--wait-ms` (default 60 s); retry with the same id | `{request, pending: true}` |
+
+`created` is false when the id had already been decided before the command
+ran. A conflicting id stays conflicting forever, also after `prune`: the
+tombstone keeps the final status, the id and the digest.
+
+`describe` reports one of `absent` (never seen), `pending` (submitted, not
+decided — typically no orchestrator is running; `start` or a retry starts it),
+`rejected` (with `reason`), `running`, `asking` (open questions with their
+full text, `qid`, `rev` and the `to` address to answer), `sealed` (finished:
+`status` plus every call's unclipped `output`, `error` and schema `data`) or
+`pruned` (`pruned: {status, endedAt}`), with `wid`, `request` and
+`spec_digest`. Live calls also show what they wait for (slot, writer lock,
+lease, exhausted provider) and the last fence of their execution
+(`lastFence: {at, exec, reason}`); the reason is a best-effort reading of the
+journals: `restart-force` when a forced restart listed the execution,
+`orchestrator-crash` when the orchestrator died uncleanly while it ran, else
+`process-died`.
+
+```sh
+pi-durable-subagents run --request build-42 --spec build-42.json --json
+# exit 75: retry later with the same id and bytes
+pi-durable-subagents describe --key build-42 --json
+pi-durable-subagents send --request build-42-a1 --to build-42 --kind answer \
+  --qid <qid> --rev <rev> --message "yes"
+```
 
 ### Housekeeping
 

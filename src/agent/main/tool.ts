@@ -26,6 +26,7 @@ export const parameters = Type.Object({
   full: Type.Optional(Type.Boolean({ description: "status: with wid, the complete workflow detail including every output." })),
   force: Type.Optional(Type.Union([Type.String(), Type.Boolean()], { description: "restart: the token shown by a refusal. Show the user the list and obtain explicit approval first; boolean true is refused. Subagents cannot force a restart." })),
   reason: Type.Optional(Type.String({ description: "restart: non-empty reason, at most 500 characters; required with force." })),
+  request: Type.Optional(Type.String({ description: "run/send/stop: your own request id (1-124 chars [A-Za-z0-9][A-Za-z0-9._:-]*) making a retry safe: the same id with the same content gets the first outcome; other content is refused (request-conflict)." })),
 }, { additionalProperties: true });
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
@@ -44,6 +45,14 @@ function call(value: unknown, cwd: string, where: string): CallSpec {
   if (typeof spec.cwd === "string") spec.cwd = resolve(cwd, spec.cwd);
   return spec as unknown as CallSpec;
 }
+/** v12 §2: Reject unknown explicit call agents before starter or outbox publication; scripts remain call-local. Shared by
+ *  the tool and the CLI `run --request` (R2). */
+export function checkAgents(body: RunBody, available: () => string[]): void {
+  const names = [...(body.call ? [body.call] : []), ...(body.tasks ?? []), ...(body.chain ?? [])].map(call => call.agent);
+  if (!names.length) return;
+  const known = available(), unknown = [...new Set(names.filter(name => !known.includes(name)))];
+  if (unknown.length) throw new Error(`Unknown agent${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. Available agents: ${known.join(", ") || "(none)"}`);
+}
 /** v12 §2: Infer unambiguous runs and normalize controls into unchanged wire bodies. */
 /** P12: a send naming a model is answered with that model and when it applies — `next-request` (a running call switches
  *  at its next provider request), `next-execution` (a call with no live execution launches on it) or `next-generation`
@@ -59,7 +68,7 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   const action = args.action === undefined && launchForms.filter(Boolean).length === 1 ? "run" : args.action;
   if (typeof action !== "string" || !action) throw new Error("action is required: run, agents, send, stop, revise, status, resume, drain, restart");
   if (action === "run") {
-    const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, by: _by, ...spec } = args;
+    const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, by: _by, request: _request, ...spec } = args;
     const choices = [workflow, source, tasks, chain, spec.agent === undefined && spec.task === undefined ? undefined : spec];
     if (choices.filter(v => v !== undefined).length !== 1) throw new Error("run requires exactly one of workflow, source, tasks, chain, or agent/task");
     // A top-level cwd on a workflow/tasks/chain/source run is the run's directory: relative paths (the workflow file,
