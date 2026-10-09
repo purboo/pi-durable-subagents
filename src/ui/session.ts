@@ -64,8 +64,8 @@ export function thoughtSummary(text: string): string {
   if (headings.length) return (headings.at(-1)![1] ?? headings.at(-1)![2]!).trim();
   return lastSentence(text);
 }
-const STOPS = new Set([...".!?。！？"]);
-/** The last match of /[^.!?。！？]+[.!?。！？](?=\s|$)/gu without the regex: a long thought with no sentence end made
+const STOPS = new Set([...".!?\u3002\uff01\uff1f"]);
+/** The last match of /[^.!?\u3002\uff01\uff1f]+[.!?\u3002\uff01\uff1f](?=\s|$)/gu without the regex: a long thought with no sentence end made
  *  that regex retry from every position (quadratic), which stalled pi's startup on long histories. Such a match is a
  *  whole run of non-stop characters followed by one stop that ends the text or precedes whitespace. */
 function lastSentence(text: string): string {

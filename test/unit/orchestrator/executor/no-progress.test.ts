@@ -132,12 +132,12 @@ test("provider evidence uses only the segment's last assistant error", () => {
   assert.equal(evidence([receipt, error], "e").error, error.message.errorMessage);
   assert.equal(evidence([error, receipt], "e").error, undefined);
   assert.equal(evidence([receipt, error, { type: "message", message: { role: "assistant", stopReason: "stop" } }], "e").error, undefined);
-  for (const text of ["402", "insufficient_quota", "insufficient balance", "insufficient funds", "billing disabled", "credit balance low", "余额不足"])
+  for (const text of ["402", "insufficient_quota", "insufficient balance", "insufficient funds", "billing disabled", "credit balance low", "\u4f59\u989d\u4e0d\u8db3"])
     assert.equal(fatalProviderError(text), true, text);
-  for (const text of ["429 rate limit", "529 overloaded", "ECONNRESET", "timeout", "quota remaining: 42", "quota exceeded", "usage limit", "额度不足"])
+  for (const text of ["429 rate limit", "529 overloaded", "ECONNRESET", "timeout", "quota remaining: 42", "quota exceeded", "usage limit", "\u989d\u5ea6\u4e0d\u8db3"])
     assert.equal(fatalProviderError(text), false, text);
   for (const text of ['503 {"error":{"message":"No available accounts: no available accounts","type":"api_error"}}', "You have reached your usage limit", "quota exceeded",
-    "quota exhausted", "You exceeded your current usage quota", "5-hour limit reached ∙ resets 3pm", "额度已用完"])
+    "quota exhausted", "You exceeded your current usage quota", "5-hour limit reached ∙ resets 3pm", "\u989d\u5ea6\u5df2\u7528\u5b8c"])
     assert.equal(quotaExhausted(text), true, text);
   for (const text of ["429 rate limit", "Request timed out.", "Anthropic stream ended without a stop reason", "402 insufficient_quota", "quota remaining: 42",
     "You exceeded your current quota, please check your plan and billing details."])

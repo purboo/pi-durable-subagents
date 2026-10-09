@@ -378,8 +378,8 @@ test("typing a message with the list open closes the list and hands the text to 
   const screen = new SubagentScreen(data, new UiActions({ home: data.home, submit: async () => ({}), presentNote() {} }),
     { ...ctx, ui: { pasteToEditor: (text: string) => { pasted.push(text); } } } as unknown as typeof ctx, tui, theme, () => { closed = true; }, state());
   screen.render(100); screen.handleInput("\x1b[B");
-  screen.handleInput("刚");
-  assert.equal(closed, true); assert.deepEqual(pasted, ["刚"]);
+  screen.handleInput("\u521a");
+  assert.equal(closed, true); assert.deepEqual(pasted, ["\u521a"]);
 });
 
 test("a multi-line command or name never breaks the frame: every rendered line is one line of the full width", () => {

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.26
+
+- A daily quota message in Chinese ("remaining quota is 0, resets at 00:00 the
+  next day") is a used-up usage window: a pool call moves to its next candidate
+  and a single-model call waits, instead of failing at once as a balance error
+  (the word for "balance" occurs inside "remaining quota"). Checked against the 7,941 provider errors
+  recorded on a working machine: this was the only usage-window text misread,
+  and no rate limit or transient error is read as one.
+- `answered.by` is `call:<wid>/<key>` for a subagent answering through the CLI
+  (the CLI now sends its `DSA_CALL` as `caller`). The caller is provenance and
+  not part of `spec_digest`: retrying a request id with or without it is the
+  same request. A pi session still running an older extension computes the
+  digest with the caller included and would see such a retry as a conflict.
+- Tests: an end-to-end pool failover through the CLI and a detached
+  orchestrator; the effects fixtures use a unique workflow id, since gate
+  processes are found by tag across the whole machine and parallel test files
+  shared one; the CI runner also reruns files reported in nested tests.
+
 ## 1.0.25
 
 - `restart` refusals show what a fence would cut short: each lease a running

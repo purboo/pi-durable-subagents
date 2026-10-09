@@ -99,7 +99,7 @@ class IdleEvaluator implements EvaluatorTransport {
   async start() {} send() {} async close() {}
 }
 test("E3 an overlong (32 CJK chars) input name is a deterministic pin failure, never an intake crash", async t => {
-  const f = await fixture(t), input = join(f.home, "input.txt"), name = "输".repeat(32);
+  const f = await fixture(t), input = join(f.home, "input.txt"), name = "\u8f93".repeat(32);
   await writeFile(input, "data");
   const req = f.run("cjk", { source: "return 1;", inputs: { [name]: input } });
   await f.store.stage(req, f.discovery); await f.store.stage(req, f.discovery);
