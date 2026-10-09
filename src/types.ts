@@ -92,7 +92,7 @@ export type RequestKind =
   // to orchestrator from main/cli
   | "run" | "send" | "stop" | "revise" | "resume" | "drain" | "prune" | "restart"
   // orchestrator to child (forwarded or own)
-  | "task" | "steer" | "follow-up" | "answer" | "model" | "continue" | "withdraw"
+  | "task" | "steer" | "notify" | "follow-up" | "answer" | "model" | "continue" | "withdraw"
   // evaluator to orchestrator
   | "call" | "emit";
 
@@ -203,8 +203,10 @@ export interface RunBody {
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
 export interface SendBody {
   to: CallId | `${Wid}/${string}`;
-  /** steer: next boundary (interrupts between turns); follow-up: only after the current run settles; answer; model. */
-  kind: "steer" | "follow-up" | "answer" | "model";
+  /** steer: next boundary (interrupts between turns); follow-up: only after the current run settles; answer; model.
+   *  notify: like a steer on a running call, held while the call waits on its question; on a sealed call (or one that
+   *  seals before it is delivered) a pending note (workflow journal `pending-note`) that the next follow-up carries. */
+  kind: "steer" | "notify" | "follow-up" | "answer" | "model";
   message?: string;
   /** "provider/id[:thinking]". */
   model?: string;
@@ -238,7 +240,7 @@ export type RestartInitiator = { call: string } | { origin: string } | { cli: { 
 export interface RestartBody { token?: string; reason?: string; initiator?: RestartInitiator }
 
 // Request bodies addressed to a child (to: CallId), written by the orchestrator (own requests or P7 forwards).
-/** kinds "task" | "steer" | "follow-up" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */
+/** kinds "task" | "steer" | "notify" | "follow-up" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */
 export interface MessageBody { message: string }
 /** kind "model": parsed from "provider/id[:thinking]" by the orchestrator. */
 /** `exec`: only that execution may apply it (a failover's switch); a later execution of the call rejects it as

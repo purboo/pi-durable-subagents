@@ -3,7 +3,8 @@
 // recorded (until resume); workflows created after it run normally.
 // Workflow entries: ev {n}; call {pos,key,gen,spec,fingerprint}; refused {pos,key,spec,fingerprint,reason};
 // reused {pos,key,gen,spec,fingerprint,from}; exposed {pos}; value {n,kind,value};
-// generation{rid,key,gen,from,spec,revision,opening} is a send resolution outside the script;
+// generation{rid,key,gen,from,spec,revision,opening,notes?} is a send resolution outside the script (notes: the pending
+// notes its opening carries, see notes.ts); pending-note{rid,call,key,message} records a notify for a sealed call;
 // its seal has a finished attention independent of workflow completion.
 // resumed {rid,n} supersedes a terminal park. emit {pos,value} records script outputs.
 // stop-requested {rid,call?} marks a call or workflow stop as taking effect, so its replay is applied, not already-sealed.
@@ -34,6 +35,7 @@ import { WaitTracker, waitCollector, startWaiting, type WaitSeed } from '../even
 import { readPage } from '../events/log.ts';
 import { eventsLog } from '../paths.ts';
 import { parseModel } from '../compat/model.ts';
+import { PENDING_NOTE, pendingNotes, unsettledNotify, withNotes } from './notes.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
 const charged = (u?: { input: number; output: number; costUsd: number }) => u && (u.input || u.output || u.costUsd) ? formatUsage(u) : undefined;
@@ -333,6 +335,7 @@ export class Engine {
       const from = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
       const seal = wf.journal.entries().find(e => e.type === JT.sealed && e.call === from);
       if (seal && send.kind === 'steer') return { action: 'reject', reason: `finished:${(seal.result as CallResult).status} — use kind "follow-up" to continue it` };
+      if (send.kind === 'notify') return this.notify(req, wf, entry, from, seal !== undefined);
       // A pool's name is a model too: the call keeps the pool, and its order and failover apply to the new generation.
       const pools = this.ledgers.config.pools, pool = send.model !== undefined && pools && Object.hasOwn(pools, send.model);
       if (send.kind === 'follow-up' && send.model !== undefined && !pool) {
@@ -340,11 +343,18 @@ export class Engine {
         catch { return { action: 'reject', reason: 'unknown-model' }; }
       }
       if (seal && send.kind === 'follow-up') {
+        // Pending notes ride on the opening message, recorded in the same entry (consumed exactly once). A notify whose
+        // fate the seal has not settled yet may still become a note: wait for it.
+        const log = revisionEntries(wf);
+        if (unsettledNotify(log, from)) return { action: 'defer' };
+        const notes = pendingNotes(log, String(entry.key));
         const gen = Math.max(0, ...wf.journal.entries().filter(e => ['call', 'generation'].includes(e.type) && e.key === entry.key).map(e => Number(e.gen))) + 1;
         // A follow-up's model replaces the continued session's for this generation and those continuing it.
         const spec = send.model !== undefined ? { ...(entry.spec as CallSpec), model: send.model } : entry.spec;
         if (send.model !== undefined) await this.note(req.rid, send.model, 'next-generation');
-        const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message: send.message ?? '' }, ...(send.model !== undefined && !pool ? { model: send.model } : {}) });
+        const message = withNotes(notes.map(n => String(n.message)), send.message ?? '');
+        const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message },
+          ...(notes.length ? { notes: notes.map(n => String(n.rid)) } : {}), ...(send.model !== undefined && !pool ? { model: send.model } : {}) });
         this.dispatchGeneration(wf, opened); return { action: 'apply' };
       }
       // A follow-up naming a model, queued on unfinished work: the executor records its model request with the message.
@@ -508,6 +518,24 @@ export class Engine {
       if (error instanceof Error && error.name === 'ExecutorShutdown') return;
       this.background(async () => { throw error; });
     });
+  }
+  /** A notify: forwarded to a running call (the executor says steered or held-until-answer); for a sealed call, or one
+   *  that sealed before the forward was recorded, a pending note in the workflow journal (`noted`). A replay finds its
+   *  note or forward and applies again without a second one. */
+  private async notify(req: Request, wf: Workflow, entry: Entry, from: string, sealed: boolean): Promise<Decision> {
+    const message = (req.body as SendBody).message;
+    if (typeof message !== 'string' || !message) return { action: 'reject', reason: 'malformed: notify needs a message' };
+    if (!revisionEntries(wf).some(e => e.type === PENDING_NOTE && e.rid === req.rid)) {
+      if (!sealed) {
+        const decision = await this.executor.forward(req, this.context(wf, entry));
+        if (!(decision.action === 'reject' && decision.reason === 'call-sealed')) return decision;
+      }
+      // Notes keep the order they were accepted in: one forwarded earlier becomes a note first.
+      if (unsettledNotify(revisionEntries(wf), from)) return { action: 'defer' };
+      await wf.journal.append(PENDING_NOTE, { rid: req.rid, call: from, key: entry.key, message });
+    }
+    if (!this.ledgers.orch.entries().some(e => e.type === 'send-note' && e.rid === req.rid)) await this.ledgers.orch.append('send-note', { rid: req.rid, delivery: 'noted' });
+    return { action: 'apply' };
   }
   /** The reply to a send that names a model says which model and when it applies (orchestrator ledger `send-note`). */
   private async note(rid: string, model: string, effect: string): Promise<void> {
