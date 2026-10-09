@@ -32,6 +32,26 @@ test("quota-class errors are told apart from billing errors and transient ones",
     assert.ok(!quotaExhausted(text) && !fatalProviderError(text), text);
 });
 
+// Texts real providers returned on the maintainer's machine (ids redacted).
+test("real provider errors: daily windows fail over, rate and concurrency limits do not", () => {
+  for (const text of [
+    '503 {"error":{"message":"No available accounts: no available accounts","type":"api_error"},"type":"error"}',
+    // A daily window, not a balance: 剩余额度 contains 余额, but the quota resets at midnight.
+    '{"error":{"message":"您的2026-10-02额度已使用完毕，当前剩余额度为 0。额度将于次日 00:00:00自动重置。如需申请提额：https://credit.example/apply","type":"payment_required"},"type":"error"}',
+  ]) assert.ok(quotaExhausted(text) && !fatalProviderError(text), text);
+  assert.ok(fatalProviderError("账户余额不足") && fatalProviderError("余额不足，当前剩余额度为 0"), "a balance is still terminal");
+  for (const text of [
+    "rate_limit_exceeded: 您的账户已达到速率限制，请您控制请求频率[0123456789abcdef]",
+    "rate_limit_exceeded: App:**0000在模型:deepseek-v4-flash每分钟请求次数超过限制",
+    "gateway_concurrency_limit: Concurrency limit exceeded for user, please retry later (rate limit)",
+    'friday API error (429): {"message":"Too many concurrent responses create requests; global concurrency limit reached (96/96)","type":"rate_limit_error","param":null,"code":"request_rate_limited"}',
+    '429 {"error":{"message":"Upstream rate limit exceeded, please retry later","type":"rate_limit_error"},"type":"error"}',
+    'sota API error (404): {"message":"Model \\"gpt-6-astra-fast\\" is not supported by any configured account in this group","type":"model_not_found"}',
+    'sota API error (503): {"message":"Service temporarily unavailable","type":"api_error"}',
+    "server_error: Scheduler unavailable",
+  ]) assert.ok(!quotaExhausted(text) && !fatalProviderError(text), text);
+});
+
 test("the session's model is pi's: the last model change or assistant message", () => {
   const change = { type: "model_change", provider: "qa", modelId: "m" };
   const answer = (provider: string) => ({ type: "message", message: { role: "assistant", provider, model: "m" } });
