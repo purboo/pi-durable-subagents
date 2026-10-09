@@ -1,5 +1,5 @@
-import { open, mkdir } from 'node:fs/promises';
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { open, mkdir, type FileHandle } from 'node:fs/promises';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Entry, JournalHandle } from '../types.ts';
 
@@ -68,22 +68,55 @@ export function readJournalSnapshot(path: string): Entry[] {
     return entries as Entry[];
   } finally { closeSync(fd); }
 }
-/** A1, C11: Repair only the tail, then serialize durable framed appends. */
+/** How long a resting journal keeps its descriptor after its last append (a burst of appends opens it once). */
+export const JOURNAL_REST_MS = 1000;
+let descriptors = 0, appends = 0;
+/** Appends committed by this process to any journal: a fold over journal entries only can be reused while it stays. */
+export function journalAppends(): number { return appends; }
+/** Journal descriptors this process holds open now (handles opened by openJournal, resting ones excluded). */
+export function openJournalDescriptors(): number { return descriptors; }
+/** A1, C11: Repair only the tail, then serialize durable framed appends. A resting handle (`resting = true`) closes its
+ *  descriptor once its appends are done and reopens it for the next append; its entries stay in memory. */
 export async function openJournal(path: string): Promise<JournalHandle> {
   await mkdir(dirname(path), { recursive: true });
   let created = false;
-  const file = await open(path, 'ax+').then(f => { created = true; return f; }, async error => {
+  const first = await open(path, 'ax+').then(f => { created = true; return f; }, async error => {
     if (error.code !== 'EEXIST') throw error;
     return open(path, 'a+');
   });
-  let entries: Entry[];
+  let entries: Entry[], size: number;
   try {
-    const bytes = await file.readFile(), decoded = decode(bytes);
-    entries = decoded.entries;
-    if (decoded.length !== bytes.length) { await file.truncate(decoded.length); await file.sync(); }
-    if (created) { await file.sync(); await syncDirectory(dirname(path)); }
-  } catch (error) { await file.close(); throw error; }
+    const bytes = await first.readFile(), decoded = decode(bytes);
+    entries = decoded.entries; size = decoded.length;
+    if (decoded.length !== bytes.length) { await first.truncate(decoded.length); await first.sync(); }
+    if (created) { await first.sync(); await syncDirectory(dirname(path)); }
+  } catch (error) { await first.close(); throw error; }
+  let file: FileHandle | undefined = first;
+  descriptors++;
   let queue: Promise<unknown> = Promise.resolve(), closed = false, failed: unknown, view: Entry[] | undefined;
+  let resting = false, restTimer: ReturnType<typeof setTimeout> | undefined;
+  // Only this process writes the file (A2): a reopened file that is not exactly what was committed was changed by
+  // someone else, and appending to it could interleave records.
+  const reopen = async (): Promise<FileHandle> => {
+    if (file) return file;
+    const f = await open(path, constants.O_WRONLY | constants.O_APPEND);
+    try { const now = (await f.stat()).size; if (now !== size) throw new Error(`Journal changed while closed: ${path} has ${now} bytes, ${size} committed`); }
+    catch (error) { await f.close(); throw error; }
+    descriptors++;
+    return file = f;
+  };
+  const release = async () => {
+    if (!file || !resting || closed) return;
+    const f = file; file = undefined; descriptors--;
+    await f.close().catch(error => console.error(`durable-subagents: closing resting journal ${path} failed: ${String(error)}`));
+  };
+  const unwritten = new WeakSet<object>();
+  const rest = () => {
+    if (restTimer) { restTimer.refresh(); return; }
+    if (!resting || closed || !file) return;
+    restTimer = setTimeout(() => { restTimer = undefined; queue = queue.then(release); }, JOURNAL_REST_MS);
+    restTimer.unref?.();
+  };
   const handle: JournalHandle = {
     path,
     // Shared frozen view, rebuilt only after an append (entries are immutable, see freeze()).
@@ -98,18 +131,33 @@ export async function openJournal(path: string): Promise<JournalHandle> {
       const operation = queue.then(async () => {
         if (failed) throw failed;
         const entry = { ...frozen, seq: entries.length + 1, ts: Date.now(), type } as Entry<T>;
-        const json = JSON.stringify(entry), bytes = Buffer.from(json);
-        await file.writeFile(`${crc32(bytes)} ${json}\n`);
-        await file.sync();
-        entries.push(freeze(JSON.parse(json))); view = undefined;
+        const json = JSON.stringify(entry), bytes = Buffer.from(json), line = `${crc32(bytes)} ${json}\n`;
+        let target: FileHandle;
+        try { target = await reopen(); }
+        catch (error) { unwritten.add(error as object); throw error; }
+        await target.writeFile(line);
+        await target.sync();
+        size += Buffer.byteLength(line);
+        entries.push(freeze(JSON.parse(json))); view = undefined; appends++;
+        rest();
         try { handle.onAppend?.(); } catch (error) { console.error(`durable-subagents: journal listener failed: ${String(error)}`); }
         return structuredClone(entry);
       });
-      queue = operation.catch(error => { failed = error; });
+      // A failed reopen wrote nothing: the next append tries again. A failed write or sync leaves the file unknown.
+      queue = operation.catch(error => { if (!(error && typeof error === 'object' && unwritten.has(error))) failed = error; });
       return operation;
     },
-    async close() { if (closed) return; closed = true; await queue; await file.close(); },
+    async close() {
+      if (closed) return; closed = true; clearTimeout(restTimer); await queue;
+      if (file) { const f = file; file = undefined; descriptors--; await f.close(); }
+    },
     get closed() { return closed; },
+    get resting() { return resting; },
+    set resting(value: boolean) {
+      resting = value;
+      if (value) rest(); else { clearTimeout(restTimer); restTimer = undefined; }
+    },
+    get descriptorOpen() { return file !== undefined; },
   };
   return handle;
 }

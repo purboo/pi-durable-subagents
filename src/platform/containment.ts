@@ -56,11 +56,14 @@ export class Containment implements Contract {
     const all = await this.table.list(execs, options);
     for (const p of all) if (p.tag !== undefined) execs.add(p.tag);
     const result = new Map<ExecId, ProcInfo[]>(), liveStarts = new Map(all.map(p => [p.pid, p.start]));
+    const tagged = new Set(all.map(p => p.tag));
     for (const exec of execs) {
       // Historical identities cannot select an absent/reused pid. Avoid allocating a string/Set entry for each one.
       const ids = new Set<string>();
       for (const group of [known.get(exec) ?? [], this.launched.get(exec) ?? []])
         for (const p of group) if (p.start !== "" && liveStarts.get(p.pid) === p.start) ids.add(identity(p));
+      // Nothing tagged and no live identity selects nothing: skip the table walks (most execs of a sweep are history).
+      if (!ids.size && !tagged.has(exec)) { result.set(exec, []); continue; }
       const selected = new Map(all.filter(p => p.tag === exec || ids.has(identity(p))).map(p => [p.pid, p]));
       let changed = true;
       while (changed) {

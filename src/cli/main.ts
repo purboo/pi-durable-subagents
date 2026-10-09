@@ -8,6 +8,7 @@ import { dsaHome } from "../paths.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger } from "../paths.ts";
 import { allWorkflows, eventsFromEntries, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, compactWorkflow } from "../orchestrator/snapshot.ts";
+import { statsLine } from "../orchestrator/stats.ts";
 import { resolution, start, startOrchestrator, submit, type Control } from "./control.ts";
 import { doctor, renderDoctor, size } from "./doctor.ts";
 import { smoke } from "./smoke.ts";
@@ -76,7 +77,7 @@ export function renderView(view: StatusView): string {
     ...w.attention.map(a => `  ${a.kind}: ${JSON.stringify(a.text.split("\n")[0])}`)].join("\n"));
   if (view.paused) lines.unshift(`${view.paused} (pi-durable-subagents resume)`);
   if (view.olderFinished) lines.push(`(+${view.olderFinished} older finished workflows; status <wid> shows one in detail)`);
-  const footer = [view.slots?.length ? `slots: ${view.slots.join(", ")}` : "", view.config ? `config: ${view.config}` : "", view.configRejected ? `config.json rejected: ${view.configRejected}` : "", view.orchestrator ? `orchestrator: ${view.orchestrator}` : "", ...(view.leases ?? []).map(l => `lease: ${l}`), ...(view.exhausted ?? []), view.versionNote ? `note: ${view.versionNote}` : ""].filter(Boolean);
+  const footer = [view.slots?.length ? `slots: ${view.slots.join(", ")}` : "", view.config ? `config: ${view.config}` : "", view.configRejected ? `config.json rejected: ${view.configRejected}` : "", view.orchestrator ? `orchestrator: ${view.orchestrator}` : "", view.orchestratorStats ? `orchestrator: ${statsLine(view.orchestratorStats)}` : "", ...(view.leases ?? []).map(l => `lease: ${l}`), ...(view.exhausted ?? []), view.versionNote ? `note: ${view.versionNote}` : ""].filter(Boolean);
   if (!lines.length) lines.push("No workflows");
   return [...lines, ...footer].join("\n");
 }

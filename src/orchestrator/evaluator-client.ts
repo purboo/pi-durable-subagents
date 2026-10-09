@@ -11,6 +11,8 @@ import type { Ledgers } from './contract.ts';
 import { scriptLogPath } from './snapshot.ts';
 
 const LOG_LIMIT = 1 << 20, LOG_LINE = 8192, LOG_FULL = '[script.log limit (1 MiB) reached; further console output is dropped]\n';
+/** The process scan of an evaluator host that runs no script (see start). */
+const IDLE_SCAN_MS = 60_000;
 const LOG_FULL_BYTES = Buffer.byteLength(LOG_FULL);
 
 export interface EvaluatorTransport {
@@ -29,6 +31,8 @@ export class EvaluatorClient implements EvaluatorTransport {
   private stopping = false;
   private logs: Promise<void> = Promise.resolve();
   private logSizes = new Map<string, number>();
+  /** Workflows whose script the host runs now (started, not stopped, done or failed). */
+  private scripts = new Set<string>();
   constructor(ledgers: Ledgers) { this.ledgers = ledgers; }
   /** P10/P11: Persist one script console line per log event; diagnostics never fail the orchestrator. */
   private log(line: string) {
@@ -88,13 +92,20 @@ export class EvaluatorClient implements EvaluatorTransport {
     child.stdin.on('error', died);
     createInterface({ input: child.stderr }).on('line', line => this.log(line));
     createInterface({ input: child.stdout }).on('line', line => {
-      try { message(JSON.parse(line) as EvalToOrch); } catch (error) { died(error); }
+      try {
+        const parsed = JSON.parse(line) as EvalToOrch;
+        if (parsed.t === 'done' || parsed.t === 'error') this.scripts.delete(parsed.wid);
+        message(parsed);
+      } catch (error) { died(error); }
     });
     void child.exited.then(died, died);
-    let scanning = false;
+    let scanning = false, scanned = -Infinity;
+    this.scripts.clear();
     this.timer = setInterval(() => {
-      if (scanning) return;
-      scanning = true;
+      // Scripts run in vm contexts of worker threads and cannot start processes; the host itself starts none. While no
+      // script runs the scan only confirms that, so it runs every IDLE_SCAN_MS instead of every tracker period.
+      if (scanning || (!this.scripts.size && performance.now() - scanned < IDLE_SCAN_MS)) return;
+      scanning = true; scanned = performance.now();
       this.scan = (async () => {
         const found = await this.containment.scan(new Map([[exec, known]]));
         for (const process of found.get(exec) ?? []) {
@@ -108,6 +119,8 @@ export class EvaluatorClient implements EvaluatorTransport {
   /** V3, P10: Send only through the current host's ordered input stream. */
   send(message: OrchToEval): void {
     if (!this.child || this.stopping) throw new Error('Evaluator unavailable');
+    if (message.t === 'start') this.scripts.add(message.wid);
+    else if (message.t === 'stop') this.scripts.delete(message.wid);
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
   /** A2: Stop tracking and prove retirement before releasing journal authority. */
