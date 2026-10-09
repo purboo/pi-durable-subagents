@@ -150,7 +150,9 @@ has one entry per target (`targets`, plus a `summary` line each). With
 sent as `<id>:<i>`, so a retry with the same list gets the same outcomes and
 sends nothing twice. Each of those requests records the whole list, so another
 message, another list (longer, shorter or reordered) or a single send under
-that id is a `request-conflict`, and nothing of it is sent.
+that id is a `request-conflict`, and nothing of it is sent. The list is compared
+as written: retry with the same addresses (the same run id or `wid/key` form),
+or the retry is a conflict too.
 
 `notify` is new in 1.0.28: after upgrading, restart the orchestrator
 (`pi-durable-subagents restart` or the tool's restart action) before using it.
@@ -525,7 +527,7 @@ resume, revise, stop or prune reopens it as needed. `status` and `doctor`
 show what the running orchestrator costs on one line,
 
 ```text
-orchestrator: 3 live / 190 workflows, 3 journals open, 0.4 passes/s, read 12 MB
+orchestrator: 1.0.28 (pid 4242) · 3 live / 190 workflows, 3 journals open, 0.4 passes/s, read 12 MB
 ```
 
 and `status --json` / `doctor --json` carry it as `orchestratorStats`:

@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.0.28
+
+- Lower orchestrator cost. A finished workflow's journal is closed about a
+  second after its last write and reopened on demand, so finished workflows
+  cost nothing while nothing touches them (before: one open file and periodic
+  work per workflow ever run). Live calls now look only at session entries
+  appended since the last check instead of rescanning the whole session every
+  second, and the process scan indexes the process table once per pass.
+  Measured in an isolated home: idle with 300 finished workflows about 0.006
+  core (was 0.03); 3 live calls with 20 MB sessions about 0.03 core (was 0.07,
+  growing with session size).
+- `status --json` and `doctor --json` include `orchestratorStats` (workflows,
+  live workflows, open journals, intake passes per second, bytes read); text
+  `status` shows it on one line.
+- `send kind:"notify"` tells a call a decision without disturbing it: a
+  running call gets it at its next safe point (`steered`), a call waiting on
+  its question gets it after the answer (`held-until-answer`), and a call that
+  is not running starts nothing: the note is recorded (`noted`) and its next
+  follow-up opens with every pending note, once. Restart the orchestrator after
+  upgrading before using it; an older orchestrator makes the client refuse it.
+- `to` may list several calls for `steer`, `notify`, `follow-up` and `model`
+  (CLI: repeated `--to`); each target is decided on its own and the reply has
+  one entry per target. A retry with the same request id and list is
+  idempotent; another list under that id is a `request-conflict`.
+- `hold <name> --slots N -- <cmd>` is a counted lease: at most N holders at a
+  time, FIFO, with the same release and visibility as other leases;
+  `leases`, `status` and restart refusals show `held k/N`. A granted ticket is
+  never treated as blocked afterwards.
+- `pi-durable-subagents drill failover` rehearses pool failover in an isolated
+  home with a scripted provider (about 30 s, offline): a call moves from a
+  used-up provider to the next candidate, new calls avoid the provider, and it
+  is used again after a probe. Interrupting it cleans up.
+- `events <wid>` names the target model of a model switch, and `failover:` the
+  provider it left when the switch was a failover.
+- `run`: with `tasks`/`chain`, a top-level `agent` is the default agent of
+  every step. A run reply names calls that start queued behind another call's
+  writer lock (`writerWait`).
+- `status`: run labels show on each workflow line and in the list.
+  `status <wid>` takes `tail: N` and `grep: "<regex>"` (CLI `--tail`,
+  `--grep`) to return just the last or matching lines of each call's result.
+
 ## 1.0.27
 
 - `hold --no-wait` (or `--max-wait 0`) takes the lease at once or exits 75

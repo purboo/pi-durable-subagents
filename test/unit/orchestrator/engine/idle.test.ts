@@ -156,7 +156,7 @@ test('status and doctor show the stats of the running orchestrator only', async 
   const stats = { pid: process.pid, at: Date.now(), workflows: 190, liveWorkflows: 3, openJournals: 3, passesPerSecond: 0.4, readBytes: 12e6 };
   await writeStats(home, stats);
   assert.deepEqual(statusView(home).orchestratorStats, stats);
-  assert.match(renderView(statusView(home)), /^orchestrator: 3 live \/ 190 workflows, 3 journals open, 0\.4 passes\/s, read 12 MB$/m);
+  assert.match(renderView(statusView(home)), /^orchestrator: 0\.0\.0 \(pid \d+\)[^\n]* · 3 live \/ 190 workflows, 3 journals open, 0\.4 passes\/s, read 12 MB$/m);
   const report = await doctor(home);
   assert.deepEqual(report.orchestratorStats, stats);
   assert.match(renderDoctor(report), /orchestrator: .*; 3 live \/ 190 workflows/);
