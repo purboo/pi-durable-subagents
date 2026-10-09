@@ -59,6 +59,9 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   // v12 §2: Infer run only when one launch form is present; never guess a control verb.
   // A top-level agent without a task beside tasks/chain is the steps' default agent, not a launch form of its own.
   const listRun = args.tasks !== undefined || args.chain !== undefined;
+  // A task beside tasks/chain is refused with what to do, before the launch form is inferred (with or without action).
+  if ((args.action === undefined || args.action === "run") && listRun && args.task !== undefined)
+    throw new Error(`task cannot be set beside ${args.tasks !== undefined ? "tasks" : "chain"}: agent+task is a single call; give each step its own task (a top-level agent alone is the default agent of every step)`);
   const launchForms = [args.task !== undefined || args.agent !== undefined && !listRun, args.tasks !== undefined,
     args.chain !== undefined, args.workflow !== undefined, args.source !== undefined];
   const action = args.action === undefined && launchForms.filter(Boolean).length === 1 ? "run" : args.action;
@@ -66,7 +69,6 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   if (action === "run") {
     const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, labels, by: _by, request: _request, ...spec } = args;
     const steps = tasks !== undefined || chain !== undefined;
-    if (steps && spec.task !== undefined) throw new Error(`task cannot be set beside ${tasks !== undefined ? "tasks" : "chain"}: agent+task is a single call; give each step its own task (a top-level agent alone is the default agent of every step)`);
     // With tasks/chain a top-level agent (no task) is the default agent of every step, like model or timeoutMs.
     const single = spec.task !== undefined || spec.agent !== undefined && !steps;
     const choices = [workflow, source, tasks, chain, single ? spec : undefined];
