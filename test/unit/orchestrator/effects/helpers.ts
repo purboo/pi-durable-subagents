@@ -2,6 +2,7 @@ import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type { TestContext } from "node:test";
 import { openJournal } from "../../../../src/kernel/journal.ts";
@@ -21,17 +22,21 @@ export function crash(journal: JournalHandle, type: string, after = false): Jour
     return journal.append(kind, fields);
   } };
 }
-/** P19–P33: Build an isolated ledger and ticket; cleanup never reaches the real HOME. */
+/** P19–P33: Build an isolated ledger and ticket; cleanup never reaches the real HOME. The workflow id is unique per
+ *  fixture: a gate's processes are tagged with its call id (DSA_EXEC) and fenced by scanning every process on the
+ *  machine, so test files running in parallel must never share one (a shared id let one file fence or count another's
+ *  gate). */
 export async function fixture(test: TestContext) {
+  const wid = `W${randomUUID().replaceAll("-", "").slice(0, 12)}`;
   const root = await mkdtemp(join(tmpdir(), "dsa-effects-")), cwd = join(root, "repo"), home = join(root, "state");
   const isolated = { HOME: root, XDG_CONFIG_HOME: join(root, "config"), PI_CODING_AGENT_DIR: join(root, "pi"), DSA_HOME: home, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
   const old = Object.fromEntries(Object.keys(isolated).map(key => [key, process.env[key]]));
   Object.assign(process.env, isolated);
   test.after(() => { for (const [key, value] of Object.entries(old)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
-  await mkdir(cwd); const journal = await openJournal(join(home, "w", "W", "journal.jsonl"));
+  await mkdir(cwd); const journal = await openJournal(join(home, "w", wid, "journal.jsonl"));
   const orch = await openJournal(join(home, "orchestrator.jsonl"));
   test.after(async () => { await journal.close(); await orch.close(); await rm(root, { recursive: true, force: true }); });
-  const t: CallTicket = { wid: "W", widRev: "W@1", key: "task", gen: 1, callId: "W@1/task@1", spec: { agent: "test", task: "task" }, cwd, journal,
+  const t: CallTicket = { wid, widRev: `${wid}@1`, key: "task", gen: 1, callId: `${wid}@1/task@1`, spec: { agent: "test", task: "task" }, cwd, journal,
     agent: { name: "test", description: "", body: "", source: "project", sourcePath: "", systemPromptMode: "append", inheritProjectContext: false, inheritSkills: false } };
   const ledgers = { home, orch, config: {} }, result: CallResult = { key: t.key, gen: 1, status: "ok", ok: true, output: "complete\n" };
   const effects = () => createEffects(ledgers), sessionPath = join(home, "session.jsonl");

@@ -34,9 +34,11 @@ if (first.code === 0) process.exit(0);
 // Failing files: "test at <file>:<line>" (spec reporter) or a TAP "location: '<file>:<line>:<col>'".
 const files = new Set();
 const text = first.output.replace(/\x1b\[[0-9;]*m/g, "");
-for (const m of text.matchAll(/^test at (\S+?):\d+:\d+$/gm)) files.add(m[1]);
-for (const m of text.matchAll(/location: '([^']+?):\d+:\d+'/g)) if (m[1].endsWith(".test.ts")) files.add(m[1]);
-const relative = [...files].map(f => f.replace(`${process.cwd()}/`, "")).filter(f => f.endsWith(".test.ts"));
+// The spec reporter indents "test at" under a nested test; any test file extension node --test runs counts.
+const testFile = /\.test\.[cm]?[jt]s$/;
+for (const m of text.matchAll(/^\s*test at (\S+?):\d+:\d+\s*$/gm)) files.add(m[1]);
+for (const m of text.matchAll(/location: '([^']+?):\d+:\d+'/g)) files.add(m[1]);
+const relative = [...files].map(f => f.replace(`${process.cwd()}/`, "")).filter(f => testFile.test(f));
 if (!relative.length) { console.log("::error::test run failed without an identifiable failing file"); process.exit(first.code); }
 
 const flags = args.filter(a => a.startsWith("--"));

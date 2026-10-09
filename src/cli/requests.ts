@@ -331,7 +331,9 @@ async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<nu
   const normalized = request({ action: "send", to: where.to, kind, ...(message !== undefined ? { message } : {}), ...(text(values, "model") !== undefined ? { model: text(values, "model") } : {}),
     ...(qid !== undefined ? { qid } : {}), ...(revision !== undefined ? { rev: revision } : {}) }, ctx.cwd ?? process.cwd());
   seen.digest = specDigest({ kind: "send", body: normalized.body, cond: normalized.cond });
-  const done = await submitAndWait(ctx, seen, id, "send", normalized.body, normalized.cond, wait, json);
+  // Inside a subagent the CLI names its call (provenance for `answered.by`; spec_digest ignores it).
+  const body = ctx.env.DSA_CALL ? { ...normalized.body as object, caller: ctx.env.DSA_CALL } : normalized.body;
+  const done = await submitAndWait(ctx, seen, id, "send", body, normalized.cond, wait, json);
   if ("code" in done) return done.code;
   return decided(ctx, id, done, json);
 }

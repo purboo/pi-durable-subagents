@@ -28,10 +28,13 @@ export function labelsOf(body: unknown): Record<string, string> | undefined {
 }
 
 /** `answered.by` from the answer request's sender: a pi session `main:<id>` → `session:<id>` (+ via "ui" when the
- *  subagent list sent it, SendBody.by "user"); the CLI sender `cli:<user>@<host>` as is; anything else `unknown`. */
+ *  subagent list sent it, SendBody.by "user"); the CLI run inside a subagent (SendBody.caller `<wid>@<rev>/<key>@<gen>`)
+ *  → `call:<wid>/<key>`; any other CLI sender `cli:<user>@<host>` as is; anything else `unknown`. */
 export function answeredBy(req: Request | undefined): { by: string; via?: "ui" } {
-  const from = req?.from ?? "";
-  if (from.startsWith("main:")) return { by: `session:${from.slice(5)}`, ...((req!.body as SendBody | undefined)?.by === "user" ? { via: "ui" as const } : {}) };
+  const from = req?.from ?? "", body = req?.body as SendBody | undefined;
+  if (from.startsWith("main:")) return { by: `session:${from.slice(5)}`, ...(body?.by === "user" ? { via: "ui" as const } : {}) };
+  const caller = typeof body?.caller === "string" ? /^([^/@]+)@\d+\/(.+)@\d+$/.exec(body.caller) : null;
+  if (from.startsWith("cli:") && caller) return { by: `call:${caller[1]}/${caller[2]}` };
   if (/^cli:[^@]+@.+$/.test(from)) return { by: from };
   return { by: "unknown" };
 }

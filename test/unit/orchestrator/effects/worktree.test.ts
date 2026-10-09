@@ -11,11 +11,11 @@ for (const window of ["normal", "intent", "branch", "effect", "created"]) test(`
   if (window !== "normal") {
     const type = ["intent", "branch"].includes(window) ? "wt-intent" : "wt-created";
     await assert.rejects(f.effects().prepare({ ...f.t, journal: crash(f.journal, type, window !== "effect") }, { sessionPath: f.sessionPath }), /crash:/);
-    if (window === "branch") await git(f.cwd, "branch", "dsa/W/task", base);
+    if (window === "branch") await git(f.cwd, "branch", `dsa/${f.t.wid}/task`, base);
     if (window === "intent") await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "new HEAD after intent");
   }
   const prepared = await f.effects().prepare(f.t, { sessionPath: f.sessionPath });
-  assert.equal(prepared.cwd, join(f.cwd, ".dsa", "W", "task"));
+  assert.equal(prepared.cwd, join(f.cwd, ".dsa", f.t.wid, "task"));
   assert.equal(await git(prepared.cwd, "rev-parse", "HEAD"), base);
   assert.deepEqual(await f.effects().prepare(f.t, { sessionPath: f.sessionPath }), prepared);
   assert.equal(f.journal.entries().filter(e => e.type === "wt-intent").length, 1);
@@ -24,7 +24,7 @@ for (const window of ["normal", "intent", "branch", "effect", "created"]) test(`
   await access(prepared.cwd);
   await f.effects().afterSeal(f.t, f.result); await f.effects().afterSeal(f.t, f.result);
   await assert.rejects(access(prepared.cwd));
-  assert.equal(await git(f.cwd, "rev-parse", "dsa/W/task"), base);
+  assert.equal(await git(f.cwd, "rev-parse", `dsa/${f.t.wid}/task`), base);
   assert.equal(f.journal.entries().filter(e => e.type === "wt-removed").length, 1);
 });
 for (const window of ["intent", "effect"]) test(`worktree removal reconciles ${window}`, async ctx => {
@@ -48,13 +48,13 @@ test("dirty worktree is retained with deduplicated attention and reused by the n
   const items = f.journal.entries().filter(e => e.type === "attention");
   assert.equal(items.length, 1); assert.match(JSON.stringify(items[0]), new RegExp(cwd));
   assert.equal(f.journal.entries().filter(e => e.type === "wt-kept" && e.call === f.t.callId).length, 1);
-  assert.deepEqual(await f.effects().prepare({ ...f.t, gen: 2, callId: "W@1/task@2", continueFrom: f.t.callId }, { sessionPath: f.sessionPath }), { cwd });
+  assert.deepEqual(await f.effects().prepare({ ...f.t, gen: 2, callId: `${f.t.widRev}/task@2`, continueFrom: f.t.callId }, { sessionPath: f.sessionPath }), { cwd });
 });
 test("non-git cwd and foreign branches refuse isolation", async ctx => {
   const f = await fixture(ctx); f.t.spec.isolation = "worktree";
   await assert.rejects(f.effects().prepare(f.t, { sessionPath: f.sessionPath }));
   assert.equal(f.journal.entries().length, 0);
   await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
-  await git(f.cwd, "branch", "dsa/W/task");
+  await git(f.cwd, "branch", `dsa/${f.t.wid}/task`);
   await assert.rejects(f.effects().prepare(f.t, { sessionPath: f.sessionPath }), /already exists/);
 });

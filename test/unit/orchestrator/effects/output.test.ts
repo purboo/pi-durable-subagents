@@ -16,7 +16,7 @@ for (const absolute of [false, true]) for (const window of ["normal", "intent", 
   assert.equal(f.journal.entries().filter(e => e.type === "output-intent").length, 1);
   assert.equal(f.journal.entries().filter(e => e.type === "output").length, 1);
   if (!absolute) {
-    assert.equal(path, join(f.home, "w", "W", "artifacts", "task@1", "1-out.txt"));
+    assert.equal(path, join(f.home, "w", f.t.wid, "artifacts", "task@1", "1-out.txt"));
     assert.equal(await readlink(join(dirname(path), "latest")), "1-out.txt");
     assert.deepEqual((await readdir(dirname(path))).sort(), ["1-out.txt", "latest"]);
   }
@@ -24,11 +24,11 @@ for (const absolute of [false, true]) for (const window of ["normal", "intent", 
 test("absolute outputs preserve foreign edits, keep attention stable, and allow our later writes", async ctx => {
   const f = await fixture(ctx); f.t.spec.output = join(f.root, "out.txt");
   await f.before();
-  const second = { ...f.t, gen: 2, callId: "W@1/task@2" };
+  const second = { ...f.t, gen: 2, callId: `${f.t.widRev}/task@2` };
   await f.before(second, { ...f.result, gen: 2, output: "second" });
   assert.equal(await readFile(f.t.spec.output, "utf8"), "second");
   await writeFile(f.t.spec.output, "foreign");
-  const third = { ...f.t, gen: 3, callId: "W@1/task@3" };
+  const third = { ...f.t, gen: 3, callId: `${f.t.widRev}/task@3` };
   assert.equal((await f.before(third)).artifacts, undefined);
   await f.before(third);
   assert.equal(await readFile(f.t.spec.output, "utf8"), "foreign");
