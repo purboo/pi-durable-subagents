@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.29
+
+- The pi UI shows subagents that other sessions or the CLI started, kept apart
+  from this session's: the dock's summary line adds
+  `elsewhere: 4 running (cli 2, 1 session 2)` (dropped first when the line is
+  narrow; shown alone when this session runs nothing), and `/subagents` ends
+  with a folded `Other sessions` group listing their running workflows with
+  name, origin and labels. They can be watched but not changed from here: the
+  list's change keys and the watch view's input, model and stop controls
+  refuse them, decided by the workflow's origin. `ui.otherSessions: false`
+  turns this off.
+
 ## 1.0.28
 
 - Lower orchestrator cost. A finished workflow's journal is closed about a
