@@ -503,6 +503,16 @@ test('a pins.json that does not verify falls back to the staged snapshot; a chan
     assert.deepEqual(recovered.pins.args, { a: 1 }, bad.slice(0, 40));
     assert.equal(await readFile(record, 'utf8'), good, 'recorded again from the snapshot');
   }
+  const renamed = JSON.parse(good); renamed.inputs = { renamed: renamed.inputs.doc };
+  await writeFile(record, JSON.stringify(renamed));
+  assert.deepEqual(Object.keys((await recover()).inputs), ['doc'], 'input names are covered by the digest');
+  assert.equal(await readFile(record, 'utf8'), good);
+  await rm(join(dir, 'agents.json'));
+  await recover();
+  assert.ok((await readFile(join(dir, 'agents.json'), 'utf8')).length > 0, 'a missing published file is published again');
+  await writeFile(join(dir, 'args.json'), '{"changed":true}');
+  await assert.rejects(recover(), /Pinned content conflict: .*args\.json/);
+  await writeFile(join(dir, 'args.json'), JSON.stringify({ a: 1 }));
   await writeFile(wf.scriptPath, 'return 999;');
   await assert.rejects(recover(), /Pinned content conflict: .*script\.js/);
   await writeFile(wf.scriptPath, 'return 1;');
