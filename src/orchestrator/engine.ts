@@ -28,6 +28,7 @@ import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts'
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
 import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
 import { validateCallSpec } from '../compat/spec.ts';
+import { labelsProblem } from '../events/labels.ts';
 import { parseModel } from '../compat/model.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
@@ -270,6 +271,9 @@ export class Engine {
     }
     if (req.kind === 'run') {
       const created = this.ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid);
+      // R6: senders validate labels; a hand-written request must not bypass that.
+      const labels = (req.body as RunBody | null)?.labels, invalid = !created && labels !== undefined ? labelsProblem(labels) : undefined;
+      if (invalid) return { action: 'reject', reason: `invalid-labels: ${invalid}` };
       if (created && this.store.pruned().has(String(created.wid))) return { action: 'apply' }; // Never resurrect a pruned run.
       let wf = created ? this.store.workflows.get(created.wid as string) : undefined;
       if (!wf) {

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { CallSpec, Conditions, Entry, RequestKind, RunBody } from "../../types.ts";
 import { validateCallSpec } from "../../compat/spec.ts";
 import { compileFanout } from "../../compat/fanout.ts";
+import { checkLabels } from "../../events/labels.ts";
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
 export const stepDefaults = ["model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once", "writer"];
@@ -43,7 +44,7 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   const action = args.action === undefined && launchForms.filter(Boolean).length === 1 ? "run" : args.action;
   if (typeof action !== "string" || !action) throw new Error("action is required: run, agents, send, stop, revise, status, resume, drain, restart");
   if (action === "run") {
-    const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, by: _by, request: _request, ...spec } = args;
+    const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, labels, by: _by, request: _request, ...spec } = args;
     const choices = [workflow, source, tasks, chain, spec.agent === undefined && spec.task === undefined ? undefined : spec];
     if (choices.filter(v => v !== undefined).length !== 1) throw new Error("run requires exactly one of workflow, source, tasks, chain, or agent/task");
     // A top-level cwd on a workflow/tasks/chain/source run is the run's directory: relative paths (the workflow file,
@@ -71,6 +72,8 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     } else body.call = call(spec, cwd, "call");
     if (inputs !== undefined) body.args = inputs;
     if (name !== undefined) body.name = string(args, "name");
+    // R6: part of the spec digest; an empty object is the same as none.
+    if (labels !== undefined && Object.keys(checkLabels(labels)).length) body.labels = labels as Record<string, string>;
     // P31a, P36, P11: workflow-level limits and declared input files (absolute paths, pinned at admission).
     if (usageBudget !== undefined) {
       const b = usageBudget as { tokens?: unknown; costUsd?: unknown };

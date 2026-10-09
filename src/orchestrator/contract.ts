@@ -13,11 +13,11 @@ export interface OrchestratorConfig {
   /** Provider slot capacities (V1). Missing provider = unlimited. */
   providers?: Record<string, { slots: number }>;
   memory?: { reserveMb?: number; perChildMb?: number };
-  /** K-parameters overrides (ms / counts). */
+  /** K-parameters overrides (ms / counts). r7Ms: period of the R7 waiting/moving check (events/r7.ts, default 5000). */
   /** Writer lock: "queue" (default) runs one writer call per git worktree at a time; "off" only reminds of observed
    *  shared writes. */
   writerLock?: "queue" | "off";
-  k?: Partial<Record<"lossBound" | "checkpointMs" | "stallMs" | "progressMs" | "switchTimeoutMs" | "idleExitMs" | "trackerMs" | "hibernateMs" | "spawnBudget" | "probeMs", number>>;
+  k?: Partial<Record<"lossBound" | "checkpointMs" | "stallMs" | "progressMs" | "switchTimeoutMs" | "idleExitMs" | "trackerMs" | "hibernateMs" | "spawnBudget" | "probeMs" | "r7Ms", number>>;
 }
 
 /** Everything the executor needs to run one call generation. */
