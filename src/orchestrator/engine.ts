@@ -37,6 +37,8 @@ const wakeStatus = (status?: string) => {
   if (status === 'parked' || status === undefined) return 'unknown';
   return status;
 };
+/** A follow-up still going when its workflow ended has no result yet: say so instead of calling it unknown. */
+const callStatus = (c: { phase: string; result?: CallResult }) => c.result || c.phase === 'sealed' ? wakeStatus(c.result?.status) : c.phase;
 /** v12 §6: Name available agents in the refusal instead of making the caller guess. */
 export function unknownAgent(name: unknown, agents: readonly { name: string }[]): string {
   return `unknown agent ${JSON.stringify(name)}; available agents: ${agents.map(a => a.name).sort().join(", ") || "none"}`;
@@ -48,11 +50,11 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
   const calls = call ? snap.calls.filter(c => c.callId === call) : [...latest.values()];
   const counts = new Map<string, number>();
   for (const c of calls) {
-    const status = wakeStatus(c.result?.status);
+    const status = callStatus(c);
     counts.set(status, (counts.get(status) ?? 0) + 1);
   }
   const parts = [...counts].map(([status, count]) => `${count} ${status}`);
-  const heading = call ? `${label}/${calls[0]?.key ?? call}@${calls[0]?.gen ?? '?'} (follow-up) ${wakeStatus(calls[0]?.result?.status)}:` :
+  const heading = call ? `${label}/${calls[0]?.key ?? call}@${calls[0]?.gen ?? '?'} (follow-up) ${calls[0] ? callStatus(calls[0]) : 'unknown'}:` :
     `${label} (${wid}) ${snap.status}${parts.length ? `: ${parts.join('; ')}` : ''}`;
   const footer = `${snap.error ? `\nError: ${tail(snap.error, 500)}` : ''}${charged(snap.usage) ? `\nUsage: ${charged(snap.usage)}` : ''}\nFull output: subagents status wid:${wid}`;
   const prefix = tail(heading, Math.max(1, 6000 - footer.length - 1));
@@ -73,7 +75,8 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
     if (allowance < 2) continue;
     const result = c.result;
     // A stop leaves the agent's edits where they are; say so, so nobody mistakes a stopped agent for a clean undo.
-    const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${wakeStatus(result?.status)}${result?.status === 'stopped' ? ' (edits it made so far are left in place)' : ''}`;
+    const going = !result && c.phase !== 'sealed' ? ' (a follow-up still going; you are told when it ends)' : '';
+    const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${callStatus(c)}${going}${result?.status === 'stopped' ? ' (edits it made so far are left in place)' : ''}`;
     const title = `\n${tail(name, allowance - 1)}`;
     const error = result?.error && allowance - title.length > 10 ? `\n  Error: ${tail(result.error, Math.min(300, allowance - title.length - 9))}` : '';
     const space = allowance - title.length - error.length;
