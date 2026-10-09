@@ -43,7 +43,7 @@ async function fixture(t: test.TestContext) {
   for (const end = Date.now() + 10_000; !journal().some(e => e.type === JT.sealed && String(e.call).endsWith('/q@1'));) {
     if (Date.now() > end) throw new Error('q did not seal'); await new Promise(r => setTimeout(r, 20));
   }
-  return { root, home, cwd, env, wid, cli, journal, cleanups, ledger: () => readJournalSnapshot(orchLedger(home)) };
+  return { root, home, cwd, env, wid, cli, journal, cleanups, orch, ledger: () => readJournalSnapshot(orchLedger(home)) };
 }
 
 test('CLI: repeated --to sends one notify per call; one bad target does not affect the others; a retry is idempotent', async t => {
@@ -74,6 +74,11 @@ test('CLI: repeated --to sends one notify per call; one bad target does not affe
   const other = await f.cli([...args.slice(0, -2), 'different', '--json']);
   assert.equal(other.code, 3, other.out);
   assert.equal((await f.cli(['send', '--request', 'm1', '--to', `${f.wid}/held`, '--to', `${f.wid}/q`, '--kind', 'notify', '--message', 'use TOML', '--json'])).code, 3);
+  // A longer list, or the same targets in another order, under the id: a conflict, and nothing is sent.
+  const longer = ['send', '--request', 'm1', '--to', `${f.wid}/held`, '--to', `${f.wid}/q`, '--to', `${f.wid}/nope`, '--to', `${f.wid}/q`, '--kind', 'notify', '--message', 'use TOML', '--json'];
+  assert.equal((await f.cli(longer)).code, 3);
+  assert.equal((await f.cli(['send', '--request', 'm1', '--to', `${f.wid}/q`, '--to', `${f.wid}/held`, '--to', `${f.wid}/nope`, '--kind', 'notify', '--message', 'use TOML', '--json'])).code, 3);
+  assert.ok(!f.ledger().some(e => e.type === JT.admitted && e.rid === 'req:m1:4'), 'the extra target was not sent');
   assert.equal((await f.cli(['send', '--request', 'm1', '--to', `${f.wid}/held`, '--kind', 'notify', '--message', 'use TOML', '--json'])).code, 3);
   assert.equal(f.journal().filter(e => e.type === 'pending-note').length, 1);
   // answer stays single-target.
@@ -112,10 +117,31 @@ test('Tool: to as a list sends one request per call with per-target results; ret
   assert.equal((await call({ ...args, message: 'other' })).targets !== undefined, true);
   assert.ok(((await call({ ...args, message: 'other' })).targets as Record<string, unknown>[]).every(r => r.reason === 'request-conflict'));
   assert.equal((await call({ ...args, to: [`${f.wid}/held`, `${f.wid}/q`] })).reason, 'request-conflict');
+  assert.equal((await call({ ...args, to: [...args.to, `${f.wid}/q`] })).reason, 'request-conflict', 'a longer list');
+  assert.ok(!f.ledger().some(e => e.type === JT.admitted && e.rid === 'req:t1:4'));
   assert.equal((await call({ ...args, to: `${f.wid}/held` })).reason, 'request-conflict');
   await assert.rejects(call({ action: 'send', kind: 'answer', to: [`${f.wid}/held`, `${f.wid}/q`], message: 'x', qid: 'q', rev: 1 }), /answer goes to one call/);
   // Without a request id each target gets its own fresh request; a one-element list is a plain send.
   const plain = await call({ action: 'send', kind: 'notify', to: [`${f.wid}/q`], message: 'single' });
   assert.equal(plain.applied, true); assert.equal(plain.delivery, 'noted');
   assert.equal(f.journal().filter(e => e.type === 'pending-note').length, 2);
+});
+
+test('notify is refused, before anything is sent, while an orchestrator older than notify runs', async t => {
+  const f = await fixture(t);
+  const send = (id: string) => f.cli(['send', '--request', id, '--to', `${f.wid}/q`, '--kind', 'notify', '--message', 'x', '--json']);
+  // This process stands in for an orchestrator of 1.0.20 that is running now.
+  await f.orch.append('orchestrator', { version: '1.0.20', pid: process.pid });
+  const refused = await send('old');
+  assert.equal(refused.code, 1, refused.out);
+  assert.match(JSON.parse(refused.out).reason, /running orchestrator 1\.0\.20 predates send kind "notify".*restart/);
+  assert.deepEqual(JSON.parse((await f.cli(['describe', '--key', 'old', '--json'])).out), { state: 'absent', request: 'old' });
+  const many = await f.cli(['send', '--request', 'old2', '--to', `${f.wid}/q`, '--to', `${f.wid}/held`, '--kind', 'notify', '--message', 'x', '--json']);
+  assert.ok(JSON.parse(many.out).targets.every((r: { applied: boolean; reason: string }) => !r.applied && /predates/.test(r.reason)));
+  // A steer is not affected; an orchestrator of this version (or none) takes a notify.
+  assert.equal((await f.cli(['send', '--request', 'st', '--to', `${f.wid}/held`, '--kind', 'steer', '--message', 'x', '--json'])).code, 0);
+  await f.orch.append('orchestrator-exit', { pid: process.pid });
+  assert.equal((await send('after-exit')).code, 0);
+  await f.orch.append('orchestrator', { version: (await import('../../../src/version.ts')).packageVersion(), pid: process.pid });
+  assert.equal((await send('current')).code, 0);
 });

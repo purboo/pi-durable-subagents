@@ -12,10 +12,10 @@ import { OsLock } from "../platform/lock.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
-import { isLive, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
-import { checkAgents, outcomeLine, request, sendReceipt } from "./main/tool.ts";
+import { NOTIFY_SINCE, isLive, orchestratorTooOld, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
+import { BATCH, checkAgents, outcomeLine, request, sendReceipt } from "./main/tool.ts";
 import { parameters } from "./main/schema.ts";
-import { findRequest, manyIds, namesMany, requestRid, sendIdentified, type Identified } from "../requests.ts";
+import { batchConflict, batchDigest, findRequest, manyIds, namesMany, requestRid, sendIdentified, type Identified } from "../requests.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { restartInputError } from "../orchestrator/restart.ts";
 import { currentOrchestrator, legacyRestart, waitExit, type OrchestratorProcess } from "../cli/restart.ts";
@@ -217,11 +217,12 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (args.replaces !== undefined) throw new Error("replaces supersedes one earlier send: use it with a single target");
     const id = args.request, ids = typeof id === "string" ? manyIds(id, targets.length) : undefined;
     if (id !== undefined && !ids) throw new Error(REQUEST_USE);
-    if (ids && typeof id === "string" && (await findRequest(home, requestRid(id)) || await findRequest(home, requestRid(`${id}:${targets.length + 1}`))))
-      return { applied: false, reason: "request-conflict", request: id, note: "this request id was used for different content; use a new id" };
+    const batch = batchDigest(targets as string[]);
+    if (ids && typeof id === "string" && await batchConflict(home, id, batch))
+      return { applied: false, reason: "request-conflict", request: id, note: "this request id was used for different content (another message or list of calls); use a new id" };
     const results = await Promise.all(targets.map(async (to, i) => {
       const request = ids ? { request: ids[i] } : {};
-      try { return { to, ...request, ...await submit({ ...args, to, ...request }, cwd, signal, wait) as Record<string, unknown> }; }
+      try { return { to, ...request, ...await submit({ ...args, to, ...request, ...(ids ? { [BATCH]: batch } : {}) }, cwd, signal, wait) as Record<string, unknown> }; }
       catch (error) { return { to, ...request, applied: false, reason: error instanceof Error ? error.message : String(error) }; }
     }));
     return { targets: results, summary: results.map(r => `${String(r.to)}: ${outcomeLine(r)}`).join("\n") };
@@ -260,6 +261,11 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     // A single send under an id that already names a send to several calls (<id>:1 ...) is other content.
     if (rid && normalized.kind === "send" && !await findRequest(home, rid) && await namesMany(home, String(args.request)))
       return { applied: false, reason: "request-conflict", request: args.request, note: "this request id was used for a send to several calls; use a new id" };
+    // A retry of a recorded request gets its first outcome; a new notify is refused while an orchestrator too old for it runs.
+    if (normalized.kind === "send" && (normalized.body as { kind?: string }).kind === "notify" && !(rid && await findRequest(home, rid))) {
+      const old = orchestratorTooOld(home, 'send kind "notify"', NOTIFY_SINCE);
+      if (old) throw new Error(old);
+    }
     if (normalized.kind === "run") checkAgents(normalized.body as RunBody, () => agentsAt(cwd).map(agent => agent.name));
     // P33: any call of the run may fork the origin context, so the origin branch is always offered for pinning.
     const sessionFile = ctx?.sessionManager.getSessionFile();

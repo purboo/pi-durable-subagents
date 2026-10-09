@@ -131,8 +131,14 @@ own: an unknown or refused target does not affect the others, and the reply
 has one entry per target (`targets`, plus a `summary` line each). With
 `request: "<id>"`, the target at position i (1-based, in the order given) is
 sent as `<id>:<i>`, so a retry with the same list gets the same outcomes and
-sends nothing twice; another message or list under that id is a
-`request-conflict`.
+sends nothing twice. Each of those requests records the whole list, so another
+message, another list (longer, shorter or reordered) or a single send under
+that id is a `request-conflict`, and nothing of it is sent.
+
+`notify` is new in 1.0.28: after upgrading, restart the orchestrator
+(`pi-durable-subagents restart` or the tool's restart action) before using it.
+While an older orchestrator runs, a notify is refused with that advice and
+nothing is sent (an older orchestrator would accept it and drop it).
 
 ### Workflow scripts
 
@@ -328,7 +334,8 @@ between), so a retry with the same content always converges.
 
 A send with several `--to` (not for `answer`) sends `<id>:1` ... `<id>:n`, one
 per target in the order given, and prints one line per target (`--json`:
-`{request, targets: [{to, request, applied, ...}]}`). Its exit code is 3 when the
+`{request, targets: [{to, request, applied, ...}]}`). The same id with another
+message or list (also a longer one) is a conflict and sends nothing. Its exit code is 3 when the
 id or one target names other content, else 75 when one target is not decided
 yet, else 1 when one was rejected, else 0. A notify's reply adds `delivery`
 (`steered`, `held-until-answer` or `noted`) and a `note` that says what it means.

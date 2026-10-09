@@ -215,6 +215,9 @@ export interface SendBody {
   /** The call that sent it through the CLI (its DSA_CALL): provenance only (`answered.by` = `call:<wid>/<key>`), not
    *  authority, and not part of spec_digest — the same request id sent from elsewhere is the same request. */
   caller?: CallId;
+  /** One request of a send to several calls: the digest of the whole target list (see manyIds in src/requests.ts), so
+   *  the same request id with another list is other content. Not shown to the call. */
+  batch?: string;
 }
 /** kind "withdraw": withdraw the sender's own earlier requests (P6). */
 export interface WithdrawBody { rids: Rid[] }
