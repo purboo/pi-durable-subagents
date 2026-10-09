@@ -110,7 +110,8 @@ export function evidence(entries: SessionEntry[], exec: string) {
 /** Only explicit payment failures are terminal; rate limits, overload and transport errors still retry, and a used-up
  *  usage window (`quotaExhausted`) waits for the provider or moves to another one. */
 export function fatalProviderError(text: string): boolean {
-  return /\b402\b|insufficient[_ ]?(quota|balance|funds)|billing|credit balance|余额/i.test(text);
+  // 余额 (balance), not 剩余额度 (remaining quota): "当前剩余额度为 0。额度将于次日 00:00:00自动重置" is a daily window.
+  return /\b402\b|insufficient[_ ]?(quota|balance|funds)|billing|credit balance|(?<!剩)余额/i.test(text);
 }
 /** A provider's usage window is used up: its requests are refused (and not counted) until the window resets, hours
  *  later. Seen as a gateway's `503 No available accounts` once pi's own retries are spent, or a usage-limit message.
