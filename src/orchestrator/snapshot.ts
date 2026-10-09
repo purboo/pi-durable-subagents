@@ -843,7 +843,10 @@ export function eventsFromEntries(entries: readonly Entry[]): TimelineEvent[] {
       case "hibernated": add(e, "hibernated", { call: e.call, qid: e.qid }); break;
       case "forward": {
         forwards.set(String(e.rid2), e);
-        add(e, "forward", { rid: e.rid, kind: (e.envelope as { kind?: string } | undefined)?.kind, dest: e.dest }); break;
+        // A model switch names its target, and a failover (the executor moved the call off a used-up provider) its source.
+        const envelope = e.envelope as { kind?: string; body?: { provider?: string; model?: string } } | undefined;
+        const target = envelope?.kind === "model" && envelope.body?.model ? (envelope.body.provider ? `${envelope.body.provider}/${envelope.body.model}` : envelope.body.model) : undefined;
+        add(e, "forward", { rid: e.rid, kind: envelope?.kind, dest: e.dest, model: target, failover: typeof e.failover === "string" ? e.failover : undefined }); break;
       }
       case "forward-delivered": case "forward-retired": {
         const f = forwards.get(String(e.rid2)), call = e.call ?? f?.dest;
