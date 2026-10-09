@@ -16,7 +16,9 @@ import { publishRequest } from '../../../src/kernel/mailbox.ts';
 import { reduceLifecycle, type DecisionRecord } from '../../../src/kernel/lifecycle.ts';
 import { journalPath, orchInbox, orchLedger } from '../../../src/paths.ts';
 import { captureStart } from '../../../src/platform/proctable.ts';
+import { leaseDir, writeTicket } from '../../../src/platform/lease.ts';
 import { Engine } from '../../../src/orchestrator/engine.ts';
+import { restartToken, subagentRestartError } from '../../../src/orchestrator/restart.ts';
 import { JT, type Request } from '../../../src/types.ts';
 import { fakeExecutor } from '../orchestrator/engine/fake.ts';
 
@@ -31,15 +33,17 @@ async function until<T>(fn: () => T | undefined | false | Promise<T | undefined 
 }
 const decision = (home: string, rid: string) => reduceLifecycle(readJournalSnapshot(orchLedger(home)).filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[]).resolved.get(rid);
 /** One sender per home: its sequence numbers start at 1 and have no gaps (a gap defers its later requests). */
-function sender() {
+function sender(from = 'test') {
   let sseq = 0;
-  return (kind: Request['kind'], body: unknown, rid?: string): Request => { sseq++; return { rid: rid ?? `r${sseq}`, from: 'test', to: 'orch', sseq, kind, body }; };
+  return (kind: Request['kind'], body: unknown, rid?: string): Request => { sseq++; return { rid: rid ?? `r${sseq}`, from, to: 'orch', sseq, kind, body }; };
 }
 
 test('restart arguments: --force only for restart, no target', () => {
   assert.deepEqual(parseArgs(['restart']), { command: 'restart', json: false });
   assert.deepEqual(parseArgs(['restart', '--force']), { command: 'restart', json: false, force: true });
-  for (const args of [['restart', 'w'], ['restart', '--json'], ['drain', '--force'], ['restart', '--force', '--force']]) assert.throws(() => parseArgs(args));
+  assert.deepEqual(parseArgs(['restart', '--force', '0123456789ab', '--reason', 'upgrade']), { command: 'restart', json: false, force: '0123456789ab', reason: 'upgrade' });
+  assert.deepEqual(parseArgs(['restart', '--reason', 'upgrade']), { command: 'restart', json: false, reason: 'upgrade' });
+  for (const args of [['restart', 'w'], ['restart', '--json'], ['drain', '--force'], ['status', '--reason', 'why'], ['restart', '--reason'], ['restart', '--force', '--force']]) assert.throws(() => parseArgs(args));
 });
 
 test('engine: a live execution refuses the restart and launches continue; an idle one ends the loop once', { timeout: 15_000 }, async t => {
@@ -57,7 +61,9 @@ test('engine: a live execution refuses the restart and launches continue; an idl
   await until(() => journal().some(e => e.type === 'fake-run' && e.key === 'a'));
   await publishRequest(orchInbox(home), request('restart', {}, 'refused'));
   await engine.intake();
-  assert.match(String((decision(home, 'refused') as { reason?: string } | undefined)?.reason), new RegExp(`^busy: 1 running execution: ${wid}/a \\d+s from test — retry when they finish`));
+  const refusal = String((decision(home, 'refused') as { reason?: string } | undefined)?.reason);
+  assert.match(refusal, new RegExp(`^busy: 1 running execution — fencing them interrupts these sessions:\\ntest:\\n  ${wid}/a \\d+s`));
+  const token = refusal.match(/token: ([a-f0-9]{12})/)![1]!;
   assert.equal(orch.entries().filter(e => e.type === 'restart').length, 0, 'a refused restart records nothing');
   assert.equal(engine.restartRequested, false);
   // The refusal lifted the launch gate: another workflow's call still launches and finishes.
@@ -66,13 +72,56 @@ test('engine: a live execution refuses the restart and launches continue; an idl
   const wid2 = String(orch.entries().find(e => e.type === JT.created && e.rid === 'run2')!.wid);
   await until(() => readJournalSnapshot(journalPath(home, wid2)).some(e => e.type === JT.done));
   const loop = engine.loop();
-  await publishRequest(orchInbox(home), request('restart', { force: true }, 'accepted'));
+  await publishRequest(orchInbox(home), request('restart', { token, reason: 'upgrade after approval', initiator: { origin: 'main:approved' } }, 'accepted'));
   await until(() => decision(home, 'accepted'));
   assert.equal(decision(home, 'accepted')!.type, 'applied');
   await loop; // ends at once: the process exits and its successor takes over
   assert.equal(engine.restartRequested, true);
   assert.deepEqual(orch.entries().filter(e => e.type === 'restart').map(e => [e.rid, e.force, e.live]), [['accepted', true, [`${wid}@1/a@1#1.1`]]]);
+  const accepted = orch.entries().find(e => e.type === 'restart')!;
+  assert.equal(accepted.reason, 'upgrade after approval');
+  assert.deepEqual(accepted.initiator, { origin: 'main:approved' });
+  assert.equal(accepted.from, 'test');
   assert.ok(!journal().some(e => e.type === 'fake-run' && e.key === 'b'), 'nothing launched after the accepted restart');
+});
+
+test('engine: force guards — grouped refusal with lease and token, stale token, missing reason, subagent and bare force refused', { timeout: 15_000 }, async t => {
+  const home = await root(t), orch = await openJournal(orchLedger(home)), request = sender(), other = sender('main:other');
+  await mkdir(join(home, 'agent/agents'), { recursive: true });
+  await writeFile(join(home, 'agent/agents/test.md'), '---\nname: test\ndescription: test\n---\nTest');
+  const ledgers = { home, orch, config: { k: { idleExitMs: 60_000 } } };
+  const engine = new Engine(ledgers, fakeExecutor(ledgers, { hold: 'a' }), { discovery: { home, agentDir: join(home, 'agent'), globalNpmRoot: null } });
+  t.after(async () => { await engine.close(); await orch.close(); });
+  await engine.recover();
+  const source = "return await runs.run('a',{agent:'test',task:'held'});";
+  await publishRequest(orchInbox(home), request('run', { cwd: home, source }, 'run1'));
+  await publishRequest(orchInbox(home), other('run', { cwd: home, source }, 'run2'));
+  await engine.intake();
+  const wid1 = String(orch.entries().find(e => e.type === JT.created && e.rid === 'run1')!.wid);
+  const wid2 = String(orch.entries().find(e => e.type === JT.created && e.rid === 'run2')!.wid);
+  await until(() => [wid1, wid2].every(w => readJournalSnapshot(journalPath(home, w)).some(e => e.type === 'fake-run')));
+  // A lease held by wid1's call is annotated on its line.
+  await mkdir(leaseDir(home, 'machine'), { recursive: true });
+  await writeTicket(home, { seq: 1, resource: 'machine', mode: 'exclusive', wrapper: { pid: process.pid }, argv: ['sim'], cwd: home, since: Date.now(), grantedAt: Date.now(), call: `${wid1}@1/a@1` });
+  const reason = (rid: string) => String((decision(home, rid) as { reason?: string } | undefined)?.reason);
+  const ask = async (rid: string, body: unknown) => { await publishRequest(orchInbox(home), request('restart', body, rid)); await engine.intake(); await until(() => decision(home, rid)); return reason(rid); };
+  const listed = await ask('list', {});
+  const token = restartToken([{ exec: `${wid1}@1/a@1#1.1` }, { exec: `${wid2}@1/a@1#1.1` }]);
+  const line = (w: string) => `  ${w}/a \\d+s${w === wid1 ? ' holds lease machine' : ''}`;
+  assert.match(listed, new RegExp(`^busy: 2 running executions — fencing them interrupts these sessions:\\nmain:other:\\n${line(wid2)}\\ntest:\\n${line(wid1)}\\ntoken: ${token}\\nto fence exactly these: pi-durable-subagents restart --force ${token} --reason "<why>"$`));
+  assert.match(await ask('stale', { token: '0123456789ab', reason: 'upgrade' }), new RegExp(`^the running executions changed since 0123456789ab\\nbusy: 2 running executions[^]*\\ntoken: ${token}\\n`));
+  assert.match(await ask('noreason', { token }), /^restart reason must be non-empty/);
+  assert.match(await ask('long', { token, reason: 'x'.repeat(501) }), /^restart reason must be non-empty and at most 500/);
+  assert.equal(await ask('sub', { token, reason: 'upgrade', initiator: { call: `${wid1}@1/a@1` } }), subagentRestartError);
+  await publishRequest(orchInbox(home), other('restart', { token, reason: 'upgrade', initiator: { call: `${wid2}@1/a@1` } }, 'submain'));
+  await engine.intake(); await until(() => decision(home, 'submain'));
+  assert.equal(reason('submain'), subagentRestartError, 'a main sender does not hide a subagent caller');
+  assert.match(await ask('bare', { force: true, reason: 'old client' }), /^force without a token is refused; first show the user the running executions\nbusy: 2/);
+  for (const rid of ['list', 'stale', 'noreason', 'long', 'sub', 'bare']) assert.equal(decision(home, rid)!.type, 'rejected', rid);
+  assert.equal(orch.entries().filter(e => e.type === 'restart').length, 0, 'refusals record nothing');
+  assert.equal(engine.restartRequested, false);
+  // A non-force restart from a subagent is allowed (and refused here only because work runs).
+  assert.match(await ask('subplain', { initiator: { call: `${wid1}@1/a@1` } }), /^busy: 2 running executions/);
 });
 
 test('engine: an idle restart is accepted without force and replayed once', { timeout: 15_000 }, async t => {
@@ -104,9 +153,16 @@ test('CLI restart: refused while a call runs, --force replaces the orchestrator 
   await until(() => readJournalSnapshot(journalPath(home, wid)).some(e => e.type === 'fake-run'));
   const first = currentOrchestrator(home)!;
   assert.equal(await main(['restart'], { env, write }), 1);
-  assert.match(out.pop()!, new RegExp(`^restart refused: busy: 1 running execution: ${wid}/a `));
+  const refusal = out.pop()!;
+  assert.match(refusal, new RegExp(`^restart refused: busy: 1 running execution — fencing them interrupts these sessions:\\ntest:\\n  ${wid}/a `));
+  const token = refusal.match(/token: ([a-f0-9]{12})/)![1]!;
   assert.equal(currentOrchestrator(home)?.pid, first.pid, 'a refused restart leaves the orchestrator running');
-  assert.equal(await main(['restart', '--force'], { env, write }), 0);
+  assert.equal(await main(['restart', '--force', token, '--reason', 'approved upgrade'], { env: { ...env, DSA_EXEC: 'self#1', DSA_CALL: 'self' }, write }), 1);
+  assert.equal(out.pop(), `restart refused: ${subagentRestartError}`);
+  assert.equal(currentOrchestrator(home)?.pid, first.pid);
+  assert.equal(await main(['restart', '--force', token], { env, write }), 1);
+  assert.match(out.pop()!, /reason must be non-empty/);
+  assert.equal(await main(['restart', '--force', token, '--reason', 'approved upgrade'], { env, write }), 0);
   const line = out.pop()!;
   const second = currentOrchestrator(home)!;
   assert.notEqual(second.pid, first.pid);
@@ -116,6 +172,12 @@ test('CLI restart: refused while a call runs, --force replaces the orchestrator 
   await until(() => readJournalSnapshot(journalPath(home, wid)).filter(e => e.type === 'fake-run').length === 2);
   assert.equal(readJournalSnapshot(journalPath(home, wid)).filter(e => e.type === JT.sealed).length, 0);
   assert.deepEqual(readJournalSnapshot(orchLedger(home)).filter(e => e.type === 'restart').map(e => [e.force, e.live]), [[true, [`${wid}@1/a@1#1.1`]]]);
+  const audit = readJournalSnapshot(orchLedger(home)).find(e => e.type === 'restart')!;
+  const cli = (audit.initiator as { cli: { user: string; host: string; ppid: number; parent: string } }).cli;
+  assert.equal(audit.reason, 'approved upgrade');
+  assert.equal(cli.ppid, process.ppid);
+  assert.ok(cli.user && cli.host && cli.parent.length <= 200, JSON.stringify(cli));
+  assert.match(String(audit.from), /^cli:/);
 });
 
 test('an orchestrator without the restart request: journals decide, SIGTERM ends it', { timeout: 15_000 }, async t => {
@@ -134,14 +196,24 @@ test('an orchestrator without the restart request: journals decide, SIGTERM ends
   const running = currentOrchestrator(home)!;
   assert.equal(running.pid, old.pid);
   assert.equal(journalLiveCalls(home).length, 1);
-  const refused = legacyRestart(home, running, false);
+  const refused = legacyRestart(home, running, {});
   assert.equal(refused.applied, false);
-  assert.match((refused as { reason: string }).reason, new RegExp(`^busy: 1 running call on orchestrator 1\\.0\\.17 \\(pid ${old.pid}\\): ${wid}/a \\d+s from main:s1 — `));
+  assert.match((refused as { reason: string }).reason, new RegExp(`^busy: 1 running execution — fencing them interrupts these sessions:\\nmain:s1:\\n  ${wid}/a \\d+s`));
+  const token = restartToken([{ exec }]);
+  assert.ok((refused as { reason: string }).reason.endsWith(`token: ${token}\nto fence exactly these: pi-durable-subagents restart --force ${token} --reason "<why>"`));
+  assert.match((legacyRestart(home, running, { token: '0123456789ab', reason: 'upgrade' }) as { reason: string }).reason, /^the running executions changed since 0123456789ab\n/);
+  assert.match((legacyRestart(home, running, { token }) as { reason: string }).reason, /reason must be non-empty/);
+  assert.equal((legacyRestart(home, running, { token, reason: 'upgrade' }, { subagent: true }) as { reason: string }).reason, subagentRestartError);
+  assert.match((legacyRestart(home, running, { token: '0123456789ab', reason: 'upgrade' }, { tool: true }) as { reason: string }).reason, new RegExp(`to fence exactly these: subagents \\{action:"restart", force:"${token}", reason:"<why>"\\}$`));
   assert.equal(await waitExit(running, 200), false, 'a refusal sends no signal');
   await journal.append(JT.fenced, { exec });
-  await journal.close();
   assert.deepEqual(journalLiveCalls(home), [], 'a fenced execution waits to run again: nothing runs');
-  assert.deepEqual(legacyRestart(home, running, false), { applied: true });
+  await journal.append(JT.exec, { exec: `${call}#2.1`, call });
+  await journal.append('selected', { exec: `${call}#2.1`, model: { provider: 'p', id: 'm' } });
+  await journal.close();
+  const again = restartToken([{ exec: `${call}#2.1` }]);
+  assert.notEqual(again, token, 'a new execution has a new token');
+  assert.deepEqual(legacyRestart(home, running, { token: again, reason: 'approved upgrade' }), { applied: true });
   assert.equal(await waitExit(running, 5_000), true);
   assert.equal(currentOrchestrator(home), undefined);
 });

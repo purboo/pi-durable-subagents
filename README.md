@@ -244,7 +244,7 @@ pi-durable-subagents stop-all           pause every existing workflow now; journ
                                         (runs you start afterwards are not held)
 pi-durable-subagents prune [wid] [--older-than <days>]
                                         delete finished workflows (done, failed, stopped); prints count and bytes freed
-pi-durable-subagents restart [--force]  switch to the installed version (see "Updating Durable Subagents")
+pi-durable-subagents restart [--force <token> --reason <text>]  switch to the installed version (see "Updating Durable Subagents")
 pi-durable-subagents hold <resource> [--shared] [--max-wait <s>] [--note <text>] -- <command…>
                                         run one command while holding a resource lease (see below)
 pi-durable-subagents leases [--json]    who holds and who waits for each resource
@@ -389,15 +389,31 @@ pi-durable-subagents restart          # or the subagents tool: action "restart"
 ```
 
 The orchestrator refuses while any execution runs (a subagent process, or a
-gate before a call's seal) and names each one with its session and age; no new
-execution starts while it decides, so nothing slips in between. Calls waiting
+gate before a call's seal). The refusal groups executions by session with ages,
+lease annotations and a token for that exact set; no new execution starts while
+it decides, so nothing slips in between. Calls waiting
 for your answer (hibernated), waiting for a provider slot, or held by a drain
 do not block it. Otherwise it exits and its successor starts at once from the
 installed files and resumes every workflow: an asker keeps its question, a
-queued call launches on the new version. `restart --force` (tool:
-`force: true`) fences running executions instead of refusing; they resume on
-the new version from their sessions, like after a crash, so a tool call that
-was running is repeated or reported as interrupted.
+queued call launches on the new version.
+
+To interrupt those executions deliberately, first show the user the refusal's
+list and obtain their explicit approval, then use its token and a non-empty
+reason (at most 500 characters):
+
+```sh
+pi-durable-subagents restart --force <token> --reason "<why>"
+# tool: {action:"restart", force:"<token>", reason:"<why>"}
+```
+
+A changed execution set is refused with a fresh list and token. With no live
+executions no token is needed. Bare force cannot fence live executions, and the
+tool rejects `force:true`. Subagents cannot force a restart, even from bash:
+it would fence themselves and other sessions' work. Force fences running
+executions; they resume on the new version from their sessions, like after a
+crash, so a tool call that was running is repeated or reported as interrupted.
+The restart ledger records the reason and initiator; after the next start,
+`status` shows who forced it and why for 24 hours.
 
 An orchestrator reads requests only after it has recovered its workflows, so
 a `restart` sent to one that just started waits for it (and says so); if no
@@ -409,8 +425,9 @@ and nothing new starts in existing workflows), retry `restart` until it is
 accepted, then `resume`. Never kill the orchestrator process: other sessions'
 running calls would be interrupted without a check. An orchestrator from 1.0.17
 or earlier does not know the restart request; `restart` then checks the
-journals itself and ends it with SIGTERM, which is not atomic: a call launched
-in between is fenced and resumes. A pi session started before the update still
+journals itself with the same token, reason and subagent checks and ends it with
+SIGTERM, which is not atomic: a call launched in between is fenced and resumes.
+The old orchestrator cannot record the new audit fields. A pi session started before the update still
 loads the old extension; start a new one.
 
 ## What we do not promise

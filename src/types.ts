@@ -219,9 +219,11 @@ export interface PruneBody { wid?: Wid; olderThanDays?: number }
 export interface DrainBody { fence?: boolean; origin?: string; wid?: Wid }
 /** kind "restart": exit the orchestrator so the installed version takes over (its successor starts at once and recovers
  *  every workflow). Refused with `busy: …` while a call has a live execution (a child process, or a gate running before
- *  its seal) unless `force`: those executions are then fenced and resume on the successor. Calls waiting for a slot,
- *  for an answer (hibernated) or held by a drain do not block it; no new execution launches while it is decided. */
-export interface RestartBody { force?: boolean }
+ *  its seal) unless the current execution set matches `token`: those executions are then fenced and resume on the
+ *  successor. Calls waiting for a slot, for an answer (hibernated) or held by a drain do not block it; no new execution
+ *  launches while it is decided. Old wire bodies with force:true are refused while live, never treated as a token. */
+export type RestartInitiator = { call: string } | { origin: string } | { cli: { user: string; host: string; ppid: number; parent: string } };
+export interface RestartBody { token?: string; reason?: string; initiator?: RestartInitiator }
 
 // Request bodies addressed to a child (to: CallId), written by the orchestrator (own requests or P7 forwards).
 /** kinds "task" | "steer" | "follow-up" | "continue" | "answer": text shown to the model (answer: cond.qid/rev set). */

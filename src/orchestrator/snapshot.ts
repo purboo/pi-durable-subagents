@@ -1,5 +1,6 @@
 // Read-only status snapshots (P25: `status` is always a fresh snapshot). Pure readers of committed journals:
 // never depend on orchestrator memory, so the UI, the CLI and the main agent see the same durable state.
+import { initiatorSummary, restartLine } from "./restart.ts";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { compileFanout } from "../compat/fanout.ts";
@@ -566,10 +567,12 @@ export interface StatusBrief {
 const ledgerStates = new Map<string, LedgerState>();
 /** The orchestrator running now (its last `orchestrator` record, without an exit, whose process lives), and a note when
  *  its version is not the one this process loaded: running work stays on the version it started with. */
-export function orchestratorView(state: LedgerState, loaded = packageVersion()): { orchestrator?: string; versionNote?: string } {
+export function orchestratorView(state: LedgerState, loaded = packageVersion(), now = Date.now()): { orchestrator?: string; versionNote?: string } {
   const o = state.orchestrator;
   if (!o || o.exited || !processAlive(o.pid, o.start)) return {};
-  return { orchestrator: `${o.version} (pid ${o.pid})`, ...(o.version === loaded ? {} : { versionNote: versionNote(o.version, loaded) }) };
+  const r = o.forceRestart, note = r && now - r.ts < 24 * 60 * 60_000
+    ? `; restarted by force ${age(now - r.ts)} ago by ${initiatorSummary(r.initiator, r.from)}: ${restartLine(r.reason ?? "no reason recorded")}` : "";
+  return { orchestrator: `${o.version} (pid ${o.pid})${note}`, ...(o.version === loaded ? {} : { versionNote: versionNote(o.version, loaded) }) };
 }
 /** Whether the recorded orchestrator still runs. On Linux its start time also tells it from a later process given the
  *  same pid after a crash (elsewhere the pid alone is checked). */
@@ -592,7 +595,7 @@ export function versionNote(running: string, loaded: string): string {
     : `the orchestrator runs durable-subagents ${running}, this pi loaded ${loaded}: running work stays on ${running}. ` +
       `It exits about 10 s after all work ends and starts again on the installed version. To switch sooner: ` +
       `restart (\`pi-durable-subagents restart\` or the subagents tool's restart action) — refused while an execution runs, ` +
-      `calls waiting for an answer or a slot do not block it; force fences running executions, which resume on the new version`;
+      `calls waiting for an answer or a slot do not block it; force with the refusal's token, a reason and explicit user approval fences running executions, which resume on the new version`;
 }
 
 /** orchestratorView of the home's orchestrator ledger. */
@@ -613,7 +616,7 @@ export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "sl
   for (const e of held.values()) if (e.pool !== "memory") holders.set(e.pool, (holders.get(e.pool) ?? 0) + 1);
   const names = [...new Set([...Object.keys(limits), ...holders.keys()])].sort();
   const slots = names.map(p => { const n = holders.get(p) ?? 0, limit = limits[p]?.slots; return typeof limit === "number" ? `${p} ${n}/${limit}` : `${p} ${n} (no limit)`; });
-  return { ...orchestratorView(state), ...(slots.length ? { slots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
+  return { ...orchestratorView(state, packageVersion(), now), ...(slots.length ? { slots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
     ...(exhausted.length ? { exhausted } : {}),
     ...(rejected ? { configRejected: `${clip(rejected.error, 200)} (${age(now - rejected.ts)} ago); ${config ? config.hash : "the start settings"} stay in effect` } : {}) };
 }
