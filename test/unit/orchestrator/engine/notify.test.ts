@@ -42,7 +42,7 @@ async function fixture(t: test.TestContext) {
     return rid;
   };
   const decision = (rid: string) => current!.ledgers.orch.entries().find(e => (e.type === JT.applied || e.type === JT.rejected) && e.rid === rid);
-  const delivery = (rid: string) => current!.ledgers.orch.entries().find(e => e.type === 'send-note' && e.rid === rid)?.delivery;
+  const delivery = (rid: string) => current!.ledgers.orch.entries().findLast(e => e.type === 'send-note' && e.rid === rid)?.delivery;
   return { home, start, stop, send, decision, delivery, get engine() { return current!.engine; }, get ledgers() { return current!.ledgers; } };
 }
 async function run(f: Awaited<ReturnType<typeof fixture>>, source: string) {
@@ -127,4 +127,52 @@ test('notify to a running call is forwarded; a follow-up waits until a notify th
   const opened = journal().find(e => e.type === 'generation')!;
   assert.equal((opened.opening as { message: string }).message, 'Notes recorded after your last turn:\n- early note\n- late note\n\ncontinue');
   assert.deepEqual(opened.notes, ['early', late]);
+});
+
+test('a replayed notify follows what happened to its forward: delivered or retired is no second note; a receipt left from a cut-off decision is corrected', async t => {
+  const f = await fixture(t);
+  await f.start();
+  const wid = await run(f, `return await runs.run('b', {agent:'test',task:'b'});`);
+  const wf = () => f.engine.store.workflows.get(wid)!, journal = () => wf().journal.entries(), b = `${wid}@1/b@1`;
+  await until(() => journal().some(e => e.type === JT.done));
+  const notes = () => journal().filter(e => e.type === 'pending-note');
+  const forward = async (rid: string, end: 'forward-delivered' | 'forward-retired' | undefined, delivery = 'steered') => {
+    // The first decision forwarded it to the running call and recorded its receipt, then the orchestrator died before
+    // the decision; the call went on (or sealed) meanwhile.
+    await f.ledgers.orch.append('send-note', { rid, delivery });
+    await wf().journal.append('forward', { rid, rid2: `${rid}-2`, dest: b, hash: 'h', envelope: { to: b, kind: 'notify', body: { message: rid } } });
+    if (end === 'forward-delivered') await wf().journal.append(end, { rid, rid2: `${rid}-2`, call: b });
+    if (end === 'forward-retired') {
+      await wf().journal.append('pending-note', { rid, call: b, key: 'b', message: rid });
+      await wf().journal.append(end, { rid, rid2: `${rid}-2`, reason: 'retired-without-child-receipt' });
+    }
+  };
+  // Delivered: applied as steered, no note.
+  await forward('n1', 'forward-delivered');
+  const n1 = await f.send({ to: `${wid}/b`, kind: 'notify', message: 'n1' }, 'n1');
+  assert.equal(f.decision(n1)?.type, JT.applied);
+  assert.equal(notes().length, 0, 'a note the call received is not pending as well');
+  assert.equal(f.delivery(n1), 'steered');
+  assert.equal(workflowSnapshot(f.home, wid).calls[0]!.notesPending, undefined);
+  // Delivered while held for a question: the receipt stays held-until-answer.
+  await forward('n2', 'forward-delivered', 'held-until-answer');
+  await f.send({ to: `${wid}/b`, kind: 'notify', message: 'n2' }, 'n2');
+  assert.equal(f.delivery('n2'), 'held-until-answer'); assert.equal(notes().length, 0);
+  // Retired at the seal: its note exists already; no second one, and the receipt says noted.
+  await forward('n3', 'forward-retired');
+  await f.send({ to: `${wid}/b`, kind: 'notify', message: 'n3' }, 'n3');
+  assert.deepEqual(notes().map(e => e.rid), ['n3']); assert.equal(f.delivery('n3'), 'noted');
+  // Cut off between its receipt and its forward: nothing reached the call, so it is a note and the receipt says so.
+  await f.ledgers.orch.append('send-note', { rid: 'n4', delivery: 'steered' });
+  await f.send({ to: `${wid}/b`, kind: 'notify', message: 'n4' }, 'n4');
+  assert.deepEqual(notes().map(e => e.rid), ['n3', 'n4']); assert.equal(f.delivery('n4'), 'noted');
+  // A forward whose end is not recorded yet: the decision waits for it.
+  await forward('n5', undefined);
+  await publishRequest(orchInbox(f.home), { rid: 'n5', from: 'cli:other', to: 'orch', sseq: 1, kind: 'send', body: { to: `${wid}/b`, kind: 'notify', message: 'n5' } });
+  await f.engine.intake(); await f.engine.intake();
+  assert.equal(f.decision('n5'), undefined);
+  await wf().journal.append('forward-delivered', { rid: 'n5', rid2: 'n5-2', call: b });
+  await until(async () => { await f.engine.intake(); return f.decision('n5'); });
+  assert.deepEqual(notes().map(e => e.rid), ['n3', 'n4']);
+  assert.equal(workflowSnapshot(f.home, wid).calls[0]!.notesPending, 2);
 });
