@@ -110,12 +110,21 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
     calls, ...(questions.length ? { questions } : {}), ...(attention.length ? { attention } : {}), ...(fence ? { lastFence: fence } : {}) };
 }
 /** R3, best effort: why the latest fence that interrupted work happened. Every execution ends with a fence; one interrupted
- *  work only when the execution neither settled (its turn ended), nor hibernated (it waits for an answer), nor was sealed
- *  (a stop or a timeout ends the call on purpose). restart-force: a forced restart listed the execution as live;
+ *  work only when the execution neither settled (its turn ended) nor hibernated (it waits for an answer) before it, and
+ *  was not sealed on purpose: a seal ends an execution on purpose unless its outcome is `unknown` (a `once` call cut off
+ *  in a tool) or the execution was recorded as lost (the loss bound sealed it), which are interruptions themselves.
+ *  A seal for an execution that never ran (a launch failure) or that the call's stop, timeout or budget ended is on
+ *  purpose. restart-force: a forced restart listed the execution as live;
  *  orchestrator-crash: the execution was launched before an orchestrator start that is not preceded by a clean exit and
  *  fenced after it (startup recovery); otherwise process-died (the child or its host went away, or a drain fenced it). */
 export function lastFence(journal: readonly Entry[], orch: readonly Entry[]): Description["lastFence"] {
-  const ended = new Set(journal.filter(e => e.type === "settled" || e.type === "hibernated" || e.type === JT.sealed).map(e => String(e.exec)));
+  const lost = new Set(journal.filter(e => e.type === "loss").map(e => String(e.exec)));
+  const fencedAt = new Map(journal.filter(e => e.type === JT.fenced).map(e => [String(e.exec), Number(e.seq)]));
+  const ended = new Set(journal.filter(e => {
+    const exec = String(e.exec);
+    if (e.type === "settled" || e.type === "hibernated") return Number(e.seq) < (fencedAt.get(exec) ?? Infinity);
+    return e.type === JT.sealed && (e.result as { status?: string } | undefined)?.status !== "unknown" && !lost.has(exec);
+  }).map(e => String(e.exec)));
   const fence = journal.findLast(e => e.type === JT.fenced && !ended.has(String(e.exec)));
   if (!fence) return undefined;
   const exec = String(fence.exec), at = Number(fence.ts);
@@ -181,13 +190,13 @@ function pending(ctx: Context, id: string, json: boolean, why = ""): number {
   return EXIT.pending;
 }
 /** Submit, then wait; a decision whose admitted envelope has other content (another sender won the id) is a conflict. */
-async function submitAndWait(ctx: Context, id: string, kind: "run" | "send" | "stop", body: unknown, cond: Request["cond"], wait: number, json: boolean):
+async function submitAndWait(ctx: Context, seen: Seen, id: string, kind: "run" | "send" | "stop", body: unknown, cond: Request["cond"], wait: number, json: boolean):
   Promise<{ code: number } | { sent: Sent; outcome: Outcome; earlier: boolean }> {
   // R2: `created` is false only when the id was already decided before this invocation submitted (decisions are
   // monotonic); racing first attempts may all report created — the wid is what identifies the run.
   const rid = requestRid(id), earlier = Boolean(await outcome(ctx.home, rid, kind === "run", 0));
   let sent: Identified;
-  try { sent = await submitIdentified(ctx.home, rid, kind, body, cond, ctx.env, ctx.starter); }
+  try { sent = await submitIdentified(ctx.home, rid, kind, body, cond, ctx.env, ctx.starter); seen.submitted = !("conflict" in sent); }
   catch (error) {
     // Exit 1 means decided (rejected) or a usage error. A busy lock submitted nothing, and a failure after the envelope
     // was recorded (starting the orchestrator, say) leaves it submitted: both are "not decided yet — retry the same id".
@@ -203,17 +212,20 @@ async function submitAndWait(ctx: Context, id: string, kind: "run" | "send" | "s
   if (admitted && specDigest(admitted) !== sent.digest) return { code: await conflict(ctx, id, specDigest(admitted), json) };
   return { sent, outcome: result, earlier };
 }
-type Seen = { digest?: string };
-/** R2: with --json, a request refused before anything was recorded for it (a usage error, an invalid spec, an unknown
- *  agent, no open question) answers in the documented shape `{request, applied:false, reason, spec_digest?}` with exit 1;
- *  spec_digest is present once the content was complete enough to hash. Nothing is recorded: `describe` stays absent. */
+type Seen = { id?: string; json?: boolean; digest?: string; submitted?: boolean };
+/** R2: a failure once this invocation submitted, or once the id is found recorded with this content, is "not decided
+ *  yet" (75), never a refusal. Otherwise, with --json, a request refused before submission (a usage error, an invalid
+ *  spec, an unknown agent, no open question) answers `{request, applied:false, reason, spec_digest?}` with exit 1;
+ *  spec_digest is present once the content was complete enough to hash. This invocation submitted nothing. */
 async function refusable(args: string[], ctx: Context, run: (args: string[], ctx: Context, seen: Seen) => Promise<number>): Promise<number> {
   const seen: Seen = {};
   try { return await run(args, ctx, seen); }
   catch (error) {
-    if (!args.includes("--json")) throw error;
-    const at = args.indexOf("--request"), id = at >= 0 && at + 1 < args.length ? args[at + 1] : args.find(a => a.startsWith("--request="))?.slice(10);
-    ctx.write(JSON.stringify({ request: id ?? null, applied: false, reason: error instanceof Error ? error.message : String(error), ...(seen.digest ? { spec_digest: seen.digest } : {}) }));
+    const reason = error instanceof Error ? error.message : String(error), json = seen.json ?? args.includes("--json");
+    const recorded = !seen.submitted && seen.id && seen.digest && REQUEST_ID.test(seen.id) ? await findRequest(ctx.home, requestRid(seen.id)).catch(() => undefined) : undefined;
+    if (seen.id && (seen.submitted || recorded && specDigest(recorded.request) === seen.digest)) return pending(ctx, seen.id, json, `submitted, then: ${reason}`);
+    if (!json) throw error;
+    ctx.write(JSON.stringify({ request: seen.id ?? null, applied: false, reason, ...(seen.digest ? { spec_digest: seen.digest } : {}) }));
     return EXIT.rejected;
   }
 }
@@ -226,6 +238,7 @@ export const runCommand = (args: string[], ctx: Context): Promise<number> => ref
 async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", spec: "value", cwd: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), file = text(values, "spec"), json = values.json === true, wait = waitMs(values, ctx);
+  seen.id = id; seen.json = json;
   if (!id || !file || positionals.length) throw new Error("usage: run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]");
   requestRid(id);
   const bytes = file === "-" ? await (ctx.stdin ?? stdin)() : readFileSync(resolve(ctx.cwd ?? process.cwd(), file), "utf8");
@@ -240,8 +253,10 @@ async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<num
   const normalized = request({ ...spec, action: "run", ...(typeof spec.cwd === "string" && spec.cwd ? { cwd: dir } : {}) }, dir);
   const body = normalized.body as RunBody;
   seen.digest = specDigest({ kind: "run", body });
-  checkAgents(body, () => discoverAgents(dir, { home: ctx.env.HOME || undefined, agentDir: ctx.env.PI_CODING_AGENT_DIR || undefined }).agents.map(a => a.name));
-  const done = await submitAndWait(ctx, id, "run", body, undefined, wait, json);
+  // A retry of a recorded submission gets its first outcome: the agents it named may have changed since.
+  const prior = (await findRequest(ctx.home, requestRid(id)))?.request;
+  if (!prior || specDigest(prior) !== seen.digest) checkAgents(body, () => discoverAgents(dir, { home: ctx.env.HOME || undefined, agentDir: ctx.env.PI_CODING_AGENT_DIR || undefined }).agents.map(a => a.name));
+  const done = await submitAndWait(ctx, seen, id, "run", body, undefined, wait, json);
   if ("code" in done) return done.code;
   if (done.outcome.type === "rejected") {
     ctx.write(json ? JSON.stringify({ request: id, applied: false, reason: done.outcome.reason, spec_digest: done.sent.digest }) : `${id}: rejected ${done.outcome.reason}`);
@@ -279,6 +294,7 @@ export const sendCommand = (args: string[], ctx: Context): Promise<number> => re
 async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", to: "value", call: "value", kind: "value", qid: "value", rev: "value", message: "value", model: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), to = text(values, "to"), kind = text(values, "kind"), json = values.json === true, wait = waitMs(values, ctx);
+  seen.id = id; seen.json = json;
   if (!id || !to || !kind || positionals.length) throw new Error("usage: send --request <id> --to <run-id|wid/key> --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]");
   const rid = requestRid(id), prior = (await findRequest(ctx.home, rid))?.request;
   const where = await target(ctx.home, to, text(values, "call"), prior);
@@ -299,7 +315,7 @@ async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<nu
   const normalized = request({ action: "send", to: where.to, kind, ...(message !== undefined ? { message } : {}), ...(text(values, "model") !== undefined ? { model: text(values, "model") } : {}),
     ...(qid !== undefined ? { qid } : {}), ...(revision !== undefined ? { rev: revision } : {}) }, ctx.cwd ?? process.cwd());
   seen.digest = specDigest({ kind: "send", body: normalized.body, cond: normalized.cond });
-  const done = await submitAndWait(ctx, id, "send", normalized.body, normalized.cond, wait, json);
+  const done = await submitAndWait(ctx, seen, id, "send", normalized.body, normalized.cond, wait, json);
   if ("code" in done) return done.code;
   return decided(ctx, id, done, json);
 }
@@ -308,6 +324,7 @@ export const stopCommand = (args: string[], ctx: Context): Promise<number> => re
 async function stopRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), json = values.json === true, wait = waitMs(values, ctx);
+  seen.id = id; seen.json = json;
   if (!id || positionals.length !== 1) throw new Error("usage: stop --request <id> <run-id|wid|wid/key> [--json]");
   requestRid(id);
   const raw = positionals[0]!, cut = raw.indexOf("/"), head = cut < 0 ? raw : raw.slice(0, cut);
@@ -315,7 +332,7 @@ async function stopRequest(args: string[], ctx: Context, seen: Seen): Promise<nu
   if ("pending" in resolved) return pending(ctx, id, json, `run ${head} has no workflow yet`);
   const normalized = request({ action: "stop", target: raw.includes("@") ? raw : `${resolved.wid}${raw.slice(head.length)}` }, ctx.cwd ?? process.cwd());
   seen.digest = specDigest({ kind: "stop", body: normalized.body });
-  const done = await submitAndWait(ctx, id, "stop", normalized.body, undefined, wait, json);
+  const done = await submitAndWait(ctx, seen, id, "stop", normalized.body, undefined, wait, json);
   if ("code" in done) return done.code;
   return decided(ctx, id, done, json);
 }

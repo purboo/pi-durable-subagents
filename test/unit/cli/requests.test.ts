@@ -186,11 +186,41 @@ test('R2: with --json a refused run or send answers {request, applied:false, rea
   assert.deepEqual(await f.inbox(), [], 'nothing was published');
 });
 
+test('R2: a retry of a recorded run, or a failure after submission, is pending (75), never a refusal', async t => {
+  const f = await fixture(t);
+  const path = await f.spec('r.json', { agent: 'echo', task: 't' });
+  assert.equal((await f.cli(['run', '--request', 'R', '--spec', path, '--json'])).code, 75);
+  // The agent is gone by the retry: the recorded submission still gets its first outcome (here: not decided yet).
+  await rm(join(f.cwd, '.pi/agents/echo.md'));
+  const retry = await f.cli(['run', '--request', 'R', '--spec', path, '--json']);
+  assert.equal(retry.code, 75, retry.out); assert.equal(JSON.parse(retry.out).pending, true);
+  // Submitted, then reading the outcome fails (the ledger cannot be read): pending with the reason, not applied:false.
+  await writeFile(join(f.cwd, '.pi/agents/echo.md'), '---\nname: echo\ndescription: echo\n---\nEcho.');
+  const lines: string[] = [];
+  const code = await main(['run', '--request', 'P', '--spec', path, '--json', '--wait-ms', '200'], { env: f.env, cwd: f.cwd, write: line => lines.push(line),
+    starter: async () => { await rm(orchLedger(f.home), { force: true }); await mkdir(orchLedger(f.home), { recursive: true }); } });
+  assert.equal(code, 75, lines.join('\n'));
+  const reply = JSON.parse(lines.join(''));
+  assert.equal(reply.pending, true); assert.match(reply.reason, /^submitted, then: .*EISDIR/);
+  // A text-mode command whose message happens to be "--json" stays text.
+  await rm(orchLedger(f.home), { recursive: true, force: true });
+  const text = await f.cli(['send', '--request', 'T', '--to', 'w1/a', '--kind', 'steer', '--message', '--json']).catch(error => ({ code: 1, out: String(error) }));
+  assert.ok(!text.out.startsWith('{'), text.out);
+});
+
 test('R3: an execution that settled, hibernated or was sealed ended normally: its fence is not reported', () => {
   const e = (seq: number, type: string, extra: Record<string, unknown> = {}) => ({ seq, ts: seq * 10, type, ...extra });
   const orch = [e(0, 'orchestrator', { pid: 1 })];
-  for (const end of ['settled', 'hibernated', JT.sealed])
+  for (const end of ['settled', 'hibernated'])
     assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, end, { exec: 'x1' }), e(3, JT.fenced, { exec: 'x1' })], orch), undefined, end);
+  for (const status of ['stopped', 'timeout', 'budget', 'failed', 'ok'])
+    assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, JT.sealed, { exec: 'x1', result: { status } })], orch), undefined, status);
+  // Cut off, then sealed because of it: a `once` call's unknown outcome, or the loss bound. The forced restart is named.
+  const forced = [...orch, e(4, 'restart', { force: true, live: ['x1'] })];
+  assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, JT.sealed, { exec: 'x1', result: { status: 'unknown' } })], forced)?.reason, 'restart-force');
+  assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, 'loss', { exec: 'x1' }), e(4, JT.sealed, { exec: 'x1', result: { status: 'failed' } })], orch)?.exec, 'x1');
+  // A settled or hibernated mark written after the fence does not make the cut-off an ordinary end.
+  assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, 'hibernated', { exec: 'x1' })], orch)?.exec, 'x1');
   // Generation 1 was cut off; generation 2 then ended normally: the interruption of x1 is still the latest one.
   const journal = [e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, JT.exec, { exec: 'x2' }), e(4, 'settled', { exec: 'x2' }), e(5, JT.fenced, { exec: 'x2' }), e(6, JT.sealed, { exec: 'x2' })];
   assert.deepEqual(lastFence(journal, orch), { at: 20, exec: 'x1', reason: 'process-died' });
