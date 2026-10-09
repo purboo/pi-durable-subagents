@@ -25,7 +25,7 @@ async function stack(t: TestContext) {
   await mkdir(join(cwd, ".pi/agents"), { recursive: true }); await mkdir(agentDir, { recursive: true }); await mkdir(home, { recursive: true });
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: [FAUX], defaultProvider: "probe", defaultModel: "scripted" }));
   await writeFile(join(cwd, ".pi/agents/echo.md"), "---\nname: echo\ndescription: echo\n---\nYou echo.\n");
-  await writeFile(join(home, "config.json"), JSON.stringify({ providers: { probe: { slots: 1 } } }));
+  await writeFile(join(home, "config.json"), JSON.stringify({ providers: { probe: { slots: 1 } }, k: { r7Ms: 200 } }));
   const env: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, HOME: root, DSA_HOME: home,
     PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root };
   const cli = (args: string[]) => new Promise<Result>((resolve, reject) => {
@@ -103,4 +103,17 @@ test("E2E R7: describe and the collector report writer-lock and slot waits; the 
   assert.equal((await s.describe("S2")).calls[0].waiting, undefined, "a sealed call does not wait");
   // Neither first run waited for anything the R7 sources name once it ran.
   for (const wid of [w1, s1]) assert.ok(!drafts.some(d => d.wid === wid && d.type === "waiting" && d.reason !== "slot"), JSON.stringify(drafts.filter(d => d.wid === wid)));
+
+  // The orchestrator's own wiring (k.r7Ms 200): the same transitions reach `events --all`, with id, labels and cursor.
+  const head = s.json(await s.cli(["events", "--all"])).head as string, epoch = head.split(":")[0]!;
+  const logged = async () => (await s.cli(["events", "--all", "--since", `${epoch}:0`])).out.split("\n").map(l => JSON.parse(l));
+  const r7Of = (events: { type: string; call?: string; reason?: string; after?: string }[], call: string) =>
+    events.filter(e => e.call === call && (e.type === "waiting" || e.type === "moving")).map(e => e.type === "waiting" ? `waiting:${e.reason}` : `moving:${e.after}`);
+  const events = await s.until(async () => { const ev = await logged(); return r7Of(ev, s2call).at(-1) === "moving:slot" && ev; }, "the log has S2's moving", 30_000);
+  assert.deepEqual(r7Of(events, s2call), ["waiting:slot", "moving:slot"]);
+  const w2logged = r7Of(events, w2call);
+  assert.ok(w2logged.includes("waiting:writer-lock") && w2logged.at(-1)?.startsWith("moving:"), w2logged.join(" "));
+  const w2wait = events.find(e => e.call === w2call && e.type === "waiting" && e.reason === "writer-lock");
+  assert.equal(w2wait.request, "W2"); assert.deepEqual(w2wait.labels, { owed_node: "n2" }); assert.match(w2wait.cursor, new RegExp(`^${epoch}:\\d+$`));
+  t.diagnostic(`log: W2 ${w2logged.join(" → ")}; S2 ${r7Of(events, s2call).join(" → ")}`);
 });
