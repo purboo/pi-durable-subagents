@@ -91,3 +91,35 @@ test("\u2193 opens the list only from pi's input editor, not from /model's selec
     hooks.get("session_shutdown")!();
   }
 });
+
+test("other origins' live work shows as the dock's elsewhere line and opens the list; a setting turns it off", async () => {
+  const { join } = await import("node:path");
+  const { writeFileSync } = await import("node:fs");
+  const { openJournal } = await import("../../../src/kernel/journal.ts");
+  const { journalPath } = await import("../../../src/paths.ts");
+  for (const shown of [true, false]) {
+    const home = join(root, `elsewhere-${shown}`), j = await openJournal(journalPath(home, "drv"));
+    await j.append("wf-created", { origin: "cli:me@host", cwd: root, revision: 1 });
+    await j.append("call", { key: "E02", gen: 1, spec: { agent: "worker" } }); await j.close();
+    if (!shown) writeFileSync(join(home, "config.json"), JSON.stringify({ ui: { otherSessions: false } }));
+    const hooks = new Map<string, Function>(); let listener: TerminalInputHandler | undefined, opened = 0, widget: { render(width: number): string[] } | undefined;
+    const tui = { getFocusedComponent: () => ({ actionHandlers: new Map() }), requestRender() {} };
+    const pi = { on: (name: string, fn: Function) => hooks.set(name, fn) } as unknown as ExtensionAPI;
+    registerUi(pi, { home, submit: async () => {}, presentNote() {} });
+    const ctx = { mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "test" }, modelRegistry: { find: () => undefined }, ui: {
+      custom: () => { opened++; return new Promise(() => {}); },
+      setWidget: (_key: string, factory: unknown) => { if (typeof factory === "function") widget = factory(tui, { fg: (_c: string, s: string) => s }); },
+      getEditorText: () => "", onTerminalInput: (fn: TerminalInputHandler) => { listener = fn; return () => {}; },
+    } } as unknown as ExtensionContext;
+    hooks.get("session_start")!({}, ctx);
+    const dock = widget!.render(100).map(l => l.trim());
+    if (shown) {
+      assert.deepEqual(dock, ["elsewhere: 1 running (cli 1) · ↓ subagents"]);
+      assert.deepEqual(listener!("\x1b[B"), { consume: true }); assert.equal(opened, 1);
+    } else {
+      assert.deepEqual(dock, []);
+      assert.equal(listener!("\x1b[B"), undefined); assert.equal(opened, 0);
+    }
+    hooks.get("session_shutdown")!();
+  }
+});

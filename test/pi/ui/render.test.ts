@@ -414,3 +414,41 @@ test("a requested model switch shows at once in the row and the watch header unt
   screen.handleInput("\r");
   assert.match(plain(screen), /→ .*\(requested\)/);
 });
+
+test("other sessions: the folded group opens with Enter; its calls can be watched but mutating keys are refused", async () => {
+  const original = Date.now; Date.now = () => now;
+  try {
+    const { screen, data, requests } = setup();
+    const other = workflow([call("a", { callId: "c01@1/a@1" }), call("b", { callId: "c01@1/b@1", phase: "sealed", endedAt: now - 1_000, result: { key: "b", gen: 1, status: "ok", ok: true, output: "" } })],
+      { wid: "c01", name: "driver", origin: "cli:me@host", labels: { task: "T7" } });
+    data.others = [other]; data.all = [...data.workflows, other];
+    const select = (pattern: RegExp) => { for (let i = 0; i < 20 && !/^› /m.test(plain(screen).split("\n").find(l => pattern.test(l)) ?? ""); i++) screen.handleInput("\x1b[B"); };
+    assert.match(plain(screen), /▸ Other sessions \(1 workflow, 1 running\)/);
+    assert.doesNotMatch(plain(screen), /c01/, "folded by default");
+    select(/Other sessions/); assert.match(stripVTControlCharacters(screen.render(100).at(-1)!), /Enter expand/);
+    screen.handleInput("\r");
+    const list = plain(screen);
+    assert.match(list, /▾ Other sessions/); assert.match(list, /▾ c01 · driver · cli:me@host · \[task=T7\]/); assert.match(list, /└ a /);
+    select(/└ a /);
+    const footer = stripVTControlCharacters(screen.render(100).at(-1)!);
+    assert.match(footer, /Enter watch · read-only: started by cli:me@host/); assert.doesNotMatch(footer, /s steer|x stop|m model/);
+    for (const key of ["s", "x", "m", "a", "f", "r"]) {
+      screen.handleInput(key);
+      assert.match(plain(screen), /read-only: started by cli:me@host; change it from that session or the CLI/, `key ${key} is refused`);
+      assert.doesNotMatch(plain(screen), /steer a:|Stop a\?|Model for a/);
+    }
+    await tick();
+    assert.equal(requests.length, 0, "nothing was submitted for another session's call");
+    screen.handleInput("\r");
+    assert.match(plain(screen), /driver › a/); assert.match(plain(screen), /Read-only: started by cli:me@host/);
+    for (const ch of "hello") screen.handleInput(ch);
+    screen.handleInput("\r"); await tick();
+    screen.handleInput("\x0c"); screen.handleInput("\x1b[Z"); await tick();
+    assert.equal(requests.length, 0, "steer, model and thinking are refused in the watch view");
+    assert.match(plain(screen), /read-only: started by cli:me@host/); assert.doesNotMatch(plain(screen), /Model for a/);
+    // Own rows keep their controls.
+    screen.handleInput("\x1b"); for (let i = 0; i < 20; i++) screen.handleInput("\x1b[A");
+    screen.handleInput("\x1b[B"); screen.handleInput("s");
+    assert.match(plain(screen), /steer E02:/);
+  } finally { Date.now = original; }
+});
