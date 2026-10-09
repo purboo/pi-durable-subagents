@@ -181,6 +181,30 @@ for (const once of [true, false]) test(`P28 a${once ? " once" : "n"} asker cut o
   assert.equal(f.journal.entries().filter(e => e.type === JT.exec && e.call === ticket.callId).length, 2, "one execution asked, one resumed with the answer");
 });
 
+for (const once of [true, false]) test(`P28 an answer given while a${once ? " once" : "n"} asker is cut off, before recovery hibernates it, is bound to the question (not lost)`, { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 600000, trackerMs: 20 } });
+  const base = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
+  const ticket: CallTicket = { ...base, spec: { ...base.spec, once } };
+  const pending = f.executor.run(ticket);
+  const question = () => f.journal.entries().find(e => e.type === JT.attention && (e.item as { qid?: string }).qid)?.item as { qid: string; rev: number } | undefined;
+  await until(() => !!question());
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  // The answer arrives in the gap: the old execution is gone and recovery has not hibernated the call yet.
+  const q = question()!, ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  const req: Request = { rid: "early", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: q.qid, rev: q.rev }, body: { to: ticket.callId, kind: "answer", message: "yes " + script([{ text: "resumed" }]) } };
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "ok");
+  assert.equal(result.output, "resumed");
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+  const bound = f.journal.entries().filter(e => e.type === "answer-bound");
+  assert.equal(bound.length, 1); assert.equal(bound[0]!.rid, "early");
+  assert.ok(f.journal.entries().some(e => e.type === "forward-retired" && e.rid === "early" && e.reason === "bound-to-hibernation"));
+  // A retry with the same rid is still the same, applied answer.
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+});
+
 test("P28/P12 a model send to a hibernated asker is recorded and its resumed execution launches on that model", { timeout: 30000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
   const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));

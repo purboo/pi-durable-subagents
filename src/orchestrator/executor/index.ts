@@ -712,6 +712,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const sleeping = hibernation(journal, t.callId);
       if (exec && sleeping?.exec === exec) {
         await fence(journal, exec, { park: a }); await release(exec);
+        await adoptAnswer(journal, t.callId, sleeping);
         for (;;) {
           if (interrupted(a) || has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs) break;
           if (reached(totalUsage(journal.entries(), t.callId), t.spec.budget) || reached(totalUsage(journal.entries()), t.workflowBudget))
@@ -738,7 +739,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         // hibernated) was waiting, not working: it hibernates now and resumes with the answer, like a planned
         // hibernation; it is neither a loss nor, for `once`, an unknown outcome.
         const asking = openQuestion(entries);
-        if (asking && dangling.length && dangling.every(d => d.startsWith("ask (")) && hibernation(journal, t.callId)?.exec !== exec) {
+        const segment = entries.findLastIndex(e => e.type === "custom" && e.customType === CT.exec && e.data?.exec === exec);
+        const ownQuestion = !!asking && segment >= 0 && entries.slice(segment + 1).some(e => e.customType === CT.question && e.data?.qid === asking.qid);
+        if (asking && ownQuestion && dangling.length && dangling.every(d => d.startsWith("ask (")) && hibernation(journal, t.callId)?.exec !== exec) {
           await serial(() => journal.append("hibernated", { call: t.callId, exec, qid: asking.qid, rev: asking.rev }));
           continue;
         }
@@ -838,6 +841,34 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         });
       } finally { await fence(journal, exec, { child, park: a }); a.live = undefined; }
     }
+  }
+  /**
+   * P28: an answer forwarded to the child while the question was still open but before the call hibernated (a restart
+   * or crash cut the asker off, or the planned hibernation fenced it first) never reached a live child. Once the call
+   * hibernates it is bound to the question like an answer given during hibernation; the forward is retired, so the
+   * reply "apply" already given (and any retry with the same rid) stays true.
+   */
+  async function adoptAnswer(journal: JournalHandle, call: string, sleeping: Entry) {
+    const entries = await readCall(journal, call);
+    await serial(async () => {
+      const all = journal.entries();
+      if (all.some(e => e.type === "answer-bound" && e.call === call && e.qid === sleeping.qid && e.rev === sleeping.rev)) return;
+      const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
+      const f = all.find(e => {
+        if (e.type !== "forward" || e.dest !== call) return false;
+        const env = e.envelope as Envelope;
+        return env.kind === "answer" && env.cond?.qid === sleeping.qid && env.cond?.rev === sleeping.rev && !receipts.has(String(e.rid2)) &&
+          !all.some(r => r.rid2 === e.rid2 && (r.type === "forward-retired" || r.type === "forward-delivered"));
+      });
+      if (!f) return;
+      const item = attentionEntries(all).find(e => e.item.call === call && e.item.qid === sleeping.qid && e.item.rev === sleeping.rev)?.item;
+      const message = String(((f.envelope as Envelope).body as { message?: unknown } | undefined)?.message ?? "");
+      // A new identity: the stale answer may still sit in the child's inbox under the forward's rid2.
+      await journal.append("answer-bound", { call, qid: sleeping.qid, rev: sleeping.rev, rid: f.rid, rid2: contentHash([String(f.rid2), "hibernated"]), hash: f.hash,
+        message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${message}` });
+      await journal.append("forward-retired", { rid: f.rid, rid2: f.rid2, reason: "bound-to-hibernation" });
+      await (await outbox).markResolved(String(f.rid2));
+    });
   }
   async function replayForward(e: Entry) {
     const envelope = e.envelope as Envelope;
