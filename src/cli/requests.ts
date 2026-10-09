@@ -7,10 +7,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
-import { findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, specDigest, type Identified } from "../requests.ts";
-import { isLive, slotsView, workflowSnapshot, type CallSnapshot } from "../orchestrator/snapshot.ts";
+import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, specDigest, type Identified } from "../requests.ts";
+import { NOTIFY_SINCE, isLive, orchestratorTooOld, slotsView, workflowSnapshot, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
-import { checkAgents, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
+import { BATCH, checkAgents, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { JT, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
 import { startOrchestrator, submitIdentified } from "./control.ts";
@@ -332,8 +332,9 @@ async function sendMany(args: string[], at: number[], ctx: Context): Promise<num
     ctx.write(JSON.stringify({ request: at >= 0 && at + 1 < args.length ? args[at + 1] : null, applied: false, reason: (error as Error).message }));
     return EXIT.rejected;
   }
-  if (await findRequest(ctx.home, requestRid(id)) || await findRequest(ctx.home, requestRid(`${id}:${targets.length + 1}`))) {
-    ctx.write(json ? JSON.stringify({ request: id, error: "request-conflict" }) : `${id}: request-conflict - this id names other content; retry with the same targets or use a new id`);
+  const batch = batchDigest(targets);
+  if (await batchConflict(ctx.home, id, batch)) {
+    ctx.write(json ? JSON.stringify({ request: id, error: "request-conflict" }) : `${id}: request-conflict - this id names other content (another message or list of calls); retry with the same targets or use a new id`);
     return EXIT.conflict;
   }
   const rest = args.filter((_, i) => !at.includes(i) && !at.includes(i - 1));
@@ -341,7 +342,7 @@ async function sendMany(args: string[], at: number[], ctx: Context): Promise<num
   const results = await Promise.all(targets.map(async (to, i) => {
     const lines: string[] = [], own = [...rest.slice(0, request + 1), ids[i]!, ...rest.slice(request + 2), "--to", to, ...(json ? [] : ["--json"])];
     let code: number;
-    try { code = await refusable(own, { ...ctx, write: line => lines.push(line) }, sendRequest); }
+    try { code = await refusable(own, { ...ctx, write: line => lines.push(line) }, (a, c, seen) => sendRequest(a, c, seen, batch)); }
     catch (error) { return { code: EXIT.rejected as number, reply: { request: ids[i], applied: false, reason: (error as Error).message } as Record<string, unknown>, to }; }
     let reply: Record<string, unknown>;
     try { reply = JSON.parse(lines.join("")); } catch { reply = { request: ids[i], output: lines.join("\n") }; }
@@ -353,7 +354,7 @@ async function sendMany(args: string[], at: number[], ctx: Context): Promise<num
   else for (const r of results) ctx.write(`${r.to}: ${r.reply.error === "request-conflict" ? "request-conflict" : r.reply.pending ? `submitted, not decided yet${r.reply.reason ? ` (${String(r.reply.reason)})` : ""}` : outcomeLine(r.reply)} [${String(r.reply.request)}]`);
   return code;
 }
-async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
+async function sendRequest(args: string[], ctx: Context, seen: Seen, batch?: string): Promise<number> {
   const { values, positionals } = flags(args, SEND_FLAGS);
   const id = text(values, "request"), to = text(values, "to"), kind = text(values, "kind"), json = values.json === true, wait = waitMs(values, ctx);
   seen.id = id; seen.json = json;
@@ -380,8 +381,11 @@ async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<nu
     qid ??= open[0]!.qid; revision ??= open[0]!.rev;
   }
   const normalized = request({ action: "send", to: where.to, kind, ...(message !== undefined ? { message } : {}), ...(text(values, "model") !== undefined ? { model: text(values, "model") } : {}),
-    ...(qid !== undefined ? { qid } : {}), ...(revision !== undefined ? { rev: revision } : {}) }, ctx.cwd ?? process.cwd());
+    ...(qid !== undefined ? { qid } : {}), ...(revision !== undefined ? { rev: revision } : {}), ...(batch !== undefined ? { [BATCH]: batch } : {}) }, ctx.cwd ?? process.cwd());
   seen.digest = specDigest({ kind: "send", body: normalized.body, cond: normalized.cond });
+  // A retry of a recorded request gets its first outcome; a new notify is refused while an orchestrator too old for it runs.
+  const old = kind === "notify" && !prior ? orchestratorTooOld(ctx.home, 'send kind "notify"', NOTIFY_SINCE) : undefined;
+  if (old) throw new Error(old);
   // Inside a subagent the CLI names its call (provenance for `answered.by`; spec_digest ignores it).
   const body = ctx.env.DSA_CALL ? { ...normalized.body as object, caller: ctx.env.DSA_CALL } : normalized.body;
   const done = await submitAndWait(ctx, seen, id, "send", body, normalized.cond, wait, json);

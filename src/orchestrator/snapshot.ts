@@ -616,6 +616,19 @@ export function versionNote(running: string, loaded: string): string {
       `calls waiting for an answer or a slot do not block it; force with the refusal's token, a reason and explicit user approval fences running executions, which resume on the new version`;
 }
 
+/** The first version whose orchestrator and child know send kind "notify". */
+export const NOTIFY_SINCE = "1.0.28";
+/** A refusal when the orchestrator running now predates `since` and is older than the version this process loaded (an
+ *  older orchestrator would accept the request and its child would drop it); none when none runs (the next one starts
+ *  on the installed version) or it is current. */
+export function orchestratorTooOld(home: string, feature: string, since: string, loaded = packageVersion()): string | undefined {
+  const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
+  ledgerStates.set(path, state);
+  const o = state.orchestrator;
+  if (!o || o.exited || !processAlive(o.pid, o.start) || !newer(since, o.version) || !newer(loaded, o.version)) return undefined;
+  return `the running orchestrator ${o.version} predates ${feature} (new in ${since}); restart it to the installed version ${loaded} first ` +
+    `(\`pi-durable-subagents restart\` or the subagents tool's restart action), then send again`;
+}
 /** orchestratorView of the home's orchestrator ledger. */
 export function runningOrchestrator(home: string): { orchestrator?: string; versionNote?: string } {
   const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));

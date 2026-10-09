@@ -34,11 +34,14 @@ export function checkAgents(body: RunBody, available: () => string[]): void {
  *  at its next provider request), `next-execution` (a call with no live execution launches on it) or `next-generation`
  *  (a follow-up's new generation runs on it). From the orchestrator ledger's `send-note`. */
 export function sendReceipt(ledger: readonly Entry[], rid: string): { model?: string; effect?: string; pool?: string; delivery?: Delivery; note?: string } {
-  const note = ledger.find(e => e.type === "send-note" && e.rid === rid);
+  // The latest one counts: a replayed notify corrects what an interrupted first decision recorded.
+  const note = ledger.findLast(e => e.type === "send-note" && e.rid === rid);
   if (!note) return {};
   if (typeof note.delivery === "string") return { delivery: note.delivery as Delivery, note: DELIVERY_NOTE[note.delivery as Delivery] ?? note.delivery };
   return { model: String(note.model), effect: String(note.effect), ...(note.pool ? { pool: String(note.pool) } : {}) };
 }
+/** The internal argument through which a send to several calls passes its `batch` (not a tool parameter). */
+export const BATCH = Symbol("batch");
 /** One line of a reply per target: applied (with how a notify went), rejected with its reason, or not decided yet. */
 export function outcomeLine(r: Record<string, unknown>): string {
   if (r.applied === true) return `applied${r.delivery ? ` (${String(r.delivery)}: ${String(r.note)})` : r.effect ? ` (model ${String(r.model)}, ${String(r.effect)})` : ""}`;
@@ -111,7 +114,9 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     if (Array.isArray(args.to)) throw new Error("to names one call here; several targets are sent one request each");
     // follow-up may name the model its continuation runs on (P37); other kinds ignore one.
     const model = kind === "model" || kind === "follow-up" && args.model !== undefined ? { model: string(args, "model") } : {};
-    const body = { to: string(args, "to"), kind, ...model, ...(kind === "model" ? {} : { message: string(args, "message") }), ...(args.by === "user" ? { by: "user" } : {}) };
+    // `batch` is set by a send to several calls (see manyIds in src/requests.ts), never by a caller.
+    const body = { to: string(args, "to"), kind, ...model, ...(kind === "model" ? {} : { message: string(args, "message") }), ...(args.by === "user" ? { by: "user" } : {}),
+      ...(typeof (args as Record<symbol, unknown>)[BATCH] === "string" ? { batch: (args as Record<symbol, unknown>)[BATCH] as string } : {}) };
     const cond: Conditions = {};
     if (kind === "answer") {
       cond.qid = string(args, "qid");

@@ -520,22 +520,41 @@ export class Engine {
     });
   }
   /** A notify: forwarded to a running call (the executor says steered or held-until-answer); for a sealed call, or one
-   *  that sealed before the forward was recorded, a pending note in the workflow journal (`noted`). A replay finds its
-   *  note or forward and applies again without a second one. */
+   *  that sealed before the forward was recorded, a pending note in the workflow journal (`noted`). A replay (the
+   *  orchestrator died before its decision was recorded) follows what already happened to this rid: a forward the child
+   *  received is no note; one retired at the seal already became its note; one not settled yet is waited for. The reply
+   *  (the rid's latest `send-note`) is corrected to match. */
   private async notify(req: Request, wf: Workflow, entry: Entry, from: string, sealed: boolean): Promise<Decision> {
     const message = (req.body as SendBody).message;
     if (typeof message !== 'string' || !message) return { action: 'reject', reason: 'malformed: notify needs a message' };
-    if (!revisionEntries(wf).some(e => e.type === PENDING_NOTE && e.rid === req.rid)) {
-      if (!sealed) {
-        const decision = await this.executor.forward(req, this.context(wf, entry));
-        if (!(decision.action === 'reject' && decision.reason === 'call-sealed')) return decision;
-      }
+    // Forwards of this rid to any generation of the key (a follow-up may have opened a newer one since).
+    const callKey = (call: string) => call.slice(0, call.lastIndexOf('@'));
+    const forwards = () => revisionEntries(wf).filter(e => e.type === 'forward' && e.rid === req.rid && callKey(String(e.dest)) === callKey(from));
+    if (!sealed && forwards().every(f => f.dest === from)) {
+      const decision = await this.executor.forward(req, this.context(wf, entry));
+      if (!(decision.action === 'reject' && decision.reason === 'call-sealed')) return decision;
+    }
+    const log = revisionEntries(wf), noted = () => revisionEntries(wf).some(e => e.type === PENDING_NOTE && e.rid === req.rid);
+    const forwarded = forwards();
+    if (forwarded.length) {
+      if (forwarded.some(f => !log.some(r => r.rid2 === f.rid2 && (r.type === 'forward-delivered' || r.type === 'forward-retired')))) return { action: 'defer' };
+      await this.delivery(req.rid, noted() ? 'noted' : undefined);
+      return { action: 'apply' };
+    }
+    if (!noted()) {
       // Notes keep the order they were accepted in: one forwarded earlier becomes a note first.
-      if (unsettledNotify(revisionEntries(wf), from)) return { action: 'defer' };
+      if (unsettledNotify(log, from)) return { action: 'defer' };
       await wf.journal.append(PENDING_NOTE, { rid: req.rid, call: from, key: entry.key, message });
     }
-    if (!this.ledgers.orch.entries().some(e => e.type === 'send-note' && e.rid === req.rid)) await this.ledgers.orch.append('send-note', { rid: req.rid, delivery: 'noted' });
+    await this.delivery(req.rid, 'noted');
     return { action: 'apply' };
+  }
+  /** Make the rid's reply say `delivery` (the latest `send-note` counts; see sendReceipt); undefined: the forward reached
+   *  the call (or was withdrawn), so a recorded held-until-answer stays and anything else says steered. */
+  private async delivery(rid: string, delivery: 'noted' | 'steered' | undefined): Promise<void> {
+    const last = this.ledgers.orch.entries().findLast(e => e.type === 'send-note' && e.rid === rid);
+    const want = delivery ?? (last?.delivery === 'held-until-answer' ? 'held-until-answer' : 'steered');
+    if (last?.delivery !== want) await this.ledgers.orch.append('send-note', { rid, delivery: want });
   }
   /** The reply to a send that names a model says which model and when it applies (orchestrator ledger `send-note`). */
   private async note(rid: string, model: string, effect: string): Promise<void> {

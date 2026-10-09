@@ -23,12 +23,23 @@ export function requestRid(id: string): string {
 /** The request id of a `req:<id>` rid; undefined for any other rid (ULIDs never contain ':'). */
 export function requestId(rid: string): string | undefined { return rid.startsWith(PREFIX) ? rid.slice(PREFIX.length) : undefined; }
 /** The request ids of one send to `n` calls under `<id>`: `<id>:1` ... `<id>:n`, one per target in the order given
- *  (each is an ordinary request id, so a retry with the same list gets the same outcomes). */
+ *  (each is an ordinary request id, so a retry with the same list gets the same outcomes). Each body carries the list's
+ *  digest (`batch`, see batchDigest), so another list under the id is a request-conflict (checked by batchConflict
+ *  before anything is sent). */
 export function manyIds(id: string, n: number): string[] {
   const ids = Array.from({ length: n }, (_, i) => `${id}:${i + 1}`);
   for (const derived of ids) if (!REQUEST_ID.test(derived)) throw new Error(`request id ${JSON.stringify(id)} is too long for a send to ${n} calls (${derived} exceeds 124 characters)`);
   requestRid(id);
   return ids;
+}
+/** The `batch` of every request of a send to the calls `targets` (in the order given). */
+export function batchDigest(targets: readonly string[]): string { return contentHash({ to: targets }); }
+/** Whether `<id>` names other content than a send to several calls with this `batch`: a single request under `<id>`, or
+ *  a send to several calls with another list (its first request `<id>:1` has another batch). */
+export async function batchConflict(home: string, id: string, batch: string): Promise<boolean> {
+  if (await findRequest(home, requestRid(id))) return true;
+  const first = `${id}:1`, prior = REQUEST_ID.test(first) ? await findRequest(home, requestRid(first)) : undefined;
+  return prior !== undefined && (prior.request.body as { batch?: unknown } | undefined)?.batch !== batch;
 }
 /** Whether `<id>` already names a send to several calls (its first derived id `<id>:1` is recorded). */
 export async function namesMany(home: string, id: string): Promise<boolean> {
