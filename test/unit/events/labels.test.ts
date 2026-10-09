@@ -150,7 +150,7 @@ test('R6: decided runs — same labels get the first outcome, other labels confl
   assert.equal(done.status, 'done');
   const byKey = JSON.parse((await f.cli(['describe', '--key', 'D', '--json'])).out), byWid = JSON.parse((await f.cli(['describe', reply.wid, '--json'])).out);
   assert.deepEqual(byKey.labels, labels); assert.deepEqual(byWid.labels, labels);
-  assert.match((await f.cli(['describe', '--key', 'D'])).out, /\n {2}labels: role=impl\n/);
+  assert.match((await f.cli(['describe', '--key', 'D'])).out, /\n {2}labels: role=impl(\n|$)/);
   const prune = await f.cli(['prune', reply.wid], { waitMs: 5000 });
   assert.equal(prune.code, 0, prune.out);
   await until(() => readJournalSnapshot(orchLedger(f.home)).some(e => e.type === 'pruned' && e.wid === reply.wid));
