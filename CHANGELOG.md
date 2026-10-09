@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.20
+
+- Orchestrator starts are fast again. Each start re-parsed every workflow's
+  staged snapshot (tens of megabytes each when it holds a forked parent
+  session) before handling any request, so a restart stalled all work for
+  over a minute. A verified `pins.json` record per revision now replaces that
+  work: on a copy of a home with 117 workflows, recovery takes about 6 s
+  instead of 80 s. The first start after the update builds the records once.
+  A record that does not verify falls back to the snapshot, so a changed
+  pinned file is still reported as a conflict.
+- `restart` no longer reports a failure while the orchestrator is still
+  recovering: it says the request is submitted and keeps waiting (up to 10
+  minutes), then exits 75 with "still pending — do not resubmit" if no
+  orchestrator reached it. After the restart it waits for the orchestrator
+  that actually decided it.
+
 ## 1.0.19
 
 - The orchestrator no longer keeps every workflow's pinned origin branch (the
