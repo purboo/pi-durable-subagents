@@ -19,7 +19,8 @@ import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
 import { JT, attentionEntries, isEntry, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type RestartBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
-import type { CallTicket, Executor, Ledgers, LiveExecution } from './contract.ts';
+import type { CallTicket, Executor, Ledgers } from './contract.ts';
+import { isForceRestart, restartRefusal } from './restart.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
 import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
@@ -372,24 +373,19 @@ export class Engine {
     } else if (req.kind === 'restart') {
       // A replay (the restart was recorded, then the process ended before its resolution) applies without restarting again.
       if (!this.ledgers.orch.entries().some(e => e.type === 'restart' && e.rid === req.rid)) {
-        const force = (req.body as RestartBody | null)?.force === true;
+        const body = (req.body as RestartBody | null) ?? {}, force = isForceRestart(body);
+        // A claimed subagent call only restricts (it cannot force); otherwise the main session's sender is authoritative.
+        const initiator = body.initiator && 'call' in body.initiator ? body.initiator : req.from.startsWith('main:') ? { origin: req.from } : body.initiator ?? { origin: req.from };
         const gate = this.executor.quiesce?.() ?? { live: [], resume() {} };
-        if (gate.live.length && !force) { gate.resume(); return { action: 'reject', reason: this.busyReason(gate.live) }; }
-        await this.ledgers.orch.append('restart', { rid: req.rid, force, live: gate.live.map(l => l.exec) });
+        const reason = restartRefusal(this.ledgers.home, gate.live.map(l => ({ ...l, origin: this.store.workflows.get(l.wid)?.origin })), body, req.from.startsWith('main:'));
+        if (reason) { gate.resume(); return { action: 'reject', reason }; }
+        try { await this.ledgers.orch.append('restart', { rid: req.rid, force, reason: body.reason, initiator, from: req.from, live: gate.live.map(l => l.exec) }); }
+        catch (error) { gate.resume(); throw error; }
         this.restarting = true;
       }
     } else if (req.kind === 'prune') return this.prune(req as Request<PruneBody>);
     else return { action: 'reject', reason: 'unsupported-kind' };
     return { action: 'apply' };
-  }
-  /** Restart refused: which executions run now, whose they are and for how long, and the way to proceed. */
-  private busyReason(live: LiveExecution[]): string {
-    const now = Date.now(), minutes = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : `${Math.round(ms / 60_000)}m`;
-    const shown = live.slice(0, 8).map(l => {
-      const origin = this.store.workflows.get(l.wid)?.origin;
-      return `${l.wid}/${l.key}${l.phase === 'gate' ? ' gate' : ''} ${minutes(now - l.since)}${origin ? ` from ${origin}` : ''}`;
-    });
-    return `busy: ${live.length} running execution${live.length === 1 ? '' : 's'}: ${shown.join('; ')}${live.length > shown.length ? `; +${live.length - shown.length} more` : ''} — retry when they finish (or drain first), or force to fence them; they resume on the new orchestrator`;
   }
   /** Set by an applied restart: the loop ends and the process exits; its successor recovers every workflow. */
   get restartRequested(): boolean { return this.restarting; }

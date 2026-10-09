@@ -198,7 +198,7 @@ test("legacy restart check counts a call whose gate runs", { timeout: 5000 }, as
   await f.journal.append("selected", { exec, model: { provider: "probe", id: "scripted" } });
   await f.journal.append(JT.fenced, { exec });
   await f.journal.append("gate-intent", { call: a.callId, id: `gate:${a.callId}#1`, exec });
-  assert.deepEqual(journalLiveCalls(f.home).map(x => x.replace(/\d+s/, "Ns")), [`${f.wid}/a gate Ns from main:o`]);
+  assert.deepEqual(journalLiveCalls(f.home).map(({ since: _, ...x }) => x), [{ wid: f.wid, key: "a", gen: 1, callId: a.callId, exec: `gate:${a.callId}#1`, phase: "gate", origin: "main:o" }]);
   await f.journal.append("gate", { id: `gate:${a.callId}#1`, exit: 0 });
   assert.deepEqual(journalLiveCalls(f.home), []);
 });

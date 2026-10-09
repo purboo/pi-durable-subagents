@@ -4,10 +4,14 @@
 // `orchestrator` record has no `restart: true`) would keep the request as an invalid inbox file and never idle-exit, so it
 // is never sent one: the client checks the journals itself and ends it with SIGTERM (its shutdown fences what still runs,
 // and recovery resumes it) — a check without the orchestrator's launch gate, so a launch can slip in between.
+import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { hostname, userInfo } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger } from "../paths.ts";
-import { JT } from "../types.ts";
+import { JT, type RestartBody, type RestartInitiator } from "../types.ts";
+import { restartInputError, restartRefusal, type RestartExecution } from "../orchestrator/restart.ts";
 import { emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
 import { allWorkflows, liveCalls, processAlive } from "../orchestrator/snapshot.ts";
 
@@ -19,30 +23,35 @@ export function currentOrchestrator(home: string): OrchestratorProcess | undefin
   return o && !o.exited && processAlive(o.pid, o.start) ? { version: o.version, pid: o.pid, ...(o.start ? { start: o.start } : {}), ts: o.ts, ...(o.restart ? { restart: true as const } : {}) } : undefined;
 }
 
-/** Calls whose execution runs per the journals: running, asking without having hibernated (its child still runs), or
- *  running a gate (a gate-intent without its outcome; an interrupted gate is not run again). */
-export function journalLiveCalls(home: string, now = Date.now()): string[] {
-  const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : `${Math.round(ms / 60_000)}m`;
+/** Best-effort provenance; never read the live DSA home to identify the invoking process. */
+export function cliInitiator(env: NodeJS.ProcessEnv): RestartInitiator {
+  if (env.DSA_CALL) return { call: env.DSA_CALL };
+  let parent = "";
+  try {
+    parent = process.platform === "linux" ? readFileSync(`/proc/${process.ppid}/cmdline`, "utf8").replace(/\0/g, " ").trim()
+      : process.platform === "darwin" ? execFileSync("ps", ["-o", "command=", "-p", String(process.ppid)], { encoding: "utf8", timeout: 1000, maxBuffer: 64 * 1024 }).trim() : "";
+  } catch { /* Parent may have exited or /proc may be unavailable. */ }
+  return { cli: { user: userInfo().username, host: hostname(), ppid: process.ppid, parent: parent.slice(0, 200) } };
+}
+
+/** Calls whose execution runs per the journals: running, asking without having hibernated, or an unresolved gate. */
+export function journalLiveCalls(home: string): RestartExecution[] {
   return allWorkflows(home).flatMap(wf => {
     const entries = readJournalSnapshot(journalPath(home, wf.wid));
     const done = new Set(entries.filter(e => e.type === "gate").map(e => String(e.id)));
     const sealed = new Set(entries.filter(e => e.type === JT.sealed).map(e => String(e.call)));
-    const gates = new Map(entries.filter(e => e.type === "gate-intent" && !done.has(String(e.id)) && !sealed.has(String(e.call))).map(e => [String(e.call), e.ts]));
-    const where = wf.origin ? ` from ${wf.origin}` : "";
-    const running = liveCalls(wf).filter(c => !gates.has(c.callId) && (c.phase === "running" || (c.phase === "asking" && c.exec !== undefined && !c.hibernated)))
-      .map(c => `${wf.wid}/${c.key}${c.startedAt ? ` ${age(now - c.startedAt)}` : ""}${where}`);
-    const gating = [...gates].map(([call, ts]) => `${wf.wid}/${call.slice(call.indexOf("/") + 1, call.lastIndexOf("@"))} gate ${age(now - ts)}${where}`);
+    const gates = new Map(entries.filter(e => e.type === "gate-intent" && !done.has(String(e.id)) && !sealed.has(String(e.call))).map(e => [String(e.call), e]));
+    const running = liveCalls(wf).filter(c => !gates.has(c.callId) && c.exec !== undefined && (c.phase === "running" || (c.phase === "asking" && !c.hibernated)))
+      .map(c => ({ wid: wf.wid, key: c.key, gen: c.gen, callId: c.callId, exec: c.exec!, since: c.startedAt ?? wf.startedAt ?? Date.now(), phase: "child" as const, origin: wf.origin }));
+    const gating = [...gates].map(([call, e]) => ({ wid: wf.wid, key: call.slice(call.indexOf("/") + 1, call.lastIndexOf("@")), gen: Number(call.slice(call.lastIndexOf("@") + 1)), callId: call, exec: String(e.id), since: e.ts, phase: "gate" as const, origin: wf.origin }));
     return [...running, ...gating];
   });
 }
 
-/** For an orchestrator without the restart request kind: refuse while calls run (unless forced), else SIGTERM it. */
-export function legacyRestart(home: string, old: OrchestratorProcess, force: boolean): { applied: true } | { applied: false; reason: string } {
-  const live = journalLiveCalls(home);
-  if (live.length && !force) {
-    const shown = live.slice(0, 8).join("; ") + (live.length > 8 ? `; +${live.length - 8} more` : "");
-    return { applied: false, reason: `busy: ${live.length} running call${live.length === 1 ? "" : "s"} on orchestrator ${old.version} (pid ${old.pid}): ${shown} — retry when they finish (or drain first), or force to fence them; they resume on the new orchestrator` };
-  }
+/** Legacy has no launch gate: check immediately before SIGTERM; a launch can still slip between (documented). */
+export function legacyRestart(home: string, old: OrchestratorProcess, body: RestartBody, options: { subagent?: boolean; tool?: boolean } = {}): { applied: true } | { applied: false; reason: string } {
+  const reason = restartInputError(body, options.subagent) ?? restartRefusal(home, journalLiveCalls(home), body, options.tool);
+  if (reason) return { applied: false, reason };
   try { process.kill(old.pid, "SIGTERM"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
   return { applied: true };

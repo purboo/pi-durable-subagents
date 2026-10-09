@@ -10,6 +10,8 @@ import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
 import { orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { unfinishedWorkflow } from "../agent/main/snapshots.ts";
+import { cliInitiator } from "./restart.ts";
+import { restartInputError } from "../orchestrator/restart.ts";
 import { JT, type DrainBody, type PruneBody, type Request, type RestartBody } from "../types.ts";
 
 export type Control = "resume" | "drain" | "stop" | "stop-all" | "prune" | "restart";
@@ -65,7 +67,7 @@ export async function resolution(home: string, rid: string, timeoutMs: number, i
   }
 }
 /** P5, P38: Serialize the stable CLI sender across processes and recover its durable outbox. */
-export async function submit(home: string, command: Control, target?: string, env: NodeJS.ProcessEnv = process.env, options: { olderThanDays?: number; force?: boolean } = {}): Promise<Request[]> {
+export async function submit(home: string, command: Control, target?: string, env: NodeJS.ProcessEnv = process.env, options: { olderThanDays?: number; restart?: RestartBody } = {}): Promise<Request[]> {
   if (command === "stop" && !target) throw new Error("stop requires a workflow or call id");
   await mkdir(home, { recursive: true });
   const sender = `cli:${userInfo().username}@${hostname()}`;
@@ -87,7 +89,9 @@ export async function submit(home: string, command: Control, target?: string, en
         const body: PruneBody = { ...(target ? { wid: target } : {}), ...(options.olderThanDays !== undefined ? { olderThanDays: options.olderThanDays } : {}) };
         requests.push(await outbox.send("orch", "prune", body));
       } else if (command === "restart") {
-        const body: RestartBody = options.force ? { force: true } : {};
+        const body: RestartBody = { ...options.restart, initiator: cliInitiator(env) };
+        const invalid = restartInputError(body, env.DSA_EXEC !== undefined);
+        if (invalid) throw new Error(invalid);
         requests.push(await outbox.send("orch", "restart", body));
       } else requests.push(await outbox.send("orch", command, command === "stop" ? { target } : command === "resume" && target ? { wid: target } : {}));
       // Publish first: even a starter failure leaves a recoverable request and no idle-exit race.
