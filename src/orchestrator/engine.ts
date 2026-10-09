@@ -38,7 +38,9 @@ const wakeStatus = (status?: string) => {
   return status;
 };
 /** A follow-up still going when its workflow ended has no result yet: say so instead of calling it unknown. */
-const callStatus = (c: { phase: string; result?: CallResult }) => c.result || c.phase === 'sealed' ? wakeStatus(c.result?.status) : c.phase;
+/** A follow-up generation still going when its workflow ended is named by its phase; anything else without a result is unknown. */
+const going = (c: { gen: number; phase: string; result?: CallResult }) => !c.result && c.phase !== 'sealed' && c.gen > 1;
+const callStatus = (c: { gen: number; phase: string; result?: CallResult }) => going(c) ? c.phase : wakeStatus(c.result?.status);
 /** v12 §6: Name available agents in the refusal instead of making the caller guess. */
 export function unknownAgent(name: unknown, agents: readonly { name: string }[]): string {
   return `unknown agent ${JSON.stringify(name)}; available agents: ${agents.map(a => a.name).sort().join(", ") || "none"}`;
@@ -75,8 +77,8 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
     if (allowance < 2) continue;
     const result = c.result;
     // A stop leaves the agent's edits where they are; say so, so nobody mistakes a stopped agent for a clean undo.
-    const going = !result && c.phase !== 'sealed' ? ' (a follow-up still going; you are told when it ends)' : '';
-    const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${callStatus(c)}${going}${result?.status === 'stopped' ? ' (edits it made so far are left in place)' : ''}`;
+    const still = going(c) ? ' (a follow-up still going; you are told when it ends)' : '';
+    const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${callStatus(c)}${still}${result?.status === 'stopped' ? ' (edits it made so far are left in place)' : ''}`;
     const title = `\n${tail(name, allowance - 1)}`;
     const error = result?.error && allowance - title.length > 10 ? `\n  Error: ${tail(result.error, Math.min(300, allowance - title.length - 9))}` : '';
     const space = allowance - title.length - error.length;
