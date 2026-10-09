@@ -57,6 +57,7 @@ export class EventPump implements EventSink {
   private closed = false;
   private compactedAt = 0;
   private reported?: string;
+  private identityScan = -1;
   /** Set by open() when the log was created (or replaced after corruption) and everything on disk was derived. */
   backfilled = false;
   /** Resolves once open() (or close()) ran: emits wait for it. */
@@ -141,6 +142,9 @@ export class EventPump implements EventSink {
     const cached = this.identities.get(wid);
     if (cached) return cached;
     const orch = committed(this.options.orch);
+    // A miss rescans the ledger only after it grew (a journal may be derived before its `created` is appended).
+    if (orch.length === this.identityScan) return {};
+    this.identityScan = orch.length;
     // One scan resolves every workflow not cached yet (a backfill asks for all of them).
     const wanted = new Map<string, string>(), rids = new Map<string, string>();
     for (const e of orch) if (e.type === JT.created && this.options.store.workflows.has(String(e.wid)) && !this.identities.has(String(e.wid))) { wanted.set(String(e.wid), String(e.rid)); rids.set(String(e.rid), String(e.wid)); }

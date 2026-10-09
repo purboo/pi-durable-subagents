@@ -235,6 +235,8 @@ pi-durable-subagents smoke              check this machine and this pi (offline,
 pi-durable-subagents chaos              run the fault suite (offline, about 2 minutes)
 pi-durable-subagents status [wid] [--json]
 pi-durable-subagents events <wid> [--json]   the meaningful timeline of one workflow
+pi-durable-subagents events --all [--since <cursor>] [--limit <n>] [--json]
+                                        milestones of every workflow, read with a cursor (see below)
 pi-durable-subagents tail [wid] [--json]
 pi-durable-subagents start              start the orchestrator if work is pending; sends nothing
 pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)
@@ -328,6 +330,75 @@ pi-durable-subagents describe --key build-42 --json
 pi-durable-subagents send --request build-42-a1 --to build-42 --kind answer \
   --qid <qid> --rev <rev> --message "yes"
 ```
+
+#### Events across workflows
+
+`events --all` reads one durable log of milestones of every workflow
+(`$DSA_HOME/events.jsonl`, written only by the orchestrator), so a program
+without a daemon can poll it and react to completions and questions without
+reading every workflow. Output is JSON lines (with or without `--json`).
+
+```sh
+pi-durable-subagents events --all                          # {"head":"<epoch>:<seq>","more":false}
+pi-durable-subagents events --all --since <cursor> --limit 500
+```
+
+Every event has `id`, `cursor`, `ts` (when the milestone happened), `type`,
+`wid`, `request` (the run id, when the run was created by `run --request`),
+`labels` (the run's labels, when it has any), and for call events `key`,
+`gen` and `call` (`<wid>@<rev>/<key>@<gen>`):
+
+| type | fields |
+| --- | --- |
+| `submitted` | `name?` — the workflow was created |
+| `started` | `exec` — the first execution of a call (generation) began |
+| `asking` | `qid`, `rev`, `question` (full text), `to` (`<wid>/<key>`, the answer address) |
+| `answered` | `qid`, `rev`, `by`, `via?`, `digest` (sha256 hex of the UTF-8 answer), `length` (its length in UTF-16 code units, as JavaScript counts) — never the text; `describe` has it |
+| `sealed` | `status` (`ok`, `failed`, `gate-failed`, `stopped`, `timeout`, `budget`, `unknown`, …), `error?` (unclipped), `data` when its JSON is at most 16 KiB, else `data_omitted: <bytes>` (read it with `describe`) |
+| `fenced` | `exec` (the execution cut off), `reason` (`restart-force`, `orchestrator-crash`, `process-died`), `at` — an execution was interrupted and the call resumed in a new one: the processes its tools had started are gone |
+| `workflow-done` | `status`, `error?` |
+
+Readers must ignore types they do not know (`waiting`/`moving` follow).
+`by` is the sender of the answer: `session:<id>` for a pi session (with
+`via: "ui"` when it came from the subagent list), `cli:<user>@<host>` for the
+CLI (a subagent answering through the CLI also shows as `cli:…`), else
+`unknown`. `fenced` is emitted when the call's next execution begins (right
+after recovery, before it waits for a slot) and only when the fence
+interrupted work, exactly as `describe`'s `lastFence`: a turn that had ended,
+a hibernated question, an answer's resume or a seal are no `fenced`. A `once`
+call cut off in a tool is never resumed: it gets `sealed` with status
+`unknown` and no `fenced`.
+
+Cursors are `<epoch>:<seq>`; `--since c` returns the events after `c` in log
+order, at most `--limit` (default and maximum 1000), then
+`{"head": …, "more": …}`. With `more: true`, `head` is the cursor of the last
+event printed: pass it as the next `--since`. With `more: false`, `head` is
+the log's head; it may name a seq that no event has (every orchestrator start
+skips 1000 seqs, so a seq you saw in a write that a power cut undid is never
+reused), and it is still a valid cursor. Without `--since` only the head is
+printed. When no log exists yet, the command starts the orchestrator (which
+creates it from everything still on disk) and waits up to `--wait-ms`
+(default 60 s), else prints `{"pending": true}` and exits 75; when the log
+exists it never starts anything.
+
+Delivery is at least once, without gaps: after a crash the orchestrator
+derives again from its last durable watermark, and an event derived again has
+the same `id` (a new cursor). Deduplicate by `id`, and persist your cursor
+only after you applied the events of a page.
+
+Retention: an event is dropped only when it was logged more than 7 days ago
+(`"k": { "eventRetentionMs": … }` in `config.json`) and its workflow is
+finished in its current revision (done, failed or stopped — not parked) with
+no open question and no unsealed call, or was pruned. The log is compacted at
+orchestrator start and at most hourly. A cursor of another epoch (the log was
+replaced: a corrupt log is kept aside as `events.jsonl.corrupt-<ms>` and a new
+one starts), below the highest dropped seq, or beyond the head gets exit 4
+and one line `{"error":"cursor-expired","head":"…","oldest":"…"}` (`oldest`
+is the smallest cursor still accepted). To recover, run `describe --key` for
+every run you have not closed (it reports `sealed`, `asking` with the full
+question, `pruned`, …), rebuild your state from those answers, then continue
+with `--since <head>` from that reply. A malformed cursor or option exits 1
+with `{"error":"invalid-arguments","message":…}`.
 
 ### Housekeeping
 

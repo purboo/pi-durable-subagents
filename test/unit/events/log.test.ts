@@ -88,6 +88,28 @@ test('R2 log: compaction drops only selected events, keeps marks and head, and d
   await again.log.close();
 });
 
+test('R2 log: a large log pages from any cursor (byte-offset search) exactly like a full scan', async t => {
+  const path = eventsLog(await home(t));
+  let { log } = await EventLog.open(path);
+  const pad = 'p'.repeat(200);
+  // Several starts (skips and head records) and marks interleaved: ~2000 events, about 600 KiB.
+  for (let start = 0; start < 4; start++) {
+    for (let i = 0; i < 5; i++) await log.append(Array.from({ length: 100 }, (_, k) => ({ ...draft(start * 1000 + i * 100 + k), error: pad })), new Map([['orch', start * 10 + i]]));
+    await log.close();
+    ({ log } = await EventLog.open(path));
+  }
+  await log.close();
+  const all = readPage(path, 0, 5000)!.events.map(e => Number(e.cursor.split(':')[1]));
+  assert.equal(all.length, 2000);
+  assert.ok((await readFile(path)).length > 512 * 1024);
+  for (const since of [0, 1, 99, 500, 1499, 1500, 1501, all[1234]!, all[1999]! - 1, all[1999]!, 4500]) {
+    const page = readPage(path, since, 7)!;
+    const expected = all.filter(s => s > since).slice(0, 7);
+    assert.deepEqual(page.events.map(e => Number(e.cursor.split(':')[1])), expected, `since ${since}`);
+    assert.equal(page.more, all.filter(s => s > since).length > 7, `more since ${since}`);
+  }
+});
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Pump over real journals.
 // ---------------------------------------------------------------------------------------------------------------------
