@@ -60,7 +60,15 @@ function answerOf(entries: readonly Entry[], limit: number, orch: readonly Entry
   return { request, text: typeof message === "string" ? message : forwarded ?? "" };
 }
 
-/** The events of journal entry `i` of workflow `wid` (usually none). */
+/** The ledger entries durable before journal entry `e` (by time: the ledger and the journal are separate files). */
+function before(orch: readonly Entry[], e: Entry): readonly Entry[] {
+  let n = orch.length;
+  while (n > 0 && Number(orch[n - 1]!.ts) > e.ts) n--;
+  return n === orch.length ? orch : orch.slice(0, n);
+}
+
+/** The events of journal entry `i` of workflow `wid` (usually none). Reads only that journal's entries up to `i` and
+ *  the ledger entries durable before it, so a re-derivation gives the same events. */
 export function deriveEntry(wid: string, entries: readonly Entry[], i: number, orch: readonly Entry[], id: Identity): EventDraft[] {
   const e = entries[i]!, base = (type: string) => ({ id: `${wid}:${e.seq}:${type}`, ts: e.ts, wid, ...echo(id) });
   if (isEntry(e, JT.exec)) {
@@ -71,7 +79,7 @@ export function deriveEntry(wid: string, entries: readonly Entry[], i: number, o
     if (!previous) return [{ ...base("started"), type: "started", ...onCall(e.call), exec: e.exec }];
     const fence = interruptingFence(entries, String(previous.exec), i);
     if (!fence) return [];
-    return [{ ...base("fenced"), type: "fenced", ...onCall(e.call), exec: String(previous.exec), reason: fenceReason(entries, orch, fence), at: fence.ts }];
+    return [{ ...base("fenced"), type: "fenced", ...onCall(e.call), exec: String(previous.exec), reason: fenceReason(entries.slice(0, i), before(orch, e), fence), at: fence.ts }];
   }
   if (isEntry(e, JT.attention)) {
     const item = e.item;
@@ -85,7 +93,7 @@ export function deriveEntry(wid: string, entries: readonly Entry[], i: number, o
     for (let j = i - 1; j >= 0 && !item; j--) { const a = entries[j]!; if (isEntry(a, JT.attention) && a.item.id === e.id && a.item.rev === e.rev) item = a; }
     const q = (item as Entry & { item: { kind: string; call?: string; qid?: string; rev: number } } | undefined)?.item;
     if (!q || q.kind !== "question" || !q.call || q.qid === undefined) return [];
-    const answer = answerOf(entries, i, orch, q.call, q.qid, q.rev);
+    const answer = answerOf(entries, i, before(orch, e), q.call, q.qid, q.rev);
     return [{ ...base("answered"), type: "answered", ...onCall(q.call), qid: q.qid, rev: q.rev, ...answeredBy(answer.request),
       digest: createHash("sha256").update(answer.text, "utf8").digest("hex"), length: answer.text.length }];
   }
