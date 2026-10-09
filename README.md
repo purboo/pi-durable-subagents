@@ -254,7 +254,7 @@ pi-durable-subagents stop-all           pause every existing workflow now; journ
 pi-durable-subagents prune [wid] [--older-than <days>]
                                         delete finished workflows (done, failed, stopped); prints count and bytes freed
 pi-durable-subagents restart [--force <token> --reason <text>]  switch to the installed version (see "Updating Durable Subagents")
-pi-durable-subagents hold <resource> [--shared] [--max-wait <s>] [--note <text>] -- <command…>
+pi-durable-subagents hold <resource> [--shared] [--max-wait <s> | --no-wait] [--note <text>] -- <command…>
                                         run one command while holding a resource lease (see below)
 pi-durable-subagents leases [--json]    who holds and who waits for each resource
 pi-durable-subagents doctor [--json]    read-only health check; exits 1 when something needs you
@@ -473,6 +473,12 @@ pi-durable-subagents hold machine --max-wait 600 --note "profile" -- ./measure.s
   everything before it, and keeps later shared requests out (no starvation).
   A waiting `hold` prints who holds the resource; `--max-wait` gives up with
   exit 75 without running the command.
+- `--no-wait` (same as `--max-wait 0`) takes the lease now or not at all.
+  It decides under the resource's lock. If it can run now, its request is
+  written already granted. Otherwise nothing is written, and it exits 75
+  naming who holds or waits, without running the command. It is never
+  listed as a waiter, even for a moment, so it can probe a resource whose
+  owner treats any queued request as interference.
 - The command runs without a shell (write `-- sh -c '…'` for one) in its
   own process group; signals to `hold` go to it and its exit status is
   returned. When it exits, whatever it left in its process group is ended

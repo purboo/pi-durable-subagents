@@ -1,14 +1,15 @@
 // `pi-durable-subagents hold <resource> [--shared] [--max-wait <s>] [--note <text>] -- <command> [args…]`
 // Waits for the lease (strict FIFO), runs the command in its own process group, ends what the command left in that
-// group, then releases. See src/platform/lease.ts for the ticket protocol.
+// group, then releases. `--max-wait 0` (or `--no-wait`) takes the lease at once or exits 75 without ever being queued.
+// See src/platform/lease.ts for the ticket protocol.
 import { spawn } from "node:child_process";
 import { watch, type FSWatcher } from "node:fs";
 import { constants } from "node:os";
 import { dsaHome } from "../paths.ts";
 import { captureStart } from "../platform/proctable.ts";
-import { blockers, enqueue, groupAlive, leaseDir, liveTickets, orphaned, removeTicket, RESOURCE, who, writeTicket, type LeaseMode, type LeaseTicket } from "../platform/lease.ts";
+import { blockers, enqueue, groupAlive, tryGrant, leaseDir, liveTickets, orphaned, removeTicket, RESOURCE, who, writeTicket, type LeaseMode, type LeaseTicket } from "../platform/lease.ts";
 
-export const HOLD_USAGE = "usage: pi-durable-subagents hold <resource> [--shared] [--max-wait <seconds>] [--note <text>] -- <command> [args…]";
+export const HOLD_USAGE = "usage: pi-durable-subagents hold <resource> [--shared] [--max-wait <seconds> | --no-wait] [--note <text>] -- <command> [args…]";
 /** Exit status when --max-wait expires before the lease is granted (EX_TEMPFAIL). */
 export const WAIT_EXPIRED = 75;
 
@@ -21,6 +22,7 @@ export function parseHold(args: string[]): HoldArgs {
   for (let i = 0; i < opts.length; i++) {
     const a = opts[i]!;
     if (a === "--shared") mode = "shared";
+    else if (a === "--no-wait") maxWaitMs = 0;
     else if (a === "--max-wait" || a === "--note") {
       const v = opts[++i];
       if (v === undefined) throw new Error(`${a} needs a value. ${HOLD_USAGE}`);
@@ -49,13 +51,21 @@ export interface HoldOptions { env?: NodeJS.ProcessEnv; stderr?: (line: string) 
 export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<number> {
   const env = options.env ?? process.env, home = dsaHome(env), say = options.stderr ?? (l => process.stderr.write(`${l}\n`));
   const pollMs = options.pollMs ?? 250, graceMs = options.graceMs ?? 2000;
-  const ticket: LeaseTicket = await enqueue(home, {
+  const request = {
     resource: args.resource, mode: args.mode,
     wrapper: { pid: process.pid, start: (await captureStart(process.pid)) || undefined },
     argv: args.argv.map(a => a.length > 200 ? `${a.slice(0, 199)}…` : a).slice(0, 32), cwd: process.cwd(),
     ...(args.note ? { note: args.note.slice(0, 300) } : {}), since: Date.now(),
     ...(env.DSA_EXEC ? { exec: env.DSA_EXEC } : {}), ...(env.DSA_CALL ? { call: env.DSA_CALL } : {}),
-  });
+  };
+  // No wait: granted now, or refused without a ticket — never listed as a waiter, even for a moment.
+  const granted = args.maxWaitMs === 0 ? await tryGrant(home, request) : undefined;
+  if (granted && "busy" in granted) {
+    const now = Date.now(), by = granted.busy.map(t => `${who(t)} (${t.mode}${t.grantedAt === undefined ? ", waiting" : ""}, ${age(now - (t.grantedAt ?? t.since))})`).join(", ");
+    say(`hold: ${args.resource} is not free now (${by}); not running the command (exit ${WAIT_EXPIRED})`);
+    return WAIT_EXPIRED;
+  }
+  const ticket: LeaseTicket = granted ?? await enqueue(home, request);
   // Signals: while waiting they withdraw the request; while the command runs they go to its process group.
   let child: ReturnType<typeof spawn> | undefined, interrupted: NodeJS.Signals | undefined, wake = () => {};
   const onSignal = (signal: NodeJS.Signals) => {
@@ -97,7 +107,7 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
       await new Promise<void>(resolve => { const timer = setTimeout(resolve, pollMs); wake = () => { clearTimeout(timer); resolve(); }; });
     }
     watcher?.close(); watcher = undefined;
-    ticket.grantedAt = Date.now();
+    ticket.grantedAt ??= Date.now();
     await writeTicket(home, ticket);
     if (interrupted) { removeTicket(home, ticket); return 128 + (constants.signals[interrupted] ?? 1); }
     if (shown) say(`hold: ${args.resource} granted after ${age(ticket.grantedAt - ticket.since)}`);

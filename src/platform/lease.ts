@@ -126,6 +126,16 @@ export function removeTicket(home: string, t: LeaseTicket) {
 /** Queue a request: number it under the resource's kernel lock and write its ticket before the lock is released, so a
  *  later request always sees it. */
 export async function enqueue(home: string, ticket: Omit<LeaseTicket, "seq">, lock = new OsLock()): Promise<LeaseTicket> {
+  return (await numbered(home, ticket, false, lock)) as LeaseTicket;
+}
+/** Take the lease now or not at all (`hold --max-wait 0`): under the resource's kernel lock, either no live ticket
+ *  blocks it and its ticket is written already granted, or nothing is written and the blockers are returned. A refused
+ *  request is never visible as a waiter, and a granted one never was one. Granting needs no more than the lock: a later
+ *  request gets a higher number and waits behind this ticket, and earlier tickets can only disappear. */
+export async function tryGrant(home: string, ticket: Omit<LeaseTicket, "seq" | "grantedAt">, lock = new OsLock()): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
+  return numbered(home, ticket, true, lock);
+}
+async function numbered(home: string, ticket: Omit<LeaseTicket, "seq">, now: boolean, lock: OsLock): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
   const dir = leaseDir(home, ticket.resource);
   mkdirSync(dir, { recursive: true });
   let handle = await lock.tryAcquire(path.join(dir, ".lock"));
@@ -138,6 +148,11 @@ export async function enqueue(home: string, ticket: Omit<LeaseTicket, "seq">, lo
     const last = Number.parseInt(await readFile(counter, "utf8").catch(() => "0"), 10) || 0;
     const highest = readTickets(home, ticket.resource).reduce((m, t) => Math.max(m, t.seq), last);
     const t: LeaseTicket = { ...ticket, seq: highest + 1 };
+    if (now) {
+      const busy = blockers(t, liveTickets(home, ticket.resource));
+      if (busy.length) return { busy };
+      t.grantedAt = Date.now();
+    }
     await writeFile(`${counter}.tmp`, String(t.seq)); renameSync(`${counter}.tmp`, counter);
     writeTicketSync(home, t);
     return t;

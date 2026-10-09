@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.27
+
+- `hold --no-wait` (or `--max-wait 0`) takes the lease at once or exits 75
+  without ever being queued: the decision is made under the resource's lock
+  and a refused request writes nothing, so `leases`, `status` and other
+  waiters never see it. Before, `--max-wait 0` queued a ticket, checked, and
+  removed it.
+
 ## 1.0.26
 
 - A daily quota message in Chinese ("remaining quota is 0, resets at 00:00 the

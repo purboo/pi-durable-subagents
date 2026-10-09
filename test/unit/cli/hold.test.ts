@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, watch } from 'node:fs';
 import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,6 +44,7 @@ test('hold: arguments are checked', () => {
   assert.throws(() => parseHold(['a/b', '--', 'make']), /Invalid resource/);
   assert.throws(() => parseHold(['m', '--max-wait', 'x', '--', 'make']), /--max-wait must be/);
   assert.throws(() => parseHold(['m', '--bogus', '--', 'make']), /Unknown option --bogus/);
+  assert.equal(parseHold(['m', '--no-wait', '--', 'make']).maxWaitMs, 0);
   assert.throws(() => parseHold(['m', '--']), /needs a command/);
 });
 
@@ -101,6 +102,33 @@ test('hold: --max-wait gives up with 75 without running the command', async t =>
   assert.match(b.stderr(), /still held by pid \d+ .* not running the command \(exit 75\)/);
   assert.equal(await a.exit, 0);
   assert.deepEqual(log(file), ['a start', 'a end']);
+});
+
+test('hold: --max-wait 0 / --no-wait takes the lease at once or exits 75 without ever being a waiter', async t => {
+  const home = await root(t), file = join(home, 'log');
+  // Free: runs at once, its ticket granted from the start.
+  const free = run(home, ['machine', '--no-wait', '--', ...step(file, 'free', 0.5)]);
+  await until(() => granted(home, 'machine', free.child.pid!));
+  assert.equal(await free.exit, 0); assert.equal(free.stderr(), '');
+  // A shared probe next to a shared holder is granted too.
+  const s = run(home, ['machine', '--shared', '--', ...step(file, 's', 3)]);
+  await until(() => granted(home, 'machine', s.child.pid!));
+  const probe = run(home, ['machine', '--shared', '--max-wait', '0', '--', ...step(file, 'probe', 0)]);
+  assert.equal(await probe.exit, 0);
+  // An exclusive request behind the shared holder waits; a shared probe now has a waiter ahead: refused, and no ticket
+  // of it ever appears in the directory (watched for the whole attempt).
+  const e = run(home, ['machine', '--', ...step(file, 'e', 0)]);
+  await until(() => queued(home, 'machine', e.child.pid!));
+  const before = (await readdir(leaseDir(home, 'machine'))).filter(n => n.endsWith('.json')).sort();
+  const seen: string[] = [], watcher = watch(leaseDir(home, 'machine'), (_event, name) => { if (name) seen.push(String(name)); });
+  const refused = run(home, ['machine', '--shared', '--no-wait', '--', ...step(file, 'refused', 0)]);
+  assert.equal(await refused.exit, 75);
+  await delay(100); watcher.close();
+  assert.match(refused.stderr(), /hold: machine is not free now \(pid \d+ `sh -c .*e start.*` \(exclusive, waiting, \d+s\)\); not running the command \(exit 75\)/);
+  assert.deepEqual(seen.filter(n => /^\d{12}\.json/.test(n) && !before.includes(n)), [], 'no ticket of the refused probe was written');
+  assert.deepEqual((await readdir(leaseDir(home, 'machine'))).filter(n => n.endsWith('.json')).sort(), before);
+  assert.deepEqual(await Promise.all([s.exit, e.exit]), [0, 0]);
+  assert.ok(!log(file).some(l => l.startsWith('refused')), 'the refused command never ran');
 });
 
 test('hold: a killed wrapper keeps the lease until its command ends; leftovers end before release', async t => {
