@@ -7,13 +7,14 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync, watch } from 'node:fs';
 import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseHold } from '../../../src/cli/hold.ts';
 import { main, renderView } from '../../../src/cli/main.ts';
 import { blockers, groupAlive, leaseCalls, leaseDir, leaseLines, leaseState, orphaned, readTickets, writeShim, type LeaseTicket } from '../../../src/platform/lease.ts';
 import { statusBrief, statusView } from '../../../src/orchestrator/snapshot.ts';
+import { restartRefusal } from '../../../src/orchestrator/restart.ts';
 
 const cli = fileURLToPath(new URL('../../../src/cli/main.ts', import.meta.url));
 async function root(t: test.TestContext) {
@@ -223,4 +224,125 @@ test('hold: the shim runs the CLI from a child environment', async t => {
   });
   assert.equal(out.trim(), 'held');
   assert.match(readFileSync(shim, 'utf8'), /^#!\/bin\/sh\nexec '.*node.*' '.*main\.ts' "\$@"\n$/);
+});
+
+// Counted leases: `hold <resource> --slots N` admits up to N holders, strictly in request order.
+/** Like step, but runs until the file `go` exists (or the test's home is removed, so a failed test leaves nothing running). */
+const gate = (file: string, name: string, go: string) => ['sh', '-c', `echo "${name} start" >> ${file}; while [ ! -f ${go} ] && [ -d ${dirname(go)} ]; do sleep 0.05; done; echo "${name} end" >> ${file}`];
+
+test('hold --slots: arguments are checked; --shared and --slots cannot be combined', () => {
+  assert.deepEqual(parseHold(['build', '--slots', '4', '--', 'cargo', 'test']), { resource: 'build', mode: 'counted', slots: 4, argv: ['cargo', 'test'] });
+  for (const bad of ['0', '-1', '1.5', 'x', '']) assert.throws(() => parseHold(['build', '--slots', bad, '--', 'x']), /--slots must be an integer >= 1/);
+  assert.throws(() => parseHold(['build', '--slots']), /--slots needs a value|needs -- before/);
+  assert.throws(() => parseHold(['build', '--slots', '2', '--shared', '--', 'x']), /--slots and --shared cannot be combined/);
+  assert.throws(() => parseHold(['build', '--shared', '--slots', '2', '--', 'x']), /--slots and --shared cannot be combined/);
+});
+
+test('hold --slots: blockers count granted tickets and never overtake an earlier waiter', () => {
+  const t = (seq: number, mode: 'exclusive' | 'shared' | 'counted', granted: boolean, slots?: number) =>
+    ({ seq, mode, ...(slots ? { slots } : {}), ...(granted ? { grantedAt: 1 } : {}) }) as LeaseTicket;
+  const c = (seq: number, slots: number) => t(seq, 'counted', false, slots);
+  // Free slots, nothing waits ahead: granted.
+  assert.deepEqual(blockers(c(3, 3), [t(1, 'counted', true, 3), t(2, 'shared', true)]), []);
+  // Full: every granted ticket keeps it, a later granted shared one included.
+  assert.deepEqual(blockers(c(3, 2), [t(1, 'counted', true, 2), c(3, 2), t(4, 'shared', true)]).map(x => x.seq), [1, 4]);
+  // Behind a waiting exclusive request: kept although slots are free.
+  assert.deepEqual(blockers(c(3, 5), [t(1, 'counted', true, 5), t(2, 'exclusive', false)]).map(x => x.seq), [2]);
+  // An earlier counted waiter (here with a smaller N) is not overtaken; nor is an earlier shared waiter.
+  assert.deepEqual(blockers(c(3, 2), [t(1, 'counted', true, 1), c(2, 1)]).map(x => x.seq), [2]);
+  assert.deepEqual(blockers(c(3, 9), [t(1, 'exclusive', true), t(2, 'shared', false)]).map(x => x.seq), [1, 2]);
+  // An exclusive request still waits for any earlier ticket; a shared one ignores slots.
+  assert.deepEqual(blockers(t(4, 'exclusive', false), [t(1, 'counted', true, 4)]).map(x => x.seq), [1]);
+  assert.deepEqual(blockers(t(4, 'shared', false), [t(1, 'counted', true, 1), c(2, 1)]), []);
+});
+
+test('hold --slots 2: two run together, the third waits until one exits; leases show k/N', async t => {
+  const home = await root(t), file = join(home, 'log'), goA = join(home, 'go-a'), goB = join(home, 'go-b');
+  const a = run(home, ['build', '--slots', '2', '--note', 'n1', '--', ...gate(file, 'a', goA)]);
+  await until(() => granted(home, 'build', a.child.pid!));
+  const b = run(home, ['build', '--slots', '2', '--', ...gate(file, 'b', goB)]);
+  await until(() => granted(home, 'build', b.child.pid!));
+  assert.equal(queued(home, 'build', a.child.pid!)!.slots, 2);
+  const c = run(home, ['build', '--slots', '2', '--', ...step(file, 'c', 0)]);
+  await until(() => /position 1, held 2\/2/.test(c.stderr()), 20_000);
+  assert.match(c.stderr(), /hold: waiting for build \(slot, position 1, held 2\/2\); held by pid \d+ `sh -c .*` \(slot, \d+s\), pid \d+ /);
+  assert.ok(!granted(home, 'build', c.child.pid!), 'the third is not granted');
+  // Visibility: text, JSON and status.
+  const state = leaseState(home);
+  assert.equal(state[0]!.slots, 2); assert.equal(state[0]!.held, 2);
+  assert.match(leaseLines(state, Date.now())[0]!, /^build 2\/2 held: pid \d+ `sh -c .*` \(slot, \d+s, n1\), pid \d+ `sh -c .*` \(slot, \d+s\); waiting: 1 \(first: pid \d+ `sh -c .*`, \d+s\)$/);
+  const lines: string[] = [];
+  assert.equal(await main(['leases', '--json'], { env: { DSA_HOME: home }, write: l => lines.push(l) }), 0);
+  const json = JSON.parse(lines.join('\n'));
+  assert.equal(json[0].slots, 2); assert.equal(json[0].held, 2);
+  assert.deepEqual(json[0].holders.map((x: LeaseTicket) => [x.mode, x.slots]), [['counted', 2], ['counted', 2]]);
+  assert.match(statusView(home).leases![0]!, /^build 2\/2 held: /);
+  // One exits: the waiter runs while the other holder still runs.
+  await writeFile(goA, '');
+  assert.equal(await c.exit, 0);
+  assert.ok(!log(file).includes('b end'), 'c ran while b still held its slot');
+  assert.match(c.stderr(), /hold: build granted after/);
+  await writeFile(goB, '');
+  assert.deepEqual(await Promise.all([a.exit, b.exit]), [0, 0]);
+  assert.deepEqual(leaseState(home), []);
+});
+
+test('hold --slots: a counted request behind a waiting exclusive one waits although slots are free; an earlier counted waiter is not overtaken', async t => {
+  const home = await root(t), file = join(home, 'log'), go = join(home, 'go'), go2 = join(home, 'go2');
+  const a = run(home, ['build', '--slots', '3', '--', ...gate(file, 'a', go)]);
+  await until(() => granted(home, 'build', a.child.pid!));
+  const e = run(home, ['build', '--', ...step(file, 'e', 0.2)]);
+  await until(() => queued(home, 'build', e.child.pid!));
+  const c = run(home, ['build', '--slots', '3', '--', ...step(file, 'c', 0)]);
+  await until(() => /position 2, held 1\/3/.test(c.stderr()), 20_000);
+  assert.ok(!granted(home, 'build', c.child.pid!), 'not granted with 2 of 3 slots free');
+  await writeFile(go, '');
+  assert.deepEqual(await Promise.all([a.exit, e.exit, c.exit]), [0, 0, 0]);
+  assert.deepEqual(log(file), ['a start', 'a end', 'e start', 'e end', 'c start', 'c end']);
+  // N=1 holder and waiter, then a request with N=2 that would fit by its own count: it queues behind the waiter.
+  const h = run(home, ['gpu', '--slots', '1', '--', ...gate(file, 'h', go2)]);
+  await until(() => granted(home, 'gpu', h.child.pid!));
+  const w = run(home, ['gpu', '--slots', '1', '--', ...step(file, 'w', 0.3)]);
+  await until(() => queued(home, 'gpu', w.child.pid!));
+  const late = run(home, ['gpu', '--slots', '2', '--', ...step(file, 'late', 0)]);
+  await until(() => /position 2, held 1\/2/.test(late.stderr()), 20_000);
+  assert.ok(!granted(home, 'gpu', late.child.pid!), 'the later request does not overtake the earlier waiter');
+  await writeFile(go2, '');
+  assert.deepEqual(await Promise.all([h.exit, w.exit, late.exit]), [0, 0, 0]);
+  // Once h ends, w is granted first and late then fits beside it (its own N is 2), so the two may start in either order.
+  const order = log(file).slice(6);
+  assert.deepEqual(order.slice(0, 2), ['h start', 'h end']);
+  assert.ok(order.includes('w start') && order.includes('late start'));
+});
+
+test('hold --slots --no-wait: granted while a slot is free, else refused without ever writing a ticket', async t => {
+  const home = await root(t), file = join(home, 'log'), go = join(home, 'go');
+  const a = run(home, ['build', '--slots', '2', '--no-wait', '--', ...gate(file, 'a', go)]);
+  await until(() => granted(home, 'build', a.child.pid!));
+  const b = run(home, ['build', '--slots', '2', '--max-wait', '0', '--', ...gate(file, 'b', go)]);
+  await until(() => granted(home, 'build', b.child.pid!));
+  assert.equal(a.stderr() + b.stderr(), '');
+  const before = (await readdir(leaseDir(home, 'build'))).filter(n => n.endsWith('.json')).sort();
+  const top = Math.max(...before.map(n => Number.parseInt(n, 10)));
+  const seen: string[] = [], watcher = watch(leaseDir(home, 'build'), (_event, name) => { if (name) seen.push(String(name)); });
+  const refused = run(home, ['build', '--slots', '2', '--no-wait', '--', ...step(file, 'refused', 0)]);
+  assert.equal(await refused.exit, 75);
+  await delay(100); watcher.close();
+  assert.match(refused.stderr(), /hold: build is not free now \(pid \d+ `sh -c .*` \(slot, \d+s\), pid \d+ `sh -c .*` \(slot, \d+s\)\); not running the command \(exit 75\)/);
+  assert.deepEqual(seen.filter(n => /^\d{12}\.json/.test(n) && Number.parseInt(n, 10) > top), [], 'no ticket of the refused probe was written');
+  assert.deepEqual((await readdir(leaseDir(home, 'build'))).filter(n => n.endsWith('.json')).sort(), before);
+  await writeFile(go, '');
+  assert.deepEqual(await Promise.all([a.exit, b.exit]), [0, 0]);
+  assert.ok(!log(file).some(l => l.startsWith('refused')), 'the refused command never ran');
+});
+
+test('hold --slots: the restart refusal names counted leases with k/N', async t => {
+  const home = await root(t), now = Date.now();
+  await mkdir(leaseDir(home, 'build'), { recursive: true });
+  const base = { resource: 'build', mode: 'counted' as const, slots: 3, wrapper: { pid: process.pid }, cwd: home, since: now, grantedAt: now };
+  await writeFile(join(leaseDir(home, 'build'), '000000000001.json'), JSON.stringify({ ...base, seq: 1, argv: ['cargo', 'test'], call: 'W1@1/a@1' }));
+  await writeFile(join(leaseDir(home, 'build'), '000000000002.json'), JSON.stringify({ ...base, seq: 2, argv: ['make'] }));
+  const text = restartRefusal(home, [{ wid: 'W1', key: 'a', gen: 1, callId: 'W1@1/a@1', exec: 'W1@1/a@1#1.1', since: now, phase: 'child' }] as never, {}, false, now)!;
+  assert.match(text, /\n  W1\/a 0s holds lease build 2\/3 \(slot, 0s, `cargo test`\)\n/);
+  assert.match(text, /\n  build 2\/3 held by pid \d+ `make` \(slot, 0s\)\n/);
 });

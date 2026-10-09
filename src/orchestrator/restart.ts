@@ -29,9 +29,11 @@ export function restartRefusal(home: string, live: readonly RestartExecution[], 
   // executions (a shell, a systemd unit, another call) keep their lease across the restart; they are listed so the
   // machine is not mistaken for free.
   const leases = new Map<string, string>(), others: string[] = [], calls = new Set(live.map(l => l.callId));
-  for (const { resource, holders } of leaseState(home)) for (const t of holders) {
-    if (t.call && calls.has(t.call)) leases.set(t.call, [leases.get(t.call), `holds lease ${resource} (${holdDetail(t, now)})`].filter(Boolean).join(", "));
-    else others.push(`  ${resource} held by ${who(t)} (${holdDetail(t, now)})`);
+  for (const { resource, holders, slots } of leaseState(home)) for (const t of holders) {
+    // A counted resource names how many of its slots are taken: "build 3/5".
+    const name = slots !== undefined ? `${resource} ${holders.length}/${slots}` : resource;
+    if (t.call && calls.has(t.call)) leases.set(t.call, [leases.get(t.call), `holds lease ${name} (${holdDetail(t, now)})`].filter(Boolean).join(", "));
+    else others.push(`  ${name} held by ${who(t)} (${holdDetail(t, now)})`);
   }
   const groups = new Map<string, RestartExecution[]>();
   for (const l of live) { const origin = l.origin ?? "unknown"; groups.set(origin, [...(groups.get(origin) ?? []), l]); }
