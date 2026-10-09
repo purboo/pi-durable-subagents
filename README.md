@@ -393,7 +393,8 @@ Retention: an event is dropped only when it was logged more than 7 days ago
 (`"k": { "eventRetentionMs": … }` in `$DSA_HOME/config.json`) and its workflow is
 finished in its current revision (done, failed or stopped — not parked) with
 no open question and no unsealed call, or was pruned. The log is compacted at
-orchestrator start and at most hourly. A cursor of another epoch (the log was
+orchestrator start and at most hourly; to compact now while a question is open
+(which keeps the orchestrator from idle exit), run `restart` without `--force`. A cursor of another epoch (the log was
 replaced: a corrupt log is kept aside as `events.jsonl.corrupt-<ms>` and a new
 one starts), below the highest dropped seq, or beyond the head gets exit 4
 and one line `{"error":"cursor-expired","head":"…","oldest":"…"}` (`oldest`
@@ -567,8 +568,11 @@ On load, it checks the pi exports and API methods it uses.
 Running work stays on the version it started with until you restart the
 orchestrator. When the orchestrator runs another version than the one a pi
 session loaded, that pi says so once, and `status` shows the running version
-with a note. The orchestrator exits about 10 s after all work ends, and the
-next start runs the new version. To switch sooner:
+with a note. The orchestrator exits about 10 s (`k.idleExitMs`) after all
+work ends: every workflow is finished in its current revision (done, failed,
+stopped or parked) or held by `drain`. A workflow with an open question is not
+finished, so a call hibernated on its question keeps the orchestrator running
+(it holds no slot and costs little). The next start runs the new version. To switch sooner:
 
 ```sh
 pi-durable-subagents restart          # or the subagents tool: action "restart"
