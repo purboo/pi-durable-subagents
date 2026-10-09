@@ -193,6 +193,8 @@ export interface RunBody {
   maxCalls?: number;
   /** Origin session for `context: "fork"` (P33): its branch up to `leafId` is pinned at admission. */
   origin?: { sessionFile: string; leafId?: string | null };
+  /** R6: caller labels (flat string map), part of the spec digest and echoed on every event of the workflow. */
+  labels?: Record<string, string>;
 }
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
 export interface SendBody {
