@@ -419,7 +419,9 @@ When an unsealed call does not move, its `waiting` in `describe` adds
 probe 1/1`) and `since` (ms: when that cause started). The event log has the
 same: `waiting {reason, detail, since}` when the reason appears or changes,
 `moving {after}` when it clears (also when the call ends), checked every
-`k.r7Ms` (default 5 s); a change of detail alone is no event. The first reason
+`k.r7Ms` (default 5 s; read when the orchestrator starts, unlike the other
+`k` settings a `config.json` change does not apply it until a restart); a
+change of detail alone is no event. The first reason
 that applies wins:
 
 | reason | the call … |
@@ -429,10 +431,14 @@ that applies wins:
 | `writer-lock` | waits for another call that writes in the same worktree |
 | `lease` | waits for a resource lease (`hold`, below) |
 | `slot` | is queued for a provider slot or memory headroom (at once when its providers are full, else after 3 s) |
-| `silent` | runs without visible activity: the stall notice, with the command running and for how long |
+| `silent` | is running (launched, not stopped) without visible activity: the stall notice of that execution, with the command running and for how long |
 
-A call that asks a question is `asking`, not waiting; a sealed call never
-waits. `provider-exhausted`, `writer-lock`, `lease` and `slot` are queues
+A call whose current execution asked a question (also while it hibernates
+until the answer) is `asking`, not waiting. Once the answer arrives the call
+launches again, and from then on it waits like any call (for a slot, the
+writer lock, …) even though `describe` still lists the question as open until
+the new execution reads it (its `state` stays `asking`). A drained call
+(no execution running) is never `silent`; a sealed call never waits. `provider-exhausted`, `writer-lock`, `lease` and `slot` are queues
 that clear by themselves; `silent` and `unconfirmed-stop` may need a look.
 
 ### Housekeeping

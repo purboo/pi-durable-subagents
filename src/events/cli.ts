@@ -2,11 +2,12 @@
 // Output is JSON lines (with or without --json). Without --since: `{"head","more":false}`. With --since: the events
 // after the cursor (at most --limit, default and max EVENTS_PAGE_MAX), then `{"head","more"}`: more:true → head is the
 // cursor of the last event printed; more:false → the log head. Exit 0; 4 cursor-expired (other epoch, seq below
-// `dropped`, or beyond the head); 1 malformed cursor or options (`{"error":"invalid-arguments","message"}`); 75 no log yet within --wait-ms (an orchestrator was
-// started to create it). Read-only: never repairs the log, never starts the orchestrator when the log exists.
+// `dropped`, or beyond the head); 1 malformed cursor or options (`{"error":"invalid-arguments","message"}`) or an
+// unreadable log (`{"error":"log-unreadable","message"}`: corrupt, or gone between reads twice); 75 no log yet within
+// --wait-ms (an orchestrator was started to create it). Read-only: never repairs the log, never starts the orchestrator when the log exists.
 import { setTimeout as delay } from "node:timers/promises";
 import { eventsLog } from "../paths.ts";
-import { EPOCH, readHead, readPage, type LogHead } from "./log.ts";
+import { EPOCH, LogCorrupt, readHead, readPage, type LogHead, type Page } from "./log.ts";
 import { EVENTS_PAGE_MAX, EXIT_CURSOR_EXPIRED } from "./types.ts";
 
 export interface EventsContext { home: string; env: NodeJS.ProcessEnv; write: (line: string) => void; starter: (home: string, env: NodeJS.ProcessEnv) => Promise<void>; waitMs?: number }
@@ -20,9 +21,20 @@ export function parseCursor(text: string): { epoch: string; seq: number } | unde
 }
 /** Exit 1 with one JSON line `{"error":"invalid-arguments","message"}` (the output stays JSON lines). */
 function invalid(ctx: EventsContext, message: string): number { ctx.write(JSON.stringify({ error: "invalid-arguments", message })); return EVENTS_EXIT.invalid; }
+/** Exit 1 with one JSON line `{"error":"log-unreadable","message"}`. */
+function unreadable(ctx: EventsContext, message: string): number { ctx.write(JSON.stringify({ error: "log-unreadable", message })); return EVENTS_EXIT.invalid; }
+class Vanished extends Error { constructor() { super("the event log disappeared while it was read"); } }
 class Expired extends Error { readonly head: LogHead; constructor(head: LogHead) { super("cursor-expired"); this.head = head; } }
 
 export async function eventsAll(args: string[], ctx: EventsContext): Promise<number> {
+  try { return await read(args, ctx); }
+  catch (error) {
+    if (error instanceof Vanished) try { return await read(args, ctx); } catch (again) { error = again; } // retried once
+    if (error instanceof LogCorrupt || error instanceof Vanished) return unreadable(ctx, error.message);
+    throw error;
+  }
+}
+async function read(args: string[], ctx: EventsContext): Promise<number> {
   const values: Record<string, string | true> = {};
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!, name = arg.startsWith("--") ? arg.slice(2) : undefined;
@@ -52,11 +64,12 @@ export async function eventsAll(args: string[], ctx: EventsContext): Promise<num
     if (!readHead(path)) { ctx.write(JSON.stringify({ pending: true })); return EVENTS_EXIT.pending; }
   }
   const cursor = (h: LogHead, seq: number) => `${h.epoch}:${seq}`;
-  if (!since) { const h = readHead(path)!; ctx.write(JSON.stringify({ head: cursor(h, h.head), more: false })); return EVENTS_EXIT.ok; }
+  if (!since) { const h = readHead(path); if (!h) throw new Vanished(); ctx.write(JSON.stringify({ head: cursor(h, h.head), more: false })); return EVENTS_EXIT.ok; }
   try {
-    const page = readPage(path, since.seq, limit ?? EVENTS_PAGE_MAX, h => {
+    const page: Page | undefined = readPage(path, since.seq, limit ?? EVENTS_PAGE_MAX, h => {
       if (h.epoch !== since.epoch || since.seq < h.dropped || since.seq > h.head) throw new Expired(h);
-    })!;
+    });
+    if (!page) throw new Vanished();
     for (const e of page.events) ctx.write(JSON.stringify(e));
     ctx.write(JSON.stringify({ head: page.more ? page.events.at(-1)!.cursor : cursor(page, page.head), more: page.more }));
     return EVENTS_EXIT.ok;

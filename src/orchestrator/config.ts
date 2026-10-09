@@ -3,7 +3,8 @@
 // Orchestrator ledger entries: config{hash,config} — the settings in effect from then on (at start, or after a change);
 // config-rejected{hash,error} — a changed file that was not applied; the settings before it stay in effect.
 // A reload changes the shared config object in place: every later read sees it (the next slot acquisition, model
-// resolution or check). Slots already held are kept when a limit drops; timers of running executions keep their period.
+// resolution or check). Slots already held are kept when a limit drops; timers of running executions keep their period, and the R7 check
+// period (k.r7Ms) is read once at orchestrator start.
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { contentHash } from "../kernel/ids.ts";

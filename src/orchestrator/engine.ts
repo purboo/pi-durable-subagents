@@ -176,18 +176,24 @@ export class Engine {
     await this.intake();
     this.startR7();
   }
-  /** R7: every k.r7Ms, why each live call does not move, as `waiting`/`moving` events through the pump. The tracker
-   *  starts from the log's latest transition per call, so a restart repeats none (and a call that ended or started
-   *  moving meanwhile gets its `moving`). */
+  /** R7: every k.r7Ms (read here, at orchestrator start), why each live call does not move, as `waiting`/`moving`
+   *  events through the pump. The tracker starts from the log's latest transition per call, so a restart repeats none
+   *  (and a call that ended or started moving meanwhile gets its `moving`). The seed reads from seq 0: retention keeps
+   *  events below `dropped`. A seed that cannot be read is logged and R7 starts empty (recovery never fails on it). */
   private startR7() {
     if (this.closed || this.r7) return;
     const latest = new Map<string, R7Seed>(), head = this.events.head;
-    if (head) for (let since = head.dropped, more = true; more;) {
-      const page = readPage(eventsLog(this.ledgers.home), since, 1000);
-      if (!page || page.epoch !== head.epoch) break;
-      for (const e of page.events) if ((e.type === 'waiting' || e.type === 'moving') && e.call) latest.set(e.call, e as R7Seed);
-      more = page.more && page.events.length > 0;
-      if (page.events.length) since = Number(page.events.at(-1)!.cursor.split(':')[1]);
+    try {
+      if (head) for (let since = 0, more = true; more;) {
+        const page = readPage(eventsLog(this.ledgers.home), since, 1000);
+        if (!page || page.epoch !== head.epoch) break;
+        for (const e of page.events) if ((e.type === 'waiting' || e.type === 'moving') && e.call) latest.set(e.call, e as R7Seed);
+        more = page.more && page.events.length > 0;
+        if (page.events.length) since = Number(page.events.at(-1)!.cursor.split(':')[1]);
+      }
+    } catch (error) {
+      console.error(`durable-subagents: R7 seed from the event log failed, starting without it: ${String(error)}`);
+      latest.clear();
     }
     const tracker = new R7Tracker(); tracker.seed(latest);
     const collect = r7Collector({ home: this.ledgers.home, workflows: () => this.store.workflows.values(), orch: this.ledgers.orch, config: this.ledgers.config });
@@ -439,17 +445,22 @@ export class Engine {
       return { action: 'reject', reason: 'invalid-prune' };
     const cutoff = olderThanDays === undefined ? undefined : Date.now() - olderThanDays * 86_400_000;
     if (wid === undefined) {
-      for (const wf of [...this.store.workflows.values()].sort((a, b) => a.wid < b.wid ? -1 : 1))
-        if (!this.unprunable(wf, cutoff)) await this.pruneWorkflow(req.rid, wf);
+      // A replayed prune may have pruned some already (before a crash).
+      let count = this.ledgers.orch.entries().some(e => e.type === 'pruned' && e.rid === req.rid) ? 1 : 0;
+      for (const wf of [...this.store.workflows.values()].sort((a, b) => a.wid < b.wid ? -1 : 1)) {
+        if (this.unprunable(wf, cutoff)) continue;
+        const failed = await this.pruneWorkflow(req.rid, wf);
+        // Once some went, the prune stays applied (its pruned entries name them); the rest wait for the next prune.
+        if (failed) { if (!count) return { action: 'reject', reason: failed }; console.error(`durable-subagents: prune ${req.rid} stopped early, the rest waits for the next prune: ${failed}`); break; }
+        count++;
+      }
       return { action: 'apply' };
     }
     if (this.ledgers.orch.entries().some(e => e.type === 'pruned' && e.rid === req.rid && e.wid === wid)) return { action: 'apply' };
     const wf = this.store.workflows.get(wid);
     if (!wf) return { action: 'reject', reason: this.store.pruned().has(wid) ? 'already-pruned' : 'unknown-workflow' };
-    const reason = this.unprunable(wf, cutoff);
-    if (reason) return { action: 'reject', reason };
-    await this.pruneWorkflow(req.rid, wf);
-    return { action: 'apply' };
+    const reason = this.unprunable(wf, cutoff) ?? await this.pruneWorkflow(req.rid, wf);
+    return reason ? { action: 'reject', reason } : { action: 'apply' };
   }
   /** Housekeeping: Why a workflow cannot be pruned: not final (parked or running), open executor work, an unresolved
    *  fence failure, or ended after the cutoff. */
@@ -465,15 +476,18 @@ export class Engine {
     if (cutoff !== undefined && done!.ts > cutoff) return 'too-recent';
     return undefined;
   }
-  /** A1, housekeeping: The pruned entry commits first; then the handle closes and the files go (recovery finishes them). */
-  private async pruneWorkflow(rid: string, wf: Workflow) {
+  /** A1, housekeeping: The pruned entry commits first; then the handle closes and the files go (recovery finishes them).
+   *  Returns the reject reason `event-log: …` when the workflow's events could not be logged first (nothing removed). */
+  private async pruneWorkflow(rid: string, wf: Workflow): Promise<string | undefined> {
     const bytes = await this.store.footprint(wf.wid);
     const done = this.terminal(wf)!, entries = this.ledgers.orch.entries();
     const createdBy = String(entries.find(e => e.type === JT.created && e.wid === wf.wid)?.rid ?? '');
     const admitted = requestId(createdBy) !== undefined ? entries.find(e => e.type === 'request' && (e.request as Request).rid === createdBy)?.request as Request | undefined : undefined;
     const identity = admitted ? { request: requestId(createdBy), spec_digest: specDigest(admitted) } : {};
-    // R2: its events are derived and logged before the journal can go (recovery removes it once `pruned` is committed).
-    await this.events.flush();
+    // R2: its events are derived and logged before the journal can go (recovery removes it once `pruned` is committed);
+    // when they cannot be, the prune is rejected and the caller retries later.
+    try { await this.events.flush(); }
+    catch (error) { return `event-log: ${error instanceof Error ? error.message : String(error)}`; }
     await this.ledgers.orch.append('pruned', { rid, wid: wf.wid, endedAt: done.ts, bytes, status: String(done.status), ...identity });
     this.states.delete(wf.wid);
     await this.store.drop(wf.wid);
