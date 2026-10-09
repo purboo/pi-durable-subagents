@@ -111,7 +111,9 @@ test('hold: --max-wait 0 / --no-wait takes the lease at once or exits 75 without
   await until(() => granted(home, 'machine', free.child.pid!));
   assert.equal(await free.exit, 0); assert.equal(free.stderr(), '');
   // A shared probe next to a shared holder is granted too.
-  const s = run(home, ['machine', '--shared', '--', ...step(file, 's', 3)]);
+  // The shared holder runs until the test lets it go, so nothing else is granted while the probe is watched.
+  const go = join(home, 'go');
+  const s = run(home, ['machine', '--shared', '--', 'sh', '-c', `while [ ! -f ${go} ]; do sleep 0.05; done`]);
   await until(() => granted(home, 'machine', s.child.pid!));
   const probe = run(home, ['machine', '--shared', '--max-wait', '0', '--', ...step(file, 'probe', 0)]);
   assert.equal(await probe.exit, 0);
@@ -120,13 +122,15 @@ test('hold: --max-wait 0 / --no-wait takes the lease at once or exits 75 without
   const e = run(home, ['machine', '--', ...step(file, 'e', 0)]);
   await until(() => queued(home, 'machine', e.child.pid!));
   const before = (await readdir(leaseDir(home, 'machine'))).filter(n => n.endsWith('.json')).sort();
+  const top = Math.max(...before.map(n => Number.parseInt(n, 10)));
   const seen: string[] = [], watcher = watch(leaseDir(home, 'machine'), (_event, name) => { if (name) seen.push(String(name)); });
   const refused = run(home, ['machine', '--shared', '--no-wait', '--', ...step(file, 'refused', 0)]);
   assert.equal(await refused.exit, 75);
   await delay(100); watcher.close();
   assert.match(refused.stderr(), /hold: machine is not free now \(pid \d+ `sh -c .*e start.*` \(exclusive, waiting, \d+s\)\); not running the command \(exit 75\)/);
-  assert.deepEqual(seen.filter(n => /^\d{12}\.json/.test(n) && !before.includes(n)), [], 'no ticket of the refused probe was written');
+  assert.deepEqual(seen.filter(n => /^\d{12}\.json/.test(n) && Number.parseInt(n, 10) > top), [], 'no ticket of the refused probe was written');
   assert.deepEqual((await readdir(leaseDir(home, 'machine'))).filter(n => n.endsWith('.json')).sort(), before);
+  await writeFile(go, '');
   assert.deepEqual(await Promise.all([s.exit, e.exit]), [0, 0]);
   assert.ok(!log(file).some(l => l.startsWith('refused')), 'the refused command never ran');
 });

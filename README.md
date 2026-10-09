@@ -478,7 +478,9 @@ pi-durable-subagents hold machine --max-wait 600 --note "profile" -- ./measure.s
   written already granted. Otherwise nothing is written, and it exits 75
   naming who holds or waits, without running the command. It is never
   listed as a waiter, even for a moment, so it can probe a resource whose
-  owner treats any queued request as interference.
+  owner treats any queued request as interference. It also leaves the
+  resource alone: unlike a queued waiter, it does not end processes left
+  by a holder whose `hold` was killed, and is refused while they remain.
 - The command runs without a shell (write `-- sh -c '…'` for one) in its
   own process group; signals to `hold` go to it and its exit status is
   returned. When it exits, whatever it left in its process group is ended
