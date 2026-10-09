@@ -77,6 +77,10 @@ test('deriver: asking carries the full question, qid, rev and answer address; an
   assert.equal(answer.length, 7, 'length counts UTF-16 units (the emoji is 2)');
   assert.deepEqual(answeredBy(request('main:S1', 'user').request as Request), { by: 'session:S1', via: 'ui' });
   assert.deepEqual(answeredBy(request('cli:me@host').request as Request), { by: 'cli:me@host' });
+  // The CLI inside a subagent names its call; a malformed caller falls back to the CLI sender.
+  const fromCall = (caller: unknown) => { const r = request('cli:me@host').request as Request; return answeredBy({ ...r, body: { ...r.body as object, caller } }); };
+  assert.deepEqual(fromCall('01W@1/review@3'), { by: 'call:01W/review' });
+  assert.deepEqual(fromCall('nonsense'), { by: 'cli:me@host' });
   assert.deepEqual(answeredBy(request('eval:x').request as Request), { by: 'unknown' });
   assert.deepEqual(answeredBy(undefined), { by: 'unknown' });
   // Hibernated asker: answer-bound names the request; its decorated message is not the answer text.

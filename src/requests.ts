@@ -27,6 +27,7 @@ export function requestId(rid: string): string | undefined { return rid.startsWi
 export function specDigest(req: Pick<Request, 'kind' | 'body' | 'cond'>): string {
   let body = req.body;
   if (req.kind === 'run' && body && typeof body === 'object' && !Array.isArray(body)) { const { origin: _, ...rest } = body as Record<string, unknown>; body = rest; }
+  if (req.kind === 'send' && body && typeof body === 'object' && !Array.isArray(body)) { const { caller: _, ...rest } = body as Record<string, unknown>; body = rest; }
   return contentHash({ kind: req.kind, body, cond: req.cond });
 }
 /** The envelope recorded for `rid`: the orchestrator's admitted copy (ledger `request`, kept after prune), else any

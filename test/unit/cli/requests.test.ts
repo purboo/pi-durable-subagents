@@ -40,9 +40,9 @@ async function fixture(t: test.TestContext) {
     for (const e of engines) await e.close();
     await rm(root, { recursive: true, force: true });
   });
-  const cli = async (args: string[], options: { waitMs?: number } = {}) => {
+  const cli = async (args: string[], options: { waitMs?: number; env?: Record<string, string> } = {}) => {
     const lines: string[] = [];
-    const code = await main(args, { env, cwd, write: line => lines.push(line), starter: async () => {}, waitMs: options.waitMs ?? 0 });
+    const code = await main(args, { env: { ...env, ...options.env }, cwd, write: line => lines.push(line), starter: async () => {}, waitMs: options.waitMs ?? 0 });
     return { code, out: lines.join('\n') };
   };
   const spec = async (name: string, value: unknown) => { const path = join(root, name); await writeFile(path, JSON.stringify(value)); return path; };
@@ -66,6 +66,7 @@ test('Ids are validated; spec_digest hashes kind, body and cond but not a run or
   assert.notEqual(specDigest(run), specDigest({ ...run, body: { ...run.body, name: 'n' } }));
   const answer = { kind: 'send' as const, body: { to: 'w/a', kind: 'answer', message: 'yes' } };
   assert.notEqual(specDigest({ ...answer, cond: { qid: 'q1', rev: 1 } }), specDigest({ ...answer, cond: { qid: 'q1', rev: 2 } }));
+  assert.equal(specDigest(answer), specDigest({ ...answer, body: { ...answer.body, caller: 'w@1/r@1' } }), 'a send caller is provenance, not content');
 });
 
 test('Run --request without a decision is pending (75); retries reuse the envelope; other content conflicts (3) and publishes nothing', async t => {
@@ -137,6 +138,12 @@ test('A decided run answers created once, then existing; cwd resolution; stop --
   assert.deepEqual(JSON.parse(other.out), { request: 'two', error: 'request-conflict', wid: reply.wid, spec_digest: reply.spec_digest, state: 'running' });
   // send --to <run-id> with two calls needs a key.
   await assert.rejects(f.cli(['send', '--request', 'f1', '--to', 'two', '--kind', 'steer', '--message', 'hi'], { waitMs: 5000 }), /name one with --call/);
+  // Inside a subagent the send names its call (caller, for answered.by); a retry from elsewhere is the same request.
+  const steer = ['send', '--request', 'f3', '--to', 'two', '--call', 'tasks:0', '--kind', 'steer', '--message', 'hi', '--json'];
+  const fromCall = await f.cli(steer, { waitMs: 5000, env: { DSA_CALL: 'Wx@1/rev@2' } });
+  assert.equal(((await findRequest(f.home, 'req:f3'))!.request.body as { caller?: string }).caller, 'Wx@1/rev@2');
+  const steerRetry = await f.cli(steer, { waitMs: 5000 });
+  assert.equal(steerRetry.code, fromCall.code); assert.deepEqual(JSON.parse(steerRetry.out), JSON.parse(fromCall.out));
   // A send to a run that has no workflow yet is pending (75), not an error.
   stopIntake();
   await f.cli(['run', '--request', 'later', '--spec', await f.spec('l.json', { agent: 'echo', task: 'l' })]);

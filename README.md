@@ -361,9 +361,9 @@ Every event has `id`, `cursor`, `ts` (when the milestone happened), `type`,
 
 Readers must ignore types they do not know (`waiting`/`moving` follow).
 `by` is the sender of the answer: `session:<id>` for a pi session (with
-`via: "ui"` when it came from the subagent list), `cli:<user>@<host>` for the
-CLI (a subagent answering through the CLI also shows as `cli:…`), else
-`unknown`. `fenced` is emitted when the call's next execution begins (right
+`via: "ui"` when it came from the subagent list), `call:<wid>/<key>` for a
+subagent answering through the CLI (its `DSA_CALL`; provenance, not
+authority), `cli:<user>@<host>` for any other CLI use, else `unknown`. `fenced` is emitted when the call's next execution begins (right
 after recovery, before it waits for a slot) and only when the fence
 interrupted work, exactly as `describe`'s `lastFence`: a turn that had ended,
 a hibernated question, an answer's resume or a seal are no `fenced`. A `once`

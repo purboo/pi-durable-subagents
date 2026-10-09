@@ -25,7 +25,7 @@ for (const [name, gate, status] of [
 });
 test("gate reads immutable result/output inputs in the call cwd", async ctx => {
   const f = await fixture(ctx);
-  f.t.spec.gate = { command: 'test "$DSA_CALL" = "W@1/task@1" && test "$(cat "$DSA_OUTPUT")" = complete && cat "$DSA_RESULT"', output: "json" };
+  f.t.spec.gate = { command: `test "$DSA_CALL" = "${f.t.callId}" && test "$(cat "$DSA_OUTPUT")" = complete && cat "$DSA_RESULT"`, output: "json" };
   const result = await f.before(); assert.deepEqual((result.data as any).gate, f.result);
 });
 for (const window of ["intent", "effect", "outcome"]) test(`gate crash at ${window} never reruns`, async ctx => {

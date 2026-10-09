@@ -45,7 +45,7 @@ test("fork requires pinned origin and refuses a foreign session without replacin
   assert.equal(await readFile(f.sessionPath, "utf8"), "foreign");
 });
 test("continued generation preserves executor-owned session copy instead of re-forking", async ctx => {
-  const f = await fixture(ctx); f.t.spec.context = "fork"; f.t.continueFrom = "W@1/task@0";
+  const f = await fixture(ctx); f.t.spec.context = "fork"; f.t.continueFrom = `${f.t.widRev}/task@0`;
   await writeFile(f.sessionPath, "executor continuation");
   await f.effects().prepare(f.t, { sessionPath: f.sessionPath });
   assert.equal(await readFile(f.sessionPath, "utf8"), "executor continuation"); assert.equal(f.journal.entries().length, 0);

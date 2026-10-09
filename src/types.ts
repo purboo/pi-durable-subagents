@@ -210,6 +210,9 @@ export interface SendBody {
   model?: string;
   /** Provenance for display and notes (ui.md: user actions are journaled as coming from the user). */
   by?: "user" | "agent";
+  /** The call that sent it through the CLI (its DSA_CALL): provenance only (`answered.by` = `call:<wid>/<key>`), not
+   *  authority, and not part of spec_digest — the same request id sent from elsewhere is the same request. */
+  caller?: CallId;
 }
 /** kind "withdraw": withdraw the sender's own earlier requests (P6). */
 export interface WithdrawBody { rids: Rid[] }
