@@ -14,6 +14,8 @@ import type { Ledgers } from '../../../../src/orchestrator/contract.ts';
 import type { EvaluatorTransport } from '../../../../src/orchestrator/evaluator-client.ts';
 import type { Workflow } from '../../../../src/orchestrator/store.ts';
 import { fakeExecutor } from './fake.ts';
+import { specDigest } from '../../../../src/requests.ts';
+import { describe } from '../../../../src/cli/requests.ts';
 
 class ManualEvaluator implements EvaluatorTransport {
   messages: OrchToEval[] = [];
@@ -162,4 +164,26 @@ test('prune: a crash between pruned and removal is finished on recovery and the 
   assert.equal(unfinishedWorkflow(dir), false);
   await mkdir(workflowDir(dir, wf.wid), { recursive: true });
   assert.equal(unfinishedWorkflow(dir), false);
+});
+
+test('R1 tombstone: pruned records the final status and, for a request-id run, its request and spec_digest', async t => {
+  const { dir, boot } = await home(t), b = await boot();
+  const body = { cwd: join(dir, 'project'), source: 'unused' } satisfies RunBody;
+  await request(b, 'run', body, 'req:job-1');
+  const wid = String(b.ledgers.orch.entries().find(e => e.type === JT.created && e.rid === 'req:job-1')!.wid);
+  b.evaluator.receive({ t: 'error', wid, ev: b.evaluator.ev(wid), kind: 'script', error: 'boom' }); await b.engine.intake();
+  const plain = await run(b, 'done');
+  const original = b.ledgers.orch.entries().find(e => e.type === 'request' && (e.request as Request).rid === 'req:job-1')!.request as Request;
+  assert.equal((await describe(dir, { request: 'job-1' })).state, 'sealed');
+  await request(b, 'prune', {});
+  const tomb = (w: string) => { const { ts: _ts, seq: _seq, rid: _rid, bytes: _bytes, endedAt: _end, ...rest } = b.ledgers.orch.entries().find(e => e.type === 'pruned' && e.wid === w)!; return rest; };
+  assert.deepEqual(tomb(wid), { type: 'pruned', wid, status: 'failed', request: 'job-1', spec_digest: specDigest(original) });
+  assert.deepEqual(tomb(plain.wid), { type: 'pruned', wid: plain.wid, status: 'done' });
+  // The admitted request and created entries survive the prune (append-only), so the id still resolves to its wid.
+  assert.ok(b.ledgers.orch.entries().some(e => e.type === 'request' && (e.request as Request).rid === 'req:job-1'));
+  const described = await describe(dir, { request: 'job-1' });
+  assert.equal(described.state, 'pruned'); assert.equal(described.wid, wid);
+  assert.deepEqual(described.pruned, { status: 'failed', endedAt: Number(b.ledgers.orch.entries().find(e => e.type === 'pruned' && e.wid === wid)!.endedAt) });
+  assert.equal(described.spec_digest, specDigest(original)); assert.equal(described.request, 'job-1');
+  assert.deepEqual((await describe(dir, { wid: plain.wid })).pruned?.status, 'done');
 });

@@ -10,10 +10,11 @@ import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
-import { CT, JT, type AttentionItem, type RunBody } from "../types.ts";
+import { CT, JT, type AttentionItem, type Request, type RunBody } from "../types.ts";
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
 import { isLive, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
-import { parameters, request, sendReceipt } from "./main/tool.ts";
+import { checkAgents, parameters, request, sendReceipt } from "./main/tool.ts";
+import { requestRid, sendIdentified, type Identified } from "../requests.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { currentOrchestrator, legacyRestart, waitExit, type OrchestratorProcess } from "../cli/restart.ts";
 import { packageVersion } from "../version.ts";
@@ -46,6 +47,7 @@ function quitPolicy(home: string): "pause" | "continue" {
   try { return (JSON.parse(readFileSync(join(home, "config.json"), "utf8")) as { onQuit?: string }).onQuit === "continue" ? "continue" : "pause"; }
   catch { return "pause"; }
 }
+const REQUEST_USE = "request is a string id for run, send or stop (not combined with replaces)";
 export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiDeps) => void): void {
   const home = dsaHome();
   let ctx: ExtensionContext | undefined, sender = "", outbox: Outbox | undefined;
@@ -205,6 +207,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal, wait = true): Promise<unknown> {
     // A run answers {submitted:{rid}} when its workflow is not created within 10 s; that rid then stands for the wid.
     for (const field of ["wid", "to", "target"]) if (typeof args[field] === "string") args = { ...args, [field]: ridToWid(args[field] as string) };
+    if (args.request !== undefined && (args.action === "status" || args.action === "agents")) throw new Error(REQUEST_USE);
     if (args.action === "status") {
       if (typeof args.wid !== "string" || !args.wid) return statusBrief(home, { origin: sender });
       const pending = pendingRun(args.wid);
@@ -220,16 +223,11 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     // A session resumes its own held work (what its quit paused); the CLI `resume` remains the global one.
     if (args.action === "resume" && args.wid === undefined) args = { ...args, origin: sender };
     const normalized = request(args as Parameters<typeof request>[0], cwd);
-    if (normalized.kind === "run") {
-      const body = normalized.body as RunBody;
-      // v12 §2: Reject unknown explicit call agents before starter or outbox publication; scripts remain call-local.
-      const names = [...(body.call ? [body.call] : []), ...(body.tasks ?? []), ...(body.chain ?? [])].map(call => call.agent);
-      if (names.length) {
-        const available = agentsAt(cwd).map(agent => agent.name);
-        const unknown = [...new Set(names.filter(name => !available.includes(name)))];
-        if (unknown.length) throw new Error(`Unknown agent${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. Available agents: ${available.join(", ") || "(none)"}`);
-      }
-    }
+    // R1: a caller-chosen request id names a run, send or stop; a retry with the same content gets the first outcome.
+    if (args.request !== undefined && (typeof args.request !== "string" || !["run", "send", "stop"].includes(normalized.kind) || normalized.replaces?.length))
+      throw new Error(REQUEST_USE);
+    const rid = typeof args.request === "string" ? requestRid(args.request) : undefined;
+    if (normalized.kind === "run") checkAgents(normalized.body as RunBody, () => agentsAt(cwd).map(agent => agent.name));
     // P33: any call of the run may fork the origin context, so the origin branch is always offered for pinning.
     const sessionFile = ctx?.sessionManager.getSessionFile();
     if (normalized.kind === "run" && sessionFile) (normalized.body as RunBody).origin = { sessionFile, leafId: ctx!.sessionManager.getLeafId() };
@@ -245,7 +243,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
         return { applied: true, note: restartNote(previous) };
       }
     }
-    const sent = await serial(async () => {
+    const outcome = await serial(async (): Promise<Request | Identified> => {
       if (!outbox || stopped) throw new Error("Main session is not active");
       signal?.throwIfAborted();
       await starter(true);
@@ -253,8 +251,15 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
         const withdrawn = await outbox.send("orch", "withdraw", { rids: normalized.replaces });
         normalized.cond = { ...normalized.cond, after: withdrawn.rid };
       }
+      if (rid) return sendIdentified(home, outbox, sender, rid, normalized.kind, normalized.body, normalized.cond);
       return outbox.send("orch", normalized.kind, normalized.body, normalized.cond);
     });
+    if ("conflict" in outcome) {
+      const created = ledger().find(e => e.type === JT.created && e.rid === rid);
+      return { applied: false, reason: "request-conflict", request: args.request, spec_digest: outcome.digest, ...(created ? { wid: created.wid } : {}),
+        note: "this request id was used for different content; use a new id" };
+    }
+    const sent = "digest" in outcome ? outcome.request : outcome;
     // P25: run waits for `created`; control requests wait for their terminal lifecycle record (applied or rejected+reason).
     const deadline = performance.now() + 10_000;
     while (wait || sent.kind === "run") {
