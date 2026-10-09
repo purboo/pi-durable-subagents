@@ -8,17 +8,22 @@
 //                              append time (ms), which retention measures (not the milestone `e.ts`).
 //   head {seq}                 an orchestrator start: the head jumps EVENT_SEQ_SKIP ahead (fsynced before any event of
 //                              that start), so a seq that a reader saw in a write a power loss undid is never reused.
+//                              Also written alone after failed writes: seqs a failed write spent (a reader may have
+//                              seen them) become durable before a write would go past durable + EVENT_SEQ_SKIP.
 //   mark {head, src}           deriver watermarks, source -> highest source seq derived ("orch" = orchestrator ledger,
 //                              else a wid); later records override earlier ones per source. Compaction writes them all.
 // Every record's position (log 0, ev/head seq, mark head) is non-decreasing in file order: the last record gives the
 // head, and readers binary-search byte offsets for `--since`. Seqs grow strictly but may have gaps.
 // Compaction writes a new file (header, kept events, full mark), fsyncs it, renames it over the log and fsyncs the
-// directory. A log that is unreadable beyond a torn tail is renamed aside (`events.jsonl.corrupt-<ms>`) and a new
-// epoch begins; it is never truncated in the middle.
+// directory; a failure after the rename leaves the writer broken (its handle may name the replaced file), and the
+// pump reopens the log. A log that is unreadable beyond a torn tail is renamed aside (`events.jsonl.corrupt-<ms>`) and
+// a new epoch begins; it is never truncated in the middle. Open removes temp files a crashed compaction left.
+// Seq invariant: the highest seq any reader can have seen <= the last durable position + EVENT_SEQ_SKIP, so the start
+// skip of the next open is past it.
 import { closeSync, fstatSync, fsyncSync, openSync, readSync, writeSync } from "node:fs";
-import { open, rename, rm, type FileHandle } from "node:fs/promises";
+import { open, readdir, rename, rm, type FileHandle } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { frameLine, syncDirectory, unframeLine } from "../kernel/journal.ts";
 import { EVENT_SEQ_SKIP, type Event, type EventDraft } from "./types.ts";
 
@@ -98,22 +103,31 @@ function scanFile(fd: number, size: number): Scan {
 export class EventLog {
   readonly path: string;
   readonly epoch: string;
-  /** The last seq handed out (or the start skip's head). */
+  /** The last seq handed out (spent: also by a write that failed), or the start skip's head. */
   head: number;
+  /** The position of the last record durably in the file (head >= durable; head <= durable + EVENT_SEQ_SKIP). */
+  private durable: number;
   /** Highest seq dropped by retention. */
   dropped: number;
   private file: FileHandle;
   private size: number;
   private queue: Promise<unknown> = Promise.resolve();
+  /** Set when the file is in an unknown state (a failed cut-back, a failure after a compaction's rename): every later
+   *  operation throws it; the owner reopens the log (EventLog.open). */
   private failed?: unknown;
   private redundant: number;
   private constructor(path: string, file: FileHandle, scan: Pick<Scan, "epoch" | "dropped" | "head" | "end" | "records" | "events">) {
-    this.path = path; this.file = file; this.epoch = scan.epoch; this.head = scan.head; this.dropped = scan.dropped; this.size = scan.end;
+    this.path = path; this.file = file; this.epoch = scan.epoch; this.head = this.durable = scan.head; this.dropped = scan.dropped; this.size = scan.end;
     this.redundant = scan.records - scan.events;
   }
+  /** The writer cannot be used any more: reopen the log. */
+  get broken(): boolean { return this.failed !== undefined; }
   /** Open the log at orchestrator start: repair a torn tail, skip the head ahead (durably), or create a new log (new
    *  epoch) when it is missing or corrupt; `created` tells the caller to derive everything still on disk (backfill). */
   static async open(path: string): Promise<{ log: EventLog; created: boolean; marks: Map<string, number>; corrupt?: string }> {
+    // A compaction that crashed before its rename left its temp file (single writer: none is in progress now).
+    const base = basename(path), stale = (name: string) => name.startsWith(base) && /^\.[0-9a-f]{8}\.tmp$/.test(name.slice(base.length));
+    for (const name of await readdir(dirname(path)).catch(() => [] as string[])) if (stale(name)) await rm(join(dirname(path), name), { force: true });
     let scan: Scan | undefined, corrupt: string | undefined;
     let fd: number | undefined;
     try { fd = openSync(path, "r"); }
@@ -139,7 +153,8 @@ export class EventLog {
       if (scan.end !== (await file.stat()).size) { await file.truncate(scan.end); await file.sync(); }
     } finally { await file.close(); }
     const log = new EventLog(path, await open(path, "a"), scan);
-    await log.write(frameLine(JSON.stringify({ k: "head", seq: log.head + EVENT_SEQ_SKIP })), () => { log.head += EVENT_SEQ_SKIP; log.redundant++; });
+    await log.write(frameLine(JSON.stringify({ k: "head", seq: log.head + EVENT_SEQ_SKIP })), log.head + EVENT_SEQ_SKIP);
+    log.head += EVENT_SEQ_SKIP; log.redundant++;
     return { log, created: false, marks: scan.marks };
   }
   private serial<T>(fn: () => Promise<T>): Promise<T> {
@@ -147,33 +162,37 @@ export class EventLog {
     this.queue = run.catch(() => {});
     return run;
   }
-  /** Write and fsync; on failure cut the file back to its last good length (or stop the log when that fails too). */
-  private async write(text: string, committed: () => void): Promise<void> {
+  /** Write and fsync records whose last position is `position`; on failure cut the file back to its last good length
+   *  (or break the log when that fails too). */
+  private async write(text: string, position: number): Promise<void> {
     try { await this.file.write(text); await this.file.sync(); }
     catch (error) {
       try { await this.file.truncate(this.size); await this.file.sync(); } catch (cause) { this.failed = cause; }
       throw error;
     }
-    this.size += Buffer.byteLength(text); committed();
+    this.size += Buffer.byteLength(text); this.durable = Math.max(this.durable, position);
   }
-  /** Append events (in writes of at most EVENT_SEQ_SKIP, each fsynced) and, with the last write, watermarks. */
+  /** Append events (in writes of at most EVENT_SEQ_SKIP, each fsynced) and, with the last write, watermarks. Returns
+   *  the events as logged (callers pass at most EVENT_SEQ_SKIP drafts at a time, so this stays small). */
   append(drafts: readonly EventDraft[], marks?: ReadonlyMap<string, number>): Promise<Event[]> {
     return this.serial(async () => {
       const out: Event[] = [];
       for (let i = 0; i < drafts.length || (i === 0 && marks?.size); i += EVENT_SEQ_SKIP) {
         const chunk = drafts.slice(i, i + EVENT_SEQ_SKIP), at = Date.now(), last = i + EVENT_SEQ_SKIP >= drafts.length;
+        // Failed writes spent seqs past the durable head: make them durable (a lone head record) before this write could
+        // spend beyond durable + EVENT_SEQ_SKIP, which the next open's skip would not clear. If that fails, no events.
+        if (this.head + chunk.length > this.durable + EVENT_SEQ_SKIP) { await this.write(frameLine(JSON.stringify({ k: "head", seq: this.head })), this.head); this.redundant++; }
         let text = "", seq = this.head;
-        const batch: Event[] = [];
         for (const e of chunk) {
           const r = { k: "ev" as const, seq: ++seq, at, e };
-          text += frameLine(JSON.stringify(r)); batch.push(publicEvent(this.epoch, r));
+          text += frameLine(JSON.stringify(r)); out.push(publicEvent(this.epoch, r));
         }
         if (last && marks?.size) text += frameLine(JSON.stringify({ k: "mark", head: seq, src: Object.fromEntries(marks) }));
         // The seqs are spent even when the write fails: a reader may have seen part of it.
         const spent = seq;
-        try { await this.write(text, () => { if (last && marks?.size) this.redundant++; }); }
+        try { await this.write(text, spent); }
         finally { this.head = spent; }
-        out.push(...batch);
+        if (last && marks?.size) this.redundant++;
       }
       return out;
     });
@@ -213,10 +232,13 @@ export class EventLog {
         } catch (error) { closeSync(out); await rm(temp, { force: true }); throw error; }
         closeSync(out);
         try { await rename(temp, this.path); } catch (error) { await rm(temp, { force: true }); throw error; }
-        await syncDirectory(dirname(this.path));
-        await this.file.close();
-        this.file = await open(this.path, "a");
-        this.size = size; this.dropped = highest; this.redundant = 1;
+        // Past the rename this handle names the replaced file: any failure breaks the writer (the owner reopens).
+        try {
+          await syncDirectory(dirname(this.path));
+          await this.file.close();
+          this.file = await open(this.path, "a");
+        } catch (error) { this.failed = error; throw error; }
+        this.size = size; this.dropped = highest; this.redundant = 1; this.durable = this.head;
         return count;
       } finally { closeSync(fd); }
     });

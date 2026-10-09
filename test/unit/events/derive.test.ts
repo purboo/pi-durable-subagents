@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { deriveCreated, deriveEntry, answeredBy, callParts } from '../../../src/events/derive.ts';
+import { deriveCreated, deriveEntry, answeredBy, callParts, labelsOf } from '../../../src/events/derive.ts';
 import { JT, type Entry, type Request } from '../../../src/types.ts';
 import { EVENT_DATA_INLINE_MAX, type EventDraft } from '../../../src/events/types.ts';
 import { lastFence } from '../../../src/cli/requests.ts';
@@ -107,4 +107,10 @@ test('R2 deriver: submitted from the ledger created entry, with request id, name
   assert.deepEqual(deriveCreated(orch, 1, { labels: { role: 'writer' } }), { id: `${W}:submitted`, ts: 77, type: 'submitted', wid: W, request: 'X', labels: { role: 'writer' }, name: 'nightly' });
   const plain = [orchEntry(1, JT.created, { rid: '01ULID', wid: W })];
   assert.deepEqual(deriveCreated(plain, 0, {}), { id: `${W}:submitted`, ts: 1, type: 'submitted', wid: W });
+});
+
+test('R6 deriver: empty labels are no labels (as describe and the R7 collector treat them)', () => {
+  assert.equal(labelsOf({ labels: {} }), undefined);
+  assert.deepEqual(labelsOf({ labels: { a: 'b' } }), { a: 'b' });
+  assert.equal(labelsOf({ labels: { a: 1 } }), undefined);
 });

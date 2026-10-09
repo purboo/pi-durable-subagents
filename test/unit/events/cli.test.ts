@@ -2,7 +2,7 @@
 // (start the orchestrator, wait, else 75). Through the CLI entry with an isolated DSA_HOME.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../../../src/cli/main.ts';
@@ -83,4 +83,22 @@ test('R2 CLI: malformed cursor or options exit 1; a missing log starts the orche
   assert.equal(ok.code, 0); assert.match(ok.json[0].head, /^[0-9a-f]{16}:0$/);
   // `events <wid>` is unchanged (an unknown workflow is still an error).
   await assert.rejects(main(['events', 'nope'], { env: { DSA_HOME: s.home }, write: () => {} }), /Unknown workflow/);
+});
+
+test('R2 CLI: an unreadable log prints {"error":"log-unreadable","message"} and exits 1', async t => {
+  const s = await cli(t);
+  const { log } = await EventLog.open(s.path);
+  const e = log.epoch;
+  await log.append([draft(1), draft(2), draft(3)]); await log.close();
+  const lines = (await readFile(s.path, 'utf8')).split('\n');
+  lines[2] = lines[2]!.replace('"ok"', '"OK"');
+  await writeFile(s.path, lines.join('\n'));
+  const r = await s.run(['--all', '--since', `${e}:0`]);
+  assert.equal(r.code, 1); assert.equal(r.lines.length, 1);
+  assert.equal(r.json[0].error, 'log-unreadable'); assert.match(r.json[0].message, /corrupt/);
+  // A bad header: also for the head-only form.
+  await writeFile(s.path, 'garbage\n');
+  const h = await s.run(['--all']);
+  assert.equal(h.code, 1); assert.deepEqual(Object.keys(h.json[0]), ['error', 'message']); assert.equal(h.json[0].error, 'log-unreadable');
+  assert.equal(s.starts(), 0);
 });

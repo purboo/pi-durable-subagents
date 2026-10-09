@@ -335,3 +335,36 @@ test('R7 collector cost: 30 finished and 3 running workflows in memory, per tick
   t.diagnostic(`collector: ${(viewed * 1000).toFixed(1)} µs per tick; ${(copying * 1000).toFixed(1)} µs when it also rebuilds the 4 changed journal views (30 finished + 3 running workflows of ~2000 entries, ledger ~3000)`);
   assert.ok(viewed < 5 && copying < 5, `${viewed} / ${copying} ms per tick`);
 });
+
+test('R7 silent: only for a working (selected, not fenced) current execution; an old stall item of a drained call is no wait', () => {
+  const wid = 'WS', a = call(wid, 'a'), j = journal();
+  const env = { now: NOW, ledger: emptyLedger() };
+  j.add('wf-created', { revision: 1 }); j.add('call', { pos: 0, key: 'a', gen: 1, spec: { agent: 'x', model: 'probe/m' } });
+  j.add('exec', { exec: `${a}#1.1`, call: a }); j.add('selected', { exec: `${a}#1.1`, model: { provider: 'probe', id: 'm' } });
+  j.add('attention', { exec: `${a}#1.1`, item: { id: `stall:${a}`, rev: 1, kind: 'stall', text: 'WS/a: no execution activity observed for 12m', wid, call: a } });
+  assert.equal(waitsOf(foldWaits(wid, j.entries()), env).get(a)?.reason, 'silent');
+  // Drained: fenced, no live execution; the stall item stays open.
+  j.add('fenced', { exec: `${a}#1.1` });
+  assert.equal(waitsOf(foldWaits(wid, j.entries()), env).get(a), undefined, 'a drained call is not waiting');
+  // Relaunched and running: the old stall item names an earlier execution.
+  j.add('exec', { exec: `${a}#1.2`, call: a }); j.add('selected', { exec: `${a}#1.2`, model: { provider: 'probe', id: 'm' } });
+  assert.equal(waitsOf(foldWaits(wid, j.entries()), env).get(a), undefined, 'the stall item is of an earlier execution');
+  // whyWaiting itself: a stall item with a queued (not selected) execution is not silent.
+  const stall = { id: `stall:${a}`, kind: 'stall', text: 'quiet', since: 1 };
+  assert.equal(whyWaiting({ exec: { id: `${a}#1.3`, since: NOW, selected: false }, attention: [stall] }, NOW), undefined);
+  assert.equal(whyWaiting({ attention: [stall] }, NOW), undefined);
+});
+
+test('R7 asking: only a question raised in the current execution; an answered asker relaunched waits like any call', () => {
+  const wid = 'WQ', a = call(wid, 'a'), j = journal();
+  const held = foldLedger(emptyLedger(), [entry('config', { hash: 'h', config: { providers: { probe: { slots: 1 } } } }), entry('hold', { pool: 'probe', slot: 0, exec: 'other#1.1' })]);
+  const env = { now: NOW, ledger: held };
+  j.add('wf-created', { revision: 1 }); j.add('call', { pos: 0, key: 'a', gen: 1, spec: { agent: 'x', model: 'probe/m' } });
+  j.add('exec', { exec: `${a}#1.1`, call: a }); j.add('selected', { exec: `${a}#1.1`, model: { provider: 'probe', id: 'm' } });
+  j.add('attention', { item: { id: `q:${a}:q1`, rev: 1, kind: 'question', text: '?', wid, call: a, qid: 'q1' } });
+  j.add('fenced', { exec: `${a}#1.1` }); j.add('hibernated', { call: a, exec: `${a}#1.1`, qid: 'q1', rev: 1 });
+  assert.equal(waitsOf(foldWaits(wid, j.entries()), env).get(a), undefined, 'a hibernated asker is asking');
+  // Answered: the executor appends a new execution, queued behind a full provider; the question item is still open.
+  j.add('answer-bound', { call: a, qid: 'q1', rev: 1, rid: 'r' }); j.add('exec', { exec: `${a}#1.2`, call: a }, NOW - 10);
+  assert.deepEqual(waitsOf(foldWaits(wid, j.entries()), env).get(a), { reason: 'slot', detail: 'waiting for a slot: probe 1/1', since: NOW - 10 });
+});

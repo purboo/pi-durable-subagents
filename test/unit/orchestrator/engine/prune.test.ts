@@ -16,6 +16,7 @@ import type { Workflow } from '../../../../src/orchestrator/store.ts';
 import { fakeExecutor } from './fake.ts';
 import { specDigest } from '../../../../src/requests.ts';
 import { describe } from '../../../../src/cli/requests.ts';
+import { EventLog } from '../../../../src/events/log.ts';
 
 class ManualEvaluator implements EvaluatorTransport {
   messages: OrchToEval[] = [];
@@ -186,4 +187,26 @@ test('R1 tombstone: pruned records the final status and, for a request-id run, i
   assert.deepEqual(described.pruned, { status: 'failed', endedAt: Number(b.ledgers.orch.entries().find(e => e.type === 'pruned' && e.wid === wid)!.endedAt) });
   assert.equal(described.spec_digest, specDigest(original)); assert.equal(described.request, 'job-1');
   assert.deepEqual((await describe(dir, { wid: plain.wid })).pruned?.status, 'done');
+});
+
+test('prune: when the event log cannot take the workflow\'s events the prune is rejected (event-log: …) and nothing goes', async t => {
+  const { boot } = await home(t), b = await boot();
+  const wf = await run(b, 'done'), other = await run(b, 'done');
+  const original = EventLog.prototype.append;
+  EventLog.prototype.append = function () { return Promise.reject(new Error('ENOSPC: no space left')); };
+  let named = '', bulk = '';
+  try {
+    // Entries that derive events, so the prune's flush has something to log.
+    for (const w of [wf, other]) await w.journal.append(JT.sealed, { call: `${w.wid}@1/x@1`, result: { status: 'ok' } });
+    named = await request(b, 'prune', { wid: wf.wid }); bulk = await request(b, 'prune', {}); }
+  finally { EventLog.prototype.append = original; }
+  for (const rid of [named, bulk]) {
+    assert.equal(decision(b, rid)?.type, JT.rejected);
+    assert.match(String(decision(b, rid)?.reason), /^event-log: .*ENOSPC/);
+  }
+  assert.deepEqual(pruned(b), []);
+  for (const w of [wf, other]) { assert.ok(b.engine.store.workflows.has(w.wid)); assert.ok(existsSync(workflowDir(b.ledgers.home, w.wid))); }
+  // The caller retries later: the events are logged first, then the journal goes.
+  const again = await request(b, 'prune', { wid: wf.wid });
+  assert.equal(decision(b, again)?.type, JT.applied);
 });

@@ -16,8 +16,12 @@
 //   slot               a queued call: `exec` appended, no `selected` yet (provider slot or memory headroom) — at once
 //                      when every candidate provider is full, else after SLOT_GRACE_MS: every launch passes through this
 //                      state while it prepares (a worktree, a fork) and is admitted, which is no wait.
-//   silent             an open `stall:`/`noprogress:` attention item (kind stall; its text names the running command).
-// An asking call (an open question, hibernated or not) is not waiting, a sealed one never.
+//   silent             an open `stall:`/`noprogress:` attention item (kind stall; its text names the running command) of
+//                      the current execution while it works (selected, not fenced): a drained call is not waiting.
+// An asking call is not waiting, a sealed one never. Asking = an open question raised in the call's current execution
+// (the call's latest `exec` before the question's attention entry is its current one), hibernated or not; once the
+// answer is bound the executor appends a new exec, and the call's waits count again although the item stays open until
+// the new execution reads it (describe's `state: "asking"` still follows the open item).
 import { JT, type AttentionItem, type Entry, type JournalHandle, type Request, type RunBody } from "../types.ts";
 import { EVENT_SEQ_SKIP, WAIT_REASONS, type EventDraft, type EventSink, type WaitReason } from "./types.ts";
 import { emptyLedger, foldLedger, settingsOf, type LedgerState } from "../orchestrator/ledger.ts";
@@ -36,7 +40,7 @@ export interface Wait { reason: WaitReason; detail: string; since: number }
 /** One unsealed call's observable state: everything `whyWaiting` decides from. */
 export interface WaitInput {
   sealed?: boolean;
-  /** An open question (hibernated or not). */
+  /** An open question raised in the current execution (hibernated or not). */
   asking?: boolean;
   /** The current execution while it is live (not fenced): queued for its slot until `selected`, then running. */
   exec?: { id: string; since: number; selected: boolean };
@@ -47,8 +51,8 @@ export interface WaitInput {
   writerWait?: { root: string; holder: string; since: number };
   /** A waiting lease ticket of the call: its status line and the earliest ticket time. */
   lease?: { detail: string; since: number };
-  /** Open attention items of the call (question, stall, unknown kinds). */
-  attention?: readonly { id: string; kind: string; text: string; since: number }[];
+  /** Open attention items of the call (question, stall, unknown kinds); `exec`: the execution it was raised in. */
+  attention?: readonly { id: string; kind: string; text: string; since: number; exec?: string }[];
   /** The slot lines of the providers a queued call waits for ("probe 1/1"), and whether all of them are full. */
   slot?: string; full?: boolean;
 }
@@ -63,7 +67,7 @@ export function whyWaiting(c: WaitInput, now: number): Wait | undefined {
     "writer-lock": () => queued && c.writerWait ? { detail: `waits for the writer lock of ${c.writerWait.root}: ${c.writerWait.holder} holds it or is ahead in the queue`, since: c.writerWait.since } : undefined,
     lease: () => exec?.selected && c.lease ? { ...c.lease } : undefined,
     slot: () => queued && (c.full || now - exec!.since >= SLOT_GRACE_MS) ? { detail: `waiting for a slot${c.slot ? `: ${c.slot}` : ""}`, since: exec!.since } : undefined,
-    silent: () => { const a = open.find(a => a.kind === "stall"); return a && { detail: a.text, since: a.since }; },
+    silent: () => { const a = exec?.selected && open.find(a => a.kind === "stall" && (a.exec === undefined || a.exec === exec.id)); return a ? { detail: a.text, since: a.since } : undefined; },
   };
   for (const reason of WAIT_REASONS) { const found = checks[reason](); if (found) return { reason, ...found }; }
   return undefined;
@@ -101,8 +105,9 @@ export interface WaitFold {
   /** The current revision's terminal entry is a workflow-done: only follow-up generations are live. */
   done: boolean;
   calls: Map<string, CallFacts>;
-  /** Open attention items (question, stall, unknown) of unsealed calls, by item id. */
-  items: Map<string, { call: string; kind: string; text: string; since: number; rev: number }>;
+  /** Open attention items (question, stall, unknown) of unsealed calls, by item id; `exec`: the call's execution when
+   *  it was raised (a stall entry names it, else the call's latest exec then). */
+  items: Map<string, { call: string; kind: string; text: string; since: number; rev: number; exec?: string }>;
 }
 const ITEM_KINDS = new Set(["question", "stall", "unknown"]);
 const modelName = (m: unknown) => { const v = m as { provider?: string; id?: string } | undefined; return v?.id ? (v.provider ? `${v.provider}/${v.id}` : v.id) : undefined; };
@@ -148,7 +153,8 @@ function applyWait(f: WaitFold, e: Entry): void {
     }
     case JT.attention: {
       const item = e.item as AttentionItem | undefined;
-      if (item?.call && ITEM_KINDS.has(item.kind) && f.calls.has(item.call)) f.items.set(item.id, { call: item.call, kind: item.kind, text: item.text, since: e.ts, rev: item.rev });
+      const c = item?.call ? f.calls.get(item.call) : undefined, exec = typeof e.exec === "string" ? e.exec : c?.exec;
+      if (item?.call && c && ITEM_KINDS.has(item.kind)) f.items.set(item.id, { call: item.call, kind: item.kind, text: item.text, since: e.ts, rev: item.rev, ...(exec !== undefined ? { exec } : {}) });
       break;
     }
     case JT.attentionResolved: { const item = f.items.get(String(e.id)); if (item && item.rev === Number(e.rev)) f.items.delete(String(e.id)); break; }
@@ -184,8 +190,12 @@ const providerOf = (model?: string) => { if (!model) return undefined; try { ret
 /** The call's state as `whyWaiting` reads it. `agentModel` names the model of a pinned agent (for a call naming none). */
 export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: (agent: string) => string | undefined): WaitInput {
   const settings = settingsOf(env.ledger, env.config ?? {}), live = c.exec && !c.fenced;
-  const attention: { id: string; kind: string; text: string; since: number }[] = [];
-  for (const [id, item] of f.items) if (item.call === c.call) attention.push({ id, kind: item.kind, text: item.text, since: item.since });
+  const attention: { id: string; kind: string; text: string; since: number; exec?: string }[] = [];
+  let asking = false;
+  for (const [id, item] of f.items) if (item.call === c.call) {
+    attention.push({ id, kind: item.kind, text: item.text, since: item.since, ...(item.exec !== undefined ? { exec: item.exec } : {}) });
+    if (item.kind === "question" && item.exec === c.exec) asking = true;
+  }
   let providers: string[] = [];
   if (live && c.selected) { const p = providerOf(c.model); if (p) providers = [p]; }
   else if (live) {
@@ -204,7 +214,7 @@ export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: 
   }).join(", ") : undefined;
   const lease = live && c.selected ? env.leases?.get(c.call) : undefined;
   return {
-    asking: attention.some(a => a.kind === "question"),
+    asking,
     ...(live ? { exec: { id: c.exec!, since: c.queued ?? 0, selected: !!c.selected } } : {}),
     ...(providers.length ? { providers } : {}), exhausted: env.ledger.exhausted,
     ...(c.writer ? { writerWait: c.writer } : {}), ...(lease ? { lease } : {}),

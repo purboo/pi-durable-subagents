@@ -1,15 +1,17 @@
 // R2: the orchestrator's event pump. Derives events from the durable sources (workflow journals, the orchestrator
 // ledger's `created`) after their appends and writes them to the event log with the watermarks of the sources derived
 // (same fsync), so a restart re-derives only after them (at least once). It is also the EventSink other producers
-// (R7 waiting/moving) emit through. One chain serializes passes, emits, compaction and close.
+// (R7 waiting/moving) emit through. One chain serializes passes, emits, compaction and close. A pass that cannot log
+// what it derived retries in the background, and `flush` (prune) rejects; a broken log (a failure after a compaction's
+// rename) is reopened by the next pass or emit.
 // Memory: per unpruned workflow one watermark and one cached identity; reads the journals' committed arrays from their
-// watermark (no journal copies per tick).
+// watermark (no journal copies per tick); a pass holds at most one chunk (EVENT_SEQ_SKIP drafts) at a time.
 import { eventsLog } from "../paths.ts";
 import { JT, isEntry, type Entry, type JournalHandle, type Request } from "../types.ts";
 import { requestId } from "../requests.ts";
 import { deriveCreated, deriveEntry, labelsOf, type Identity } from "./derive.ts";
 import { EventLog } from "./log.ts";
-import { EVENT_RETENTION_MS, type EventDraft, type EventSink } from "./types.ts";
+import { EVENT_RETENTION_MS, EVENT_SEQ_SKIP, type EventDraft, type EventSink } from "./types.ts";
 
 /** What the pump reads of the orchestrator's store: its unpruned workflows and a hook called after their appends. */
 export interface PumpStore { workflows: ReadonlyMap<string, { journal: JournalHandle }>; appended?: (wid: string) => void }
@@ -88,20 +90,24 @@ export class EventPump implements EventSink {
       for (const [source, seq] of opened.marks) if (source === "orch" || this.options.store.workflows.has(source)) this.marks.set(source, seq);
       await this.compact();
       for (const wid of this.options.store.workflows.keys()) this.dirty.add(wid);
-      await this.pass();
+      await this.pass().catch(() => {}); // logged; retried in the background
     }).finally(() => this.isReady());
   }
   /** A source appended: derive soon (batched). */
   kick(wid?: string): void {
     if (wid !== undefined) this.dirty.add(wid);
     if (this.timer || this.closed) return;
-    this.timer = setTimeout(() => { this.timer = undefined; void this.serial(() => this.pass()); }, this.options.delayMs ?? 50);
+    this.timer = setTimeout(() => { this.timer = undefined; this.serial(() => this.pass()).catch(() => {}); }, this.options.delayMs ?? 50);
     this.timer.unref?.();
   }
-  /** Derive and log everything appended so far (prune calls it before the journal goes). */
+  /** Derive and log everything appended so far (prune calls it before the journal goes). Rejects when that could not be
+   *  logged (or the log is not open): the caller must not drop the sources. */
   flush(): Promise<void> {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
-    return this.serial(() => this.pass());
+    return this.serial(async () => {
+      if (!this.log || this.closed) throw new Error("event log not open");
+      await this.pass();
+    });
   }
   /** EventSink: append drafts (any type), echoing the workflow's request id and labels when the draft has none. */
   async emit(drafts: readonly EventDraft[]): Promise<void> {
@@ -109,11 +115,12 @@ export class EventPump implements EventSink {
     return this.serial(async () => {
       // After close (the orchestrator exits) nothing is logged: R7 state is derived again by the next orchestrator.
       if (!this.log || this.closed || !drafts.length) return;
+      const log = await this.writer();
       const filled = drafts.map(d => {
         const id = this.identity(d.wid);
         return { ...d, ...(d.request === undefined && id.request !== undefined ? { request: id.request } : {}), ...(d.labels === undefined && id.labels ? { labels: id.labels } : {}) } as EventDraft;
       });
-      await this.log.append(filled);
+      await log.append(filled);
     });
   }
   /** Orchestrator exit: derive what is left, record the watermarks, close the log. */
@@ -121,13 +128,15 @@ export class EventPump implements EventSink {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
     const done = this.serial(async () => {
       if (this.closed) return;
-      const log = this.log;
       try {
-        if (log) {
+        if (this.log) {
           await this.pass();
-          if (this.unsaved.size) { await log.append([], this.saved()); this.unsaved.clear(); }
+          if (this.unsaved.size) { await (await this.writer()).append([], this.saved()); this.unsaved.clear(); }
         }
-      } finally { this.closed = true; await log?.close(); }
+      } finally {
+        this.closed = true; await this.log?.close();
+        if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+      }
     }).finally(() => this.isReady());
     return done.catch(error => console.error(`durable-subagents: event log close failed: ${String(error)}`));
   }
@@ -160,18 +169,54 @@ export class EventPump implements EventSink {
     for (const [w, id] of found) this.identities.set(w, id);
     return this.identities.get(wid) ?? {};
   }
-  /** One derivation pass over the orchestrator ledger and the workflows appended to since the last one. */
+  /** The writer; a broken one (a failure after a compaction's rename) is reopened first: the open applies the start
+   *  skip. A log it had to create anew (corrupt or gone) is backfilled from everything on disk: the caller's drafts
+   *  were derived for the old one, so this throws (a pass retries from the cleared watermarks, R7 on its next tick). */
+  private async writer(): Promise<EventLog> {
+    const log = this.log!;
+    if (!log.broken) return log;
+    await log.close();
+    const opened = await EventLog.open(eventsLog(this.options.home));
+    this.log = opened.log;
+    if (opened.corrupt) console.error(`durable-subagents: ${opened.corrupt}; a new event log (epoch ${opened.log.epoch}) starts`);
+    if (opened.created) {
+      this.marks.clear(); this.unsaved.clear(); this.backfilled = true;
+      for (const wid of this.options.store.workflows.keys()) this.dirty.add(wid);
+      this.kick();
+      throw new Error(`event log replaced by a new epoch ${opened.log.epoch}: deriving everything again`);
+    }
+    return opened.log;
+  }
+  /** One derivation pass over the orchestrator ledger and the workflows appended to since the last one. Appends in
+   *  chunks of at most EVENT_SEQ_SKIP drafts, each with the watermarks of what it completes (a source cut inside a chunk
+   *  gets the position up to which its events are in it), so memory stays bounded and a failure re-derives only the
+   *  rest. Throws when a chunk could not be logged (after scheduling a retry). */
   private async pass(): Promise<void> {
-    const log = this.log;
-    if (!log || this.closed) return;
-    const drafts: EventDraft[] = [], next = new Map<string, number>(), forgotten: string[] = [];
-    const orch = committed(this.options.orch), from = this.marks.get("orch") ?? 0;
+    if (!this.log || this.closed) return;
     const dirty = [...this.dirty]; this.dirty.clear();
+    let drafts: EventDraft[] = [], forgotten: string[] = [];
+    const next = new Map<string, number>();
+    // Log the chunk (with the watermarks it completes) and move the in-memory watermarks; a chunk without events only
+    // moves them (recorded with the next write, or at close).
+    const commit = async () => {
+      if (drafts.length) { await (await this.writer()).append(drafts, this.saved(next)); this.unsaved.clear(); }
+      for (const [source, seq] of next) { this.marks.set(source, seq); if (!drafts.length) this.unsaved.add(source); }
+      for (const wid of forgotten) { this.marks.delete(wid); this.identities.delete(wid); this.unsaved.delete(wid); }
+      drafts = []; forgotten = []; next.clear();
+    };
+    /** Add the drafts of source position `at`, committing first when they would overflow the chunk (`done` = the
+     *  watermark of that source before them). */
+    const add = async (source: string, done: number, derived: readonly EventDraft[]) => {
+      if (!derived.length) return;
+      if (drafts.length + derived.length > EVENT_SEQ_SKIP && drafts.length) { if (done > (this.marks.get(source) ?? 0)) next.set(source, done); await commit(); }
+      drafts.push(...derived);
+    };
     try {
+      const orch = committed(this.options.orch), from = this.marks.get("orch") ?? 0;
       // The ledger first: a workflow's `submitted` precedes its journal's events.
       for (let i = from; i < orch.length; i++) {
         const e = orch[i]!;
-        if (e.type === JT.created && this.options.store.workflows.has(String(e.wid))) drafts.push(deriveCreated(orch, i, this.identity(String(e.wid))));
+        if (e.type === JT.created && this.options.store.workflows.has(String(e.wid))) await add("orch", i, [deriveCreated(orch, i, this.identity(String(e.wid)))]);
         else if (e.type === "pruned") forgotten.push(String(e.wid));
       }
       if (orch.length > from) next.set("orch", orch.length);
@@ -181,26 +226,22 @@ export class EventPump implements EventSink {
         const entries = committed(wf.journal), start = this.marks.get(wid) ?? 0;
         if (entries.length <= start) continue;
         const id = this.identity(wid);
-        for (let i = start; i < entries.length; i++) drafts.push(...deriveEntry(wid, entries, i, orch, id));
+        for (let i = start; i < entries.length; i++) await add(wid, i, deriveEntry(wid, entries, i, orch, id));
         next.set(wid, entries.length);
       }
-      if (drafts.length) await log.append(drafts, this.saved(next));
+      await commit();
     } catch (error) {
       for (const wid of dirty) this.dirty.add(wid);
       const text = `durable-subagents: event log append failed (retrying): ${String(error)}`;
       if (this.reported !== text) { this.reported = text; console.error(text); }
-      if (!this.closed && !this.timer) { this.timer = setTimeout(() => { this.timer = undefined; void this.serial(() => this.pass()); }, 1000); this.timer.unref?.(); }
-      return;
+      if (!this.closed && !this.timer) { this.timer = setTimeout(() => { this.timer = undefined; this.serial(() => this.pass()).catch(() => {}); }, 1000); this.timer.unref?.(); }
+      throw error;
     }
-    for (const [source, seq] of next) { this.marks.set(source, seq); if (drafts.length) this.unsaved.delete(source); else this.unsaved.add(source); }
-    if (drafts.length) this.unsaved.clear();
-    for (const wid of forgotten) { this.marks.delete(wid); this.identities.delete(wid); this.unsaved.delete(wid); }
     if (Date.now() - this.compactedAt >= COMPACT_EVERY_MS) await this.compact();
   }
   /** Retention: drop events older than the window whose workflow is quiet (or pruned); at start and at most hourly. */
   private async compact(): Promise<void> {
-    const log = this.log;
-    if (!log) return;
+    if (!this.log) return;
     this.compactedAt = Date.now();
     const window = this.options.retentionMs?.() ?? EVENT_RETENTION_MS, cutoff = Date.now() - window;
     const pruned = new Set<string>(), orch = committed(this.options.orch);
@@ -218,7 +259,7 @@ export class EventPump implements EventSink {
     try {
       // The watermarks written are the ones durable now plus those moved since (both are true of the derived log).
       const marks = new Map(this.marks);
-      const dropped = await log.compact(r => r.at < cutoff && droppable(String(r.e.wid)), marks);
+      const dropped = await (await this.writer()).compact(r => r.at < cutoff && droppable(String(r.e.wid)), marks);
       if (dropped) this.unsaved.clear();
     } catch (error) { console.error(`durable-subagents: event log compaction failed: ${String(error)}`); }
   }

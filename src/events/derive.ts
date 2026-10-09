@@ -18,12 +18,13 @@ export function callParts(call: string): { key: string; gen: number } | undefine
 const echo = (id: Identity) => ({ ...(id.request !== undefined ? { request: id.request } : {}), ...(id.labels ? { labels: id.labels } : {}) });
 const onCall = (call: string) => { const p = callParts(call); return p ? { key: p.key, gen: p.gen, call } : { call }; };
 
-/** The labels of a run body: a plain object of strings (anything else is not echoed). */
+/** The labels of a run body: a non-empty plain object of strings (anything else, and `{}`, is not echoed — as describe
+ *  and the R7 collector treat them). */
 export function labelsOf(body: unknown): Record<string, string> | undefined {
   const labels = (body as { labels?: unknown } | null)?.labels;
   if (!labels || typeof labels !== "object" || Array.isArray(labels)) return undefined;
   const entries = Object.entries(labels as Record<string, unknown>);
-  return entries.every(([, v]) => typeof v === "string") ? Object.fromEntries(entries) as Record<string, string> : undefined;
+  return entries.length && entries.every(([, v]) => typeof v === "string") ? Object.fromEntries(entries) as Record<string, string> : undefined;
 }
 
 /** `answered.by` from the answer request's sender: a pi session `main:<id>` → `session:<id>` (+ via "ui" when the
@@ -60,7 +61,8 @@ function answerOf(entries: readonly Entry[], limit: number, orch: readonly Entry
   return { request, text: typeof message === "string" ? message : forwarded ?? "" };
 }
 
-/** The ledger entries durable before journal entry `e` (by time: the ledger and the journal are separate files). */
+/** The ledger entries durable before journal entry `e` (by time: the ledger and the journal are separate files). A wall
+ *  clock step back can change which ledger entries a re-derivation sees, and so `by`/`reason` of its event (ids stay). */
 function before(orch: readonly Entry[], e: Entry): readonly Entry[] {
   let n = orch.length;
   while (n > 0 && Number(orch[n - 1]!.ts) > e.ts) n--;

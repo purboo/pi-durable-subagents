@@ -10,7 +10,7 @@ import { eventsLog, journalPath, orchLedger } from '../../../src/paths.ts';
 import { EventLog, readHead, readPage } from '../../../src/events/log.ts';
 import { EventPump } from '../../../src/events/pump.ts';
 import { EVENT_SEQ_SKIP, type EventDraft } from '../../../src/events/types.ts';
-import { JT, type JournalHandle } from '../../../src/types.ts';
+import { JT, type Entry, type JournalHandle } from '../../../src/types.ts';
 
 async function home(t: TestContext) {
   const dir = await mkdtemp(join(tmpdir(), 'dsa-events-'));
@@ -236,4 +236,131 @@ test('R2 pump: flush derives a workflow before it is pruned; a pruned workflow i
   await again.log.close();
   const q = s.pump(); await q.open(); await q.close();
   assert.equal(read(s.path).filter(e => e.wid === 'A' && e.type === 'submitted').length, 1, 'not derived again');
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Failure paths (batch 2 review).
+// ---------------------------------------------------------------------------------------------------------------------
+test('R2 log: failed writes never spend more than EVENT_SEQ_SKIP seqs past the durable head (no seq reuse after reopen)', async t => {
+  const dir = await home(t);
+  /** Partial writes then ENOSPC (the complete lines are visible to a reader until the writer cuts them); `only` picks
+   *  the writes that fail. Returns the highest seq a reader saw. */
+  const failing = (path: string, log: EventLog, only: (text: string) => boolean) => {
+    const file = (log as unknown as { file: { write: (text: string) => Promise<unknown> } }).file, write = file.write.bind(file);
+    const state = { seen: 0, fail: true };
+    file.write = async (text: string) => {
+      if (!state.fail || !only(text)) return write(text);
+      await write(text.slice(0, Math.floor(text.length / 2)));
+      state.seen = Math.max(state.seen, ...seqs(path));
+      throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+    };
+    return state;
+  };
+  for (const [name, only] of [['every write fails', () => true], ['only event writes fail', (text: string) => text.includes('"k":"ev"')]] as const) {
+    const path = join(dir, `${name.replaceAll(' ', '-')}.jsonl`);
+    const { log } = await EventLog.open(path);
+    await log.append([draft(0)]);
+    const state = failing(path, log, only);
+    for (let r = 0; r < 3; r++) await assert.rejects(log.append(Array.from({ length: 600 }, (_, i) => draft(i))), /ENOSPC/);
+    assert.ok(state.seen > 0, name);
+    if (name === 'only event writes fail') {
+      // A later write first makes the spent seqs durable (a lone head record), then writes its events after them.
+      state.fail = false;
+      const [late] = await log.append([draft(7)]);
+      assert.ok(Number(late!.cursor.split(':')[1]) > state.seen, name);
+      state.fail = true;
+      await assert.rejects(log.append(Array.from({ length: 600 }, (_, i) => draft(i))), /ENOSPC/);
+    }
+    state.fail = false;
+    await log.close();
+    const again = await EventLog.open(path);
+    const [next] = await again.log.append([draft(9)]);
+    assert.ok(Number(next!.cursor.split(':')[1]) > state.seen, `${name}: seq ${next!.cursor} reused, a reader at seq ${state.seen} would skip it`);
+    await again.log.close();
+  }
+});
+
+test('R2 log: a compaction that fails after its rename leaves the log broken (appends throw); open removes stale temp files', async t => {
+  const dir = await home(t), path = eventsLog(dir);
+  await writeFile(`${path}.0badc0de.tmp`, 'stale');
+  const { log } = await EventLog.open(path);
+  assert.ok(!(await readdir(dir)).some(n => n.endsWith('.tmp')), 'stale temp file removed');
+  await log.append([draft(1, 'A'), draft(2, 'B')]);
+  const file = (log as unknown as { file: { close: () => Promise<void> } }).file, close = file.close.bind(file);
+  file.close = async () => { throw new Error('EIO on close'); };
+  await assert.rejects(log.compact(r => r.e.wid === 'A', new Map()), /EIO/);
+  assert.equal(log.broken, true);
+  // The old handle names the replaced inode: writing there would lose the events.
+  await assert.rejects(log.append([draft(3, 'B')]), /EIO/);
+  await close();
+  assert.deepEqual(seqs(path), [2]);
+});
+
+test('R2 pump: flush rejects when the pass could not log what it derived; the retry logs it', async t => {
+  const s = await sources(t);
+  const a = await s.add('A');
+  const p = s.pump(); await p.open();
+  t.after(() => p.close());
+  const original = EventLog.prototype.append;
+  EventLog.prototype.append = function () { return Promise.reject(new Error('ENOSPC')); };
+  try {
+    await a.append(JT.done, { status: 'done' });
+    await assert.rejects(p.flush(), /ENOSPC/);
+  } finally { EventLog.prototype.append = original; }
+  await p.flush();
+  assert.ok(read(s.path).some(e => e.type === 'workflow-done'));
+});
+
+test('R2 pump: after a compaction broke the log, the next pass reopens it and logs to the live file', async t => {
+  const s = await sources(t);
+  const a = await s.add('A'), b = await s.add('B');
+  await a.append(JT.done, { status: 'done' });
+  const p = s.pump(); await p.open();
+  t.after(() => p.close());
+  const log = (p as unknown as { log: EventLog }).log, file = (log as unknown as { file: { close: () => Promise<void> } }).file;
+  file.close = async () => { throw new Error('EIO on close'); };
+  s.setRetention(1); await new Promise(r => setTimeout(r, 5));
+  await (p as unknown as { compact: () => Promise<void> }).compact();
+  await b.append(JT.done, { status: 'done' });
+  await p.flush();
+  assert.ok(read(s.path).some(e => e.wid === 'B' && e.type === 'workflow-done'), 'logged to the file readers see');
+  assert.ok(Number(read(s.path).at(-1)!.cursor.split(':')[1]) > EVENT_SEQ_SKIP, 'the reopen applied the start skip');
+});
+
+test('R2 pump: a pass appends in chunks of at most EVENT_SEQ_SKIP with partial watermarks; a failed chunk is re-derived', async t => {
+  const s = await sources(t);
+  // A large backfill: one workflow whose journal derives more than two chunks of events (a plain array journal).
+  const entries: Entry[] = [{ seq: 1, ts: 1, type: 'wf-created' } as Entry];
+  const n = EVENT_SEQ_SKIP * 2 + 10;
+  for (let i = 0; i < n; i++) entries.push({ seq: entries.length + 1, ts: 2, type: JT.exec, call: C('BIG', `k${i}`), exec: `${C('BIG', `k${i}`)}#1.1` } as Entry);
+  await s.orch.append('request', { request: { rid: 'req:big', from: 'cli:t@h', to: 'orch', sseq: 1, kind: 'run', body: { cwd: s.dir } } });
+  await s.orch.append(JT.created, { rid: 'req:big', wid: 'BIG' });
+  s.store.workflows.set('BIG', { journal: { path: '', entries: () => entries, committed: () => entries, close: async () => {} } as unknown as JournalHandle });
+  const original = EventLog.prototype.append, sizes: number[] = [];
+  let calls = 0;
+  EventLog.prototype.append = function (drafts, marks) {
+    sizes.push(drafts.length);
+    if (++calls === 2) return Promise.reject(new Error('ENOSPC'));
+    return original.call(this, drafts, marks);
+  };
+  const p = s.pump();
+  try { await p.open(); await p.flush(); } finally { EventLog.prototype.append = original; }
+  await p.close();
+  assert.ok(sizes.every(size => size <= EVENT_SEQ_SKIP), `chunks ${sizes.join(',')}`);
+  const all: string[] = [];
+  for (let since = 0, page = readPage(s.path, 0, 1000)!; ; page = readPage(s.path, since, 1000)!) {
+    all.push(...page.events.filter(e => e.type === 'started').map(e => e.id));
+    if (!page.more) break;
+    since = Number(page.events.at(-1)!.cursor.split(':')[1]);
+  }
+  assert.equal(new Set(all).size, n, 'every event logged (at least once) after the failed chunk');
+  assert.equal(all.length, n, 'the chunk logged before the failure is not derived again (its partial watermark)');
+  const q = s.pump(); await q.open(); await q.close();
+  let again = 0;
+  for (let since = 0, page = readPage(s.path, 0, 1000)!; ; page = readPage(s.path, since, 1000)!) {
+    again += page.events.filter(e => e.type === 'started').length;
+    if (!page.more) break;
+    since = Number(page.events.at(-1)!.cursor.split(':')[1]);
+  }
+  assert.equal(again, all.length, 'the watermarks cover everything: a restart derives nothing again');
 });
