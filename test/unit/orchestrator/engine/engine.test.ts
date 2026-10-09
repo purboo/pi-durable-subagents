@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -78,7 +79,9 @@ test('intake FIFO, gap holding, immutable identity and pin copies', async t => {
   await publishRequest(orchInbox(home), { ...one, body: { source: 'different' } }); await engine.intake();
   assert.equal(ledgers.orch.entries().filter(e => e.type === JT.created).length, 1);
   assert.equal(ledgers.orch.entries().filter(e => e.type === JT.applied && e.rid === 'one').length, 1);
-  assert.ok(ledgers.orch.entries().some(e => e.type === JT.rejected && e.reason === 'identity-conflict'));
+  // R1: 'one' is already resolved, so its conflicting duplicate is dropped without a decision record; its file goes.
+  assert.ok(!ledgers.orch.entries().some(e => e.type === JT.rejected && e.reason === 'identity-conflict'));
+  assert.ok(!existsSync(join(orchInbox(home), 'one.json')));
 });
 
 test('live call -> run -> seal -> durable exposure -> send; host death replays sealed calls', async t => {
