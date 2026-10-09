@@ -1,3 +1,4 @@
+import { restartInputError } from "../../orchestrator/restart.ts";
 import { resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { CallSpec, Conditions, Entry, RequestKind, RunBody } from "../../types.ts";
@@ -23,7 +24,8 @@ export const parameters = Type.Object({
   timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number). Omit unless a hard limit is needed; prefer budgets." })),
   key: Type.Optional(Type.String({ description: "A single agent/task run: the call's key. status with wid: that call's full result." })),
   full: Type.Optional(Type.Boolean({ description: "status: with wid, the complete workflow detail including every output." })),
-  force: Type.Optional(Type.Boolean({ description: "restart: fence running executions instead of refusing (they resume on the new orchestrator)." })),
+  force: Type.Optional(Type.Union([Type.String(), Type.Boolean()], { description: "restart: the token shown by a refusal. Show the user the list and obtain explicit approval first; boolean true is refused. Subagents cannot force a restart." })),
+  reason: Type.Optional(Type.String({ description: "restart: non-empty reason, at most 500 characters; required with force." })),
 }, { additionalProperties: true });
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
@@ -119,6 +121,13 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     ...(args.source === undefined ? {} : { source: string(args, "source") }), ...(args.args === undefined ? {} : { args: args.args }) } };
   if (action === "resume") return { kind: "resume", body: args.wid !== undefined ? { wid: string(args, "wid") } : typeof args.origin === "string" ? { origin: args.origin } : {} };
   if (action === "drain") return { kind: "drain", body: {} };
-  if (action === "restart") return { kind: "restart", body: args.force === true ? { force: true } : {} };
+  if (action === "restart") {
+    if (args.force === true) throw new Error('force:true is refused; show the user the running executions from a restart refusal, then use force:"<token>" and reason:"<why>" only with explicit user approval');
+    if (args.force !== undefined && args.force !== false && typeof args.force !== "string") throw new Error("force must be the token from a refused restart");
+    const body = { ...(typeof args.force === "string" ? { token: args.force } : {}), ...(args.reason !== undefined ? { reason: args.reason as string } : {}) };
+    const invalid = restartInputError(body);
+    if (invalid) throw new Error(invalid);
+    return { kind: "restart", body };
+  }
   throw new Error(`Unsupported action: ${action}; use run, agents, send, stop, revise, status, resume, drain, or restart`);
 }
