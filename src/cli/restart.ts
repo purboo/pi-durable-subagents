@@ -49,6 +49,14 @@ export function legacyRestart(home: string, old: OrchestratorProcess, force: boo
 }
 
 /** Wait (bounded) until the process ends; false when it still runs at the deadline. */
+/** The orchestrator that decided request `rid`: the last start recorded before its resolution. */
+export function decidedBy(home: string, rid: string): OrchestratorProcess | undefined {
+  const entries = readJournalSnapshot(orchLedger(home));
+  const at = entries.findIndex(e => (e.type === JT.applied || e.type === JT.rejected) && e.rid === rid);
+  const o = at < 0 ? undefined : entries.slice(0, at).findLast(e => e.type === 'orchestrator');
+  return o ? { version: String(o.version), pid: Number(o.pid), ...(o.start ? { start: String(o.start) } : {}), ts: o.ts, ...(o.restart ? { restart: true as const } : {}) } : undefined;
+}
+
 export async function waitExit(old: OrchestratorProcess, timeoutMs: number): Promise<boolean> {
   const deadline = performance.now() + timeoutMs;
   while (processAlive(old.pid, old.start)) {

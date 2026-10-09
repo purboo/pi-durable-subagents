@@ -13,7 +13,7 @@ import { doctor, renderDoctor, size } from "./doctor.ts";
 import { smoke } from "./smoke.ts";
 import { serviceFiles, manageService, type ServiceRunner } from "./service.ts";
 import { leaseLines, leaseState } from "../platform/lease.ts";
-import { currentOrchestrator, legacyRestart, waitExit, waitSuccessor } from "./restart.ts";
+import { currentOrchestrator, decidedBy, legacyRestart, waitExit, waitSuccessor } from "./restart.ts";
 
 const commands = ["smoke", "tail", "status", "events", "start", "resume", "drain", "stop", "stop-all", "prune", "restart", "leases", "doctor", "install-service", "uninstall-service", "help"] as const;
 type Command = typeof commands[number];
@@ -95,8 +95,9 @@ export function serviceEntryError(entry: string): string | undefined {
 }
 export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | prune [wid] [--older-than <days>] | restart [--force] | hold <resource> [--shared] [--max-wait <s>] [--note <text>] -- <command…> | leases [--json] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
 /** Restart: the orchestrator exits when no execution runs (or `force`) and the installed version takes over. */
-async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line: string) => void, options: { force: boolean; starter?: typeof startOrchestrator; waitMs?: number }): Promise<number> {
-  const starter = options.starter ?? startOrchestrator, old = currentOrchestrator(home);
+async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line: string) => void, options: { force: boolean; starter?: typeof startOrchestrator; waitMs?: number; pendingMs?: number }): Promise<number> {
+  const starter = options.starter ?? startOrchestrator;
+  let old = currentOrchestrator(home);
   if (!old) {
     write(await start(home, env, starter) ? "restart: no orchestrator was running; started one for the pending work" : "restart: no orchestrator is running (one starts when work is submitted)");
     return 0;
@@ -108,9 +109,17 @@ async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line
     if (!legacy.applied) { write(`restart refused: ${legacy.reason}`); return 1; }
   } else {
     const [req] = await submit(home, "restart", undefined, env, { force: options.force });
-    const outcome = await resolution(home, req!.rid, waitMs);
-    if (!outcome) { write(`submitted restart ${req!.rid}; not resolved within ${Math.round(waitMs / 1000)} s (see: pi-durable-subagents doctor)`); return 1; }
+    // The orchestrator reads requests only after recovering its workflows (it may itself have just started): keep
+    // waiting while one runs. An undecided request stays durable and is decided later — say so, never resubmit.
+    let outcome = await resolution(home, req!.rid, waitMs);
+    if (!outcome && currentOrchestrator(home)) {
+      write(`restart ${req!.rid}: submitted; the orchestrator has not reached it yet (it may still be recovering) — waiting`);
+      const deadline = performance.now() + (options.pendingMs ?? 600_000);
+      while (!outcome && currentOrchestrator(home) && performance.now() < deadline) outcome = await resolution(home, req!.rid, Math.min(waitMs, 5_000));
+    }
+    if (!outcome) { write(`restart ${req!.rid} is still pending: it is decided when an orchestrator reaches it (do not resubmit; see: pi-durable-subagents status)`); return 75; }
     if (outcome.type === "rejected") { write(`restart refused: ${outcome.reason}`); return 1; }
+    old = decidedBy(home, req!.rid) ?? old;
   }
   if (!await waitExit(old, Math.max(waitMs, 60_000))) { write(`restart: orchestrator ${old.version} (pid ${old.pid}) is still shutting down; see: pi-durable-subagents status`); return 1; }
   await starter(home, env);
@@ -119,7 +128,7 @@ async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line
   return 0;
 }
 /** P1, P21, P25, P38: Dispatch the public CLI using durable requests and read-only snapshots. */
-export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string; waitMs?: number; now?: number } = {}): Promise<number> {
+export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string; waitMs?: number; pendingMs?: number; now?: number } = {}): Promise<number> {
   if (args[0] === "hold") { const { hold, parseHold } = await import("./hold.ts"); return hold(parseHold(args.slice(1)), { env: options.env ?? process.env }); }
   if (args[0] === "chaos") return (await import("./chaos/index.ts")).chaos(args.slice(1), options.env ?? process.env, options.write);
   const { command, target, json, dryRun, olderThanDays, force } = parseArgs(args), env = options.env ?? process.env;
@@ -180,7 +189,7 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     write(json ? JSON.stringify(state, null, 2) : state.length ? leaseLines(state).join("\n") : "No leases held or waited for");
     return 0;
   }
-  if (command === "restart") return restartCommand(home, env, write, { force: force === true, starter: options.starter, waitMs: options.waitMs });
+  if (command === "restart") return restartCommand(home, env, write, { force: force === true, starter: options.starter, waitMs: options.waitMs, pendingMs: options.pendingMs });
   for (const req of await submit(home, command as Control, target, env)) write(`submitted ${req.kind} ${req.rid}`);
   return 0;
 }

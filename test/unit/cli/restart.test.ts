@@ -3,14 +3,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { main, parseArgs } from '../../../src/cli/main.ts';
 import { startOrchestrator } from '../../../src/cli/control.ts';
-import { currentOrchestrator, journalLiveCalls, legacyRestart, waitExit } from '../../../src/cli/restart.ts';
+import { currentOrchestrator, decidedBy, journalLiveCalls, legacyRestart, waitExit } from '../../../src/cli/restart.ts';
 import { openJournal, readJournalSnapshot } from '../../../src/kernel/journal.ts';
 import { publishRequest } from '../../../src/kernel/mailbox.ts';
 import { reduceLifecycle, type DecisionRecord } from '../../../src/kernel/lifecycle.ts';
@@ -144,4 +144,43 @@ test('an orchestrator without the restart request: journals decide, SIGTERM ends
   assert.deepEqual(legacyRestart(home, running, false), { applied: true });
   assert.equal(await waitExit(running, 5_000), true);
   assert.equal(currentOrchestrator(home), undefined);
+});
+
+/** submit() starts an orchestrator when its lock is free; these tests play the orchestrator through the ledger. */
+async function inert(home: string) { const entry = join(home, 'inert.mjs'); await writeFile(entry, ''); return { DSA_HOME: home, DSA_ORCHESTRATOR_ENTRY: entry }; }
+async function sleeper(t: test.TestContext) {
+  const p = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  t.after(() => { p.kill('SIGKILL'); });
+  return { p, start: await captureStart(p.pid!).catch(() => '') };
+}
+test('CLI restart waits for an orchestrator that has not reached the request (recovering); undecided → 75, pending', { timeout: 20_000 }, async t => {
+  const home = await root(t), busy = await sleeper(t);
+  const orch = await openJournal(orchLedger(home));
+  await orch.append('orchestrator', { version: '1.0.19', pid: busy.p.pid, ...(busy.start ? { start: busy.start } : {}), restart: true });
+  await orch.close();
+  const lines: string[] = [];
+  const code = await main(['restart'], { env: await inert(home), write: l => lines.push(l), waitMs: 100, pendingMs: 400, starter: async () => {} });
+  assert.equal(code, 75);
+  assert.match(lines[0]!, /^restart \S+: submitted; the orchestrator has not reached it yet \(it may still be recovering\) — waiting$/);
+  assert.match(lines[1]!, /^restart \S+ is still pending: it is decided when an orchestrator reaches it \(do not resubmit/);
+});
+test('CLI restart decided by a successor orchestrator waits for that one, not the one it first saw', { timeout: 20_000 }, async t => {
+  const home = await root(t), first = await sleeper(t), second = await sleeper(t), third = await sleeper(t);
+  const orch = await openJournal(orchLedger(home));
+  t.after(() => orch.close());
+  const record = (s: { p: { pid?: number }; start: string }) => ({ version: '1.0.19', pid: s.p.pid, ...(s.start ? { start: s.start } : {}), restart: true });
+  await orch.append('orchestrator', record(first));
+  const lines: string[] = [];
+  const done = main(['restart'], { env: await inert(home), write: l => lines.push(l), waitMs: 100, pendingMs: 10_000,
+    starter: async () => { await orch.append('orchestrator', record(third)); } });
+  const rid = await until(async () => (await readdir(orchInbox(home)).catch(() => [] as string[])).find(n => n.endsWith('.json'))?.replace(/\.json$/, ''));
+  // The first orchestrator ends without deciding; its successor (still recovering at first) applies the restart and exits.
+  first.p.kill('SIGKILL'); await orch.append('orchestrator-exit', { pid: first.p.pid });
+  await orch.append('orchestrator', record(second));
+  await delay(300);
+  await orch.append(JT.applied, { rid });
+  assert.equal(decidedBy(home, rid)!.pid, second.p.pid);
+  second.p.kill('SIGKILL');
+  assert.equal(await done, 0);
+  assert.match(lines.at(-1)!, new RegExp(`^restarted: orchestrator 1\\.0\\.19 \\(pid ${second.p.pid}\\) → 1\\.0\\.19 \\(pid ${third.p.pid}\\)$`));
 });

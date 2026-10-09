@@ -5,7 +5,7 @@
 // revised {rid,revision,snapshot} commit publications; old pins remain immutable.
 // pruned {rid,wid,endedAt,bytes} (written by the engine) is decisive: the wid is gone, its create-intent and
 // created entries stay for identity (A1), and recovery finishes removing w/<wid> and its staging dirs.
-import { lstat, readdir, readFile, stat, rm } from 'node:fs/promises';
+import { access, lstat, readdir, readFile, stat, rm } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { basename, extname, join, relative } from 'node:path';
 import { discoverAgents, type AgentDefinition, type DiscoveryOptions } from '../compat/agents.ts';
@@ -26,6 +26,8 @@ export interface Pins {
  *  from the published files: `originPath` (pinned origin.jsonl, when the run has an origin) and `inputs`. */
 export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string>; originPath?: string }
 type SnapshotRef = { path: string; hash: string };
+/** pinned/<rN>/pins.json: the in-memory pins of a published revision, valid for the snapshot hash it names. */
+type PinRecord = { snapshot: string; pins: Pins; inputs: Record<string, string>; origin: boolean };
 type Snapshot = { hash: string; pins?: Pins; error?: string; warnings?: string[] };
 
 // E3: errors of the machine rather than of the request; only these propagate, so the next intake retries the request.
@@ -234,6 +236,9 @@ export class Store {
   private async publishPins(wid: string, revision: number, pins: Pins) {
     const root = pinnedDir(this.ledgers.home, wid), dir = revision === 1 ? root : join(root, `r${revision}`);
     const publish = async (directory: string, name: string, bytes: string | Buffer) => {
+      // Already published (a restart): compare without writing and syncing another copy.
+      const existing = await readFile(join(directory, name)).catch(() => undefined);
+      if (existing?.equals(typeof bytes === 'string' ? Buffer.from(bytes) : bytes)) return;
       if (await publishFile(directory, name, bytes) === 'conflict') throw new Error(`Pinned content conflict: ${directory}/${name}`);
     };
     if (pins.origin !== undefined) await publish(dir, 'origin.jsonl', pins.origin);
@@ -249,12 +254,34 @@ export class Store {
     const { origin, inputs: _bytes, ...kept } = pins;
     return { pins: { ...kept, inputs: {} }, scriptPath: join(dir, 'script.js'), inputs, originPath: origin === undefined ? undefined : join(dir, 'origin.jsonl') };
   }
+  /** A1: The pinned files of one revision. The first publication verifies the staged snapshot and ends with `pins.json`
+   *  (the in-memory pins, keyed by the snapshot hash); later starts read that small record instead of parsing and
+   *  re-publishing the snapshot, which can hold a multi-megabyte origin branch per workflow. */
+  private async pinnedFiles(wid: string, revision: number, intent: Entry): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'>> {
+    const dir = revision === 1 ? pinnedDir(this.ledgers.home, wid) : join(pinnedDir(this.ledgers.home, wid), `r${revision}`);
+    const ref = intent.pins ? undefined : intent.snapshot as SnapshotRef | undefined;
+    if (ref) {
+      const record = await readFile(join(dir, 'pins.json'), 'utf8').then(text => JSON.parse(text) as PinRecord, () => undefined);
+      if (record?.snapshot === ref.hash) {
+        const files = { pins: record.pins, scriptPath: join(dir, 'script.js'), inputs: Object.fromEntries(Object.entries(record.inputs).map(([name, file]) => [name, join(dir, file)])),
+          originPath: record.origin ? join(dir, 'origin.jsonl') : undefined };
+        const present = await Promise.all([files.scriptPath, ...Object.values(files.inputs), ...(files.originPath ? [files.originPath] : [])].map(path => access(path).then(() => true, () => false)));
+        if (present.every(Boolean)) return files;
+      }
+    }
+    const files = await this.publishPins(wid, revision, await this.pinned(intent));
+    if (ref) {
+      const record: PinRecord = { snapshot: ref.hash, pins: files.pins, inputs: Object.fromEntries(Object.entries(files.inputs).map(([name, path]) => [name, relative(dir, path)])), origin: files.originPath !== undefined };
+      await publishFile(dir, 'pins.json', JSON.stringify(record), existing => { try { return (JSON.parse(existing.toString('utf8')) as PinRecord).snapshot === ref.hash; } catch { return false; } })
+        .then(outcome => { if (outcome === 'conflict') return rm(join(dir, 'pins.json'), { force: true }).then(() => publishFile(dir, 'pins.json', JSON.stringify(record))); });
+    }
+    return files;
+  }
   /** P14, A2: Publish a new revision only after the engine has retired its predecessor. */
   async revise(intent: Entry): Promise<void> {
     const wf = this.workflows.get(intent.wid as string)!;
     if (wf.revision >= Number(intent.revision)) return;
-    const pins = await this.pinned(intent), revision = Number(intent.revision);
-    const files = await this.publishPins(wf.wid, revision, pins);
+    const revision = Number(intent.revision), files = await this.pinnedFiles(wf.wid, revision, intent);
     await wf.journal.append('revised', { rid: intent.rid, revision, snapshot: intent.snapshot });
     Object.assign(wf, files, { revision });
   }
@@ -265,8 +292,7 @@ export class Store {
       ? this.ledgers.orch.entries().find(e => e.type === 'create-intent' && e.wid === wf.wid)
       : wf.journal.entries().find(e => e.type === 'revised' && e.revision === revision);
     if (!intent) throw new Error(`Missing pinned revision: ${wf.wid}@${revision}`);
-    const pins = await this.pinned(intent);
-    return { ...wf, revision, ...await this.publishPins(wf.wid, revision, pins) };
+    return { ...wf, revision, ...await this.pinnedFiles(wf.wid, revision, intent) };
   }
   /** A1, housekeeping: Wids with a committed pruned entry; they are gone and never materialize again. */
   pruned(): Set<string> { return new Set(this.ledgers.orch.entries().filter(e => e.type === 'pruned').map(e => String(e.wid))); }
@@ -306,14 +332,14 @@ export class Store {
     const wid = intent.wid as string, existing = this.workflows.get(wid);
     if (existing) return existing;
     if (this.pruned().has(wid)) throw new Error(`Workflow ${wid} was pruned`);
-    const pins = await this.pinned(intent), files = await this.publishPins(wid, 1, pins);
+    const files = await this.pinnedFiles(wid, 1, intent);
     const journal = await openJournal(journalPath(this.ledgers.home, wid));
     const wf: Workflow = { wid, revision: 1, origin: intent.origin as string, cwd: intent.cwd as string, journal, ...files };
     this.workflows.set(wid, wf);
     if (!journal.entries().length) await journal.append('wf-created', { rid: intent.rid, origin: intent.origin, cwd: intent.cwd, revision: 1,
       ...(intent.name !== undefined ? { name: intent.name } : {}) });
     const revised = journal.entries().findLast(e => e.type === 'revised');
-    if (revised) Object.assign(wf, await this.publishPins(wid, Number(revised.revision), await this.pinned(revised)), { revision: Number(revised.revision) });
+    if (revised) Object.assign(wf, await this.pinnedFiles(wid, Number(revised.revision), revised), { revision: Number(revised.revision) });
     if (!this.ledgers.orch.entries().some(e => e.type === JT.created && e.rid === intent.rid)) await this.ledgers.orch.append(JT.created, { rid: intent.rid, wid, origin: intent.origin });
     return wf;
   }

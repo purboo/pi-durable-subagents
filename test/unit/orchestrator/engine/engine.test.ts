@@ -459,6 +459,35 @@ test('origin branch and input bytes stay on disk, not in memory, across revision
   await again.store.close();
 });
 
+test('a restart reads each revision\'s pins.json instead of parsing and re-publishing its staged snapshot', async t => {
+  const evaluator = new ManualEvaluator(), { home, run, engine, ledgers } = await fixture(t, evaluator);
+  const session = join(home, 'origin.jsonl'), input = join(home, 'doc');
+  await writeFile(session, JSON.stringify({ type: 'session', version: 3, id: 'origin' }) + '\n');
+  await writeFile(input, 'v1');
+  const wf = await run('source', { origin: { sessionFile: session }, inputs: { doc: input }, usageBudget: { tokens: 5 } });
+  await writeFile(input, 'v2');
+  await submit(engine, home, 'revise', { wid: wf.wid, source: 'new source' });
+  const recover = async () => {
+    const again = new Engine(ledgers, fakeExecutor(ledgers), { discovery: { home, agentDir: join(home, 'config'), globalNpmRoot: null } });
+    try { await again.store.recover(); return again.store.workflows.get(wf.wid)!; } finally { await again.store.close(); }
+  };
+  const records = [join(pinnedDir(home, wf.wid), 'pins.json'), join(pinnedDir(home, wf.wid), 'r2', 'pins.json')];
+  for (const record of records) assert.equal(JSON.parse(await readFile(record, 'utf8')).pins.origin, undefined);
+  // Without the staged snapshots, only the records can rebuild the workflow.
+  await rm(join(home, 'staging'), { recursive: true, force: true });
+  const recovered = await recover();
+  assert.equal(recovered.revision, 2); assert.equal(recovered.pins.source, 'new source');
+  assert.deepEqual(recovered.pins.usageBudget, { tokens: 5 }); assert.deepEqual(recovered.pins.inputSources, wf.pins.inputSources);
+  assert.equal(recovered.originPath, wf.originPath); assert.equal(recovered.scriptPath, wf.scriptPath);
+  assert.equal(await readFile(recovered.inputs.doc!, 'utf8'), 'v2');
+  const first = await engine.store.atRevision(recovered, 1);
+  assert.equal(first.pins.source, 'source'); assert.equal(await readFile(first.inputs.doc!, 'utf8'), 'v1');
+  // A record for another snapshot is not trusted: the snapshot is needed again (and here it is gone).
+  const r2 = JSON.parse(await readFile(records[1]!, 'utf8')); r2.snapshot = 'other';
+  await writeFile(records[1]!, JSON.stringify(r2));
+  await assert.rejects(recover(), /ENOENT/);
+});
+
 test('revision re-pins inputs, reuses matching seals, allocates changed generations and rejects stale requests', async t => {
   const evaluator = new ManualEvaluator(), { home, run, engine, ledgers } = await fixture(t, evaluator);
   const input = join(home, 'document'); await writeFile(input, 'before');
