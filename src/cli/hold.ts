@@ -85,7 +85,8 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
     try { watcher = watch(leaseDir(home, args.resource), () => wake()); watcher.on("error", () => {}); } catch { /* polling suffices */ }
     let shown: string | undefined;
     const ended = new Map<number, number>();
-    for (;;) {
+    // A ticket granted under the lock (no wait) runs at once; only a queued one waits.
+    while (ticket.grantedAt === undefined) {
       if (interrupted) { removeTicket(home, ticket); return 128 + (constants.signals[interrupted] ?? 1); }
       const all = liveTickets(home, args.resource), ahead = blockers(ticket, all);
       if (!ahead.length) break;

@@ -478,8 +478,9 @@ pi-durable-subagents hold build --slots 4 -- cargo test   # at most 4 at a time
   resource a counting semaphore: a request runs once fewer than N holders
   (slot or shared) hold it, no exclusive request is ahead of it, and no
   earlier request of any kind still waits, so it never overtakes a waiter.
-  Shared requests are not limited by slots but occupy them. Each request
-  applies its own N, so use one N per resource name. `leases` shows
+  Shared requests are not limited by slots but occupy them, and they do not
+  queue behind a slot waiter, so a stream of shared requests can keep it
+  waiting; use one mode and one N per resource name. `leases` shows
   ``build 3/4 held: pid 123 `cargo test` (slot, 2m), ...; waiting: 2 (first: pid 456, 30s)``,
   `leases --json` adds `slots` and `held` to the resource,
   and a waiting `hold` prints its position and `held k/N`.
