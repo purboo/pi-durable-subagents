@@ -57,7 +57,9 @@ the npx cache, so `install-service` refuses to run from there.
 | A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
 | A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded) | Found at the second refusal in a row, while pi is still retrying. A call in a pool continues **in the same session** on the pool's next model (within pi's next retry or two); new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
 | Two subagents would write in the same worktree | Only one runs there at a time. A call that can write (its tools include `edit` or `write`, which pi's default tools do) holds its git worktree's writer lock from its launch until it ends, also while it waits for an answer. Another writer for that worktree waits in order, and status shows `waiting for writer lock: <root> held by <wid>/<key>`. `writer: false` (a call that does not write there), `isolation: "worktree"` and `"writerLock": "off"` opt out. |
-| A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. |
+| A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. The question survives orchestrator restarts (also forced ones) and crashes, including one that hits before the subagent released its slot. |
+| A subagent's work ends (finished, stopped, or cut off) | Every process its tools started ends with that execution, also ones started with `nohup`, `setsid` or `&`: they carry the execution's tag (see the limit below). Anything that must outlive the subagent has to be started by you or the parent session. A command run under `hold` is no exception: a forced restart stops it and its lease is released. |
+| A subagent runs in a worktree you made (`isolation: "none"`, the default, with `cwd`) | Durable Subagents never creates, cleans, moves or deletes that directory or its branch, also not on `prune`; `prune` deletes only its own state and the worktrees it created for `isolation: "worktree"`. |
 
 ## Use it
 
@@ -424,8 +426,13 @@ loads the old extension; start a new one.
   "outcome unknown" notice; other work keeps running.
 - A tool that already ran inside a subagent may run again after a crash, if
   its result never reached the session. Make external side effects
-  idempotent, or mark the step `once: true` (it then stops as `unknown`
-  instead of repeating).
+  idempotent, or mark the step `once: true`: when an execution is cut off
+  while a tool call is running (its result never arrived), the step then
+  ends as `unknown` instead of repeating it. Cut off between tool calls, a
+  `once` step continues like any other (nothing was left half done), and a
+  step waiting for your answer is never `unknown` — it keeps waiting and
+  resumes with the answer. A follow-up on an `unknown` step continues the
+  same session as its next generation.
 - After a crash, the model call that was in flight is paid for again.
 - Process containment uses process tags plus a 1-second tracker. A process
   that clears its tag and leaves the process tree within its first second
