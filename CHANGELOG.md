@@ -1,7 +1,31 @@
 # Changelog
 
-## 1.0.20
+## 1.0.21
 
+1.0.20 was not published; its changes ship in this release.
+
+- Programs can name requests: `run`, `send` and `stop` take `--request <id>`
+  (CLI) or `request` (the `subagents` tool). A retry with the same id and the
+  same content gets the first outcome and never starts a second workflow or
+  follow-up; other content under the id is a `request-conflict` and sends
+  nothing. Exit codes: 0 applied, 1 rejected, 3 conflict, 75 not decided yet
+  (retry with the same id). `describe --key <id>` (or a wid) reports the
+  state, open questions and every call's output in full, what live calls
+  wait for and why their last execution was fenced. A pruned workflow leaves
+  a tombstone with its final status, request id and digest. See "Driving dsa
+  from a program" in the README.
+- A forced restart needs the user's approval in a checkable form: a refused
+  `restart` lists the running executions grouped by session (with held
+  leases) and a token; `restart --force <token> --reason <text>` fences
+  exactly that set and is refused again if it changed. A subagent cannot
+  force a restart. The ledger records who forced it and why, and `status`
+  shows it for 24 hours.
+- An asker cut off by a restart or crash before its planned hibernation no
+  longer loses its question: it hibernates and resumes with the answer
+  (also an answer given while dsa restarted), and a `once` step waiting for
+  an answer no longer ends as `unknown`.
+- A workflow's done notice names a follow-up still going (queued or running)
+  instead of calling it `unknown`.
 - Orchestrator starts are fast again. Each start re-parsed every workflow's
   staged snapshot (tens of megabytes each when it holds a forked parent
   session) before handling any request, so a restart stalled all work for
