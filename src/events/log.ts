@@ -1,4 +1,4 @@
-// R2: the cross-workflow event log, `<home>/events.jsonl`. Single writer: the orchestrator (under its OS lock). Each line
+// The cross-workflow event log, `<home>/events.jsonl`. Single writer: the orchestrator (under its OS lock). Each line
 // is CRC-framed like the journals (`<crc32 hex 8> <json>\n`, kernel/journal.ts); a reader ignores a torn final line, a
 // bad line before the last one is corruption. Records (`k`):
 //   log  {v, epoch, dropped}   first line, written when the file is created or compacted. `epoch` (16 hex chars, random)
@@ -99,7 +99,7 @@ function scanFile(fd: number, size: number): Scan {
   return { epoch: header.epoch, dropped: header.dropped, head: Math.max(head, header.dropped), marks, end: bad ?? end, records, events };
 }
 
-/** R2: The writer. Appends, compaction and close are serialized; an append resolves only after fsync. */
+/** The writer. Appends, compaction and close are serialized; an append resolves only after fsync. */
 export class EventLog {
   readonly path: string;
   readonly epoch: string;

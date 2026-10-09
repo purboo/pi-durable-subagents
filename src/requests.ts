@@ -1,4 +1,4 @@
-// R1: Caller-chosen request ids. A program names a run/send/stop with `<id>`; its kernel rid is `req:<id>` (fits the
+// Caller-chosen request ids. A program names a run/send/stop with `<id>`; its kernel rid is `req:<id>` (fits the
 // mailbox rid pattern), unique per DSA_HOME across kinds and senders. A retry with the same id and the same content
 // (spec_digest) gets the first outcome; a different content is a request-conflict and is never published.
 // The check-and-send is serialized per home by the OS lock <home>/requests.lock (CLI and tool senders alike); no
@@ -15,21 +15,21 @@ import type { Conditions, Request, RequestKind } from './types.ts';
 
 export const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/;
 const PREFIX = 'req:';
-/** R1: `<id>` → its rid `req:<id>`; ids are 1–124 chars `[A-Za-z0-9][A-Za-z0-9._:-]*`. */
+/** `<id>` → its rid `req:<id>`; ids are 1–124 chars `[A-Za-z0-9][A-Za-z0-9._:-]*`. */
 export function requestRid(id: string): string {
   if (!REQUEST_ID.test(id)) throw new Error(`invalid request id ${JSON.stringify(id)}: 1-124 characters [A-Za-z0-9][A-Za-z0-9._:-]*`);
   return PREFIX + id;
 }
-/** R1: The request id of a `req:<id>` rid; undefined for any other rid (ULIDs never contain ':'). */
+/** The request id of a `req:<id>` rid; undefined for any other rid (ULIDs never contain ':'). */
 export function requestId(rid: string): string | undefined { return rid.startsWith(PREFIX) ? rid.slice(PREFIX.length) : undefined; }
-/** R1: spec_digest = contentHash({kind, body, cond}) (cond omitted when absent). A run's body.origin (the pi session
+/** Spec_digest = contentHash({kind, body, cond}) (cond omitted when absent). A run's body.origin (the pi session
  *  branch offered for context:"fork") is delivery metadata, not spec: it differs on every turn, so it is not hashed. */
 export function specDigest(req: Pick<Request, 'kind' | 'body' | 'cond'>): string {
   let body = req.body;
   if (req.kind === 'run' && body && typeof body === 'object' && !Array.isArray(body)) { const { origin: _, ...rest } = body as Record<string, unknown>; body = rest; }
   return contentHash({ kind: req.kind, body, cond: req.cond });
 }
-/** R1: The envelope recorded for `rid`: the orchestrator's admitted copy (ledger `request`, kept after prune), else any
+/** The envelope recorded for `rid`: the orchestrator's admitted copy (ledger `request`, kept after prune), else any
  *  sender's outbox `sent` entry (published or about to be). Read-only. */
 export async function findRequest(home: string, rid: string): Promise<{ request: Request; admitted: boolean } | undefined> {
   const admitted = readJournalSnapshot(orchLedger(home)).find(e => e.type === 'request' && (e.request as Request).rid === rid);
@@ -45,7 +45,7 @@ export async function findRequest(home: string, rid: string): Promise<{ request:
 /** A lock was not free within 10 s: nothing was submitted by this attempt; a retry with the same id is safe. */
 export class RequestsBusy extends Error { override name = 'RequestsBusy'; }
 export type Identified = { request: Request; digest: string; sent: boolean } | { conflict: Request; digest: string };
-/** R1, P5: Check-then-send under the home-wide request-id lock (innermost: taken after a sender's own lock), so no two
+/** P5: Check-then-send under the home-wide request-id lock (innermost: taken after a sender's own lock), so no two
  *  senders publish one rid and no second envelope with an existing rid and other content reaches the inbox (it would
  *  stall its sender's sequence). Same content: the recorded envelope stands (republished when it is this sender's and
  *  pending; `sent` false). */

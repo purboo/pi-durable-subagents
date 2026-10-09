@@ -1,7 +1,7 @@
-// R7 (owed requirements §4 R7, §18.2, §20.2): why a call is not moving. One pure decision (`whyWaiting`) from one
+// Why a call is not moving. One pure decision (`whyWaiting`) from one
 // unsealed call's observable state; `describe` (CLI, from disk snapshots) and the orchestrator's collector (from its
 // in-memory journals) both build that state with the same fold (`foldWaits`) and the same inputs (`waitsOf`), so they
-// agree. The tracker turns the per-tick waits into `waiting`/`moving` event drafts for the log's EventSink; `startR7`
+// agree. The tracker turns the per-tick waits into `waiting`/`moving` event drafts for the log's EventSink; `startWaiting`
 // runs it on a timer. No durable state of its own: the log holds what was emitted, and seeds the tracker after a start.
 //
 // Sources, per reason (precedence WAIT_REASONS, first wins):
@@ -57,7 +57,7 @@ export interface WaitInput {
   slot?: string; full?: boolean;
 }
 
-/** R7: why the call does not move, or undefined when it moves (or is asking or sealed). Pure. */
+/** Why the call does not move, or undefined when it moves (or is asking or sealed). Pure. */
 export function whyWaiting(c: WaitInput, now: number): Wait | undefined {
   if (c.sealed || c.asking) return undefined;
   const open = c.attention ?? [], exec = c.exec, queued = !!exec && !exec.selected;
@@ -225,7 +225,7 @@ export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: 
 export function liveWaitCalls(f: WaitFold): CallFacts[] {
   return [...f.calls.values()].filter(c => !f.done || c.generation);
 }
-/** R7: the waits of a folded workflow's live calls (calls that move are absent). */
+/** The waits of a folded workflow's live calls (calls that move are absent). */
 export function waitsOf(f: WaitFold, env: WaitEnv, agentModel?: (agent: string) => string | undefined): Map<string, Wait> {
   const out = new Map<string, Wait>();
   if (!f.calls.size) return out;
@@ -236,21 +236,21 @@ export function waitsOf(f: WaitFold, env: WaitEnv, agentModel?: (agent: string) 
 // ---------------------------------------------------------------------------------------------------------------------
 // Tracker: per-tick waits → `waiting`/`moving` drafts.
 // ---------------------------------------------------------------------------------------------------------------------
-/** What a draft of one call carries besides its R7 fields (as every event of the workflow does). */
+/** What a draft of one call carries besides its waiting fields (as every event of the workflow does). */
 export interface WaitMeta { wid: string; key: string; gen: number; call: string; request?: string; labels?: Record<string, string> }
 /** A latest `waiting`/`moving` event of a call, as the log has it (seed). */
-export type R7Seed = { type: string; reason?: WaitReason; detail?: string; since?: number; wid: string; key?: string; gen?: number; call?: string; request?: string; labels?: Record<string, string> };
+export type WaitSeed = { type: string; reason?: WaitReason; detail?: string; since?: number; wid: string; key?: string; gen?: number; call?: string; request?: string; labels?: Record<string, string> };
 const base = (m: WaitMeta) => ({ wid: m.wid, ...(m.request ? { request: m.request } : {}), key: m.key, gen: m.gen, call: m.call, ...(m.labels ? { labels: m.labels } : {}) });
 
 /** Holds the last reason emitted per call. `waiting` when a reason appears or changes, `moving{after}` when it clears
  *  (also when the call seals or disappears while waiting); a change of detail or age alone emits nothing. Ids carry the
  *  observing tick: the same cause can recur with the same `since` (a used-up provider whose probe is refused again keeps
  *  its first `since`), and a reader deduplicating on the id must still see it. A draft that failed to log is retried with
- *  its id (startR7), and the seed keeps a restarted tracker from repeating a logged transition. */
-export class R7Tracker {
+ *  its id (startWaiting), and the seed keeps a restarted tracker from repeating a logged transition. */
+export class WaitTracker {
   private last = new Map<string, { wait: Wait; meta: WaitMeta }>();
   /** Start from the latest `waiting`/`moving` per call id (the log's view at an orchestrator start). */
-  seed(latest: ReadonlyMap<string, R7Seed>): void {
+  seed(latest: ReadonlyMap<string, WaitSeed>): void {
     for (const [call, e] of latest) {
       if (e.type === "waiting" && e.reason && WAIT_REASONS.includes(e.reason))
         this.last.set(call, { wait: { reason: e.reason, detail: e.detail ?? "", since: Number(e.since) }, meta: { wid: e.wid, key: String(e.key ?? ""), gen: Number(e.gen ?? 0), call, ...(e.request ? { request: e.request } : {}), ...(e.labels ? { labels: e.labels } : {}) } });
@@ -280,15 +280,15 @@ export class R7Tracker {
   }
 }
 
-export interface R7Collected { current: ReadonlyMap<string, Wait | undefined>; meta: ReadonlyMap<string, WaitMeta> }
-/** Every `intervalMs` (k.r7Ms, default 5000): collect, diff, emit. Never overlaps itself; an emit failure is logged and
+export interface WaitsCollected { current: ReadonlyMap<string, Wait | undefined>; meta: ReadonlyMap<string, WaitMeta> }
+/** Every `intervalMs` (k.waitCheckMs, default 5000): collect, diff, emit. Never overlaps itself; an emit failure is logged and
  *  its drafts are emitted first on the next tick (in order, same ids), so no transition is lost. `tick()` runs one now
  *  (or joins the one running). */
-export function startR7(options: { collect: () => R7Collected | Promise<R7Collected>; sink: EventSink; intervalMs?: number; tracker?: R7Tracker; now?: () => number; log?: (line: string) => void;
+export function startWaiting(options: { collect: () => WaitsCollected | Promise<WaitsCollected>; sink: EventSink; intervalMs?: number; tracker?: WaitTracker; now?: () => number; log?: (line: string) => void;
   /** The sink's log epoch: when it changes (a broken log reopened as a new one), the tracker resets, so the new log gets
    *  every current wait again. */
   epoch?: () => string | undefined }): { stop(): Promise<void>; tick(): Promise<void> } {
-  const tracker = options.tracker ?? new R7Tracker(), now = options.now ?? Date.now, log = options.log ?? (line => console.error(line));
+  const tracker = options.tracker ?? new WaitTracker(), now = options.now ?? Date.now, log = options.log ?? (line => console.error(line));
   let pending: EventDraft[] = [], running: Promise<void> | undefined, stopped = false, timer: ReturnType<typeof setTimeout> | undefined, epoch = options.epoch?.();
   const once = async () => {
     try {
@@ -296,11 +296,11 @@ export function startR7(options: { collect: () => R7Collected | Promise<R7Collec
       if (seen !== epoch) { epoch = seen; tracker.reset(); }
       pending.push(...tracker.diff(at, current, meta));
     }
-    catch (error) { log(`durable-subagents: R7 collection failed: ${String(error)}`); }
+    catch (error) { log(`durable-subagents: wait collection failed: ${String(error)}`); }
     while (pending.length) {
       const batch = pending.slice(0, EVENT_SEQ_SKIP);
       try { await options.sink.emit(batch); pending = pending.slice(batch.length); }
-      catch (error) { log(`durable-subagents: ${pending.length} R7 event(s) not logged, retried next tick: ${String(error)}`); return; }
+      catch (error) { log(`durable-subagents: ${pending.length} waiting/moving event(s) not logged, retried next tick: ${String(error)}`); return; }
     }
   };
   const tick = () => running ??= once().finally(() => { running = undefined; });
@@ -317,11 +317,11 @@ export function startR7(options: { collect: () => R7Collected | Promise<R7Collec
 // The orchestrator's collector.
 // ---------------------------------------------------------------------------------------------------------------------
 /** A workflow as the orchestrator holds it (Store `Workflow`): its in-memory journal and pinned agents. */
-export interface R7Workflow { wid: string; journal: Pick<JournalHandle, "entries">; pins?: { agents?: readonly { name: string; model?: string }[] } }
-export interface R7Sources {
+export interface WaitWorkflow { wid: string; journal: Pick<JournalHandle, "entries">; pins?: { agents?: readonly { name: string; model?: string }[] } }
+export interface WaitSources {
   home: string;
   /** The workflows in memory, e.g. `() => engine.store.workflows.values()`. */
-  workflows: () => Iterable<R7Workflow>;
+  workflows: () => Iterable<WaitWorkflow>;
   /** The orchestrator ledger (Ledgers.orch). */
   orch: Pick<JournalHandle, "entries">;
   /** The settings the orchestrator was given (Ledgers.config), when its ledger records none. */
@@ -329,13 +329,13 @@ export interface R7Sources {
   /** Lease state; default `leaseState(home)`, read only when a running call is live. */
   leases?: () => ReturnType<typeof leaseState>;
 }
-/** The waits of the orchestrator's live calls, for `startR7`'s `collect`:
- *    const collect = r7Collector({ home, workflows: () => engine.store.workflows.values(), orch: ledgers.orch, config: ledgers.config });
- *    startR7({ collect: () => collect(), sink, intervalMs: config.k?.r7Ms, tracker });
+/** The waits of the orchestrator's live calls, for `startWaiting`'s `collect`:
+ *    const collect = waitCollector({ home, workflows: () => engine.store.workflows.values(), orch: ledgers.orch, config: ledgers.config });
+ *    startWaiting({ collect: () => collect(), sink, intervalMs: config.k?.waitCheckMs, tracker });
  *  Per tick: one `entries()` per workflow (a cached view unless it was appended to), each changed journal folded only
  *  past what was folded before; a workflow without unsealed calls costs a map lookup. The ledger is folded the same way
  *  (slots, used-up providers, settings, and each workflow's request id and labels). Call it from one place at a time. */
-export function r7Collector(src: R7Sources): (now?: number) => R7Collected {
+export function waitCollector(src: WaitSources): (now?: number) => WaitsCollected {
   const folds = new Map<string, { entries: readonly Entry[]; fold: WaitFold }>();
   const ledger = emptyLedger();
   // Run requests not yet created (rid → labels) and the request id and labels of each workflow: bounded by the

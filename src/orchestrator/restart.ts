@@ -1,7 +1,7 @@
 // Restart guards shared by the orchestrator and the legacy client. The caller owns the launch gate;
 // these checks never change durable state. A1: only an accepted restart is appended to the ledger.
 import { contentHash } from "../kernel/ids.ts";
-import { leaseCalls, leaseState } from "../platform/lease.ts";
+import { holdDetail, leaseState, who } from "../platform/lease.ts";
 import type { RestartBody, RestartInitiator } from "../types.ts";
 import type { LiveExecution } from "./contract.ts";
 
@@ -25,7 +25,14 @@ export function restartRefusal(home: string, live: readonly RestartExecution[], 
   if (!live.length) return undefined;
   const token = restartToken(live);
   if (body.token === token) return undefined;
-  const leases = leaseCalls(leaseState(home).map(r => ({ ...r, waiters: [] })), now);
+  // What a fence would cut short: each lease a listed call holds, with its age and command. Holders outside these
+  // executions (a shell, a systemd unit, another call) keep their lease across the restart; they are listed so the
+  // machine is not mistaken for free.
+  const leases = new Map<string, string>(), others: string[] = [], calls = new Set(live.map(l => l.callId));
+  for (const { resource, holders } of leaseState(home)) for (const t of holders) {
+    if (t.call && calls.has(t.call)) leases.set(t.call, [leases.get(t.call), `holds lease ${resource} (${holdDetail(t, now)})`].filter(Boolean).join(", "));
+    else others.push(`  ${resource} held by ${who(t)} (${holdDetail(t, now)})`);
+  }
   const groups = new Map<string, RestartExecution[]>();
   for (const l of live) { const origin = l.origin ?? "unknown"; groups.set(origin, [...(groups.get(origin) ?? []), l]); }
   const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : `${Math.round(ms / 60_000)}m`;
@@ -35,6 +42,7 @@ export function restartRefusal(home: string, live: readonly RestartExecution[], 
     ...[...groups].sort(([a], [b]) => a.localeCompare(b)).flatMap(([origin, executions]) => [
       `${origin}:`, ...executions.map(l => `  ${l.wid}/${l.key} ${age(now - l.since)}${l.phase === "gate" ? " gate" : ""}${leases.has(l.callId) ? ` ${leases.get(l.callId)}` : ""}`),
     ]),
+    ...(others.length ? ["not fenced (a restart leaves these leases held):", ...others] : []),
     `token: ${token}`,
     tool ? `to fence exactly these: subagents {action:"restart", force:"${token}", reason:"<why>"}` : `to fence exactly these: pi-durable-subagents restart --force ${token} --reason "<why>"`,
   ].join("\n");

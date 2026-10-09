@@ -1,4 +1,4 @@
-// R6 (owed requirements §20.2): caller labels of a run — `run --labels <json>`, the tool's `labels`, and the
+// Caller labels of a run — `run --labels <json>`, the tool's `labels`, and the
 // orchestrator's admission all validate with this one function. Labels are part of RunBody, so they are part of the
 // request's spec_digest (the same request id with other labels is a request-conflict) and are echoed by `describe` and
 // on every event of the workflow.

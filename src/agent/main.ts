@@ -232,7 +232,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     // A session resumes its own held work (what its quit paused); the CLI `resume` remains the global one.
     if (args.action === "resume" && args.wid === undefined) args = { ...args, origin: sender };
     const normalized = request(args as Parameters<typeof request>[0], cwd);
-    // R1: a caller-chosen request id names a run, send or stop; a retry with the same content gets the first outcome.
+    // A caller-chosen request id names a run, send or stop; a retry with the same content gets the first outcome.
     if (args.request !== undefined && (typeof args.request !== "string" || !["run", "send", "stop"].includes(normalized.kind) || normalized.replaces?.length))
       throw new Error(REQUEST_USE);
     const rid = typeof args.request === "string" ? requestRid(args.request) : undefined;

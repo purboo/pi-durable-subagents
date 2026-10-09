@@ -1,4 +1,4 @@
-// R1–R4: Program-facing commands named by caller-chosen request ids — `run|send|stop --request <id>` and `describe`.
+// Program-facing commands named by caller-chosen request ids — `run|send|stop --request <id>` and `describe`.
 // Exit codes: 0 decided (applied/created), 1 rejected or invalid, 3 request-conflict (the id names other content),
 // 75 not decided within --wait-ms (retry with the same id and content: safe).
 import { existsSync, readFileSync } from "node:fs";
@@ -16,7 +16,7 @@ import { JT, type CallResult, type Entry, type Request, type RunBody } from "../
 import { startOrchestrator, submitIdentified } from "./control.ts";
 import { endedExecs, fenceReason } from "../events/fence.ts";
 import { parseLabels } from "../events/labels.ts";
-import { foldWaits, leaseWaits, waitsOf } from "../events/r7.ts";
+import { foldWaits, leaseWaits, waitsOf } from "../events/waiting.ts";
 import type { WaitReason } from "../events/types.ts";
 import { emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
 
@@ -55,19 +55,19 @@ const createdBy = (entries: readonly Entry[], rid: string) => entries.find(e => 
 async function stdin(): Promise<string> { const chunks: Buffer[] = []; for await (const chunk of process.stdin) chunks.push(chunk as Buffer); return Buffer.concat(chunks).toString("utf8"); }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// describe (R3): read-only from the journals; never starts the orchestrator.
+// describe: read-only from the journals; never starts the orchestrator.
 // ---------------------------------------------------------------------------------------------------------------------
 export type DescribeState = "absent" | "pending" | "rejected" | "running" | "asking" | "sealed" | "pruned" | "applied";
 export interface DescribedCall {
   key: string; gen: number; phase: CallSnapshot["phase"]; agent: string; model?: string;
   status?: CallResult["status"]; ok?: boolean; error?: string; output?: string; data?: unknown;
   /** Unsealed calls: why they wait — writer lock, resource lease, the provider's slot use and exhaustion (as `status`);
-   *  R7: `reason` (WAIT_REASONS precedence), its status line `detail` and `since` (ms) when the call does not move. */
+   *  `reason` (WAIT_REASONS precedence), its status line `detail` and `since` (ms) when the call does not move. */
   waiting?: { writerWait?: { root: string; holder: string }; lease?: string; slot?: string; exhausted?: string; hibernated?: true; reason?: WaitReason; detail?: string; since?: number };
 }
 export interface Description {
   state: DescribeState; request?: string; kind?: string; wid?: string; spec_digest?: string; reason?: string;
-  /** R6: the run's labels. */
+  /** The run's labels. */
   labels?: Record<string, string>;
   status?: string; error?: string; pruned?: { status?: string; endedAt?: number };
   calls?: DescribedCall[];
@@ -75,7 +75,7 @@ export interface Description {
   attention?: { id: string; rev: number; kind: string; call?: string; text: string }[];
   lastFence?: { at: number; exec: string; reason: "restart-force" | "orchestrator-crash" | "process-died" };
 }
-/** R3: The state of a request id (`{request}`) or a workflow (`{wid}`), with full texts (no clipping). */
+/** The state of a request id (`{request}`) or a workflow (`{wid}`), with full texts (no clipping). */
 export async function describe(home: string, key: { request: string } | { wid: string }, now = Date.now()): Promise<Description> {
   const entries = ledger(home);
   if ("wid" in key) return describeWorkflow(home, key.wid, entries, now);
@@ -89,7 +89,7 @@ export async function describe(home: string, key: { request: string } | { wid: s
   if (decided && found.request.kind !== "run") return { state: "applied", ...head };
   return { state: "pending", ...head };
 }
-/** R6: `{labels}` of a run request that has any. */
+/** `{labels}` of a run request that has any. */
 function labelsOf(request: Request | undefined): { labels?: Record<string, string> } {
   const labels = request?.kind === "run" ? (request.body as RunBody | undefined)?.labels : undefined;
   return labels && typeof labels === "object" && Object.keys(labels).length ? { labels } : {};
@@ -99,7 +99,7 @@ function runOf(entries: readonly Entry[], wid: string): { created?: Entry; run?:
   const created = entries.find(e => e.type === JT.created && e.wid === wid);
   return { created, run: created ? entries.find(e => e.type === "request" && (e.request as Request).rid === created.rid)?.request as Request | undefined : undefined };
 }
-/** The pinned agents of a workflow revision, read once on demand (R7: the model of a call that names none). */
+/** The pinned agents of a workflow revision, read once on demand (the waiting check needs the model of a call that names none). */
 function pinnedAgentModel(home: string, wid: string, rev: number): (agent: string) => string | undefined {
   let agents: { name?: string; model?: string }[] | undefined;
   return name => {
@@ -112,7 +112,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   if (pruned) return { state: "pruned", wid, pruned: { ...(pruned.status !== undefined ? { status: String(pruned.status) } : {}), endedAt: Number(pruned.endedAt) },
     ...(typeof pruned.request === "string" ? { request: pruned.request } : {}), ...(typeof pruned.spec_digest === "string" ? { spec_digest: pruned.spec_digest } : {}), ...labelsOf(runOf(entries, wid).run) };
   if (!/^[^/\\\0]+$/.test(wid) || wid === "." || wid === ".." || !existsSync(journalPath(home, wid))) return { state: "absent", wid };
-  // The snapshot and the journal the R7 fold reads must be the same bytes (a writer-wait appended between the two reads
+  // The snapshot and the journal the wait fold reads must be the same bytes (a writer-wait appended between the two reads
   // would give a reason without its writerWait): read again until the journal did not move around the snapshot.
   let journal = readJournalSnapshot(journalPath(home, wid)) as Entry[], wf = workflowSnapshot(home, wid);
   for (let i = 0, again = readJournalSnapshot(journalPath(home, wid)) as Entry[]; again !== journal && i < 5; i++, again = readJournalSnapshot(journalPath(home, wid)) as Entry[]) {
@@ -121,7 +121,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   const { created, run } = runOf(entries, wid), id = created ? requestId(String(created.rid)) : undefined;
   const admitted = id ? run : undefined;
   const lstate = leaseState(home), slots = slotsView(home, now), leases = leaseCalls(lstate, now);
-  // R7: the same fold and decision the orchestrator's collector uses, from the disk snapshots.
+  // The same fold and decision the orchestrator's collector uses, from the disk snapshots.
   const waits = waitsOf(foldWaits(wid, journal), { now, ledger: foldLedger(emptyLedger(), entries), leases: leaseWaits(lstate, now) }, pinnedAgentModel(home, wid, wf.rev));
   const line = (lines: string[] | undefined, model?: string) => { const provider = model?.split("/")[0]; return provider ? lines?.find(l => l.startsWith(`${provider} `)) : undefined; };
   const latest = [...new Map(wf.calls.map(c => [c.key, c] as const)).values()];
@@ -142,7 +142,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   return { state, wid, ...(id ? { request: id } : {}), ...(admitted ? { spec_digest: specDigest(admitted) } : {}), ...labelsOf(run), status: wf.status, ...(wf.error ? { error: wf.error } : {}),
     calls, ...(questions.length ? { questions } : {}), ...(attention.length ? { attention } : {}), ...(fence ? { lastFence: fence } : {}) };
 }
-/** R3, best effort: why the latest fence that interrupted work happened. The per-execution classification and the
+/** Best effort: why the latest fence that interrupted work happened. The per-execution classification and the
  *  reason are shared with the event log's `fenced` events (src/events/fence.ts). */
 export function lastFence(journal: readonly Entry[], orch: readonly Entry[]): Description["lastFence"] {
   const ended = endedExecs(journal);
@@ -175,7 +175,7 @@ export async function describeCommand(args: string[], ctx: Context): Promise<num
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// run / send / stop --request (R1, R2)
+// run / send / stop --request
 // ---------------------------------------------------------------------------------------------------------------------
 type Outcome = { type: "applied"; wid?: string } | { type: "rejected"; reason: string };
 /** Wait (bounded) for the request's decision: a run's `created` wid, or the lifecycle resolution. */
@@ -204,7 +204,7 @@ function pending(ctx: Context, id: string, json: boolean, why = ""): number {
 /** Submit, then wait; a decision whose admitted envelope has other content (another sender won the id) is a conflict. */
 async function submitAndWait(ctx: Context, seen: Seen, id: string, kind: "run" | "send" | "stop", body: unknown, cond: Request["cond"], wait: number, json: boolean):
   Promise<{ code: number } | { sent: Sent; outcome: Outcome; earlier: boolean }> {
-  // R2: `created` is false only when the id was already decided before this invocation submitted (decisions are
+  // `created` is false only when the id was already decided before this invocation submitted (decisions are
   // monotonic); racing first attempts may all report created — the wid is what identifies the run.
   const rid = requestRid(id), earlier = Boolean(await outcome(ctx.home, rid, kind === "run", 0));
   let sent: Identified;
@@ -225,7 +225,7 @@ async function submitAndWait(ctx: Context, seen: Seen, id: string, kind: "run" |
   return { sent, outcome: result, earlier };
 }
 type Seen = { id?: string; json?: boolean; digest?: string; submitted?: boolean };
-/** R2: a failure once this invocation submitted, or once the id is found recorded with this content, is "not decided
+/** A failure once this invocation submitted, or once the id is found recorded with this content, is "not decided
  *  yet" (75), never a refusal. Otherwise, with --json, a request refused before submission (a usage error, an invalid
  *  spec, an unknown agent, no open question) answers `{request, applied:false, reason, spec_digest?}` with exit 1;
  *  spec_digest is present once the content was complete enough to hash. This invocation submitted nothing. */
@@ -245,7 +245,7 @@ async function refusable(args: string[], ctx: Context, run: (args: string[], ctx
 const forks = (spec: Record<string, unknown>) => [spec, ...["tasks", "chain"].flatMap(k => Array.isArray(spec[k]) ? spec[k] as unknown[] : [])]
   .some(s => s && typeof s === "object" && (s as { context?: unknown }).context === "fork");
 
-/** R2: `run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]`. The spec is the `subagents` run
+/** `run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]`. The spec is the `subagents` run
  *  form ({agent,task,…} or {tasks|chain:[…],…}); it is validated by the tool's own normalizer and agent check. */
 export const runCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, runRequest);
 async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
@@ -290,7 +290,7 @@ async function widOf(home: string, head: string): Promise<{ wid: string } | { pe
   const found = await findRequest(home, rid);
   return found?.request.kind === "run" && decision(ledger(home), rid)?.type !== "rejected" ? { pending: true } : { wid: head };
 }
-/** R2: `--to <run-id>[/<key>] | <wid>/<key>` (+ `--call <key>`) → `<wid>/<key>`; a run of one call implies its key. */
+/** `--to <run-id>[/<key>] | <wid>/<key>` (+ `--call <key>`) → `<wid>/<key>`; a run of one call implies its key. */
 async function target(home: string, to: string, call: string | undefined, prior: Request | undefined): Promise<{ to: string } | { pending: true }> {
   const cut = to.indexOf("/"), head = cut < 0 ? to : to.slice(0, cut), key = cut < 0 ? call : to.slice(cut + 1);
   if (cut >= 0 && call !== undefined) throw new Error("give the call key in --to or --call, not both");
@@ -305,7 +305,7 @@ async function target(home: string, to: string, call: string | undefined, prior:
   if (keys.length === 1) return { to: `${resolved.wid}/${keys[0]}` };
   throw new Error(`${to} has ${keys.length ? `calls ${keys.join(", ")}` : "no calls yet"}; name one with --call <key> or --to <wid>/<key>`);
 }
-/** R2: `send --request <id> --to <…> --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>]`. */
+/** `send --request <id> --to <…> --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>]`. */
 export const sendCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, sendRequest);
 async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", to: "value", call: "value", kind: "value", qid: "value", rev: "value", message: "value", model: "value", json: "flag", "wait-ms": "value" });
@@ -335,7 +335,7 @@ async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<nu
   if ("code" in done) return done.code;
   return decided(ctx, id, done, json);
 }
-/** R2: `stop --request <id> <run-id|wid|wid/key|callId>`. */
+/** `stop --request <id> <run-id|wid|wid/key|callId>`. */
 export const stopCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, stopRequest);
 async function stopRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", json: "flag", "wait-ms": "value" });

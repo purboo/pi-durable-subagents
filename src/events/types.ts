@@ -1,14 +1,13 @@
-// R2/R6/R7 (owed requirements §18.2, §20.2): the public shape of the cross-workflow event log. Pinned by the parent for
-// batch 2; both leaves build on it. Changing a field here changes the public contract: do it only with the parent.
+// The public shape of the cross-workflow event log. Changing a field here changes the public contract.
 //
 // One durable sequence, single writer (the orchestrator). Each record is one event; `seq` grows strictly (gaps allowed:
 // retention drops records and every orchestrator start skips ahead, see EVENT_SEQ_SKIP). The public cursor is
 // `<epoch>:<seq>`; `--since c` returns events with a larger seq of the same epoch.
 
-/** Milestone types (R2) and why-not-moving transitions (R7). Readers must ignore types they do not know. */
+/** Milestone types and why-not-moving transitions. Readers must ignore types they do not know. */
 export type EventType = "submitted" | "started" | "asking" | "answered" | "sealed" | "fenced" | "workflow-done" | "waiting" | "moving";
 
-/** R7 reasons, one per waiting call, in this precedence when several apply (first wins). */
+/** Wait reasons, one per waiting call, in this precedence when several apply (first wins). */
 export const WAIT_REASONS = ["unconfirmed-stop", "provider-exhausted", "writer-lock", "lease", "slot", "silent"] as const;
 export type WaitReason = typeof WAIT_REASONS[number];
 
@@ -22,14 +21,14 @@ export interface EventBase {
   ts: number;
   type: EventType;
   wid: string;
-  /** The run request id (R1 `run --request <id>`), when the workflow was created by one. */
+  /** The run request id (`run --request <id>`), when the workflow was created by one. */
   request?: string;
   /** Call key and generation; absent on workflow-level events (`submitted`, `workflow-done`). */
   key?: string;
   gen?: number;
   /** Full call id `<wid>@<rev>/<key>@<gen>`, with key/gen. */
   call?: string;
-  /** R6: the labels given at `run --labels`, echoed on every event of the workflow. */
+  /** The labels given at `run --labels`, echoed on every event of the workflow. */
   labels?: Record<string, string>;
 }
 export type Event =

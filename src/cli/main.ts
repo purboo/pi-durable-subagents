@@ -143,12 +143,12 @@ async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line
 export async function main(args = process.argv.slice(2), options: { env?: NodeJS.ProcessEnv; write?: (line: string) => void; signal?: AbortSignal; serviceRunner?: ServiceRunner; starter?: typeof startOrchestrator; entry?: string; waitMs?: number; pendingMs?: number; now?: number; cwd?: string; stdin?: () => Promise<string> } = {}): Promise<number> {
   if (args[0] === "hold") { const { hold, parseHold } = await import("./hold.ts"); return hold(parseHold(args.slice(1)), { env: options.env ?? process.env }); }
   if (args[0] === "chaos") return (await import("./chaos/index.ts")).chaos(args.slice(1), options.env ?? process.env, options.write);
-  // R2: the cross-workflow event log (strict flags of its own); `events <wid>` stays below.
+  // The cross-workflow event log (strict flags of its own); `events <wid>` stays below.
   if (args[0] === "events" && args.includes("--all")) {
     const env = options.env ?? process.env;
     return (await import("../events/cli.ts")).eventsAll(args.slice(1), { home: dsaHome(env), env, write: options.write ?? ((line: string) => console.log(line)), starter: options.starter ?? startOrchestrator, waitMs: options.waitMs });
   }
-  // R1–R3: program-facing commands named by request ids (strict flags of their own).
+  // Program-facing commands named by request ids (strict flags of their own).
   if (["run", "send", "describe"].includes(args[0]!) || (args[0] === "stop" && args.includes("--request"))) {
     const env = options.env ?? process.env, requests = await import("./requests.ts");
     const ctx = { home: dsaHome(env), env, write: options.write ?? ((line: string) => console.log(line)), starter: options.starter, waitMs: options.waitMs, cwd: options.cwd, stdin: options.stdin };

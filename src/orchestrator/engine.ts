@@ -9,7 +9,7 @@
 // stop-requested {rid,call?} marks a call or workflow stop as taking effect, so its replay is applied, not already-sealed.
 // Orch entry pruned {rid,wid,endedAt,bytes,status,request?,spec_digest?} is the decisive record of a prune: appended before
 // the journal handle is closed and w/<wid> and its staging dirs are removed (bytes = footprint measured just before;
-// status = the final workflow status; request/spec_digest when the workflow was created by a request id, R1 tombstone).
+// status = the final workflow status; request/spec_digest when the workflow was created by a request id, request-id tombstone).
 // Nothing is rewritten (A1): the admitted request and created entries stay, so a retried id still resolves to this wid.
 import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readdir, unlink } from 'node:fs/promises';
@@ -30,7 +30,7 @@ import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snaps
 import { validateCallSpec } from '../compat/spec.ts';
 import { EventPump } from '../events/pump.ts';
 import { labelsProblem } from '../events/labels.ts';
-import { R7Tracker, r7Collector, startR7, type R7Seed } from '../events/r7.ts';
+import { WaitTracker, waitCollector, startWaiting, type WaitSeed } from '../events/waiting.ts';
 import { readPage } from '../events/log.ts';
 import { eventsLog } from '../paths.ts';
 import { parseModel } from '../compat/model.ts';
@@ -100,9 +100,9 @@ export interface EngineOptions { evaluator?: EvaluatorTransport; discovery?: Dis
 /** A1, P2, P10, P11: Serialize decisions while executions run independently. */
 export class Engine {
   readonly store: Store;
-  /** R2: the cross-workflow event log's writer (derives milestones from the journals; R7 emits through it). */
+  /** The cross-workflow event log's writer (derives milestones from the journals; waiting/moving emits through it). */
   readonly events: EventPump;
-  private r7?: { stop(): Promise<void>; tick(): Promise<void> };
+  private waiting?: { stop(): Promise<void>; tick(): Promise<void> };
   private ledgers: Ledgers;
   private executor: Executor;
   private evaluator: EvaluatorTransport;
@@ -147,7 +147,7 @@ export class Engine {
   /** A2, P10: Recover executor authority before replaying each unfinished workflow. */
   async recover(): Promise<void> {
     await this.store.recover();
-    // R2: before any recovery append, so every journal entry from here on is derived promptly (and a new log derives
+    // Before any recovery append, so every journal entry from here on is derived promptly (and a new log derives
     // everything still on disk).
     await this.events.open();
     for (const wf of this.store.workflows.values()) {
@@ -174,30 +174,30 @@ export class Engine {
       for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     }
     await this.intake();
-    this.startR7();
+    this.startWaiting();
   }
-  /** R7: every k.r7Ms (read here, at orchestrator start), why each live call does not move, as `waiting`/`moving`
+  /** Every k.waitCheckMs (read here, at orchestrator start), why each live call does not move, as `waiting`/`moving`
    *  events through the pump. The tracker starts from the log's latest transition per call, so a restart repeats none
    *  (and a call that ended or started moving meanwhile gets its `moving`). The seed reads from seq 0: retention keeps
-   *  events below `dropped`. A seed that cannot be read is logged and R7 starts empty (recovery never fails on it). */
-  private startR7() {
-    if (this.closed || this.r7) return;
-    const latest = new Map<string, R7Seed>(), head = this.events.head;
+   *  events below `dropped`. A seed that cannot be read is logged and the tracker starts empty (recovery never fails on it). */
+  private startWaiting() {
+    if (this.closed || this.waiting) return;
+    const latest = new Map<string, WaitSeed>(), head = this.events.head;
     try {
       if (head) for (let since = 0, more = true; more;) {
         const page = readPage(eventsLog(this.ledgers.home), since, 1000);
         if (!page || page.epoch !== head.epoch) break;
-        for (const e of page.events) if ((e.type === 'waiting' || e.type === 'moving') && e.call) latest.set(e.call, e as R7Seed);
+        for (const e of page.events) if ((e.type === 'waiting' || e.type === 'moving') && e.call) latest.set(e.call, e as WaitSeed);
         more = page.more && page.events.length > 0;
         if (page.events.length) since = Number(page.events.at(-1)!.cursor.split(':')[1]);
       }
     } catch (error) {
-      console.error(`durable-subagents: R7 seed from the event log failed, starting without it: ${String(error)}`);
+      console.error(`durable-subagents: waiting seed from the event log failed, starting without it: ${String(error)}`);
       latest.clear();
     }
-    const tracker = new R7Tracker(); tracker.seed(latest);
-    const collect = r7Collector({ home: this.ledgers.home, workflows: () => this.store.workflows.values(), orch: this.ledgers.orch, config: this.ledgers.config });
-    this.r7 = startR7({ collect: () => collect(), sink: this.events, intervalMs: this.ledgers.config.k?.r7Ms, tracker, epoch: () => this.events.head?.epoch });
+    const tracker = new WaitTracker(); tracker.seed(latest);
+    const collect = waitCollector({ home: this.ledgers.home, workflows: () => this.store.workflows.values(), orch: this.ledgers.orch, config: this.ledgers.config });
+    this.waiting = startWaiting({ collect: () => collect(), sink: this.events, intervalMs: this.ledgers.config.k?.waitCheckMs, tracker, epoch: () => this.events.head?.epoch });
   }
   private async startHost() {
     await this.evaluator.start(message => this.background(() => this.message(message)), () => this.background(async () => {
@@ -306,7 +306,7 @@ export class Engine {
     }
     if (req.kind === 'run') {
       const created = this.ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid);
-      // R6: senders validate labels; a hand-written request must not bypass that.
+      // Senders validate labels; a hand-written request must not bypass that.
       const labels = (req.body as RunBody | null)?.labels, invalid = !created && labels !== undefined ? labelsProblem(labels) : undefined;
       if (invalid) return { action: 'reject', reason: `invalid-labels: ${invalid}` };
       if (created && this.store.pruned().has(String(created.wid))) return { action: 'apply' }; // Never resurrect a pruned run.
@@ -484,7 +484,7 @@ export class Engine {
     const createdBy = String(entries.find(e => e.type === JT.created && e.wid === wf.wid)?.rid ?? '');
     const admitted = requestId(createdBy) !== undefined ? entries.find(e => e.type === 'request' && (e.request as Request).rid === createdBy)?.request as Request | undefined : undefined;
     const identity = admitted ? { request: requestId(createdBy), spec_digest: specDigest(admitted) } : {};
-    // R2: its events are derived and logged before the journal can go (recovery removes it once `pruned` is committed);
+    // Its events are derived and logged before the journal can go (recovery removes it once `pruned` is committed);
     // when they cannot be, the prune is rejected and the caller retries later.
     try { await this.events.flush(); }
     catch (error) { return `event-log: ${error instanceof Error ? error.message : String(error)}`; }
@@ -674,6 +674,6 @@ export class Engine {
   /** A1, A2: Retire asynchronous producers before closing their journals. */
   async close(): Promise<void> {
     this.closed = true; this.watcher?.close(); clearInterval(this.poll);
-    await this.r7?.stop(); await this.queue; await this.evaluator.close(); await this.executor.shutdown(); await this.events.close(); await this.store.close();
+    await this.waiting?.stop(); await this.queue; await this.evaluator.close(); await this.executor.shutdown(); await this.events.close(); await this.store.close();
   }
 }

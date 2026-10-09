@@ -1,4 +1,4 @@
-// End-to-end request ids (R1–R3) through the real CLI processes, a detached orchestrator and child pi with the faux
+// End-to-end request ids through the real CLI processes, a detached orchestrator and child pi with the faux
 // provider: concurrent retries across an orchestrator SIGKILL, conflicts, prune tombstones, concurrent follow-ups,
 // describe states and answers addressed by run id. Everything lives under one temp root (HOME, DSA_HOME, agent dir).
 import { test, type TestContext } from "node:test";
@@ -49,7 +49,7 @@ async function stack(t: TestContext) {
 }
 const of = (entries: Entry[], type: string) => entries.filter(e => e.type === type);
 
-test("E2E R1/R2: 20 concurrent retries across an orchestrator SIGKILL create one workflow; conflicts and prune keep the identity", { timeout: 240_000 }, async t => {
+test("E2E request ids: 20 concurrent retries across an orchestrator SIGKILL create one workflow; conflicts and prune keep the identity", { timeout: 240_000 }, async t => {
   const s = await stack(t);
   const path = await s.spec("x.json", { agent: "echo", task: script([{ delayMs: 1_500, text: "X done" }]) });
   const wave = () => Array.from({ length: 10 }, () => s.cli(["run", "--request", "X", "--spec", path, "--json"]));
@@ -94,7 +94,7 @@ test("E2E R1/R2: 20 concurrent retries across an orchestrator SIGKILL create one
   assert.ok(!(await readdir(join(s.home, "w")).catch(() => [] as string[])).includes(wid));
 });
 
-test("E2E R2/R3: describe states, full questions, answers by run id, and 10 concurrent follow-ups create one generation", { timeout: 240_000 }, async t => {
+test("E2E request ids: describe states, full questions, answers by run id, and 10 concurrent follow-ups create one generation", { timeout: 240_000 }, async t => {
   const s = await stack(t);
   assert.deepEqual(await s.describe("D"), { state: "absent", request: "D" });
   // Pending: submitted, but no orchestrator decides it (the starter launches a no-op entry).

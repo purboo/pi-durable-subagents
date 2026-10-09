@@ -154,7 +154,7 @@ export async function diskUsage(path: string): Promise<number> {
 /** A1, P11: Own shared workflow handles and reconcile create intents after a crash. */
 export class Store {
   readonly workflows = new Map<string, Workflow>();
-  /** R2: called after each append to a workflow journal (the event pump derives from it). */
+  /** Called after each append to a workflow journal (the event pump derives from it). */
   appended?: (wid: string) => void;
   private ledgers: Ledgers;
   constructor(ledgers: Ledgers) { this.ledgers = ledgers; }

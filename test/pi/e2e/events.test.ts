@@ -1,5 +1,5 @@
-// End-to-end R2 event log through the real CLI, a detached orchestrator and child pi with the faux provider (owed
-// acceptance tests 3, 9 and 10): per-workflow milestone order with labels, a forced restart as a `fenced` event, a reader
+// End-to-end event log through the real CLI, a detached orchestrator and child pi with the faux provider:
+// per-workflow milestone order with labels, a forced restart as a `fenced` event, a reader
 // that persists its cursor across a restart and a kill -9, and cursor expiry with recovery. Everything lives under one
 // temp root (HOME, DSA_HOME, agent dir); only orchestrators started on that home are signalled.
 import { test, type TestContext } from "node:test";
@@ -59,7 +59,7 @@ async function stack(t: TestContext, config?: unknown) {
     }
   };
   let sseq = 0;
-  /** A run request published directly (the CLI --labels flag is another leaf's): sender main:e2e. */
+  /** A run request published directly (bypassing the CLI --labels flag): sender main:e2e. */
   const runWith = async (rid: string, body: Partial<RunBody>) => {
     const req: Request = { rid, from: "main:e2e", to: "orch", sseq: ++sseq, kind: "run", body: { cwd, ...body } };
     await publishRequest(orchInbox(home), req);
@@ -76,14 +76,14 @@ async function stack(t: TestContext, config?: unknown) {
 }
 const of = (entries: readonly Entry[], type: string) => entries.filter(e => e.type === type);
 
-test("E2E R2/R6: ask → answer → seal gives submitted, started, asking, answered, sealed, workflow-done in order, labels on each", { timeout: 180_000 }, async t => {
+test("E2E events: ask → answer → seal gives submitted, started, asking, answered, sealed, workflow-done in order, labels on each", { timeout: 180_000 }, async t => {
   const s = await stack(t);
   const head = await s.page();
   assert.equal(head.code, 0, head.out + head.err); // no log yet: the command starts the orchestrator and waits for it
   const start = head.lines[0].head as string;
   assert.match(start, /^[0-9a-f]{16}:\d+$/);
   const question = `Which colour? ${"Think about it. ".repeat(40)}`;
-  const labels = { owed_node: "n1", owed_attempt: "2", role: "writer" };
+  const labels = { node: "n1", attempt: "2", role: "writer" };
   const wid = await s.runWith("run-ask", { name: "asker", labels, call: { agent: "echo", task: script([{ tool: "ask", args: { question } }, { text: "the answer was heard" }]) } });
   const asking = await s.until(async () => (await s.drain(start)).events.find(e => e.wid === wid && e.type === "asking"), "asking event", 60_000);
   assert.equal(asking.question, question, "full question text");
@@ -93,7 +93,7 @@ test("E2E R2/R6: ask → answer → seal gives submitted, started, asking, answe
   const done = await s.until(async () => { const r = await s.drain(start); return r.events.some(e => e.wid === wid && e.type === "workflow-done") && r; }, "workflow-done event", 90_000);
   const mine = done.events.filter(e => e.wid === wid);
   assert.deepEqual(mine.map(e => e.type), ["submitted", "started", "asking", "answered", "sealed", "workflow-done"], JSON.stringify(mine, null, 1));
-  for (const e of mine) { assert.deepEqual(e.labels, labels, `${e.type} echoes labels`); assert.equal(e.request, undefined, "not an R1 run id"); }
+  for (const e of mine) { assert.deepEqual(e.labels, labels, `${e.type} echoes labels`); assert.equal(e.request, undefined, "not a request-id run"); }
   assert.equal(mine[0]!.name, "asker");
   const answered = mine[3]!;
   assert.equal(answered.qid, asking.qid); assert.equal(answered.rev, asking.rev);
@@ -106,7 +106,7 @@ test("E2E R2/R6: ask → answer → seal gives submitted, started, asking, answe
   assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b));
 });
 
-test("E2E R2 (owed test 10): restart --force while a call runs → fenced{restart-force}; the call continues and seals ok; describe shows the same fence", { timeout: 180_000 }, async t => {
+test("E2E events: restart --force while a call runs → fenced{restart-force}; the call continues and seals ok; describe shows the same fence", { timeout: 180_000 }, async t => {
   const s = await stack(t);
   const spec = join(s.root, "f.json");
   await writeFile(spec, JSON.stringify({ agent: "echo", task: script([{ tool: "bash", args: { command: "sleep 8; echo slept" } }, { text: "finished after the fence" }]) }));
@@ -119,7 +119,7 @@ test("E2E R2 (owed test 10): restart --force while a call runs → fenced{restar
   assert.equal(refused.code, 1, refused.out + refused.err);
   const token = /token: ([a-f0-9]{12})/.exec(refused.out)?.[1];
   assert.ok(token, refused.out);
-  const forced = await s.cli(["restart", "--force", token!, "--reason", "e2e test 10"]);
+  const forced = await s.cli(["restart", "--force", token!, "--reason", "e2e forced restart"]);
   assert.equal(forced.code, 0, forced.out + forced.err);
   const fenced = await s.until(async () => (await s.drain(`${(await s.page()).lines[0].head.split(":")[0]}:0`)).events.find(e => e.wid === wid && e.type === "fenced"), "fenced event", 60_000);
   assert.equal(fenced.reason, "restart-force"); assert.equal(fenced.request, "F1");
@@ -133,7 +133,7 @@ test("E2E R2 (owed test 10): restart --force while a call runs → fenced{restar
   assert.equal(of(s.journal(wid), JT.exec).length, 2, "one execution fenced, one resumed");
 });
 
-test("E2E R2 (owed test 3): a reader persisting its cursor per page sees every sealed and asking, across a restart and a kill -9", { timeout: 300_000 }, async t => {
+test("E2E events: a reader persisting its cursor per page sees every sealed and asking, across a restart and a kill -9", { timeout: 300_000 }, async t => {
   const s = await stack(t, { k: { idleExitMs: 1500 } });
   const seen = new Map<string, Ev>();
   let cursor = (await s.page()).lines[0].head as string;
@@ -150,12 +150,12 @@ test("E2E R2 (owed test 3): a reader persisting its cursor per page sees every s
     const r = await s.cli(["run", "--request", id, "--spec", await spec(id, steps), "--json"]);
     assert.equal(r.code, 0, r.out + r.err); return JSON.parse(r.out).wid as string;
   };
-  const w1 = await submit("R1", [{ text: "one" }]);
-  const w2 = await submit("R2", [{ tool: "ask", args: { question: "Proceed?" } }, { text: "two" }]);
-  const w3 = await submit("R3", [{ tool: "bash", args: { command: "sleep 6; echo three" } }, { text: "three" }]);
+  const w1 = await submit("W1", [{ text: "one" }]);
+  const w2 = await submit("W2", [{ tool: "ask", args: { question: "Proceed?" } }, { text: "two" }]);
+  const w3 = await submit("W3", [{ tool: "bash", args: { command: "sleep 6; echo three" } }, { text: "three" }]);
   await readPage();
-  // kill -9 while R3 runs and R2 asks.
-  await s.until(() => s.journal(w3).some(e => e.type === "tracked") && of(s.journal(w2), JT.attention).length > 0, "R3 running, R2 asking", 60_000);
+  // kill -9 while W3 runs and W2 asks.
+  await s.until(() => s.journal(w3).some(e => e.type === "tracked") && of(s.journal(w2), JT.attention).length > 0, "W3 running, W2 asking", 60_000);
   await readPage();
   const killed = s.running()!;
   process.kill(killed, "SIGKILL");
@@ -164,15 +164,15 @@ test("E2E R2 (owed test 3): a reader persisting its cursor per page sees every s
   assert.equal((await s.cli(["start"])).code, 0);
   await s.until(() => s.running() && s.running() !== killed, "restarted after kill -9");
   const q = await s.until(() => of(s.journal(w2), JT.attention).find(e => (e.item as { kind: string }).kind === "question")?.item as { qid: string; rev: number } | undefined, "question");
-  const answered = await s.cli(["send", "--request", "A2", "--to", "R2", "--kind", "answer", "--qid", q.qid, "--rev", String(q.rev), "--message", "yes", "--json"]);
+  const answered = await s.cli(["send", "--request", "A2", "--to", "W2", "--kind", "answer", "--qid", q.qid, "--rev", String(q.rev), "--message", "yes", "--json"]);
   assert.equal(answered.code, 0, answered.out + answered.err);
   while (await readPage()) { /* pages */ }
   await s.until(() => [w1, w2, w3].every(w => s.journal(w).some(e => e.type === JT.done)), "all done", 120_000);
   // A clean restart: wait for the idle exit, then new work starts a new orchestrator.
   const before = s.running();
   if (before) await s.until(() => !s.alive(before), "idle exit", 30_000);
-  const w4 = await submit("R4", [{ text: "four" }]);
-  await s.until(() => s.journal(w4).some(e => e.type === JT.done), "R4 done", 60_000);
+  const w4 = await submit("W4", [{ text: "four" }]);
+  await s.until(() => s.journal(w4).some(e => e.type === JT.done), "W4 done", 60_000);
   await delay(500);
   while (await readPage()) { /* pages */ }
   await readPage();
@@ -185,7 +185,7 @@ test("E2E R2 (owed test 3): a reader persisting its cursor per page sees every s
   assert.ok(s.pids().length >= 3, "the reads spanned a kill -9 and a clean restart");
 });
 
-test("E2E R2 (owed test 9): with a tiny retention an old cursor is cursor-expired (exit 4); from the reported head the reader continues", { timeout: 240_000 }, async t => {
+test("E2E events: with a tiny retention an old cursor is cursor-expired (exit 4); from the reported head the reader continues", { timeout: 240_000 }, async t => {
   const s = await stack(t, { k: { eventRetentionMs: 1, idleExitMs: 1500 } });
   const spec = async (name: string, steps: unknown[]) => { const path = join(s.root, `${name}.json`); await writeFile(path, JSON.stringify({ agent: "echo", task: script(steps) })); return path; };
   const first = await s.cli(["run", "--request", "OLD", "--spec", await spec("old", [{ text: "old" }]), "--json"]);
@@ -207,7 +207,7 @@ test("E2E R2 (owed test 9): with a tiny retention an old cursor is cursor-expire
   const reply = expired.lines[0];
   assert.equal(reply.error, "cursor-expired");
   assert.match(reply.oldest, new RegExp(`^${epoch}:\\d+$`)); assert.ok(Number(reply.oldest.split(":")[1]) > 0);
-  // Recovery as R2 describes: describe --key for every open attempt, then continue from the reported head.
+  // Recovery as the README describes: describe --key for every open attempt, then continue from the reported head.
   const described = JSON.parse((await s.cli(["describe", "--key", "OLD", "--json"])).out);
   assert.equal(described.state, "sealed");
   const after = await s.until(async () => { const r = await s.drain(reply.head); return r.events.some(e => e.wid === fresh && e.type === "sealed") && r; }, "NEW sealed after the head", 60_000);

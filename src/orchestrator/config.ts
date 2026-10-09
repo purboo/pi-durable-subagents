@@ -3,8 +3,8 @@
 // Orchestrator ledger entries: config{hash,config} — the settings in effect from then on (at start, or after a change);
 // config-rejected{hash,error} — a changed file that was not applied; the settings before it stay in effect.
 // A reload changes the shared config object in place: every later read sees it (the next slot acquisition, model
-// resolution or check). Slots already held are kept when a limit drops; timers of running executions keep their period, and the R7 check
-// period (k.r7Ms) is read once at orchestrator start.
+// resolution or check). Slots already held are kept when a limit drops; timers of running executions keep their period, and the waiting check
+// period (k.waitCheckMs) is read once at orchestrator start.
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { contentHash } from "../kernel/ids.ts";
@@ -13,7 +13,7 @@ import type { OrchestratorConfig } from "./contract.ts";
 
 /** The keys the orchestrator reads; config.json also holds pi-side settings (ui, onQuit) that it ignores. */
 const KEYS = ["defaultModel", "pools", "providers", "memory", "writerLock", "k"] as const;
-const K = ["lossBound", "checkpointMs", "stallMs", "progressMs", "switchTimeoutMs", "idleExitMs", "trackerMs", "hibernateMs", "spawnBudget", "probeMs", "eventRetentionMs", "r7Ms"];
+const K = ["lossBound", "checkpointMs", "stallMs", "progressMs", "switchTimeoutMs", "idleExitMs", "trackerMs", "hibernateMs", "spawnBudget", "probeMs", "eventRetentionMs", "waitCheckMs"];
 
 export const configPath = (home: string) => join(home, "config.json");
 

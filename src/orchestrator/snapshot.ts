@@ -606,7 +606,7 @@ export function runningOrchestrator(home: string): { orchestrator?: string; vers
   return orchestratorView(state);
 }
 
-/** One `exhausted` line of the status views (R7 `provider-exhausted` uses it as its detail). */
+/** One `exhausted` line of the status views (the `provider-exhausted` wait uses it as its detail). */
 export function exhaustedLine(provider: string, x: Exhaustion, now: number): string {
   return `${provider} exhausted since ${age(now - x.since)} ago (${clip(x.error, 80)}), ` +
     (x.probe ? `probing with ${x.probe.split("#")[0]}` : x.nextTry > now ? `next try in ${age(x.nextTry - now)}` : "next call probes it");

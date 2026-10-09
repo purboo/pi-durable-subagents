@@ -1,4 +1,4 @@
-// R2: journal → event drafts. Pure functions of durable sources: the entry at journal index i (seq i+1) is derived from
+// Journal → event drafts. Pure functions of durable sources: the entry at journal index i (seq i+1) is derived from
 // that journal's entries up to it and from orchestrator-ledger entries durable before it, so a re-derivation after a
 // crash gives the same events with the same ids (`<wid>:<journal seq>:<type>`, `<wid>:submitted`).
 import { createHash } from "node:crypto";
@@ -19,7 +19,7 @@ const echo = (id: Identity) => ({ ...(id.request !== undefined ? { request: id.r
 const onCall = (call: string) => { const p = callParts(call); return p ? { key: p.key, gen: p.gen, call } : { call }; };
 
 /** The labels of a run body: a non-empty plain object of strings (anything else, and `{}`, is not echoed — as describe
- *  and the R7 collector treat them). */
+ *  and the wait collector treat them). */
 export function labelsOf(body: unknown): Record<string, string> | undefined {
   const labels = (body as { labels?: unknown } | null)?.labels;
   if (!labels || typeof labels !== "object" || Array.isArray(labels)) return undefined;

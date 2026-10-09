@@ -1,7 +1,7 @@
-// R2: the orchestrator's event pump. Derives events from the durable sources (workflow journals, the orchestrator
+// The orchestrator's event pump. Derives events from the durable sources (workflow journals, the orchestrator
 // ledger's `created`) after their appends and writes them to the event log with the watermarks of the sources derived
 // (same fsync), so a restart re-derives only after them (at least once). It is also the EventSink other producers
-// (R7 waiting/moving) emit through. One chain serializes passes, emits, compaction and close. A pass that cannot log
+// (waiting/moving) emit through. One chain serializes passes, emits, compaction and close. A pass that cannot log
 // what it derived retries in the background, and `flush` (prune) rejects; a broken log (a failure after a compaction's
 // rename) is reopened by the next pass or emit.
 // Memory: per unpruned workflow one watermark and one cached identity; reads the journals' committed arrays from their
@@ -113,7 +113,7 @@ export class EventPump implements EventSink {
   async emit(drafts: readonly EventDraft[]): Promise<void> {
     await this.ready;
     return this.serial(async () => {
-      // After close (the orchestrator exits) nothing is logged: R7 state is derived again by the next orchestrator.
+      // After close (the orchestrator exits) nothing is logged: waiting state is derived again by the next orchestrator.
       if (!this.log || this.closed || !drafts.length) return;
       const log = await this.writer();
       const filled = drafts.map(d => {
@@ -171,7 +171,7 @@ export class EventPump implements EventSink {
   }
   /** The writer; a broken one (a failure after a compaction's rename) is reopened first: the open applies the start
    *  skip. A log it had to create anew (corrupt or gone) is backfilled from everything on disk: the caller's drafts
-   *  were derived for the old one, so this throws (a pass retries from the cleared watermarks, R7 on its next tick). */
+   *  were derived for the old one, so this throws (a pass retries from the cleared watermarks, waiting/moving on its next tick). */
   private async writer(): Promise<EventLog> {
     const log = this.log!;
     if (!log.broken) return log;

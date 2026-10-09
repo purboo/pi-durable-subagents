@@ -22,7 +22,7 @@ function call(value: unknown, cwd: string, where: string): CallSpec {
   return spec as unknown as CallSpec;
 }
 /** v12 §2: Reject unknown explicit call agents before starter or outbox publication; scripts remain call-local. Shared by
- *  the tool and the CLI `run --request` (R2). */
+ *  the tool and the CLI `run --request`. */
 export function checkAgents(body: RunBody, available: () => string[]): void {
   const names = [...(body.call ? [body.call] : []), ...(body.tasks ?? []), ...(body.chain ?? [])].map(call => call.agent);
   if (!names.length) return;
@@ -72,7 +72,7 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     } else body.call = call(spec, cwd, "call");
     if (inputs !== undefined) body.args = inputs;
     if (name !== undefined) body.name = string(args, "name");
-    // R6: part of the spec digest; an empty object is the same as none.
+    // Part of the spec digest; an empty object is the same as none.
     if (labels !== undefined && Object.keys(checkLabels(labels)).length) body.labels = labels as Record<string, string>;
     // P31a, P36, P11: workflow-level limits and declared input files (absolute paths, pinned at admission).
     if (usageBudget !== undefined) {

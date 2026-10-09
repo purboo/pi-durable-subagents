@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.25
+
+- `restart` refusals show what a fence would cut short: each lease a running
+  call holds, with its mode, how long it has been held, its command and note.
+  Leases held outside those executions (a shell, a `systemd-run` unit) are
+  listed apart, since a restart leaves them held.
+- The waiting/moving check period is configured as `k.waitCheckMs` (was
+  `k.r7Ms` in 1.0.24; the old key is not accepted).
+- README: deduplicate events by `id`, not cursor; a call with no next
+  execution has no `fenced`; an open question keeps the orchestrator from its
+  idle exit (compact the event log now with a non-force `restart`); leases
+  outside calls survive restarts; why a restart cannot hand running
+  executions to the new orchestrator.
+
 ## 1.0.24
 
 - `events --all [--since <cursor>] [--limit <n>]`: one durable log of
@@ -13,7 +27,7 @@
   prune whose events cannot be logged first is rejected (`event-log: …`).
 - `run --labels <json>` (tool: `labels`): caller labels, part of the spec
   digest, returned by `describe` and echoed on every event of the run.
-- Why a call does not move (R7): `describe` adds `reason`, `detail` and
+- Why a call does not move: `describe` adds `reason`, `detail` and
   `since` to each waiting call, and the event log gets `waiting`/`moving`
   when the reason changes: `unconfirmed-stop`, `provider-exhausted`,
   `writer-lock`, `lease`, `slot`, `silent`.
