@@ -16,11 +16,12 @@ import { JT } from "../../types.ts";
 
 export interface DrillOptions { keep: boolean; json: boolean }
 export interface DrillStep { step: number; name: string; ok: boolean; ms: number; detail: string }
-export interface DrillReport { drill: "failover"; passed: boolean; steps: DrillStep[]; ms: number; probeMs: number; evidence?: string }
+export interface DrillReport { drill: "failover"; passed: boolean; steps: DrillStep[]; ms: number; probeMs: number; interrupted?: NodeJS.Signals; evidence?: string }
 
 const A = "drill-a", B = "drill-b", POOL = "failover";
-/** Short enough to keep the drill well under a minute, long enough for steps 1-3 to finish before it. */
-export const DRILL_PROBE_MS = 10_000;
+/** Steps 1-3 (about 5 s here) must finish before it; 25 s leaves room for a loaded or several times slower machine
+ *  and keeps the drill well under a minute. Step 3 says so explicitly when the machine was too slow. */
+export const DRILL_PROBE_MS = 25_000;
 const STEPS = [
   `a pool call starts on ${A}, hits the used-up error, moves to ${B} and ends ok there`,
   `status lists ${A} as used up with its next probe time; describe/events show the move ${A} -> ${B}`,
@@ -113,6 +114,21 @@ export async function drill(args: string[], inherited: NodeJS.ProcessEnv = proce
   };
 
   let first: any, firstWid = "", nextTry = 0, before2 = 0, wid3 = "";
+  // An interrupted drill cleans up as a finished one: stop its orchestrator, fence what its calls left, and remove the
+  // root (with --keep, print it). The handlers are removed when the drill ends.
+  let stopping = false;
+  const interrupted = (signal: NodeJS.Signals) => {
+    if (stopping) return; stopping = true;
+    void (async () => {
+      try { await cleanup(home); } catch (error) { write(`  cleanup after ${signal} failed: ${String(error)}`); }
+      if (!options.keep) rmSync(root, { recursive: true, force: true });
+      if (options.json) write(JSON.stringify({ drill: "failover", passed: false, interrupted: signal, steps, ms: Math.round(performance.now() - started), probeMs: DRILL_PROBE_MS, ...(options.keep ? { evidence: root } : {}) }));
+      else { if (options.keep) write(`  kept: ${root}`); write(`failover drill: interrupted by ${signal}`); }
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    })();
+  };
+  const onInt = () => interrupted("SIGINT"), onTerm = () => interrupted("SIGTERM");
+  process.on("SIGINT", onInt); process.on("SIGTERM", onTerm);
   try {
     if (!options.json) write(`failover drill (isolated home ${home}, probe interval ${DRILL_PROBE_MS / 1000} s)`);
     await step(1, async () => {
@@ -139,13 +155,13 @@ export async function drill(args: string[], inherited: NodeJS.ProcessEnv = proce
       const events = r.out.split("\n").filter(Boolean).map(l => JSON.parse(l));
       const launched = events.filter(e => e.event === "model").map(e => e.model);
       const forward = events.find(e => e.event === "forward" && e.kind === "model");
+      check(forward?.model === `${B}/m` && forward.failover === A, `events show no failover ${A} -> ${B}/m: ${JSON.stringify(forward ?? null)}`);
       const delivered = forward && events.find(e => e.event === "delivered" && e.kind === "model" && e.rid === forward.rid);
       check(launched.length === 1 && launched[0] === `${A}/m`, `events show launches on ${launched.join(", ") || "(none)"}`);
       check(delivered, `events show no model switch delivered to the call: ${events.map(e => e.event).join(" ")}`);
       const d = await json(["describe", firstWid]);
       check(d.calls?.length === 1 && call(d).model === `${B}/m`, `describe ${firstWid}: ${summary(d)}`);
-      const moved = [launched[0], `switch #${forward.seq} delivered #${delivered.seq}`, call(d).model];
-      return `status: ${line}; events: ${moved.join(" -> ")}`;
+      return `status: ${line}; events: launched on ${launched[0]}, failover from ${forward.failover} to ${forward.model} (#${forward.seq}, delivered #${delivered.seq})`;
     });
     await step(3, async () => {
       before2 = requests().length;
@@ -188,7 +204,11 @@ export async function drill(args: string[], inherited: NodeJS.ProcessEnv = proce
       check(!requests().slice(n).includes(B), `${B} received a request during the third call: ${requests().join(",")}`);
       return `events: ${launched.join(" -> ")}; ${summary(d)}`;
     });
-  } finally { await cleanup(home); }
+  } finally {
+    if (stopping) await new Promise(() => {}); // the signal handler owns cleanup and exits
+    process.removeListener("SIGINT", onInt); process.removeListener("SIGTERM", onTerm);
+    await cleanup(home);
+  }
 
   const passed = steps.length === STEPS.length && steps.every(s => s.ok), ms = Math.round(performance.now() - started);
   const report: DrillReport = { drill: "failover", passed, steps, ms, probeMs: DRILL_PROBE_MS, ...(options.keep ? { evidence: root } : {}) };
