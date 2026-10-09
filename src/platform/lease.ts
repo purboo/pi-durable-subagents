@@ -1,8 +1,12 @@
 // Command-scoped resource leases: `pi-durable-subagents hold <resource> -- <command>` (README "Resource leases").
 // One ticket file per request under $DSA_HOME/leases/<resource>/, numbered under a kernel lock so the numbers are
 // strictly increasing and never reused. Grants are strict FIFO by number: an exclusive request needs no earlier live
-// ticket, a shared one no earlier live exclusive ticket. Whether a request is grantable depends only on earlier tickets,
-// which can only disappear, so a grant needs no lock once the ticket exists. A ticket is live while its wrapper or its
+// ticket, a shared one no earlier live exclusive ticket. A counted request (`--slots N`) needs no earlier live waiter of
+// any mode, no earlier live exclusive ticket, and fewer than N live granted tickets. Whether an exclusive or shared
+// request is grantable depends only on earlier tickets, which can only disappear. A counted request also counts later
+// granted tickets, but only shared ones can be granted past it (shared requests ignore slots by design), and earlier
+// counted tickets are all granted before it is (FIFO), so counted grants happen one at a time in number order and none
+// can be missed: a grant needs no lock once the ticket exists. A ticket is live while its wrapper or its
 // command (pid + start token) lives, or processes the command left in its group remain; a waiter next in line ends such
 // leftovers of a killed wrapper. Anyone may delete a dead ticket. No orchestrator is involved.
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -10,10 +14,12 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { OsLock } from "./lock.ts";
 
-export type LeaseMode = "exclusive" | "shared";
+export type LeaseMode = "exclusive" | "shared" | "counted";
 export interface LeaseProcess { pid: number; start?: string }
 export interface LeaseTicket {
   seq: number; resource: string; mode: LeaseMode;
+  /** Mode "counted": at most this many live granted tickets (counted or shared) when it is granted. */
+  slots?: number;
   wrapper: LeaseProcess; command?: LeaseProcess;
   /** The command as given (clipped), its working directory and an optional note. */
   argv: string[]; cwd: string; note?: string;
@@ -106,9 +112,15 @@ export function liveTickets(home: string, resource: string): LeaseTicket[] {
   });
 }
 
-/** The live tickets that come before `t` and keep it waiting (empty when it may run). */
-export function blockers(t: Pick<LeaseTicket, "seq" | "mode">, tickets: LeaseTicket[]): LeaseTicket[] {
-  return tickets.filter(o => o.seq < t.seq && (t.mode === "exclusive" || o.mode === "exclusive"));
+/** The live tickets that keep `t` waiting (empty when it may run). For an exclusive or shared request these are earlier
+ *  tickets; a counted one is kept by earlier waiters and exclusive tickets, else, when all its slots are taken, by every
+ *  granted ticket (a granted shared one may be later). `tickets` is the resource's live list, `t` itself ignored. */
+export function blockers(t: Pick<LeaseTicket, "seq" | "mode" | "slots">, tickets: LeaseTicket[]): LeaseTicket[] {
+  if (t.mode !== "counted") return tickets.filter(o => o.seq < t.seq && (t.mode === "exclusive" || o.mode === "exclusive"));
+  const ahead = tickets.filter(o => o.seq < t.seq && (o.grantedAt === undefined || o.mode === "exclusive"));
+  if (ahead.length) return ahead;
+  const granted = tickets.filter(o => o.seq !== t.seq && o.grantedAt !== undefined);
+  return granted.length >= (t.slots ?? 1) ? granted : [];
 }
 
 function writeTicketSync(home: string, t: LeaseTicket) {
@@ -161,13 +173,25 @@ async function numbered(home: string, ticket: Omit<LeaseTicket, "seq">, now: boo
 
 /** Every resource with live tickets: holders (granted) and waiters, in request order. Cheap: a directory listing,
  *  small files and a liveness check of the few ticket processes. */
-export function leaseState(home: string): { resource: string; holders: LeaseTicket[]; waiters: LeaseTicket[] }[] {
+export interface LeaseResource {
+  resource: string; holders: LeaseTicket[]; waiters: LeaseTicket[];
+  /** When a live ticket is counted: the slot count (that of the first counted waiter, else of the latest counted ticket)
+   *  and how many tickets hold the resource. */
+  slots?: number; held?: number;
+}
+export function leaseState(home: string): LeaseResource[] {
   let resources: string[];
   try { resources = readdirSync(leasesRoot(home)).filter(r => RESOURCE.test(r)).sort(); } catch { return []; }
   return resources.map(resource => {
-    const tickets = liveTickets(home, resource);
-    return { resource, holders: tickets.filter(t => t.grantedAt !== undefined), waiters: tickets.filter(t => t.grantedAt === undefined) };
+    const tickets = liveTickets(home, resource), holders = tickets.filter(t => t.grantedAt !== undefined), waiters = tickets.filter(t => t.grantedAt === undefined);
+    const slots = slotCount(tickets);
+    return { resource, holders, waiters, ...(slots !== undefined ? { slots, held: holders.length } : {}) };
   }).filter(r => r.holders.length || r.waiters.length);
+}
+/** The slot count shown for a resource: its first counted waiter's, else its latest counted ticket's (one N per name). */
+export function slotCount(tickets: LeaseTicket[]): number | undefined {
+  const counted = tickets.filter(t => t.mode === "counted");
+  return (counted.find(t => t.grantedAt === undefined) ?? counted.at(-1))?.slots;
 }
 
 const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`;
@@ -177,21 +201,28 @@ export const callAddress = (call: string) => { const m = /^([^@/]+)@\d+\/(.+)@\d
 /** Who holds or waits: the subagent call when there is one, else the pid and command. */
 export const who = (t: LeaseTicket) => t.call ? callAddress(t.call) : `pid ${t.wrapper.pid} \`${clip(t.argv.join(" "), 60)}\``;
 
+/** How a mode reads in listings: a counted ticket holds a "slot". */
+export const modeLabel = (t: Pick<LeaseTicket, "mode">) => t.mode === "counted" ? "slot" : t.mode;
 /** A granted ticket's mode, how long it has been held, the command (unless `who` already names it) and the note:
  *  "exclusive, 12m, `make bench`, nightly". */
 export const holdDetail = (t: LeaseTicket, now = Date.now(), command = !!t.call) =>
-  `${t.mode}, ${age(now - (t.grantedAt ?? t.since))}${command ? `, \`${clip(t.argv.join(" "), 60)}\`` : ""}${t.note ? `, ${clip(t.note, 80)}` : ""}`;
+  `${modeLabel(t)}, ${age(now - (t.grantedAt ?? t.since))}${command ? `, \`${clip(t.argv.join(" "), 60)}\`` : ""}${t.note ? `, ${clip(t.note, 80)}` : ""}`;
 
-/** One status line per resource: "machine held by <who> (exclusive, 12m, `make bench`); waiting: <who> 3m, …". */
-export function leaseLines(state: ReturnType<typeof leaseState>, now = Date.now()): string[] {
-  return state.map(({ resource, holders, waiters }) => {
+/** One status line per resource: "machine held by <who> (exclusive, 12m, `make bench`); waiting: <who> 3m, …". A resource
+ *  with counted tickets: "build 3/5 held: <who> (slot, 2m, ...), ...; waiting: 2 (first: <who>, 30s)". */
+export function leaseLines(state: LeaseResource[], now = Date.now()): string[] {
+  return state.map(({ resource, holders, waiters, slots }) => {
+    if (slots !== undefined) {
+      const by = holders.map(t => `${who(t)} (${holdDetail(t, now)})`).join(", ");
+      return `${resource} ${holders.length}/${slots} held${by ? `: ${by}` : ""}${waiters.length ? `; waiting: ${waiters.length} (first: ${who(waiters[0]!)}, ${age(now - waiters[0]!.since)})` : ""}`;
+    }
     const held = holders.length ? `held by ${holders.map(t => `${who(t)} (${holdDetail(t, now)})`).join(", ")}` : "free";
     return `${resource} ${held}${waiters.length ? `; waiting: ${waiters.map(t => `${who(t)} ${t.mode === "shared" ? "shared " : ""}${age(now - t.since)}`).join(", ")}` : ""}`;
   });
 }
 
 /** Per call id: "holds lease machine" / "waiting for lease machine 3m". */
-export function leaseCalls(state: ReturnType<typeof leaseState>, now = Date.now()): Map<string, string> {
+export function leaseCalls(state: LeaseResource[], now = Date.now()): Map<string, string> {
   const out = new Map<string, string>();
   for (const { resource, holders, waiters } of state) {
     for (const t of holders) if (t.call) out.set(t.call, [out.get(t.call), `holds lease ${resource}`].filter(Boolean).join(", "));
