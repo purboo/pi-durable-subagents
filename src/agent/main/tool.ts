@@ -1,33 +1,8 @@
 import { restartInputError } from "../../orchestrator/restart.ts";
 import { resolve } from "node:path";
-import { Type } from "@earendil-works/pi-ai";
 import type { CallSpec, Conditions, Entry, RequestKind, RunBody } from "../../types.ts";
 import { validateCallSpec } from "../../compat/spec.ts";
 import { compileFanout } from "../../compat/fanout.ts";
-
-const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, schema?, gate?, isolation?, context?, budget?, once?, tools?, skills?, writer?, key?}; " +
-  "each call is addressed as '<wid>/<key>', where key is the step's own unique key or else 'tasks:<i>' / 'chain:<i>'.";
-
-export const parameters = Type.Object({
-  action: Type.Optional(Type.Union(["run", "agents", "send", "stop", "revise", "status", "resume", "drain", "restart"].map(v => Type.Literal(v)))),
-  workflow: Type.Optional(Type.String()), source: Type.Optional(Type.String()), args: Type.Optional(Type.Unknown()),
-  tasks: Type.Optional(Type.Array(Type.Any(), { description: `Parallel calls. ${stepsDoc}` })),
-  chain: Type.Optional(Type.Array(Type.Any(), { description: `Sequential calls ({previous} = previous output). ${stepsDoc}` })),
-  agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
-  cwd: Type.Optional(Type.String({ description: "Run directory (default: this session's). Relative workflow, inputs and call cwd paths resolve against it." })),
-  to: Type.Optional(Type.String()), kind: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("follow-up"), Type.Literal("answer"), Type.Literal("model")])),
-  message: Type.Optional(Type.String()), qid: Type.Optional(Type.String()), rev: Type.Optional(Type.Integer({ minimum: 1 })),
-  replaces: Type.Optional(Type.Array(Type.String())), target: Type.Optional(Type.String()), wid: Type.Optional(Type.String()),
-  usageBudget: Type.Optional(Type.Object({ tokens: Type.Optional(Type.Number()), costUsd: Type.Optional(Type.Number()) })),
-  maxCalls: Type.Optional(Type.Integer({ minimum: 1 })), inputs: Type.Optional(Type.Record(Type.String(), Type.String())),
-  name: Type.Optional(Type.String()),
-  timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number). Omit unless a hard limit is needed; prefer budgets." })),
-  key: Type.Optional(Type.String({ description: "A single agent/task run: the call's key. status with wid: that call's full result." })),
-  full: Type.Optional(Type.Boolean({ description: "status: with wid, the complete workflow detail including every output." })),
-  force: Type.Optional(Type.Union([Type.String(), Type.Boolean()], { description: "restart: the token shown by a refusal. Show the user the list and obtain explicit approval first; boolean true is refused. Subagents cannot force a restart." })),
-  reason: Type.Optional(Type.String({ description: "restart: non-empty reason, at most 500 characters; required with force." })),
-  request: Type.Optional(Type.String({ description: "run/send/stop: your own request id (1-124 chars [A-Za-z0-9][A-Za-z0-9._:-]*) making a retry safe: the same id with the same content gets the first outcome; other content is refused (request-conflict)." })),
-}, { additionalProperties: true });
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
 export const stepDefaults = ["model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once", "writer"];

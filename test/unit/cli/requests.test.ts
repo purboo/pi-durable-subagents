@@ -169,6 +169,33 @@ test('R3: lastFence names restart-force, orchestrator-crash or process-died from
   assert.equal(lastFence(journal, [...clean, e(3, 'restart', { force: false, live: ['x1'] })])?.reason, 'process-died');
 });
 
+test('R2: with --json a refused run or send answers {request, applied:false, reason, spec_digest?}; nothing is recorded', async t => {
+  const f = await fixture(t);
+  const unknown = await f.cli(['run', '--request', 'U', '--spec', await f.spec('u.json', { agent: 'nobody', task: 't' }), '--json']);
+  assert.equal(unknown.code, 1);
+  const reply = JSON.parse(unknown.out);
+  assert.equal(reply.request, 'U'); assert.equal(reply.applied, false); assert.match(reply.reason, /Unknown agent: nobody/);
+  assert.match(reply.spec_digest, /^[0-9a-f]{8,}$/);
+  assert.deepEqual(JSON.parse((await f.cli(['describe', '--key', 'U', '--json'])).out), { state: 'absent', request: 'U' });
+  // An unusable spec has no digest; text mode keeps throwing (the CLI prints the error, exit 1).
+  const broken = await f.cli(['run', '--request', 'B', '--spec', await f.spec('b.json', 'x'), '--json']);
+  assert.equal(broken.code, 1); assert.deepEqual(JSON.parse(broken.out), { request: 'B', applied: false, reason: '--spec must be a JSON object' });
+  await assert.rejects(f.cli(['run', '--request', 'U', '--spec', await f.spec('u2.json', { agent: 'nobody', task: 't' })]), /Unknown agent/);
+  const send = await f.cli(['send', '--request', 'S', '--to', 'w1/a', '--kind', 'answer', '--json']);
+  assert.equal(send.code, 1); assert.equal(JSON.parse(send.out).applied, false); assert.equal(JSON.parse(send.out).request, 'S');
+  assert.deepEqual(await f.inbox(), [], 'nothing was published');
+});
+
+test('R3: an execution that settled, hibernated or was sealed ended normally: its fence is not reported', () => {
+  const e = (seq: number, type: string, extra: Record<string, unknown> = {}) => ({ seq, ts: seq * 10, type, ...extra });
+  const orch = [e(0, 'orchestrator', { pid: 1 })];
+  for (const end of ['settled', 'hibernated', JT.sealed])
+    assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, end, { exec: 'x1' }), e(3, JT.fenced, { exec: 'x1' })], orch), undefined, end);
+  // Generation 1 was cut off; generation 2 then ended normally: the interruption of x1 is still the latest one.
+  const journal = [e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, JT.exec, { exec: 'x2' }), e(4, 'settled', { exec: 'x2' }), e(5, JT.fenced, { exec: 'x2' }), e(6, JT.sealed, { exec: 'x2' })];
+  assert.deepEqual(lastFence(journal, orch), { at: 20, exec: 'x1', reason: 'process-died' });
+});
+
 test('R1: the subagents tool shares request ids with the CLI: same content → same wid, other content → request-conflict', async t => {
   const f = await fixture(t), engine = await f.boot();
   f.pump(engine);

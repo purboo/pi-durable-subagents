@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { request, parameters, sendReceipt } from "../../../src/agent/main/tool.ts";
+import { request, sendReceipt } from "../../../src/agent/main/tool.ts";
+import { parameters } from "../../../src/agent/main/schema.ts";
 import { registerMain } from "../../../src/agent/main.ts";
 import { tempRoot } from "../../harness/pi.ts";
 

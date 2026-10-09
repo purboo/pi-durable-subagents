@@ -286,7 +286,7 @@ session and is rejected.
 | exit | meaning | `--json` reply |
 | --- | --- | --- |
 | 0 | decided and applied (a retry gets the same answer) | run: `{request, wid, created, spec_digest}`; send/stop: `{request, applied, generation?, call?, spec_digest}` |
-| 1 | decided and rejected (`reason`), or a usage error | `{request, applied: false, reason, spec_digest}` |
+| 1 | decided and rejected (`reason`), or refused before submission (usage error, invalid spec, unknown agent: nothing recorded) | `{request, applied: false, reason, spec_digest?}` (`spec_digest` once the content could be hashed) |
 | 3 | `request-conflict`: the id already names other content; nothing was sent | `{request, error, wid?, spec_digest, state}` (the original's digest and state) |
 | 75 | not decided yet: submitted but undecided in `--wait-ms` (default 60 s), submitted and then a later step failed (`reason` says which), or a lock was busy (`reason: "busy"`); retry with the same id | `{request, pending: true, reason?}` |
 
@@ -311,8 +311,10 @@ full text, `qid`, `rev` and the `to` address to answer), `sealed` (finished:
 `pruned` (`pruned: {status, endedAt}`; workflows pruned before 1.0.21 have
 only `endedAt`), with `wid`, `request` and
 `spec_digest`. Live calls also show what they wait for (slot, writer lock,
-lease, exhausted provider) and the last fence of their execution
-(`lastFence: {at, exec, reason}`); the reason is a best-effort reading of the
+lease, exhausted provider). `lastFence: {at, exec, reason}` appears only
+when an execution was cut off: it neither ended its turn, nor hibernated on a
+question, nor was stopped or timed out (every execution ends with a fence, so
+an ordinary end is not reported). The reason is a best-effort reading of the
 journals: `restart-force` when a forced restart listed the execution,
 `orchestrator-crash` when the orchestrator died uncleanly while it ran, else
 `process-died`.

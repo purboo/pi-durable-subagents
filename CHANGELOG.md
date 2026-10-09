@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.22
+
+- The installed CLI runs `run`, `send` and `stop` again: 1.0.21 loaded the
+  optional pi peer package from the tool schema and failed with
+  `ERR_MODULE_NOT_FOUND` where it does not resolve (pi's own npm prefix,
+  `npm i -g`). The schema lives apart now; the import check rejects any pi
+  import reachable from the CLI, orchestrator or evaluator, and `pack:smoke`
+  drives a run by request id from a package directory that cannot see pi.
+- `describe` reports `lastFence` only for an execution that was cut off; an
+  execution that ended its turn, hibernated, or was stopped or timed out is
+  not an interruption.
+- With `--json`, a `run`/`send`/`stop` refused before submission (unknown
+  agent, invalid spec, usage) answers `{request, applied: false, reason,
+  spec_digest?}` instead of plain text; exit code 1 as before.
+
 ## 1.0.21
 
 1.0.20 was not published; its changes ship in this release.
