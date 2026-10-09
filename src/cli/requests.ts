@@ -2,11 +2,11 @@
 // Exit codes: 0 decided (applied/created), 1 rejected or invalid, 3 request-conflict (the id names other content),
 // 75 not decided within --wait-ms (retry with the same id and content: safe).
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
-import { journalPath, orchLedger } from "../paths.ts";
+import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { findRequest, REQUEST_ID, requestId, requestRid, RequestsBusy, specDigest, type Identified } from "../requests.ts";
 import { isLive, slotsView, workflowSnapshot, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
@@ -15,6 +15,10 @@ import { discoverAgents } from "../compat/agents.ts";
 import { JT, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
 import { startOrchestrator, submitIdentified } from "./control.ts";
 import { endedExecs, fenceReason } from "../events/fence.ts";
+import { parseLabels } from "../events/labels.ts";
+import { foldWaits, leaseWaits, waitsOf } from "../events/r7.ts";
+import type { WaitReason } from "../events/types.ts";
+import { emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
 
 export const EXIT = { ok: 0, rejected: 1, conflict: 3, pending: 75 } as const;
 export interface Context { home: string; env: NodeJS.ProcessEnv; write: (line: string) => void; starter?: typeof startOrchestrator; waitMs?: number; cwd?: string; stdin?: () => Promise<string> }
@@ -57,11 +61,14 @@ export type DescribeState = "absent" | "pending" | "rejected" | "running" | "ask
 export interface DescribedCall {
   key: string; gen: number; phase: CallSnapshot["phase"]; agent: string; model?: string;
   status?: CallResult["status"]; ok?: boolean; error?: string; output?: string; data?: unknown;
-  /** Unsealed calls: why they wait — writer lock, resource lease, the provider's slot use and exhaustion (as `status`). */
-  waiting?: { writerWait?: { root: string; holder: string }; lease?: string; slot?: string; exhausted?: string; hibernated?: true };
+  /** Unsealed calls: why they wait — writer lock, resource lease, the provider's slot use and exhaustion (as `status`);
+   *  R7: `reason` (WAIT_REASONS precedence), its status line `detail` and `since` (ms) when the call does not move. */
+  waiting?: { writerWait?: { root: string; holder: string }; lease?: string; slot?: string; exhausted?: string; hibernated?: true; reason?: WaitReason; detail?: string; since?: number };
 }
 export interface Description {
   state: DescribeState; request?: string; kind?: string; wid?: string; spec_digest?: string; reason?: string;
+  /** R6: the run's labels. */
+  labels?: Record<string, string>;
   status?: string; error?: string; pruned?: { status?: string; endedAt?: number };
   calls?: DescribedCall[];
   questions?: { qid?: string; rev: number; to: string; call?: string; text: string }[];
@@ -74,7 +81,7 @@ export async function describe(home: string, key: { request: string } | { wid: s
   if ("wid" in key) return describeWorkflow(home, key.wid, entries, now);
   const rid = requestRid(key.request), found = await findRequest(home, rid);
   if (!found) return { state: "absent", request: key.request };
-  const head = { request: key.request, kind: found.request.kind, spec_digest: specDigest(found.request) };
+  const head = { request: key.request, kind: found.request.kind, spec_digest: specDigest(found.request), ...labelsOf(found.request) };
   const decided = decision(entries, rid), created = createdBy(entries, rid);
   if (found.request.kind === "run" && created) return { ...await describeWorkflow(home, String(created.wid), entries, now), ...head };
   if (decided?.type === "rejected") return { state: "rejected", ...head, reason: String(decided.reason) };
@@ -82,22 +89,42 @@ export async function describe(home: string, key: { request: string } | { wid: s
   if (decided && found.request.kind !== "run") return { state: "applied", ...head };
   return { state: "pending", ...head };
 }
+/** R6: `{labels}` of a run request that has any. */
+function labelsOf(request: Request | undefined): { labels?: Record<string, string> } {
+  const labels = request?.kind === "run" ? (request.body as RunBody | undefined)?.labels : undefined;
+  return labels && typeof labels === "object" && Object.keys(labels).length ? { labels } : {};
+}
+/** The admitted run request that created `wid` (the ledger keeps it after a prune). */
+function runOf(entries: readonly Entry[], wid: string): { created?: Entry; run?: Request } {
+  const created = entries.find(e => e.type === JT.created && e.wid === wid);
+  return { created, run: created ? entries.find(e => e.type === "request" && (e.request as Request).rid === created.rid)?.request as Request | undefined : undefined };
+}
+/** The pinned agents of a workflow revision, read once on demand (R7: the model of a call that names none). */
+function pinnedAgentModel(home: string, wid: string, rev: number): (agent: string) => string | undefined {
+  let agents: { name?: string; model?: string }[] | undefined;
+  return name => {
+    if (!agents) { try { agents = JSON.parse(readFileSync(join(pinnedDir(home, wid), rev === 1 ? "" : `r${rev}`, "agents.json"), "utf8")); } catch { agents = []; } }
+    return Array.isArray(agents) ? agents.find(a => a?.name === name)?.model : undefined;
+  };
+}
 function describeWorkflow(home: string, wid: string, entries: readonly Entry[], now: number): Description {
   const pruned = entries.find(e => e.type === "pruned" && e.wid === wid);
   if (pruned) return { state: "pruned", wid, pruned: { ...(pruned.status !== undefined ? { status: String(pruned.status) } : {}), endedAt: Number(pruned.endedAt) },
-    ...(typeof pruned.request === "string" ? { request: pruned.request } : {}), ...(typeof pruned.spec_digest === "string" ? { spec_digest: pruned.spec_digest } : {}) };
+    ...(typeof pruned.request === "string" ? { request: pruned.request } : {}), ...(typeof pruned.spec_digest === "string" ? { spec_digest: pruned.spec_digest } : {}), ...labelsOf(runOf(entries, wid).run) };
   if (!/^[^/\\\0]+$/.test(wid) || wid === "." || wid === ".." || !existsSync(journalPath(home, wid))) return { state: "absent", wid };
   const wf = workflowSnapshot(home, wid), journal = readJournalSnapshot(journalPath(home, wid)) as Entry[];
-  const created = entries.find(e => e.type === JT.created && e.wid === wid), id = created ? requestId(String(created.rid)) : undefined;
-  const admitted = id ? entries.find(e => e.type === "request" && (e.request as Request).rid === created!.rid)?.request as Request | undefined : undefined;
-  const slots = slotsView(home, now), leases = leaseCalls(leaseState(home), now);
+  const { created, run } = runOf(entries, wid), id = created ? requestId(String(created.rid)) : undefined;
+  const admitted = id ? run : undefined;
+  const lstate = leaseState(home), slots = slotsView(home, now), leases = leaseCalls(lstate, now);
+  // R7: the same fold and decision the orchestrator's collector uses, from the disk snapshots.
+  const waits = waitsOf(foldWaits(wid, journal), { now, ledger: foldLedger(emptyLedger(), entries), leases: leaseWaits(lstate, now) }, pinnedAgentModel(home, wid, wf.rev));
   const line = (lines: string[] | undefined, model?: string) => { const provider = model?.split("/")[0]; return provider ? lines?.find(l => l.startsWith(`${provider} `)) : undefined; };
   const latest = [...new Map(wf.calls.map(c => [c.key, c] as const)).values()];
   const calls = latest.map((c): DescribedCall => {
     const r = c.result, waiting = r ? undefined : {
       ...(c.writerWait ? { writerWait: c.writerWait } : {}), ...(leases.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
       ...(line(slots.slots, c.model) ? { slot: line(slots.slots, c.model) } : {}), ...(line(slots.exhausted, c.model) ? { exhausted: line(slots.exhausted, c.model) } : {}),
-      ...(c.hibernated ? { hibernated: true as const } : {}) };
+      ...(c.hibernated ? { hibernated: true as const } : {}), ...waits.get(c.callId) };
     return { key: c.key, gen: c.gen, phase: c.phase, agent: c.agent, ...(c.model ? { model: c.model } : {}),
       ...(r ? { status: r.status, ok: r.ok, ...(r.error ? { error: r.error } : {}), output: r.output, ...(r.data !== undefined ? { data: r.data } : {}) } : {}),
       ...(waiting && Object.keys(waiting).length ? { waiting } : {}) };
@@ -107,7 +134,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   const attention = wf.attention.filter(a => a.kind !== "question").map(a => ({ id: a.id, rev: a.rev, kind: a.kind, ...(a.call ? { call: a.call } : {}), text: a.text }));
   const state: DescribeState = questions.length ? "asking" : isLive(wf) || wf.status === "parked" ? "running" : "sealed";
   const fence = lastFence(journal, entries);
-  return { state, wid, ...(id ? { request: id } : {}), ...(admitted ? { spec_digest: specDigest(admitted) } : {}), status: wf.status, ...(wf.error ? { error: wf.error } : {}),
+  return { state, wid, ...(id ? { request: id } : {}), ...(admitted ? { spec_digest: specDigest(admitted) } : {}), ...labelsOf(run), status: wf.status, ...(wf.error ? { error: wf.error } : {}),
     calls, ...(questions.length ? { questions } : {}), ...(attention.length ? { attention } : {}), ...(fence ? { lastFence: fence } : {}) };
 }
 /** R3, best effort: why the latest fence that interrupted work happened. The per-execution classification and the
@@ -119,6 +146,7 @@ export function lastFence(journal: readonly Entry[], orch: readonly Entry[]): De
 }
 export function renderDescription(d: Description): string {
   const lines = [`${d.request ?? d.wid}: ${d.state}${d.reason ? ` (${d.reason})` : ""}${d.wid && d.request ? ` — ${d.wid}` : ""}${d.status && d.state !== d.status ? ` · ${d.status}` : ""}`];
+  if (d.labels) lines.push(`  labels: ${Object.entries(d.labels).map(([k, v]) => `${k}=${v}`).join(" ")}`);
   if (d.pruned) lines.push(`  pruned: ${d.pruned.status ?? "?"} at ${new Date(d.pruned.endedAt ?? 0).toISOString()}`);
   if (d.error) lines.push(`  error: ${d.error}`);
   for (const c of d.calls ?? []) {
@@ -216,21 +244,23 @@ const forks = (spec: Record<string, unknown>) => [spec, ...["tasks", "chain"].fl
  *  form ({agent,task,…} or {tasks|chain:[…],…}); it is validated by the tool's own normalizer and agent check. */
 export const runCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, runRequest);
 async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
-  const { values, positionals } = flags(args, { request: "value", spec: "value", cwd: "value", json: "flag", "wait-ms": "value" });
+  const { values, positionals } = flags(args, { request: "value", spec: "value", cwd: "value", labels: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), file = text(values, "spec"), json = values.json === true, wait = waitMs(values, ctx);
   seen.id = id; seen.json = json;
-  if (!id || !file || positionals.length) throw new Error("usage: run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]");
+  if (!id || !file || positionals.length) throw new Error("usage: run --request <id> --spec <file|-> [--labels <json>] [--cwd <dir>] [--json] [--wait-ms <n>]");
   requestRid(id);
+  const raw = text(values, "labels"), labels = raw !== undefined ? parseLabels(raw) : undefined;
   const bytes = file === "-" ? await (ctx.stdin ?? stdin)() : readFileSync(resolve(ctx.cwd ?? process.cwd(), file), "utf8");
   let spec: Record<string, unknown>;
   try { spec = JSON.parse(bytes); } catch (error) { throw new Error(`--spec is not JSON: ${(error as Error).message}`); }
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("--spec must be a JSON object");
   if (spec.action !== undefined && spec.action !== "run") throw new Error("--spec describes a run; action must be absent or \"run\"");
   if (spec.request !== undefined) throw new Error("the request id is --request, not a spec field");
+  if (spec.labels !== undefined) throw new Error("labels are given with --labels <json>, not in the spec");
   if (forks(spec)) throw new Error("context \"fork\" needs a pi session to fork; it is not available to run --request");
   // RunBody.cwd = spec.cwd ?? --cwd ?? the current directory, absolute before the digest.
   const base = resolve(ctx.cwd ?? process.cwd(), text(values, "cwd") ?? "."), dir = typeof spec.cwd === "string" && spec.cwd ? resolve(base, spec.cwd) : base;
-  const normalized = request({ ...spec, action: "run", ...(typeof spec.cwd === "string" && spec.cwd ? { cwd: dir } : {}) }, dir);
+  const normalized = request({ ...spec, action: "run", ...(typeof spec.cwd === "string" && spec.cwd ? { cwd: dir } : {}), ...(labels ? { labels } : {}) }, dir);
   const body = normalized.body as RunBody;
   seen.digest = specDigest({ kind: "run", body });
   // An id already recorded is decided by that record: the same content gets its first outcome (the agents it named may

@@ -242,7 +242,7 @@ pi-durable-subagents start              start the orchestrator if work is pendin
 pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)
 pi-durable-subagents drain              hold existing workflows: running calls finish, nothing new starts in them
 pi-durable-subagents stop <wid|call>
-pi-durable-subagents run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]
+pi-durable-subagents run --request <id> --spec <file|-> [--labels <json>] [--cwd <dir>] [--json] [--wait-ms <n>]
                                         start a run under a caller-chosen id; safe to retry (see below)
 pi-durable-subagents send --request <id> --to <run-id|wid/key> --kind follow-up|answer|steer|model
                          [--call <key>] [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]
@@ -312,8 +312,9 @@ full text, `qid`, `rev` and the `to` address to answer), `sealed` (finished:
 `status` plus every call's unclipped `output`, `error` and schema `data`) or
 `pruned` (`pruned: {status, endedAt}`; workflows pruned before 1.0.21 have
 only `endedAt`), with `wid`, `request` and
-`spec_digest`. Live calls also show what they wait for (slot, writer lock,
-lease, exhausted provider). `lastFence: {at, exec, reason}` appears only
+`spec_digest`, and `labels` when the run has any. Live calls also show what
+they wait for (slot, writer lock, lease, exhausted provider; see "Labels and
+why a call does not move"). `lastFence: {at, exec, reason}` appears only
 when an execution was cut off: it had not ended its turn when it was fenced,
 did not hibernate on a question (also when recovery finds it cut off while only
 its question's `ask` ran), and was not ended on purpose (stop, timeout,
@@ -399,6 +400,40 @@ every run you have not closed (it reports `sealed`, `asking` with the full
 question, `pruned`, …), rebuild your state from those answers, then continue
 with `--since <head>` from that reply. A malformed cursor or option exits 1
 with `{"error":"invalid-arguments","message":…}`.
+
+#### Labels and why a call does not move
+
+`run --request <id> --spec <file> --labels '{"node":"n1","attempt":"2"}'`
+(tool: `labels: {…}`) attaches your own labels to a run: a flat JSON object
+of at most 32 keys `[A-Za-z0-9_.:-]{1,64}` with string values of at most 256
+characters, at most 4096 bytes of JSON. They are part of the content: the
+same id with other labels (or none) is a `request-conflict` (exit 3). Give
+them only with `--labels`; a `labels` field in the spec file is refused.
+Invalid labels exit 1 and submit nothing, and the orchestrator rejects a
+request that carries invalid ones (`invalid-labels: …`). `describe` returns
+them as `labels` (also after `prune`), and every event of the run carries
+them.
+
+When an unsealed call does not move, its `waiting` in `describe` adds
+`reason`, `detail` (the status line for that cause, e.g. `waiting for a slot:
+probe 1/1`) and `since` (ms: when that cause started). The event log has the
+same: `waiting {reason, detail, since}` when the reason appears or changes,
+`moving {after}` when it clears (also when the call ends), checked every
+`k.r7Ms` (default 5 s); a change of detail alone is no event. The first reason
+that applies wins:
+
+| reason | the call … |
+| --- | --- |
+| `unconfirmed-stop` | had processes that did not exit after SIGKILL; it starts nothing until they are gone (look at them) |
+| `provider-exhausted` | runs on, or can only be admitted to, providers whose usage window is used up |
+| `writer-lock` | waits for another call that writes in the same worktree |
+| `lease` | waits for a resource lease (`hold`, below) |
+| `slot` | is queued for a provider slot or memory headroom (at once when its providers are full, else after 3 s) |
+| `silent` | runs without visible activity: the stall notice, with the command running and for how long |
+
+A call that asks a question is `asking`, not waiting; a sealed call never
+waits. `provider-exhausted`, `writer-lock`, `lease` and `slot` are queues
+that clear by themselves; `silent` and `unconfirmed-stop` may need a look.
 
 ### Housekeeping
 
@@ -552,7 +587,11 @@ pi-durable-subagents restart --force <token> --reason "<why>"
 A changed execution set is refused with a fresh list and token. With no live
 executions no token is needed. Bare force cannot fence live executions, and the
 tool rejects `force:true`. Subagents cannot force a restart, even from bash:
-it would fence themselves and other sessions' work. Force fences running
+it would fence themselves and other sessions' work. That guard reads the
+environment on purpose (`DSA_EXEC`/`DSA_CALL` and the request's initiator
+call): it is a rail against accidents and instructions, not a security
+boundary — a subagent runs as the same OS user and could signal the
+orchestrator anyway. Force fences running
 executions; they resume on the new version from their sessions, like after a
 crash, so a tool call that was running is repeated or reported as interrupted.
 The restart ledger records the reason and initiator; after the next start,
