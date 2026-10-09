@@ -123,3 +123,33 @@ test("other origins' live work shows as the dock's elsewhere line and opens the 
     hooks.get("session_shutdown")!();
   }
 });
+
+test("a refresh whose control reconcile throws has already split by origin: another session's call stays read-only", async t => {
+  const { join } = await import("node:path");
+  const { openJournal } = await import("../../../src/kernel/journal.ts");
+  const { journalPath } = await import("../../../src/paths.ts");
+  const { UiActions } = await import("../../../src/ui/data.ts");
+  t.mock.method(UiActions.prototype, "reconcile", () => { throw new Error("ledger unreadable"); });
+  const home = join(root, "reconcile-throws"), j = await openJournal(journalPath(home, "drv"));
+  await j.append("wf-created", { origin: "cli:me@host", cwd: root, revision: 1 });
+  await j.append("call", { key: "E02", gen: 1, spec: { agent: "worker" } }); await j.close();
+  const hooks = new Map<string, Function>(); let listener: TerminalInputHandler | undefined;
+  let screen: { render(width: number): string[]; handleInput(key: string): void } | undefined;
+  const tui = { terminal: { rows: 40, columns: 100 }, requestRender() {} }, theme = { fg: (_c: string, s: string) => s, bg: (_c: string, s: string) => s, bold: (s: string) => s };
+  const pi = { on: (name: string, fn: Function) => hooks.set(name, fn) } as unknown as ExtensionAPI;
+  registerUi(pi, { home, submit: async () => { throw new Error("must not send"); }, presentNote() {} });
+  t.after(() => hooks.get("session_shutdown")!());
+  const ctx = { mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "test" }, modelRegistry: { find: () => undefined, getAvailable: () => [] }, ui: {
+    custom: (factory: Function) => { screen = factory(tui, theme, {}, () => {}); return new Promise(() => {}); },
+    setWidget() {}, getEditorText: () => "", onTerminalInput: (fn: TerminalInputHandler) => { listener = fn; return () => {}; },
+  } } as unknown as ExtensionContext;
+  hooks.get("session_start")!({}, ctx);
+  assert.deepEqual(listener!("\x1b[B"), { consume: true });
+  await new Promise(resolve => setImmediate(resolve));
+  const text = () => screen!.render(100).join("\n");
+  assert.match(text(), /Other sessions \(1 workflow, 1 running\)/);
+  for (const key of ["\r", "\x1b[B", "\x1b[B"]) { screen!.handleInput(key); text(); }
+  assert.match(text(), /› .*E02/);
+  screen!.handleInput("s");
+  assert.match(text(), /read-only: started by cli:me@host/); assert.doesNotMatch(text(), /steer E02:/);
+});

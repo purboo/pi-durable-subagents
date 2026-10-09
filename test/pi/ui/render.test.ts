@@ -452,3 +452,70 @@ test("other sessions: the folded group opens with Enter; its calls can be watche
     assert.match(plain(screen), /steer E02:/);
   } finally { Date.now = original; }
 });
+
+function otherSetup() {
+  const s = setup();
+  s.data.workflows[0] = { ...s.data.workflows[0]!, paused: true }; // r on this session's row would resume at once
+  const sealed = (key: string) => call(key, { callId: `c01@1/${key}@1`, phase: "sealed", endedAt: now - 1_000, result: { key, gen: 1, status: "ok", ok: true, output: "" } });
+  const cli = workflow([call("a", { callId: "c01@1/a@1" }), sealed("b")], { wid: "c01", name: "driver", origin: "cli:me@host", startedAt: now - 1_000 });
+  const peer = workflow([call("p", { callId: "p01@1/p@1" })], { wid: "p01", name: "peer", origin: "main:peer-abcdefghij", startedAt: now - 2_000 });
+  s.data.others = [cli, peer]; s.data.all = [...s.data.workflows, cli, peer];
+  s.screen.state.others = true;
+  const select = (pattern: RegExp) => {
+    for (let i = 0; i < 30 && !/^› /m.test(plain(s.screen).split("\n").find(l => pattern.test(l)) ?? ""); i++) s.screen.handleInput("\x1b[B");
+    assert.match(plain(s.screen).split("\n").find(l => pattern.test(l)) ?? "", /^› /, `selected ${pattern}`);
+  };
+  return { ...s, cli, peer, select };
+}
+const selectedLine = (screen: InstanceType<typeof SubagentScreen>) => plain(screen).split("\n").find(l => l.startsWith("› "));
+
+test("other sessions: a vanished selected row falls back to the group header or to no row, never onto this session's rows", async () => {
+  const original = Date.now; Date.now = () => now;
+  try {
+    const { screen, data, requests, select, peer } = otherSetup();
+    select(/└ a /);
+    data.others = [peer]; // the selected workflow ended: the header still exists
+    assert.match(selectedLine(screen) ?? "", /Other sessions/);
+    data.others = []; // the whole group went: nothing is selected
+    assert.equal(selectedLine(screen), undefined, plain(screen));
+    for (const key of ["x", "r", "s", "m"]) screen.handleInput(key);
+    await tick();
+    assert.equal(requests.length, 0, "r did not resume this session's paused workflow");
+    assert.doesNotMatch(plain(screen), /Stop .*\?|steer |Model for/);
+    screen.handleInput("\x1b[B"); assert.match(selectedLine(screen) ?? "", /exec-0927/, "↓ chooses a row again");
+  } finally { Date.now = original; }
+});
+
+test("other sessions: read-only is decided by origin, also when they were never split from this session's list", async () => {
+  const original = Date.now; Date.now = () => now;
+  try {
+    const { screen, data, requests, cli } = otherSetup();
+    data.workflows = [...data.workflows, cli]; data.others = []; // an interrupted refresh: everything in one list
+    for (let i = 0; i < 30 && !/c01|└ a|├ a/.test(selectedLine(screen) ?? ""); i++) screen.handleInput("\x1b[B");
+    assert.match(selectedLine(screen) ?? "", / a /);
+    for (const key of ["s", "x", "m"]) { screen.handleInput(key); assert.match(plain(screen), /read-only: started by cli:me@host/); }
+    await tick(); assert.equal(requests.length, 0);
+  } finally { Date.now = original; }
+});
+
+test("other sessions: the done page, header clicks and a follow-up on a finished call are refused", async () => {
+  const original = Date.now; Date.now = () => now;
+  try {
+    const { screen, requests, select } = otherSetup();
+    select(/[├└] a /); screen.handleInput("\r");
+    assert.match(plain(screen), /driver › a/);
+    // Clicks on the model and thinking labels of the header open no selector.
+    for (const x of [2 + 3, 2 + 25]) {
+      screen.handleMouse({ type: "click", button: "left", x, y: 2 } as TuiMouseEvent);
+      assert.doesNotMatch(plain(screen), /Model for a|Thinking for a/); assert.match(plain(screen), /read-only: started by cli:me@host/);
+    }
+    screen.handleInput("\x1b[C"); assert.match(plain(screen), /driver › done/);
+    assert.match(stripVTControlCharacters(screen.render(100).at(-1)!), /read-only/); assert.doesNotMatch(stripVTControlCharacters(screen.render(100).at(-1)!), /f follow-up|m model/);
+    for (const key of ["f", "m", "x"]) { screen.handleInput(key); assert.match(plain(screen), /read-only: started by cli:me@host/); assert.doesNotMatch(plain(screen), /follow-up b:|Model for b|Stop b\?/); }
+    screen.handleInput("\r"); assert.match(plain(screen), /driver › b/);
+    for (const ch of "again") screen.handleInput(ch);
+    screen.handleInput("\x1b\r"); screen.handleInput("\r"); await tick();
+    assert.equal(requests.length, 0, "no follow-up, continue or menu choice was submitted");
+    assert.match(plain(screen), /read-only: started by cli:me@host/);
+  } finally { Date.now = original; }
+});
