@@ -78,6 +78,10 @@ export interface JournalHandle {
   close(): Promise<void>;
   /** True once close() was called; owners that outlive a workflow (the executor sweep) skip closed handles. */
   readonly closed?: boolean;
+  /** R2: the committed entries without a copy (the live, append-only array; read it, never change it). */
+  committed?(): readonly Entry[];
+  /** R2: called after each durable append (one listener: the orchestrator's event pump). */
+  onAppend?: (() => void) | undefined;
 }
 
 // ---------------------------------------------------------------------------

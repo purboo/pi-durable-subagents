@@ -4,10 +4,19 @@ import { dirname } from 'node:path';
 import type { Entry, JournalHandle } from '../types.ts';
 
 const TABLE = new Uint32Array(256).map((_, n) => { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
-function crc32(bytes: Uint8Array): string {
+/** C11: the CRC-32 (IEEE) of a record, 8 lowercase hex digits: the frame of every journal line. */
+export function crc32(bytes: Uint8Array): string {
   let crc = 0xffffffff;
   for (let i = 0; i < bytes.length; i++) crc = TABLE[(crc ^ bytes[i]!) & 0xff]! ^ (crc >>> 8);
   return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0');
+}
+/** C11: One framed line `<crc32 hex 8> <json>\n` (the journal format; the event log uses it too). */
+export function frameLine(json: string): string { return `${crc32(Buffer.from(json))} ${json}\n`; }
+/** C11: The JSON text of one framed line (without its newline), or undefined when its frame or checksum is wrong. */
+export function unframeLine(line: Uint8Array): string | undefined {
+  if (line.length < 10 || line[8] !== 32) return undefined;
+  const head = Buffer.from(line.subarray(0, 8)).toString(), json = line.subarray(9);
+  return /^[0-9a-f]{8}$/.test(head) && crc32(json) === head ? Buffer.from(json).toString() : undefined;
 }
 /** Entries are immutable history (A1): freeze them so shared snapshots can be handed out without copying. */
 function freeze<T>(value: T): T {
@@ -75,10 +84,14 @@ export async function openJournal(path: string): Promise<JournalHandle> {
     if (created) { await file.sync(); await syncDirectory(dirname(path)); }
   } catch (error) { await file.close(); throw error; }
   let queue: Promise<unknown> = Promise.resolve(), closed = false, failed: unknown, view: Entry[] | undefined;
-  return {
+  const handle: JournalHandle = {
     path,
     // Shared frozen view, rebuilt only after an append (entries are immutable, see freeze()).
     entries: () => view ??= Object.freeze(entries.slice()) as Entry[],
+    // The growing array itself (no copy): it is only ever appended to, so a reader may keep it and read below a length
+    // it saw (the event pump reads new entries per tick without copying the journal).
+    committed: () => entries,
+    onAppend: undefined,
     append<T extends string>(type: T, fields: Record<string, unknown>): Promise<Entry<T>> {
       if (closed) return Promise.reject(new Error('Journal closed'));
       const frozen = structuredClone(fields);
@@ -89,6 +102,7 @@ export async function openJournal(path: string): Promise<JournalHandle> {
         await file.writeFile(`${crc32(bytes)} ${json}\n`);
         await file.sync();
         entries.push(freeze(JSON.parse(json))); view = undefined;
+        try { handle.onAppend?.(); } catch (error) { console.error(`durable-subagents: journal listener failed: ${String(error)}`); }
         return structuredClone(entry);
       });
       queue = operation.catch(error => { failed = error; });
@@ -97,4 +111,5 @@ export async function openJournal(path: string): Promise<JournalHandle> {
     async close() { if (closed) return; closed = true; await queue; await file.close(); },
     get closed() { return closed; },
   };
+  return handle;
 }

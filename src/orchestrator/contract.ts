@@ -17,7 +17,7 @@ export interface OrchestratorConfig {
   /** Writer lock: "queue" (default) runs one writer call per git worktree at a time; "off" only reminds of observed
    *  shared writes. */
   writerLock?: "queue" | "off";
-  k?: Partial<Record<"lossBound" | "checkpointMs" | "stallMs" | "progressMs" | "switchTimeoutMs" | "idleExitMs" | "trackerMs" | "hibernateMs" | "spawnBudget" | "probeMs", number>>;
+  k?: Partial<Record<"lossBound" | "checkpointMs" | "stallMs" | "progressMs" | "switchTimeoutMs" | "idleExitMs" | "trackerMs" | "hibernateMs" | "spawnBudget" | "probeMs" | "eventRetentionMs", number>>;
 }
 
 /** Everything the executor needs to run one call generation. */

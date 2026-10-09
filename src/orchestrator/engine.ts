@@ -28,6 +28,7 @@ import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts'
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
 import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
 import { validateCallSpec } from '../compat/spec.ts';
+import { EventPump } from '../events/pump.ts';
 import { parseModel } from '../compat/model.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
@@ -95,6 +96,8 @@ export interface EngineOptions { evaluator?: EvaluatorTransport; discovery?: Dis
 /** A1, P2, P10, P11: Serialize decisions while executions run independently. */
 export class Engine {
   readonly store: Store;
+  /** R2: the cross-workflow event log's writer (derives milestones from the journals; R7 emits through it). */
+  readonly events: EventPump;
   private ledgers: Ledgers;
   private executor: Executor;
   private evaluator: EvaluatorTransport;
@@ -121,6 +124,7 @@ export class Engine {
   constructor(ledgers: Ledgers, executor: Executor, options: EngineOptions = {}) {
     this.ledgers = ledgers; this.executor = executor; this.discovery = options.discovery;
     this.store = new Store(ledgers); this.evaluator = options.evaluator ?? new EvaluatorClient(ledgers);
+    this.events = new EventPump({ home: ledgers.home, orch: ledgers.orch, store: this.store, retentionMs: () => ledgers.config.k?.eventRetentionMs });
   }
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const result = this.queue.then(fn);
@@ -138,6 +142,9 @@ export class Engine {
   /** A2, P10: Recover executor authority before replaying each unfinished workflow. */
   async recover(): Promise<void> {
     await this.store.recover();
+    // R2: before any recovery append, so every journal entry from here on is derived promptly (and a new log derives
+    // everything still on disk).
+    await this.events.open();
     for (const wf of this.store.workflows.values()) {
       await this.executor.recover(wf.wid, wf.journal);
       // A seal may survive a crash before post-seal effects, even after workflow completion.
@@ -439,6 +446,8 @@ export class Engine {
     const createdBy = String(entries.find(e => e.type === JT.created && e.wid === wf.wid)?.rid ?? '');
     const admitted = requestId(createdBy) !== undefined ? entries.find(e => e.type === 'request' && (e.request as Request).rid === createdBy)?.request as Request | undefined : undefined;
     const identity = admitted ? { request: requestId(createdBy), spec_digest: specDigest(admitted) } : {};
+    // R2: its events are derived and logged before the journal can go (recovery removes it once `pruned` is committed).
+    await this.events.flush();
     await this.ledgers.orch.append('pruned', { rid, wid: wf.wid, endedAt: done.ts, bytes, status: String(done.status), ...identity });
     this.states.delete(wf.wid);
     await this.store.drop(wf.wid);
@@ -625,6 +634,6 @@ export class Engine {
   /** A1, A2: Retire asynchronous producers before closing their journals. */
   async close(): Promise<void> {
     this.closed = true; this.watcher?.close(); clearInterval(this.poll);
-    await this.queue; await this.evaluator.close(); await this.executor.shutdown(); await this.store.close();
+    await this.queue; await this.evaluator.close(); await this.executor.shutdown(); await this.events.close(); await this.store.close();
   }
 }
