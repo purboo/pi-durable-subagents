@@ -13,7 +13,7 @@ import { unfinishedWorkflow } from "../agent/main/snapshots.ts";
 import { cliInitiator } from "./restart.ts";
 import { restartInputError } from "../orchestrator/restart.ts";
 import { JT, type Conditions, type DrainBody, type PruneBody, type Request, type RequestKind, type RestartBody } from "../types.ts";
-import { sendIdentified, type Identified } from "../requests.ts";
+import { RequestsBusy, sendIdentified, type Identified } from "../requests.ts";
 
 export type Control = "resume" | "drain" | "stop" | "stop-all" | "prune" | "restart";
 /** P1: Start the detached orchestrator only after probing its OS lock. */
@@ -107,7 +107,7 @@ async function withSender<T>(home: string, fn: (outbox: Outbox, sender: string) 
   const locker = new OsLock(), deadline = performance.now() + 10_000;
   let lock = await locker.tryAcquire(join(home, `${sender}.lock`));
   while (!lock && performance.now() < deadline) { await delay(50); lock = await locker.tryAcquire(join(home, `${sender}.lock`)); }
-  if (!lock) throw new Error("CLI sender is busy; retry the command");
+  if (!lock) throw new RequestsBusy("CLI sender is busy; retry the command");
   try {
     const outbox = await Outbox.open(outboxRoot(home), sender, () => orchInbox(home));
     try {

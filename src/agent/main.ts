@@ -14,7 +14,7 @@ import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBod
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
 import { isLive, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
 import { checkAgents, parameters, request, sendReceipt } from "./main/tool.ts";
-import { requestRid, sendIdentified, type Identified } from "../requests.ts";
+import { findRequest, requestRid, sendIdentified, type Identified } from "../requests.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { restartInputError } from "../orchestrator/restart.ts";
 import { currentOrchestrator, legacyRestart, waitExit, type OrchestratorProcess } from "../cli/restart.ts";
@@ -220,6 +220,13 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       ({ name, description, ...(model === undefined ? {} : { model }), source }));
     // A send addressed like a stop (target:) means the same call; the field name is not worth a failed round trip.
     if (args.action === "send" && args.to === undefined && typeof args.target === "string") { const { target, ...rest } = args; args = { ...rest, to: target }; }
+    // A retried answer addresses the question the first attempt resolved (it may be closed by now), like the CLI.
+    if (args.action === "send" && args.kind === "answer" && typeof args.request === "string" && (args.qid === undefined || args.rev === undefined)) {
+      const prior = (await findRequest(home, requestRid(args.request)))?.request, body = prior?.body as { to?: unknown; kind?: unknown } | undefined;
+      if (prior?.kind === "send" && body?.kind === "answer" && typeof body.to === "string" && prior.cond?.qid !== undefined &&
+        (args.to === undefined || args.to === body.to) && (args.qid === undefined || args.qid === prior.cond.qid))
+        args = { ...args, to: body.to, qid: prior.cond.qid, rev: args.rev ?? prior.cond.rev };
+    }
     if (args.action === "send") args = completeSend(args);
     // A session resumes its own held work (what its quit paused); the CLI `resume` remains the global one.
     if (args.action === "resume" && args.wid === undefined) args = { ...args, origin: sender };

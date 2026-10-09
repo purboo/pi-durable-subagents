@@ -288,18 +288,28 @@ session and is rejected.
 | 0 | decided and applied (a retry gets the same answer) | run: `{request, wid, created, spec_digest}`; send/stop: `{request, applied, generation?, call?, spec_digest}` |
 | 1 | decided and rejected (`reason`), or a usage error | `{request, applied: false, reason, spec_digest}` |
 | 3 | `request-conflict`: the id already names other content; nothing was sent | `{request, error, wid?, spec_digest, state}` (the original's digest and state) |
-| 75 | submitted but not decided in `--wait-ms` (default 60 s); retry with the same id | `{request, pending: true}` |
+| 75 | not decided yet: submitted but undecided in `--wait-ms` (default 60 s), submitted and then a later step failed (`reason` says which), or a lock was busy (`reason: "busy"`); retry with the same id | `{request, pending: true, reason?}` |
 
 `created` is false when the id had already been decided before the command
 ran. A conflicting id stays conflicting forever, also after `prune`: the
-tombstone keeps the final status, the id and the digest.
+tombstone keeps the final status, the id and the digest. Any sender's retry
+completes a submission another one recorded but did not publish (it died in
+between), so a retry with the same content always converges.
+
+From the `subagents` tool, `request` works the same, with one difference: a
+run's origin session (what `context: "fork"` copies, and where notices go) is
+not part of the digest. A retry of the same id from another session therefore
+gets the first session's workflow, its notices and its forked context. A
+retried answer may leave out `to`, `qid` and `rev`: it addresses the question
+the first attempt answered.
 
 `describe` reports one of `absent` (never seen), `pending` (submitted, not
 decided — typically no orchestrator is running; `start` or a retry starts it),
 `rejected` (with `reason`), `running`, `asking` (open questions with their
 full text, `qid`, `rev` and the `to` address to answer), `sealed` (finished:
 `status` plus every call's unclipped `output`, `error` and schema `data`) or
-`pruned` (`pruned: {status, endedAt}`), with `wid`, `request` and
+`pruned` (`pruned: {status, endedAt}`; workflows pruned before 1.0.21 have
+only `endedAt`), with `wid`, `request` and
 `spec_digest`. Live calls also show what they wait for (slot, writer lock,
 lease, exhausted provider) and the last fence of their execution
 (`lastFence: {at, exec, reason}`); the reason is a best-effort reading of the

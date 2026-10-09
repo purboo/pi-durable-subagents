@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger } from "../paths.ts";
-import { findRequest, REQUEST_ID, requestId, requestRid, specDigest, type Identified } from "../requests.ts";
+import { findRequest, REQUEST_ID, requestId, requestRid, RequestsBusy, specDigest, type Identified } from "../requests.ts";
 import { isLive, slotsView, workflowSnapshot, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { checkAgents, request } from "../agent/main/tool.ts";
@@ -183,7 +183,16 @@ async function submitAndWait(ctx: Context, id: string, kind: "run" | "send" | "s
   // R2: `created` is false only when the id was already decided before this invocation submitted (decisions are
   // monotonic); racing first attempts may all report created — the wid is what identifies the run.
   const rid = requestRid(id), earlier = Boolean(await outcome(ctx.home, rid, kind === "run", 0));
-  const sent = await submitIdentified(ctx.home, rid, kind, body, cond, ctx.env, ctx.starter);
+  let sent: Identified;
+  try { sent = await submitIdentified(ctx.home, rid, kind, body, cond, ctx.env, ctx.starter); }
+  catch (error) {
+    // Exit 1 means decided (rejected) or a usage error. A busy lock submitted nothing, and a failure after the envelope
+    // was recorded (starting the orchestrator, say) leaves it submitted: both are "not decided yet — retry the same id".
+    const recorded = await findRequest(ctx.home, rid).catch(() => undefined);
+    if (error instanceof RequestsBusy || recorded && specDigest(recorded.request) === specDigest({ kind, body, cond }))
+      return { code: pending(ctx, id, json, error instanceof RequestsBusy ? "busy" : `submitted, then: ${(error as Error).message ?? String(error)}`) };
+    throw error;
+  }
   if ("conflict" in sent) return { code: await conflict(ctx, id, sent.digest, json) };
   const result = await outcome(ctx.home, rid, kind === "run", wait);
   if (!result) return { code: pending(ctx, id, json) };
