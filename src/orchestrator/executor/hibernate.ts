@@ -1,7 +1,7 @@
 // Private workflow entries (P28): hibernated{call,qid,rev,exec};
 // answer-bound{call,qid,rev,rid,rid2,message,hash}; resumed{call,rid,exec}.
 import { CT, type JournalHandle } from "../../types.ts";
-import { receiptId, type SessionEntry } from "./session.ts";
+import { cutAskResult, receiptId, type SessionEntry } from "./session.ts";
 
 /** P28, V4: Find an unanswered question whose native ask tool remains blocked. */
 export function openQuestion(entries: SessionEntry[]): { qid: string; rev: number; question: string } | undefined {
@@ -15,7 +15,7 @@ export function openQuestion(entries: SessionEntry[]): { qid: string; rev: numbe
   for (const e of entries) {
     const m = e.message;
     if (m?.role === "assistant" && Array.isArray(m.content)) for (const b of m.content) if (b.type === "toolCall" && b.name === "ask" && b.id) pending.add(b.id);
-    if (m?.role === "toolResult" && m.toolCallId) pending.delete(m.toolCallId);
+    if (m?.role === "toolResult" && m.toolCallId && !cutAskResult(m)) pending.delete(m.toolCallId);
   }
   if (!pending.size) return;
   return { qid: q.qid, rev: q.rev, question: String(q.question) };

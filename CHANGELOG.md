@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- An asker cut off by a restart (also `restart --force`) now hibernates and
+  resumes with the answer, as documented. A graceful shutdown let its `ask`
+  end with its own "Session shut down" (or "Ask aborted") error before the
+  process exited; recovery took that for an answered ask, recorded a loss and
+  ran the call again, so the model asked a second time, `describe` showed a
+  `lastFence` and the stale question stayed listed. Only a killed process (no
+  result at all) was recognised before.
+
 ## 1.0.22
 
 - The installed CLI runs `run`, `send` and `stop` again: 1.0.21 loaded the

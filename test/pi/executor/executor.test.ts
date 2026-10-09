@@ -13,7 +13,7 @@ import { binDir, callDir, callInbox, callSession, journalPath, orchLedger, outbo
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { scanInbox } from "../../../src/kernel/mailbox.ts";
 import { contentHash, forwardRid, ulid } from "../../../src/kernel/ids.ts";
-import { CT, JT, type Containment, type JournalHandle, type Request } from "../../../src/types.ts";
+import { ASK_CUT, CT, JT, type Containment, type JournalHandle, type Request } from "../../../src/types.ts";
 import type { CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
 import { writeShim } from "../../../src/platform/lease.ts";
@@ -179,6 +179,37 @@ for (const once of [true, false]) test(`P28 a${once ? " once" : "n"} asker cut o
   assert.equal(result.output, "resumed");
   assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
   assert.equal(f.journal.entries().filter(e => e.type === JT.exec && e.call === ticket.callId).length, 2, "one execution asked, one resumed with the answer");
+});
+
+// A graceful shutdown (a restart, including a forced one) lets the child's ask end with its own error before the process
+// exits; that result is no answer, so recovery must hibernate the asker exactly as when the process was killed.
+for (const [cut, once] of [[ASK_CUT.shutdown, true], [ASK_CUT.aborted, false]] as const) test(`P28 a${once ? " once" : "n"} asker whose ask ended "${cut}" when it was cut off hibernates on recovery (no loss, not unknown, not asked again)`, { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 600000, trackerMs: 20 } });
+  const base = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { tool: "ask", args: { question: "Asked again?" } }, { text: "asked again" }]));
+  const ticket: CallTicket = { ...base, spec: { ...base.spec, once } };
+  const pending = f.executor.run(ticket);
+  const question = () => f.journal.entries().find(e => e.type === JT.attention && (e.item as { qid?: string }).qid)?.item as { qid: string; rev: number } | undefined;
+  await until(() => !!question());
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  const session = callSession(f.home, f.wid, "a", 1);
+  const rows = (await readFile(session, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const call = rows.flatMap(e => e.message?.role === "assistant" ? e.message.content : []).find((b: { type?: string; name?: string }) => b.type === "toolCall" && b.name === "ask");
+  assert.ok(call, "the ask tool call is in the session");
+  await appendFile(session, JSON.stringify({ type: "message", id: "cut00001", parentId: rows.at(-1).id, timestamp: new Date().toISOString(),
+    message: { role: "toolResult", toolCallId: call.id, toolName: "ask", content: [{ type: "text", text: cut }], details: {}, isError: true, timestamp: Date.now() } }) + "\n");
+  const resumed = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  assert.equal(h.qid, question()!.qid);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0, "not sealed unknown");
+  const req: Request = { rid: "answer", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: "yes " + script([{ text: "resumed" }]) } };
+  assert.deepEqual(await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen }), { action: "apply" });
+  const result = await resumed;
+  assert.equal(result.status, "ok");
+  assert.equal(result.output, "resumed");
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attention && (e.item as { qid?: string }).qid).length, 1, "the question was not asked again");
 });
 
 for (const once of [true, false]) test(`P28 an answer given while a${once ? " once" : "n"} asker is cut off, before recovery hibernates it, is bound to the question (not lost)`, { timeout: 30000 }, async t => {
