@@ -112,7 +112,12 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   if (pruned) return { state: "pruned", wid, pruned: { ...(pruned.status !== undefined ? { status: String(pruned.status) } : {}), endedAt: Number(pruned.endedAt) },
     ...(typeof pruned.request === "string" ? { request: pruned.request } : {}), ...(typeof pruned.spec_digest === "string" ? { spec_digest: pruned.spec_digest } : {}), ...labelsOf(runOf(entries, wid).run) };
   if (!/^[^/\\\0]+$/.test(wid) || wid === "." || wid === ".." || !existsSync(journalPath(home, wid))) return { state: "absent", wid };
-  const wf = workflowSnapshot(home, wid), journal = readJournalSnapshot(journalPath(home, wid)) as Entry[];
+  // The snapshot and the journal the R7 fold reads must be the same bytes (a writer-wait appended between the two reads
+  // would give a reason without its writerWait): read again until the journal did not move around the snapshot.
+  let journal = readJournalSnapshot(journalPath(home, wid)) as Entry[], wf = workflowSnapshot(home, wid);
+  for (let i = 0, again = readJournalSnapshot(journalPath(home, wid)) as Entry[]; again !== journal && i < 5; i++, again = readJournalSnapshot(journalPath(home, wid)) as Entry[]) {
+    journal = again; wf = workflowSnapshot(home, wid);
+  }
   const { created, run } = runOf(entries, wid), id = created ? requestId(String(created.rid)) : undefined;
   const admitted = id ? run : undefined;
   const lstate = leaseState(home), slots = slotsView(home, now), leases = leaseCalls(lstate, now);
