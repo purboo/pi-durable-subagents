@@ -930,6 +930,16 @@ test("P9 P15 AC4 a once call whose tool was cut off seals unknown, raises one un
   assert.equal(items().length, 1);
   assert.ok(!f.journal.entries().some(e => e.type === JT.attentionResolved));
   assertSealed(f.journal, ticket.callId, "unknown");
+  // A follow-up on the unknown call continues the same session as its next generation: the model sees the cut-off
+  // tool call and dsa does not re-run the tool.
+  const next: CallTicket = { ...ticket, gen: 2, callId: `${f.wid}@1/a@2`, continueFrom: ticket.callId, opening: { rid: "check", kind: "follow-up", message: script([{ text: "checked" }]) } };
+  const followed = await f.executor.run(next);
+  assert.equal(followed.status, "ok"); assert.equal(followed.output, "checked");
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 2), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  const bash = rows.findIndex(e => e.message?.role === "assistant" && JSON.stringify(e.message.content).includes(marker));
+  const opening = rows.findIndex(e => e.type === "custom_message" && JSON.stringify(e.content).includes("checked"));
+  assert.ok(bash >= 0 && opening > bash, "the follow-up message follows the cut-off call in the same session");
+  assert.equal(readFileSync(marker, "utf8"), "ran\n");
 });
 
 test("P15 AC4 recovery raises the unknown item for a seal committed before its attention", { timeout: 10000 }, async t => {
