@@ -254,6 +254,9 @@ test('hold --slots: blockers count granted tickets and never overtake an earlier
   // An exclusive request still waits for any earlier ticket; a shared one ignores slots.
   assert.deepEqual(blockers(t(4, 'exclusive', false), [t(1, 'counted', true, 4)]).map(x => x.seq), [1]);
   assert.deepEqual(blockers(t(4, 'shared', false), [t(1, 'counted', true, 1), c(2, 1)]), []);
+  // A granted counted ticket (e.g. by --no-wait under the lock) is never blocked again by later grants: a shared one, or
+  // a counted one with a larger N.
+  assert.deepEqual(blockers(t(1, 'counted', true, 1), [t(1, 'counted', true, 1), t(2, 'shared', true), t(3, 'counted', true, 5)]), []);
 });
 
 test('hold --slots 2: two run together, the third waits until one exits; leases show k/N', async t => {
