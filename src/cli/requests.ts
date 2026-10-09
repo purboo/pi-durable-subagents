@@ -110,7 +110,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
     calls, ...(questions.length ? { questions } : {}), ...(attention.length ? { attention } : {}), ...(fence ? { lastFence: fence } : {}) };
 }
 /** R3, best effort: why the latest fence that interrupted work happened. Every execution ends with a fence; one interrupted
- *  work only when the execution neither settled (its turn ended) nor hibernated (it waits for an answer) before it, and
+ *  work only when the execution neither settled (its turn ended) before it nor hibernated (it waits for an answer), and
  *  was not sealed on purpose: a seal ends an execution on purpose unless its outcome is `unknown` (a `once` call cut off
  *  in a tool) or the execution was recorded as lost (the loss bound sealed it), which are interruptions themselves.
  *  A seal for an execution that never ran (a launch failure) or that the call's stop, timeout or budget ended is on
@@ -122,7 +122,10 @@ export function lastFence(journal: readonly Entry[], orch: readonly Entry[]): De
   const fencedAt = new Map(journal.filter(e => e.type === JT.fenced).map(e => [String(e.exec), Number(e.seq)]));
   const ended = new Set(journal.filter(e => {
     const exec = String(e.exec);
-    if (e.type === "settled" || e.type === "hibernated") return Number(e.seq) < (fencedAt.get(exec) ?? Infinity);
+    // Recovery records `hibernated` after the fence for an execution cut off while only its question's ask ran (P28):
+    // it was waiting, not working, so that is no interruption either.
+    if (e.type === "hibernated") return true;
+    if (e.type === "settled") return Number(e.seq) < (fencedAt.get(exec) ?? Infinity);
     return e.type === JT.sealed && (e.result as { status?: string } | undefined)?.status !== "unknown" && !lost.has(exec);
   }).map(e => String(e.exec)));
   const fence = journal.findLast(e => e.type === JT.fenced && !ended.has(String(e.exec)));
@@ -225,7 +228,8 @@ async function refusable(args: string[], ctx: Context, run: (args: string[], ctx
     const recorded = !seen.submitted && seen.id && seen.digest && REQUEST_ID.test(seen.id) ? await findRequest(ctx.home, requestRid(seen.id)).catch(() => undefined) : undefined;
     if (seen.id && (seen.submitted || recorded && specDigest(recorded.request) === seen.digest)) return pending(ctx, seen.id, json, `submitted, then: ${reason}`);
     if (!json) throw error;
-    ctx.write(JSON.stringify({ request: seen.id ?? null, applied: false, reason, ...(seen.digest ? { spec_digest: seen.digest } : {}) }));
+    const at = args.indexOf("--request"), id = seen.id ?? (at >= 0 && at + 1 < args.length ? args[at + 1] : undefined);
+    ctx.write(JSON.stringify({ request: id ?? null, applied: false, reason, ...(seen.digest ? { spec_digest: seen.digest } : {}) }));
     return EXIT.rejected;
   }
 }
@@ -253,9 +257,10 @@ async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<num
   const normalized = request({ ...spec, action: "run", ...(typeof spec.cwd === "string" && spec.cwd ? { cwd: dir } : {}) }, dir);
   const body = normalized.body as RunBody;
   seen.digest = specDigest({ kind: "run", body });
-  // A retry of a recorded submission gets its first outcome: the agents it named may have changed since.
+  // An id already recorded is decided by that record: the same content gets its first outcome (the agents it named may
+  // have changed since), other content is a request-conflict. Only a new id is checked here.
   const prior = (await findRequest(ctx.home, requestRid(id)))?.request;
-  if (!prior || specDigest(prior) !== seen.digest) checkAgents(body, () => discoverAgents(dir, { home: ctx.env.HOME || undefined, agentDir: ctx.env.PI_CODING_AGENT_DIR || undefined }).agents.map(a => a.name));
+  if (!prior) checkAgents(body, () => discoverAgents(dir, { home: ctx.env.HOME || undefined, agentDir: ctx.env.PI_CODING_AGENT_DIR || undefined }).agents.map(a => a.name));
   const done = await submitAndWait(ctx, seen, id, "run", body, undefined, wait, json);
   if ("code" in done) return done.code;
   if (done.outcome.type === "rejected") {

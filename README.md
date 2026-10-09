@@ -288,7 +288,7 @@ session and is rejected.
 | 0 | decided and applied (a retry gets the same answer) | run: `{request, wid, created, spec_digest}`; send/stop: `{request, applied, generation?, call?, spec_digest}` |
 | 1 | decided and rejected (`reason`), or refused before submission (usage error, invalid spec, unknown agent: this invocation submitted nothing) | `{request, applied: false, reason, spec_digest?}` (`spec_digest` once the content could be hashed) |
 | 3 | `request-conflict`: the id already names other content; nothing was sent | `{request, error, wid?, spec_digest, state}` (the original's digest and state) |
-| 75 | not decided yet: submitted but undecided in `--wait-ms` (default 60 s), submitted and then a later step failed (`reason` says which), or a lock was busy (`reason: "busy"`); a retry of a recorded submission is never refused again (its agents are not rechecked); retry with the same id | `{request, pending: true, reason?}` |
+| 75 | not decided yet: submitted but undecided in `--wait-ms` (default 60 s), submitted and then a later step failed (`reason` says which), or a lock was busy (`reason: "busy"`); an id already recorded is never refused again (the same content gets its first outcome, its agents are not rechecked; other content is a conflict); retry with the same id | `{request, pending: true, reason?}` |
 
 `created` is false when the id had already been decided before the command
 ran. A conflicting id stays conflicting forever, also after `prune`: the
@@ -312,8 +312,9 @@ full text, `qid`, `rev` and the `to` address to answer), `sealed` (finished:
 only `endedAt`), with `wid`, `request` and
 `spec_digest`. Live calls also show what they wait for (slot, writer lock,
 lease, exhausted provider). `lastFence: {at, exec, reason}` appears only
-when an execution was cut off: it had neither ended its turn nor hibernated on
-a question when it was fenced, and was not ended on purpose (stop, timeout,
+when an execution was cut off: it had not ended its turn when it was fenced,
+did not hibernate on a question (also when recovery finds it cut off while only
+its question's `ask` ran), and was not ended on purpose (stop, timeout,
 budget). Every execution ends with a fence, so an ordinary end is not
 reported; a `once` call sealed `unknown` or a call sealed after repeated losses
 is. The reason is a best-effort reading of the journals: `restart-force` when a forced restart listed the execution,

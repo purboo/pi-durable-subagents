@@ -202,8 +202,14 @@ test('R2: a retry of a recorded run, or a failure after submission, is pending (
   assert.equal(code, 75, lines.join('\n'));
   const reply = JSON.parse(lines.join(''));
   assert.equal(reply.pending, true); assert.match(reply.reason, /^submitted, then: .*EISDIR/);
-  // A text-mode command whose message happens to be "--json" stays text.
   await rm(orchLedger(f.home), { recursive: true, force: true });
+  // Other content under a recorded id is a conflict (3) even when its agent does not exist.
+  const other = await f.cli(['run', '--request', 'R', '--spec', await f.spec('o.json', { agent: 'nobody', task: 't' }), '--json']);
+  assert.equal(other.code, 3, other.out); assert.equal(JSON.parse(other.out).error, 'request-conflict');
+  // A flag error still names the request.
+  const bogus = await f.cli(['run', '--request', 'X', '--spec', path, '--bogus', '--json']);
+  assert.equal(bogus.code, 1); assert.equal(JSON.parse(bogus.out).request, 'X');
+  // A text-mode command whose message happens to be "--json" stays text.
   const text = await f.cli(['send', '--request', 'T', '--to', 'w1/a', '--kind', 'steer', '--message', '--json']).catch(error => ({ code: 1, out: String(error) }));
   assert.ok(!text.out.startsWith('{'), text.out);
 });
@@ -219,8 +225,10 @@ test('R3: an execution that settled, hibernated or was sealed ended normally: it
   const forced = [...orch, e(4, 'restart', { force: true, live: ['x1'] })];
   assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, JT.sealed, { exec: 'x1', result: { status: 'unknown' } })], forced)?.reason, 'restart-force');
   assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, 'loss', { exec: 'x1' }), e(4, JT.sealed, { exec: 'x1', result: { status: 'failed' } })], orch)?.exec, 'x1');
-  // A settled or hibernated mark written after the fence does not make the cut-off an ordinary end.
-  assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, 'hibernated', { exec: 'x1' })], orch)?.exec, 'x1');
+  // A settled mark written after the fence does not make the cut-off an ordinary end; a recovery hibernation (P28: only
+  // the question's ask was running) does.
+  assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, 'settled', { exec: 'x1' })], orch)?.exec, 'x1');
+  assert.equal(lastFence([e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, 'hibernated', { exec: 'x1' })], forced), undefined);
   // Generation 1 was cut off; generation 2 then ended normally: the interruption of x1 is still the latest one.
   const journal = [e(1, JT.exec, { exec: 'x1' }), e(2, JT.fenced, { exec: 'x1' }), e(3, JT.exec, { exec: 'x2' }), e(4, 'settled', { exec: 'x2' }), e(5, JT.fenced, { exec: 'x2' }), e(6, JT.sealed, { exec: 'x2' })];
   assert.deepEqual(lastFence(journal, orch), { at: 20, exec: 'x1', reason: 'process-died' });

@@ -34,8 +34,8 @@ const urlLiterals = node => {
 };
 function references(file) {
   const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true), found = [];
-  const typeOnly = clause => clause.isTypeOnly || (!clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings)
-    && clause.namedBindings.elements.length > 0 && clause.namedBindings.elements.every(e => e.isTypeOnly));
+  // Only `import type …` is erased: under verbatimModuleSyntax `import { type X } from "m"` still emits `import {} from "m"`.
+  const typeOnly = clause => clause.isTypeOnly;
   const visitNode = node => {
     if (ts.isImportDeclaration(node) && !(node.importClause && typeOnly(node.importClause))) found.push(node.moduleSpecifier.text);
     else if (ts.isExportDeclaration(node) && node.moduleSpecifier && !node.isTypeOnly) found.push(node.moduleSpecifier.text);
