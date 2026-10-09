@@ -167,7 +167,7 @@ test('R7 tracker: appear, change, clear, seal while waiting, unchanged detail â†
   const A = 'W@1/a@1', B = 'W@1/b@1', tracker = new R7Tracker();
   const slot: Wait = { reason: 'slot', detail: 'waiting for a slot: p 1/1', since: 10 };
   let drafts = tracker.diff(100, new Map([[A, slot]]), metas);
-  assert.deepEqual(drafts, [{ id: `${A}:waiting:slot:100`, ts: 10, type: 'waiting', wid: 'W', request: 'run-1', key: 'a', gen: 1, call: A, labels: { node: 'n' }, reason: 'slot', detail: slot.detail, since: 10 }]);
+  assert.deepEqual(drafts, [{ id: `${A}:waiting:slot:100`, ts: 100, type: 'waiting', wid: 'W', request: 'run-1', key: 'a', gen: 1, call: A, labels: { node: 'n' }, reason: 'slot', detail: slot.detail, since: 10 }]);
   assert.deepEqual(tracker.diff(200, new Map([[A, { ...slot, detail: 'waiting for a slot: p 2/1' }]]), metas), [], 'detail alone changes nothing');
   drafts = tracker.diff(300, new Map([[A, { reason: 'writer-lock', detail: 'w', since: 250 }], [B, undefined]]), metas);
   assert.deepEqual(drafts.map(d => [d.type, d.call, 'reason' in d ? d.reason : undefined]), [['waiting', A, 'writer-lock']], 'a change emits the new waiting only');
