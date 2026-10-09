@@ -1,5 +1,5 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { isLive, liveCalls, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { isLive, labelsText, liveCalls, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import type { CallStatus } from "../types.ts";
 import type { sessionFacts } from "./session.ts";
 import { oneLine } from "./frame.ts";
@@ -242,7 +242,10 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     // Stable order (UI §2): active rows keep proposal (snapshot) order; done rows by immutable end time.
     const done = doneOrder(w.calls), active = liveCalls(w), folded = !isOpen(w, state);
     const progress = progressOf(w); // v12 §4: done/planned, `n+` while a script workflow keeps proposing
-    rows.push({ id: w.wid, kind: "workflow", workflow: w, dim, text: `${folded ? "▸" : "▾"} ${w.name ?? w.wid} · ${progress.done}/${progress.total}${progress.plus ? "+" : ""} · ${duration((w.endedAt ?? now) - (w.startedAt ?? now))}` });
+    const head = `${folded ? "▸" : "▾"} ${w.name ?? w.wid} · ${progress.done}/${progress.total}${progress.plus ? "+" : ""} · ${duration((w.endedAt ?? now) - (w.startedAt ?? now))}`;
+    // The run's labels follow when the row has room for a useful part of them (clipped to at most 60 characters).
+    const room = Math.min(60, width - visibleWidth(head) - 3);
+    rows.push({ id: w.wid, kind: "workflow", workflow: w, dim, text: w.labels && room >= 12 ? `${head} · ${labelsText(w.labels, room)}` : head });
     if (folded) continue;
     if (dim) { // a finished workflow lists its agents directly (no nested "done" node)
       done.forEach((c, i) => callRow(w, c, i === done.length - 1 ? "  └ " : "  ├ ", undefined, dim));

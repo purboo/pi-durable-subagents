@@ -12,6 +12,7 @@ import type { Exhaustion } from "./providers.ts";
 import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
 import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
+import { labelsOf } from "../events/derive.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
@@ -71,6 +72,8 @@ export interface WorkflowSnapshot {
   planned?: number;
   /** P31: every call ever charged to this workflow, across revisions (always set by snapshotFromEntries). */
   usage?: Usage;
+  /** The run's labels (from its run request in the orchestrator ledger), when it has any. */
+  labels?: Record<string, string>;
 }
 
 /** A workflow has live work: it runs, or follow-ups opened on it after it finished have not ended yet. */
@@ -332,6 +335,10 @@ export interface LedgerIndex {
   created: Map<unknown, Entry>;
   /** wids archived by `prune`. */
   pruned: Set<string>;
+  /** The labels of each workflow's run request (only workflows that have any). */
+  labels: Map<string, Record<string, string>>;
+  /** Run requests with labels, by rid, until their workflow is created. */
+  runLabels: Map<string, Record<string, string>>;
   /** Last drain/undrain without scope, per `wid` and per `origin`. */
   global?: number; byWid: Map<unknown, number>; byOrigin: Map<unknown, number>;
   lastDrain?: number;
@@ -341,13 +348,20 @@ const ledgerIndexes = new WeakMap<readonly Entry[], Folded>();
 export function ledgerIndex(ledger: readonly Entry[]): LedgerIndex {
   let ix = ledgerIndexes.get(ledger);
   if (!ix || ix.length > ledger.length || (ix.length && ledger[ix.length - 1] !== ix.last)) {
-    ix = { length: 0, created: new Map(), pruned: new Set(), byWid: new Map(), byOrigin: new Map() };
+    ix = { length: 0, created: new Map(), pruned: new Set(), labels: new Map(), runLabels: new Map(), byWid: new Map(), byOrigin: new Map() };
     ledgerIndexes.set(ledger, ix);
   }
   for (let i = ix.length; i < ledger.length; i++) {
     const e = ledger[i]!;
-    if (e.type === JT.created) { if (!ix.created.has(e.wid)) ix.created.set(e.wid, e); }
-    else if (e.type === "pruned") ix.pruned.add(String(e.wid));
+    if (e.type === JT.created) {
+      if (!ix.created.has(e.wid)) ix.created.set(e.wid, e);
+      const labels = ix.runLabels.get(String(e.rid));
+      if (labels) { if (!ix.labels.has(String(e.wid))) ix.labels.set(String(e.wid), labels); ix.runLabels.delete(String(e.rid)); }
+    } else if (e.type === "request") {
+      const r = e.request as { rid?: unknown; kind?: unknown; body?: unknown } | undefined, labels = r?.kind === "run" ? labelsOf(r.body) : undefined;
+      if (labels && typeof r?.rid === "string") ix.runLabels.set(r.rid, labels);
+    } else if (e.type === JT.rejected) ix.runLabels.delete(String(e.rid));
+    else if (e.type === "pruned") { ix.pruned.add(String(e.wid)); ix.labels.delete(String(e.wid)); }
     else if (e.type === "drain" || e.type === "undrain") {
       if (e.type === "drain") ix.lastDrain = i;
       if (e.wid === undefined && e.origin === undefined) ix.global = i;
@@ -378,18 +392,28 @@ export function holdOf(ledger: readonly Entry[], wid: string, origin?: string): 
   return !created || created.seq < last.seq ? last : undefined;
 }
 /** Drain: the workflows a drain (stop-all, a quit pi) holds until resume, and since when. */
-export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean } {
+export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean; labels: (wid: string) => Record<string, string> | undefined } {
   const ledger = readJournalSnapshot(orchLedger(home)), ix = ledgerIndex(ledger);
   const origin = (wid: string) => ix.created.get(wid)?.origin as string | undefined;
   const hold = (wid: string) => holdOf(ledger, wid, origin(wid));
   const since = ix.lastDrain !== undefined ? ledger[ix.lastDrain]!.ts : undefined;
-  return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined };
+  return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined, labels: wid => ix.labels.get(wid) };
+}
+/** The workflow with its run's labels, when it has any. */
+function labelled<T extends WorkflowSnapshot>(wf: T, labels: Record<string, string> | undefined): T {
+  return labels ? { ...wf, labels } : wf;
+}
+/** Labels clipped for one status line: "[k=v k2=v2]", at most `width` characters (empty without labels). */
+export function labelsText(labels: Record<string, string> | undefined, width = 60): string {
+  if (!labels) return "";
+  const text = Object.entries(labels).map(([k, v]) => `${k}=${v}`).join(" ").replace(/\s+/g, " ");
+  return text ? `[${clip(text, Math.max(1, width - 3))}]` : "";
 }
 
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
 export function allWorkflows(home: string): WorkflowSnapshot[] {
-  const { held } = heldWorkflows(home);
-  return workflowIds(home).sort().reverse().map(wid => { const wf = workflowSnapshot(home, wid); return isLive(wf) && held(wid) ? { ...wf, paused: true } : wf; });
+  const { held, labels } = heldWorkflows(home);
+  return workflowIds(home).sort().reverse().map(wid => { const wf = labelled(workflowSnapshot(home, wid), labels(wid)); return isLive(wf) && held(wid) ? { ...wf, paused: true } : wf; });
 }
 
 /** P10/P11: Per-workflow script console log written by the orchestrator (bounded, human-readable). */
@@ -433,6 +457,8 @@ export interface StatusWorkflow {
   paused?: boolean;
   /** Follow-ups still open on this finished workflow. */
   followUps?: number;
+  /** The run's labels. */
+  labels?: Record<string, string>;
 }
 export interface StatusView {
   workflows: StatusWorkflow[];
@@ -467,7 +493,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
         ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
-    ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}),
+    ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}), ...(wf.labels ? { labels: wf.labels } : {}),
   };
 }
 
@@ -482,9 +508,9 @@ function origins(home: string): Map<string, string | undefined> {
 /** Every workflow with its origin and hold, own session first, then newest first. */
 function snapshots(home: string, origin?: string): { all: WorkflowSnapshot[]; since?: number } {
   const own = (w: WorkflowSnapshot) => Number(!!origin && w.origin === origin);
-  const { since, held } = heldWorkflows(home);
+  const { since, held, labels } = heldWorkflows(home);
   const all = [...origins(home)].sort(([a], [b]) => a < b ? 1 : a > b ? -1 : 0).map(([wid, origin]) => {
-    const wf = workflowSnapshot(home, wid), withOrigin = wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
+    const wf = labelled(workflowSnapshot(home, wid), labels(wid)), withOrigin = wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
     return isLive(withOrigin) && held(wid) ? { ...withOrigin, paused: true } : withOrigin;
   }).sort((a, b) => own(b) - own(a));
   return { all, ...(since !== undefined ? { since } : {}) };
@@ -529,6 +555,8 @@ export interface BriefCall {
 }
 export interface BriefWorkflow {
   wid: string; name?: string; status: WorkflowSnapshot["status"]; paused?: true;
+  /** The run's labels on one clipped line, e.g. "[node=A3 attempt=2]" (the full labels: status wid=<wid>, describe). */
+  labels?: string;
   /** Follow-ups still open on this finished workflow (its status stays final). */
   followUps?: number;
   /** "done/total" of the current revision ("+" while a script may still add calls). */
@@ -638,7 +666,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
   const mine = (w: WorkflowSnapshot) => !origin || w.origin === origin;
   const line = (w: WorkflowSnapshot) => {
     const p = progressOf(w), notOk = latestCalls(w).filter(c => c.result && !c.result.ok).length;
-    return [w.wid, w.name, `${w.paused ? "paused" : w.followUps ? `${w.status}, follow-up running` : w.status}`, `${p.done}/${p.total}${p.plus ? "+" : ""} done`, notOk ? `${notOk} not ok` : "",
+    return [w.wid, labelsText(w.labels), w.name, `${w.paused ? "paused" : w.followUps ? `${w.status}, follow-up running` : w.status}`, `${p.done}/${p.total}${p.plus ? "+" : ""} done`, notOk ? `${notOk} not ok` : "",
       w.endedAt !== undefined ? `ended ${age(now - w.endedAt)} ago` : w.startedAt !== undefined ? `started ${age(now - w.startedAt)} ago` : ""].filter(Boolean).join(" · ");
   };
   const brief = (w: WorkflowSnapshot): BriefWorkflow => {
@@ -658,7 +686,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
       ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300) }));
     const alerts = open.filter(a => a.kind !== "question").map(a => `${a.kind}${a.call ? ` ${w.wid}/${callKey(a.call)}` : ""}: ${clip(a.text, 200)}`);
-    return { wid: w.wid, ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.paused ? { paused: true as const } : {}), ...(w.followUps ? { followUps: w.followUps } : {}),
+    return { wid: w.wid, ...(w.labels ? { labels: labelsText(w.labels) } : {}), ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.paused ? { paused: true as const } : {}), ...(w.followUps ? { followUps: w.followUps } : {}),
       progress: `${p.done}/${p.total}${p.plus ? "+" : ""}`, tokens: tokens(w.usage), calls,
       ...(asking.length ? { asking } : {}), ...(alerts.length ? { alerts } : {}) };
   };
@@ -688,17 +716,55 @@ export function widOfRid(ledger: readonly Entry[], value: string): string {
   return created ? `${String(created.wid)}${value.slice(head.length)}` : value;
 }
 
+/** A call of a workflow queued behind a git worktree's writer lock: "<wid>/<key>", the holder "<wid>/<key>" and the
+ *  worktree root. */
+export interface WriterWaitNote { call: string; heldBy: string; cwd: string }
+export const WRITER_WAIT_HINT = "a call waits for its worktree's writer lock (one call that may edit/write runs per worktree); writer:false (when it does not write there) or isolation:'worktree' opts out";
+/** The unsealed calls of `wid` that wait for a writer lock now (a read of its journal; nothing waits for one). */
+export function writerWaits(home: string, wid: string): WriterWaitNote[] {
+  if (!existsSync(journalPath(home, wid))) return [];
+  return latestCalls(workflowSnapshot(home, wid)).filter(c => c.writerWait && c.phase !== "sealed")
+    .map(c => ({ call: `${wid}/${c.key}`, heldBy: c.writerWait!.holder, cwd: c.writerWait!.root }));
+}
+/** One line per waiting call: "<wid>/<key> held by <wid>/<key> (<cwd>)". */
+export const writerWaitLine = (w: WriterWaitNote) => `${w.call} held by ${w.heldBy} (${w.cwd})`;
+
 export type StatusCallDetail = Omit<CallSnapshot, "sends"> & { wid: string; sends?: CallSend[] };
 export type StatusCompactDetail = Omit<StatusWorkflow, "calls"> & { cwd?: string; scriptLog?: string; result?: unknown;
   calls: (StatusCall & { agent: string; output?: string })[]; hint: string };
 const OUTPUT = 600;
+/** `status <wid>` line selection of each call's output: `grep` keeps the lines matching a JS regular expression
+ *  (case-sensitive), then `tail` keeps the last N lines. */
+export interface OutputSelect { tail?: number; grep?: string }
+/** Most characters of one call's selected lines (the last ones are kept). */
+export const SELECT_MAX = 4000;
+/** A valid selection (throws a usage error otherwise); undefined when neither is given. */
+export function outputSelect(tail: unknown, grep: unknown): (OutputSelect & { regex?: RegExp }) | undefined {
+  if (tail === undefined && grep === undefined) return undefined;
+  if (tail !== undefined && (!Number.isSafeInteger(tail) || Number(tail) < 1)) throw new Error("tail must be a positive integer (lines)");
+  if (grep !== undefined && (typeof grep !== "string" || !grep)) throw new Error("grep must be a non-empty regular expression");
+  let regex: RegExp | undefined;
+  if (typeof grep === "string") try { regex = new RegExp(grep); } catch (error) { throw new Error(`grep is not a valid regular expression: ${(error as Error).message}`); }
+  return { ...(tail !== undefined ? { tail: Number(tail) } : {}), ...(typeof grep === "string" ? { grep } : {}), ...(regex ? { regex } : {}) };
+}
+/** The selected lines of `output`, unclipped up to SELECT_MAX characters (then its last SELECT_MAX, marked). */
+export function selectLines(output: string, select: OutputSelect & { regex?: RegExp }): string {
+  const regex = select.regex ?? (select.grep !== undefined ? new RegExp(select.grep) : undefined);
+  let lines = output.replace(/\n+$/, "").split("\n");
+  if (regex) lines = lines.filter(line => regex.test(line));
+  if (select.tail !== undefined) lines = lines.slice(-select.tail);
+  const text = lines.join("\n");
+  return text.length > SELECT_MAX ? `[${text.length - SELECT_MAX} earlier chars clipped]...${text.slice(-SELECT_MAX)}` : text;
+}
 /** Tool status with a wid: one workflow with each call's output clipped (the full detail repeated every output twice and
- *  reached ~100K characters); `key` gives one call in full. */
-export function statusCompactDetail(home: string, wid: string): StatusCompactDetail {
+ *  reached ~100K characters); `key` gives one call in full. With `select`, each output is its selected lines instead. */
+export function statusCompactDetail(home: string, wid: string, select?: OutputSelect & { regex?: RegExp }): StatusCompactDetail {
   const detail = statusDetail(home, wid), compact = compactWorkflow(detail);
   const byId = new Map(detail.calls.map(c => [c.callId, c]));
   const calls = compact.calls.map(({ lastLine: _l, ...c }) => {
-    const full = byId.get(c.callId)!, output = full.result?.output?.trim();
+    const full = byId.get(c.callId)!;
+    if (select) return { ...c, agent: full.agent, ...(full.result ? { output: selectLines(full.result.output ?? "", select) } : {}) };
+    const output = full.result?.output?.trim();
     return { ...c, agent: full.agent, ...(output ? { output: output.length > OUTPUT ? `${output.slice(0, OUTPUT)}… [${output.length - OUTPUT} more chars: status wid key=${c.key}]` : output } : {}) };
   });
   let result: unknown;
@@ -721,7 +787,7 @@ export function statusCallDetail(home: string, wid: string, key: string): Status
 export function statusDetail(home: string, wid: string): StatusDetail {
   const origin = origins(home);
   if (!origin.has(wid)) throw new Error(prunedIds(home).has(wid) ? `Workflow ${wid} was pruned` : `Unknown workflow: ${wid}`);
-  const wf = workflowSnapshot(home, wid), log = scriptLogPath(home, wid);
+  const wf = labelled(workflowSnapshot(home, wid), heldWorkflows(home).labels(wid)), log = scriptLogPath(home, wid);
   return { ...wf, ...(wf.origin === undefined && origin.get(wid) !== undefined ? { origin: origin.get(wid) } : {}), ...(existsSync(log) ? { scriptLog: log } : {}) };
 }
 
