@@ -77,11 +77,17 @@ try {
   const refused = cli("run", "--request", "pack-bad", "--spec", (writeFileSync(specFile, JSON.stringify({ agent: "nobody", task: "t" })), specFile), "--json");
   if (refused.code !== 1 || JSON.parse(refused.out).applied !== false) throw new Error(`packaged CLI refusal: exit ${refused.code} ${refused.out}`);
   console.log("packaged CLI: run, describe, follow-up and refusal ok");
+  // Wait for the orchestrator to end (it may still be writing the follow-up generation) before the directory goes.
+  const ended = new Promise(r => orch.exitCode !== null || orch.signalCode !== null ? r() : orch.once("exit", () => r()));
   orch.kill("SIGTERM");
+  await Promise.race([ended, new Promise(r => setTimeout(r, 15_000))]);
   const outputs = Array.isArray(done.result) ? done.result.map(r => r.output) : [];
   if (done.status !== "done" || outputs.join(",") !== "alpha,beta") throw new Error(`unexpected result: ${JSON.stringify(done)}`);
   console.log(`packaged chain: ${done.status} ${JSON.stringify(outputs)}`);
   console.log("pack-smoke ok");
 } finally {
-  if (keep) console.log(`kept: ${root}`); else rmSync(root, { recursive: true, force: true });
+  // Cleanup must not turn a passing check into a failure: a late writer (macOS ENOTEMPTY) gets retries, then a warning.
+  if (keep) console.log(`kept: ${root}`);
+  else try { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
+  catch (error) { console.warn(`pack-smoke: could not remove ${root}: ${error.message}`); }
 }

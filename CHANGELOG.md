@@ -8,6 +8,11 @@
   waiters never see it. Before, `--max-wait 0` queued a ticket, checked, and
   removed it. A no-wait request also no longer ends processes left by a
   killed holder (a queued waiter still does); it is refused while they remain.
+- Release check: `pack:smoke` waits for its orchestrator to exit before
+  removing its temporary directory, and a failed removal is a warning. The
+  1.0.26 release stopped at this step on macOS (`ENOTEMPTY` after
+  `pack-smoke ok`), so 1.0.26 was never published; 1.0.27 includes its
+  changes.
 
 ## 1.0.26
 
