@@ -13,7 +13,9 @@
 //                      next try or while another call probes it; a running call unless it is the probe itself).
 //   writer-lock        a queued call's journal `writer-wait` (cleared by `writer-acquired`).
 //   lease              a running call's waiting lease ticket (`pi-durable-subagents hold`, platform/lease.ts).
-//   slot               a queued call: `exec` appended, no `selected` yet (provider slot or memory headroom).
+//   slot               a queued call: `exec` appended, no `selected` yet (provider slot or memory headroom) — at once
+//                      when every candidate provider is full, else after SLOT_GRACE_MS: every launch passes through this
+//                      state while it prepares (a worktree, a fork) and is admitted, which is no wait.
 //   silent             an open `stall:`/`noprogress:` attention item (kind stall; its text names the running command).
 // An asking call (an open question, hibernated or not) is not waiting, a sealed one never.
 import { JT, type AttentionItem, type Entry, type JournalHandle, type Request, type RunBody } from "../types.ts";
@@ -26,6 +28,8 @@ import { parseModel, resolveModel } from "../compat/model.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { requestId } from "../requests.ts";
 
+/** A queued call whose providers have a free slot (or are unknown) counts as waiting for a slot only after this long. */
+export const SLOT_GRACE_MS = 3000;
 /** Why one call waits: the cause, the status line that explains it, and when that cause started (ms). */
 export interface Wait { reason: WaitReason; detail: string; since: number }
 
@@ -45,8 +49,8 @@ export interface WaitInput {
   lease?: { detail: string; since: number };
   /** Open attention items of the call (question, stall, unknown kinds). */
   attention?: readonly { id: string; kind: string; text: string; since: number }[];
-  /** The slot lines of the providers a queued call waits for ("probe 1/1"). */
-  slot?: string;
+  /** The slot lines of the providers a queued call waits for ("probe 1/1"), and whether all of them are full. */
+  slot?: string; full?: boolean;
 }
 
 /** R7: why the call does not move, or undefined when it moves (or is asking or sealed). Pure. */
@@ -58,7 +62,7 @@ export function whyWaiting(c: WaitInput, now: number): Wait | undefined {
     "provider-exhausted": () => exhaustedWait(c, now),
     "writer-lock": () => queued && c.writerWait ? { detail: `waits for the writer lock of ${c.writerWait.root}: ${c.writerWait.holder} holds it or is ahead in the queue`, since: c.writerWait.since } : undefined,
     lease: () => exec?.selected && c.lease ? { ...c.lease } : undefined,
-    slot: () => queued ? { detail: `waiting for a slot${c.slot ? `: ${c.slot}` : ""}`, since: exec!.since } : undefined,
+    slot: () => queued && (c.full || now - exec!.since >= SLOT_GRACE_MS) ? { detail: `waiting for a slot${c.slot ? `: ${c.slot}` : ""}`, since: exec!.since } : undefined,
     silent: () => { const a = open.find(a => a.kind === "stall"); return a && { detail: a.text, since: a.since }; },
   };
   for (const reason of WAIT_REASONS) { const found = checks[reason](); if (found) return { reason, ...found }; }
@@ -191,9 +195,12 @@ export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: 
     if (raw && Object.hasOwn(pools, raw)) { try { providers = [...new Set(resolveModel(raw, pools).map(m => m.provider).filter((p): p is string => !!p))]; } catch { /* an invalid pool: unknown */ } }
     else { const p = providerOf(c.model ?? raw); if (p) providers = [p]; }
   }
+  let full = live && !c.selected && providers.length > 0;
   const slot = live && !c.selected && providers.length ? providers.map(p => {
     let held = 0; for (const h of env.ledger.held.values()) if (h.pool === p) held++;
-    return slotLine(p, held, settings.providers?.[p]?.slots);
+    const limit = settings.providers?.[p]?.slots;
+    if (limit === undefined || held < limit) full = false;
+    return slotLine(p, held, limit);
   }).join(", ") : undefined;
   const lease = live && c.selected ? env.leases?.get(c.call) : undefined;
   return {
@@ -201,7 +208,7 @@ export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: 
     ...(live ? { exec: { id: c.exec!, since: c.queued ?? 0, selected: !!c.selected } } : {}),
     ...(providers.length ? { providers } : {}), exhausted: env.ledger.exhausted,
     ...(c.writer ? { writerWait: c.writer } : {}), ...(lease ? { lease } : {}),
-    ...(attention.length ? { attention } : {}), ...(slot ? { slot } : {}),
+    ...(attention.length ? { attention } : {}), ...(slot ? { slot } : {}), ...(full ? { full } : {}),
   };
 }
 /** The live calls of a folded workflow: every unsealed call of a running one, else its open follow-up generations. */

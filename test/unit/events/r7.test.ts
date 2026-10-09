@@ -10,7 +10,7 @@ import { openJournal } from '../../../src/kernel/journal.ts';
 import { journalPath, orchLedger } from '../../../src/paths.ts';
 import { describe } from '../../../src/cli/requests.ts';
 import { emptyLedger, foldLedger } from '../../../src/orchestrator/ledger.ts';
-import { R7Tracker, foldWaits, r7Collector, startR7, waitsOf, whyWaiting, type R7Collected, type Wait, type WaitInput, type WaitMeta } from '../../../src/events/r7.ts';
+import { R7Tracker, SLOT_GRACE_MS, foldWaits, r7Collector, startR7, waitsOf, whyWaiting, type R7Collected, type Wait, type WaitInput, type WaitMeta } from '../../../src/events/r7.ts';
 import { WAIT_REASONS, type EventDraft } from '../../../src/events/types.ts';
 import type { Exhaustion } from '../../../src/orchestrator/providers.ts';
 import type { Entry } from '../../../src/types.ts';
@@ -24,6 +24,12 @@ test('R7 whyWaiting: each reason from its source; asking, sealed and moving call
   assert.equal(whyWaiting(running, NOW), undefined, 'running');
   assert.deepEqual(whyWaiting({ ...queued, providers: ['probe'], slot: 'probe 1/1' }, NOW), { reason: 'slot', detail: 'waiting for a slot: probe 1/1', since: 500 });
   assert.deepEqual(whyWaiting(queued, NOW), { reason: 'slot', detail: 'waiting for a slot', since: 500 });
+  // A launch passes through the queued state while it prepares and is admitted: a slot wait only once every provider is
+  // full, or after the grace period.
+  const fresh = { exec: { ...queued.exec, since: NOW - SLOT_GRACE_MS + 1 } };
+  assert.equal(whyWaiting({ ...fresh, providers: ['probe'], slot: 'probe 0/1' }, NOW), undefined);
+  assert.equal(whyWaiting({ ...fresh, providers: ['probe'], slot: 'probe 1/1', full: true }, NOW)?.reason, 'slot');
+  assert.equal(whyWaiting({ ...fresh, providers: ['probe'], slot: 'probe 0/1' }, NOW + 1)?.reason, 'slot');
   assert.deepEqual(whyWaiting({ ...queued, writerWait: { root: '/repo', holder: 'w/b', since: 600 } }, NOW),
     { reason: 'writer-lock', detail: 'waits for the writer lock of /repo: w/b holds it or is ahead in the queue', since: 600 });
   assert.deepEqual(whyWaiting({ ...running, lease: { detail: 'waiting for lease machine 3m', since: 700 } }, NOW), { reason: 'lease', detail: 'waiting for lease machine 3m', since: 700 });
