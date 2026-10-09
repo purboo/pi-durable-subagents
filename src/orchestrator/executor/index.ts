@@ -24,6 +24,7 @@ import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts"
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
 import { hibernation, openQuestion } from "./hibernate.ts";
+import { SessionFold, answerKey, digestOpenQuestion } from "./digest.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
@@ -232,13 +233,19 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   // E2: inbox files are deleted once their resolution is durable: a child receipt (after an fsync of the session)
   // or the call's seal. The child never re-applies a resolved request: its receipts are in the session it recovers.
   const collected = new Map<string, Set<string>>();
+  // Per call: what the periodic checks need from its session, folded over appended entries only (digest.ts).
+  const folds = new Map<string, SessionFold>();
+  const digestOf = (call: string, entries: readonly SessionEntry[]) => {
+    let fold = folds.get(call);
+    // Only a running call keeps its fold (it ends with the call); a one-off read (recovery, retirement) folds once.
+    if (!fold) { fold = new SessionFold(call); if (active.has(call)) folds.set(call, fold); }
+    return fold.update(entries);
+  };
+  const forgetCall = (call: string) => { const a = address(call); forgetSession(callSession(home, a.wid, a.key, a.gen)); folds.delete(call); };
   async function collectReceipts(call: string, entries: SessionEntry[]) {
     const done = collected.get(call) ?? new Set<string>(); collected.set(call, done);
     const fresh = new Set<string>();
-    for (const e of entries) {
-      const rid = receiptId(e);
-      if (rid && !done.has(rid) && !/^\.|[/\\\0]/.test(rid) && !(e.customType === CT.rejected && e.data?.reason === "identity-conflict")) fresh.add(rid);
-    }
+    for (const rid of digestOf(call, entries).receipts.keys()) if (!done.has(rid) && !/^\.|[/\\\0]/.test(rid)) fresh.add(rid);
     if (!fresh.size) return;
     const a = address(call), file = await open(callSession(home, a.wid, a.key, a.gen), "r");
     try { await file.sync(); } finally { await file.close(); }
@@ -262,15 +269,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     if (!orch.entries().some(e => e.type === "send-note" && e.rid === rid)) await orch.append("send-note", { rid, model, effect, ...(pool ? { pool } : {}) });
   }
   async function forwardsDelivered(journal: JournalHandle, call: string, entries: SessionEntry[]) {
-    const all = journal.entries();
-    const open = all.filter(e => e.type === "forward" && e.dest === call &&
-      !all.some(r => r.rid2 === e.rid2 && (r.type === "forward-retired" || (r.type === "forward-delivered" && r.call === call))));
+    const retired = entriesOf(journal, "forward-retired"), delivered = entriesOf(journal, "forward-delivered");
+    const open = entriesOf(journal, "forward").filter(e => e.dest === call &&
+      !retired.some(r => r.rid2 === e.rid2) && !delivered.some(r => r.rid2 === e.rid2 && r.call === call));
     if (!open.length) return;
-    const receipts = new Map<string, SessionEntry>();
-    for (const e of entries) {
-      const rid = receiptId(e);
-      if (rid && !receipts.has(rid) && !(e.customType === CT.rejected && e.data?.reason === "identity-conflict")) receipts.set(rid, e);
-    }
+    const receipts = digestOf(call, entries).receipts;
     for (const e of open) {
       const receipt = receipts.get(String(e.rid2)); if (!receipt) continue;
       const reason = receipt.customType === CT.rejected ? receipt.data?.reason : undefined;
@@ -570,18 +573,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     await collectReceipts(t.callId, entries).catch(error => console.error(`durable-subagents: inbox cleanup of ${t.callId} failed: ${String(error)}`));
     await serial(async () => {
       await forwardsDelivered(t.journal, t.callId, entries);
-      for (const e of entries) {
-        if (e.type !== "custom" || e.customType !== CT.question || !e.data) continue;
-        const { qid, rev, question } = e.data;
-        if (typeof qid !== "string" || typeof rev !== "number") continue;
+      const digest = digestOf(t.callId, entries);
+      for (const { qid, rev, question } of digest.questions) {
         const id = `q:${t.callId}:${qid}`;
-        if (!t.journal.entries().some(r => isEntry(r, JT.attention) && r.item.id === id && r.item.rev === rev))
+        if (!entriesOf(t.journal, JT.attention).some(r => isEntry(r, JT.attention) && r.item.id === id && r.item.rev === rev))
           await t.journal.append(JT.attention, { item: { id, rev, kind: "question", text: String(question), wid: t.wid, call: t.callId, qid, session: callSession(home, t.wid, t.key, t.gen) } });
-        const answered = entries.some(r => {
-          const details = r.message?.details ?? r.details;
-          return details?.qid === qid && details?.rev === rev && receiptId(r) !== undefined;
-        });
-        if (answered && !t.journal.entries().some(r => r.type === JT.attentionResolved && r.id === id && r.rev === rev))
+        if (digest.answered.has(answerKey(qid, rev)) && !entriesOf(t.journal, JT.attentionResolved).some(r => r.id === id && r.rev === rev))
           await t.journal.append(JT.attentionResolved, { id, rev, resolution: "answered" });
       }
     });
@@ -826,16 +823,16 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           track: () => track(journal, exec!), fence: async () => { await fence(journal, exec!, { child, park: a }); },
           questions: async entries => {
             await questions(t, entries);
-            const q = openQuestion(entries);
-            const segment = entries.findLastIndex(e => e.type === "custom" && e.customType === CT.exec && e.data?.exec === exec);
-            if (!q || interrupted(a) || segment < 0 || !entries.slice(segment + 1).some(e => e.customType === CT.question && e.data?.qid === q.qid) || journal.entries().some(e => e.type === "answer-bound" && e.call === t.callId && e.qid === q.qid && e.rev === q.rev)) return;
+            const digest = digestOf(t.callId, entries), q = digestOpenQuestion(entries, digest);
+            const segment = digest.execAt.get(exec) ?? -1;
+            if (!q || interrupted(a) || segment < 0 || !((digest.questionAt.get(q.qid) ?? -1) > segment) || entriesOf(journal, "answer-bound").some(e => e.call === t.callId && e.qid === q.qid && e.rev === q.rev)) return;
             await serial(async () => {
-              const attention = journal.entries().find(e => isEntry(e, JT.attention) && e.item.qid === q.qid && e.item.call === t.callId && e.item.rev === q.rev);
+              const attention = entriesOf(journal, JT.attention).find(e => isEntry(e, JT.attention) && e.item.qid === q.qid && e.item.call === t.callId && e.item.rev === q.rev);
               if (attention && Date.now() - attention.ts >= (config.k?.hibernateMs ?? 120000) && !has(journal, JT.fenced, exec!) && hibernation(journal, t.callId)?.exec !== exec) {
                 await journal.append("hibernated", { call: t.callId, exec, qid: q.qid, rev: q.rev }); a.wake();
               }
             });
-          }, recordUsage: values => recordUsage(t, values),
+          }, recordUsage: values => recordUsage(t, values), usage: entries => digestOf(t.callId, entries).usage,
           wrote: path => wrote(t, exec!, cwd, path),
           switched: event => switched(exec!, journal, event), answered: event => answered(t, exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
@@ -902,7 +899,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         finally {
           writerWaits.delete(ticket.callId);
           active.delete(ticket.callId); collected.delete(ticket.callId); for (const e of inUse.keys()) if (callOf(e) === ticket.callId) inUse.delete(e);
-          for (const e of refusals.keys()) if (callOf(e) === ticket.callId) refusals.delete(e); forgetSession(callSession(home, ticket.wid, ticket.key, ticket.gen)); wake();
+          for (const e of refusals.keys()) if (callOf(e) === ticket.callId) refusals.delete(e); forgetCall(ticket.callId); wake();
         }
       });
       // Shutdown rejection is still delivered to callers, without an unhandled rejection during teardown.
@@ -1054,7 +1051,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             await retireForwards(journal, call); await retireAttention(journal, call); await unknownAttention(journal, call);
           }
         });
-        if (!active.has(call)) { const a = address(call); forgetSession(callSession(home, a.wid, a.key, a.gen)); }
+        if (!active.has(call)) forgetCall(call);
       }
       for (const e of journal.entries().filter(e => e.type === "forward" && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2))) await replayForward(e);
       await (await outbox).republishPending();
