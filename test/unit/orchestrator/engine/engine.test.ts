@@ -802,6 +802,13 @@ test('v12 §3: finished attention digests latest calls, report, errors and stopp
   assert.match(current, /^nightly \(w\) stopped: 1 timeout; 1 stopped; 1 skipped/);
   assert.match(current, /a@2: timeout\n  retry timed out/);
   assert.doesNotMatch(current, /DONE: a/);
+  // A follow-up sent before the workflow ended and still going is not "unknown".
+  entries.push(e(11, 'generation', { key: 'a', gen: 3, from: 'w@1/a@2', spec: { agent: 'x' } }));
+  const going = finishedText('w', entries as never);
+  assert.match(going, /^nightly \(w\) stopped: 1 queued; 1 stopped; 1 skipped/);
+  assert.match(going, /\na@3: queued \(a follow-up still going; you are told when it ends\)\n/);
+  assert.doesNotMatch(going, /unknown/);
+  assert.match(finishedText('w', entries as never, 'w@1/a@3'), /^nightly\/a@3 \(follow-up\) queued:/);
 });
 
 test('v12 §3: digest shares the notice fairly, bounds the whole, and keeps output and report tails', async () => {
