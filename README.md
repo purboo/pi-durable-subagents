@@ -397,6 +397,11 @@ queued call launches on the new version. `restart --force` (tool:
 the new version from their sessions, like after a crash, so a tool call that
 was running is repeated or reported as interrupted.
 
+An orchestrator reads requests only after it has recovered its workflows, so
+a `restart` sent to one that just started waits for it (and says so); if no
+orchestrator reaches the request in time, `restart` exits 75 and the request
+stays pending — it is decided later, so do not send another.
+
 To restart only when the machine is quiet, `drain` first (running calls finish
 and nothing new starts in existing workflows), retry `restart` until it is
 accepted, then `resume`. Never kill the orchestrator process: other sessions'
