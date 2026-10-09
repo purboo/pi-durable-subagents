@@ -23,7 +23,7 @@ export const parameters = Type.Object({
   timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number). Omit unless a hard limit is needed; prefer budgets." })),
   key: Type.Optional(Type.String({ description: "A single agent/task run: the call's key. status with wid: that call's full result." })),
   tail: Type.Optional(Type.Integer({ minimum: 1, description: "status with wid: the last N lines of each call's result (unclipped, at most 4000 characters per call)." })),
-  grep: Type.Optional(Type.String({ description: "status with wid: only the lines of each call's result matching this case-sensitive JS regular expression (with tail: grep first, then the last N)." })),
+  grep: Type.Optional(Type.String({ description: "status with wid: only the lines of each call's result matching this case-sensitive JS regular expression, run in-process: avoid nested quantifiers such as (a+)+; it tests the first 2000 characters of a line and the last 5000 lines (with tail: grep first, then the last N)." })),
   full: Type.Optional(Type.Boolean({ description: "status: with wid, the complete workflow detail including every output." })),
   force: Type.Optional(Type.Union([Type.String(), Type.Boolean()], { description: "restart: the token shown by a refusal. Show the user the list and obtain explicit approval first; boolean true is refused. Subagents cannot force a restart (an environment-based rail against accidents, not a security boundary)." })),
   reason: Type.Optional(Type.String({ description: "restart: non-empty reason, at most 500 characters; required with force." })),

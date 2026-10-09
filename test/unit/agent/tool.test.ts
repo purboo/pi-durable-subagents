@@ -93,9 +93,10 @@ test("a top-level agent without task is the default agent of every tasks/chain s
   // A step without an agent after defaults keeps its error.
   assert.throws(() => request({ tasks: [{ task: "t" }] }, "/w"), /Invalid tasks\[0\]/);
   // agent+task beside a list is refused with what to do; so is a task alone.
-  for (const args of [{ action: "run", tasks: [{ task: "t" }], agent: "a", task: "x" }, { action: "run", chain: [{ agent: "a", task: "t" }], task: "x" }])
+  // With or without action: the guiding message, never the generic "action is required".
+  for (const args of [{ action: "run", tasks: [{ task: "t" }], agent: "a", task: "x" }, { action: "run", chain: [{ agent: "a", task: "t" }], task: "x" },
+    { tasks: [{ task: "t" }], agent: "a", task: "x" }, { chain: [{ agent: "a", task: "t" }], task: "x" }])
     assert.throws(() => request(args, "/w"), /task cannot be set beside (tasks|chain): agent\+task is a single call; give each step its own task/);
-  assert.throws(() => request({ tasks: [{ task: "t" }], agent: "a", task: "x" }, "/w"), /action is required/);
   // A workflow or source run still takes no agent.
   assert.throws(() => request({ action: "run", workflow: "x.js", agent: "a" }, "/w"), /run requires exactly one of/);
 });

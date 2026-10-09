@@ -767,14 +767,20 @@ export function outputSelect(tail: unknown, grep: unknown): (OutputSelect & { re
   if (typeof grep === "string") try { regex = new RegExp(grep); } catch (error) { throw new Error(`grep is not a valid regular expression: ${(error as Error).message}`); }
   return { ...(tail !== undefined ? { tail: Number(tail) } : {}), ...(typeof grep === "string" ? { grep } : {}), ...(regex ? { regex } : {}) };
 }
+/** grep runs the caller's regular expression in this process (the pi session or the CLI): it tests at most the first
+ *  GREP_LINE_CHARS characters of a line, and only the last GREP_MAX_LINES lines of each output, to bound its cost. */
+export const GREP_LINE_CHARS = 2000, GREP_MAX_LINES = 5000;
 /** The selected lines of `output`, unclipped up to SELECT_MAX characters (then its last SELECT_MAX, marked). */
 export function selectLines(output: string, select: OutputSelect & { regex?: RegExp }): string {
   const regex = select.regex ?? (select.grep !== undefined ? new RegExp(select.grep) : undefined);
-  let lines = output.replace(/\n+$/, "").split("\n");
-  if (regex) lines = lines.filter(line => regex.test(line));
+  let lines = output.replace(/\n+$/, "").split("\n"), skipped = 0;
+  if (regex) {
+    skipped = Math.max(0, lines.length - GREP_MAX_LINES);
+    lines = lines.slice(skipped).filter(line => regex.test(line.length > GREP_LINE_CHARS ? line.slice(0, GREP_LINE_CHARS) : line));
+  }
   if (select.tail !== undefined) lines = lines.slice(-select.tail);
-  const text = lines.join("\n");
-  return text.length > SELECT_MAX ? `[${text.length - SELECT_MAX} earlier chars clipped]...${text.slice(-SELECT_MAX)}` : text;
+  const text = lines.join("\n"), note = skipped ? `[${skipped} earlier lines not searched]\n` : "";
+  return note + (text.length > SELECT_MAX ? `[${text.length - SELECT_MAX} earlier chars clipped]...${text.slice(-SELECT_MAX)}` : text);
 }
 /** Tool status with a wid: one workflow with each call's output clipped (the full detail repeated every output twice and
  *  reached ~100K characters); `key` gives one call in full. With `select`, each output is its selected lines instead. */

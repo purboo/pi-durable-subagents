@@ -86,7 +86,11 @@ or `full: true` for everything. `tail: N` gives the last N lines of each call's
 result instead, and `grep: "<regex>"` only its lines matching a case-sensitive
 JavaScript regular expression (both: grep first, then the last N); either is
 unclipped up to 4000 characters per call, which suits a receipt on the last
-line of each output. An invalid regex is an error. When a run replies `{submitted: {rid}}`
+line of each output. An invalid regex is an error. The regex runs in the
+process that asks (the pi session or the CLI), so avoid nested quantifiers
+such as `(a+)+`, which can take seconds on one line; to bound its cost it
+tests only the first 2000 characters of a line and the last 5000 lines of an
+output (the reply then starts with `[n earlier lines not searched]`). When a run replies `{submitted: {rid}}`
 (its workflow was not created within 10 s), the rid works wherever a wid does.
 A call's `model` in `status` is the model its last provider request used; a
 requested switch not used yet shows as `switching`, a refused one as
