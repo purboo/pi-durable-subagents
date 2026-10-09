@@ -368,7 +368,8 @@ after recovery, before it waits for a slot) and only when the fence
 interrupted work, exactly as `describe`'s `lastFence`: a turn that had ended,
 a hibernated question, an answer's resume or a seal are no `fenced`. A `once`
 call cut off in a tool is never resumed: it gets `sealed` with status
-`unknown` and no `fenced`.
+`unknown` and no `fenced`. A call with no next execution has no `fenced`; its
+`sealed` carries the outcome (`describe`'s `lastFence` still names the fence).
 
 Cursors are `<epoch>:<seq>`; `--since c` returns the events after `c` in log
 order, at most `--limit` (default and maximum 1000), then
@@ -384,11 +385,12 @@ exists it never starts anything.
 
 Delivery is at least once, without gaps: after a crash the orchestrator
 derives again from its last durable watermark, and an event derived again has
-the same `id` (a new cursor). Deduplicate by `id`, and persist your cursor
-only after you applied the events of a page.
+the same `id` (a new cursor). Deduplicate by `id`, not by cursor (keeping
+ids for the retention window is enough), and persist your cursor only after
+you applied the events of a page.
 
 Retention: an event is dropped only when it was logged more than 7 days ago
-(`"k": { "eventRetentionMs": … }` in `config.json`) and its workflow is
+(`"k": { "eventRetentionMs": … }` in `$DSA_HOME/config.json`) and its workflow is
 finished in its current revision (done, failed or stopped — not parked) with
 no open question and no unsealed call, or was pruned. The log is compacted at
 orchestrator start and at most hourly. A cursor of another epoch (the log was
