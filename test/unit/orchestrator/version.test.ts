@@ -83,3 +83,27 @@ test("a pi session says once when the running orchestrator is another version th
   assert.match(notices[0]![0], new RegExp(`^Durable Subagents: the orchestrator runs durable-subagents 0\\.0\\.1, this pi loaded ${packageVersion().replaceAll(".", "\\.")}: `));
   assert.equal(notices[0]![1], "warning");
 });
+
+test("status shows who forced the latest restart and why for 24 hours, on one line; old restart records still fold", () => {
+  const forced = (initiator: Record<string, unknown> | undefined, reason?: string) => foldLedger(emptyLedger(), entries(
+    ["orchestrator", { version: "1.0.20", pid: 1 }],
+    ["restart", { rid: "r1", force: true, ...(reason === undefined ? {} : { reason }), ...(initiator ? { initiator } : {}), from: "cli:abc", live: ["w@1/a@1#1.1"] }],
+    ["orchestrator", { version: "1.0.21", pid: process.pid, restart: true }]));
+  const ts = 1002, hour = 3_600_000;
+  const view = orchestratorView(forced({ origin: "main:s1" }, "upgrade\nafter approval"), "1.0.21", ts + 5 * 60_000);
+  assert.equal(view.orchestrator, `1.0.21 (pid ${process.pid}); restarted by force 5m ago by main:s1: upgrade after approval`);
+  const cli = orchestratorView(forced({ cli: { user: "u", host: "h", ppid: 7, parent: "bash -c x" } }, "fix"), "1.0.21", ts + 1000);
+  assert.equal(cli.orchestrator, `1.0.21 (pid ${process.pid}); restarted by force 1s ago by cli:u@h: fix`);
+  const rendered = renderView({ workflows: [], ...view } as StatusView);
+  assert.equal(rendered.split("\n").filter(l => l.startsWith("orchestrator: ")).length, 1);
+  assert.ok(!rendered.includes("upgrade\nafter"), "the reason is one line");
+  assert.equal(orchestratorView(forced({ origin: "main:s1" }, "upgrade"), "1.0.21", ts + 24 * hour + 1).orchestrator, `1.0.21 (pid ${process.pid})`, "hidden after 24 hours");
+  // A 1.0.20 record has no reason, initiator or from fields; a non-force restart notes nothing.
+  const old = foldLedger(emptyLedger(), entries(["restart", { rid: "r1", force: true, live: [] }], ["orchestrator", { version: "1.0.21", pid: process.pid, restart: true }]));
+  assert.equal(orchestratorView(old, "1.0.21", 1001 + 60_000).orchestrator, `1.0.21 (pid ${process.pid}); restarted by force 1m ago by unknown: no reason recorded`);
+  const plain = foldLedger(emptyLedger(), entries(["restart", { rid: "r1", force: false, live: [] }], ["orchestrator", { version: "1.0.21", pid: process.pid, restart: true }]));
+  assert.equal(orchestratorView(plain, "1.0.21", 2000).orchestrator, `1.0.21 (pid ${process.pid})`);
+  // Only the start that followed the force restart carries it.
+  const later = foldLedger(emptyLedger(), [...entries(["restart", { rid: "r1", force: true, reason: "x", live: [] }], ["orchestrator", { version: "1.0.21", pid: 1, restart: true }]), ...entries(["orchestrator", { version: "1.0.21", pid: process.pid }]).map(e => ({ ...e, seq: 3, ts: 1003 }))]);
+  assert.equal(orchestratorView(later, "1.0.21", 2000).orchestrator, `1.0.21 (pid ${process.pid})`);
+});

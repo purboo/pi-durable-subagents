@@ -26,7 +26,7 @@ test("v12 §6: tool description teaches discovery, addresses, verb meaning and l
   } finally {
     for (const [name, value] of Object.entries(old)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
   }
-  for (const phrase of ["agents:", "Available agents:", "<wid>/<key>", "single-call", "steer", "follow-up", "answer", "model", "stop", "drain", "resume", "status", "↓", "Enter", "s steer", "x stop", "m model", "a answer", "f follow-up"]) {
+  for (const phrase of ["agents:", "Available agents:", "<wid>/<key>", "single-call", "steer", "follow-up", "answer", "model", "stop", "drain", "resume", "status", "↓", "Enter", "s steer", "x stop", "m model", "a answer", "f follow-up", "Never force without the user's explicit approval", "force:'<token>'", "Subagents cannot force"]) {
     assert.ok(description.includes(phrase), `missing ${phrase}`);
   }
 });
@@ -88,4 +88,19 @@ test("P12: a follow-up may name a model; a send naming one is answered with the 
   const ledger = [{ type: "send-note", seq: 1, ts: 1, rid: "r1", model: "p/m", effect: "next-execution" }] as unknown as Parameters<typeof sendReceipt>[0];
   assert.deepEqual(sendReceipt(ledger, "r1"), { model: "p/m", effect: "next-execution" });
   assert.deepEqual(sendReceipt(ledger, "r2"), {});
+});
+
+test("restart: force names the refusal's token with a reason; force:true and invalid reasons are refused at the tool", () => {
+  assert.deepEqual(request({ action: "restart" }, "/w"), { kind: "restart", body: {} });
+  assert.deepEqual(request({ action: "restart", reason: "upgrade" }, "/w"), { kind: "restart", body: { reason: "upgrade" } });
+  assert.deepEqual(request({ action: "restart", force: "0123456789ab", reason: "user approved upgrade" }, "/w"), { kind: "restart", body: { token: "0123456789ab", reason: "user approved upgrade" } });
+  assert.deepEqual(request({ action: "restart", force: false }, "/w"), { kind: "restart", body: {} });
+  assert.throws(() => request({ action: "restart", force: true, reason: "why" }, "/w"), /force:true is refused; show the user the running executions from a restart refusal, then use force:"<token>" and reason:"<why>" only with explicit user approval/);
+  assert.throws(() => request({ action: "restart", force: "0123456789ab" }, "/w"), /reason must be non-empty/);
+  assert.throws(() => request({ action: "restart", force: "0123456789ab", reason: " " }, "/w"), /reason must be non-empty/);
+  assert.throws(() => request({ action: "restart", force: "0123456789ab", reason: "x".repeat(501) }, "/w"), /at most 500 characters/);
+  assert.throws(() => request({ action: "restart", force: "not-a-token", reason: "why" }, "/w"), /12-hex token/);
+  assert.throws(() => request({ action: "restart", force: 1, reason: "why" }, "/w"), /force must be the token/);
+  assert.ok(parameters.properties.force && parameters.properties.reason);
+  assert.match(JSON.stringify(parameters.properties.force), /explicit approval/);
 });
