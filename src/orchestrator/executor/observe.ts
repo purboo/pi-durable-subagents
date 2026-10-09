@@ -14,6 +14,7 @@ import { entriesOf } from "./indexes.ts";
 import { ActiveTime, activeTotal } from "./time.ts";
 import { observation, reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 
+const UPDATE = '{"type":"tool_execution_update",';
 export const sessionChanged = (name: string | Buffer | null) => name === null || String(name) === "session.jsonl" || String(name) === "inbox";
 
 type Dependencies = {
@@ -109,7 +110,10 @@ export async function observeExecution(d: Dependencies) {
   const drained = new Promise<void>(resolve => lines.once("close", () => resolve()));
   lines.on("line", line => {
     let event: Record<string, unknown>;
-    try { event = JSON.parse(line); } catch { return; }
+    // A tool update repeats the tool's whole partial output (tens of KiB per chunk of a chatty command) and is used only
+    // as activity evidence below: its type, which pi serializes first, is enough.
+    if (line.length > 4096 && line.startsWith(UPDATE) && line.endsWith("}")) event = { type: "tool_execution_update" };
+    else try { event = JSON.parse(line); } catch { return; }
     if (ending) return;
     // P18: Apply RPC boundaries at receipt, before any in-flight scan can resume.
     // Durable observations remain queued; clock transitions never wait on I/O.

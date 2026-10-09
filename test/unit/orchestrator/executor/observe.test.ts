@@ -80,3 +80,30 @@ test("P18 a scan completing after received ask start never charges the ask inter
   const active = Number(journal.entries().findLast(e => e.type === "time")!.active);
   assert.ok(active < ticket.spec.timeoutMs!, `ask interval incorrectly charged: ${active}ms`);
 });
+
+test("each scan records only the usage appended since the previous one; a restarted list is recorded again", { timeout: 10000 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-observe-usage-")), wid = ulid(), journal = await openJournal(join(home, "journal"));
+  const ticket: CallTicket = { wid, widRev: `${wid}@1`, key: "a", gen: 1, callId: `${wid}@1/a@1`, cwd: home, journal,
+    spec: { agent: "test", task: "test" }, agent: { name: "test", description: "test", body: "test", sourcePath: "fixture", source: "project", systemPromptMode: "replace", inheritProjectContext: false, inheritSkills: false } };
+  await mkdir(callDir(home, wid, "a", 1), { recursive: true });
+  const stdout = new PassThrough(), stdin = new PassThrough(), stderr = new PassThrough(), ready = deferred();
+  const u = (id: string) => ({ id, usage: { input: 1, output: 1, costUsd: 0 } });
+  let list = [u("1"), u("2")], wake = () => {};
+  const recorded: string[][] = [];
+  const running = observeExecution({ home, config: { k: { trackerMs: 20 } }, ticket, exec: `${ticket.callId}#1.1`,
+    child: { pid: 1, start: "fixture", stdin, stdout, stderr, exited: new Promise(() => {}) },
+    serial: fn => fn(), setWake: fn => { wake = fn; ready.resolve(); }, interrupted: () => false,
+    track: async () => [], fence: async () => {}, questions: async () => {}, usage: () => list,
+    recordUsage: async values => { if (values.length) recorded.push(values.map(v => v.id)); }, switched: async () => {}, pendingSwitch: () => undefined });
+  t.after(async () => { wake(); await running; stdout.destroy(); stdin.destroy(); stderr.destroy(); await journal.close(); await rm(home, { recursive: true, force: true }); });
+  await ready.promise;
+  // A large tool update is activity evidence without being parsed; it changes nothing recorded.
+  stdout.write(`{"type":"tool_execution_update","toolCallId":"t","partialResult":"${"x".repeat(10000)}"}\n`);
+  await delay(100);
+  list.push(u("3"));
+  await delay(100);
+  list = [u("1"), u("2"), u("3")]; // a session read from scratch: a new list
+  await delay(100);
+  assert.deepEqual(recorded, [["1", "2"], ["3"], ["1", "2", "3"]]);
+  assert.equal(journal.entries().some(e => e.type === "observation"), false);
+});
