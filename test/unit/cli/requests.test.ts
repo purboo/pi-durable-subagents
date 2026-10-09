@@ -203,5 +203,46 @@ test('R1: the subagents tool shares request ids with the CLI: same content → s
   assert.equal(stop.applied, true, JSON.stringify(stop));
   assert.equal((await call({ action: 'stop', target: first.wid, request: 'tool-stop' })).applied, true);
   assert.equal(readJournalSnapshot(orchLedger(f.home)).filter(e => e.type === JT.admitted && e.rid === 'req:tool-stop').length, 1);
+  // An answer retried with its id but without qid/rev/to addresses what the first attempt did (no open question now).
+  const answer = { action: 'send', to: `${first.wid}/a`, kind: 'answer', qid: 'q-gone', rev: 1, message: 'blue', request: 'tool-answer' };
+  const answered = await call(answer);
+  assert.deepEqual(await call({ action: 'send', kind: 'answer', message: 'blue', request: 'tool-answer' }), answered);
+  assert.equal(readJournalSnapshot(orchLedger(f.home)).filter(e => e.type === JT.admitted && e.rid === 'req:tool-answer').length, 1);
   assert.ok(!readJournalSnapshot(orchLedger(f.home)).some(e => e.type === 'orchestrator'), 'no orchestrator process was started');
+});
+
+test('R2: a failure after the envelope is recorded, or a busy lock, is pending (75), not a rejection (1)', async t => {
+  const f = await fixture(t), path = await f.spec('a.json', { agent: 'echo', task: 'hello' });
+  const lines: string[] = [];
+  const code = await main(['run', '--request', 'boom', '--spec', path, '--json'], { env: f.env, cwd: f.cwd, write: line => lines.push(line), waitMs: 0,
+    starter: async () => { throw new Error('spawn failed'); } });
+  assert.equal(code, 75, lines.join('\n'));
+  assert.deepEqual(JSON.parse(lines.join('\n')), { request: 'boom', pending: true, reason: 'submitted, then: spawn failed' });
+  assert.equal(JSON.parse((await f.cli(['describe', '--key', 'boom', '--json'])).out).state, 'pending');
+  // A usage error still exits 1 and records nothing.
+  await assert.rejects(main(['run', '--request', 'bad', '--spec', await f.spec('bad.json', { agent: 'nobody', task: 'x' })], { env: f.env, cwd: f.cwd, write: () => {}, waitMs: 0, starter: async () => {} }));
+  assert.equal(JSON.parse((await f.cli(['describe', '--key', 'bad', '--json'])).out).state, 'absent');
+  // The home-wide request lock held by someone else for 10 s: busy, retry the same id.
+  const { OsLock } = await import('../../../src/platform/lock.ts');
+  const held = await new OsLock().tryAcquire(join(f.home, 'requests.lock'));
+  assert.ok(held);
+  try {
+    const busy = await f.cli(['run', '--request', 'later', '--spec', path, '--json']);
+    assert.equal(busy.code, 75); assert.deepEqual(JSON.parse(busy.out), { request: 'later', pending: true, reason: 'busy' });
+  } finally { await held!.release(); }
+});
+
+test('R1: an envelope another sender recorded but never published is published by a retry with the same content', async t => {
+  const f = await fixture(t);
+  const dead = await Outbox.open(outboxRoot(f.home), 'main:dead-session', () => orchInbox(f.home));
+  const body = { cwd: f.cwd, call: { agent: 'echo', task: 'hello' } };
+  const sent = await sendIdentified(f.home, dead, 'main:dead-session', requestRid('orphan'), 'run', body);
+  await dead.close();
+  assert.ok('sent' in sent && sent.sent);
+  // The session died between recording and publishing: the inbox never got the file.
+  await rm(join(orchInbox(f.home), 'req:orphan.json'));
+  const retry = await f.cli(['run', '--request', 'orphan', '--spec', await f.spec('a.json', { agent: 'echo', task: 'hello' }), '--json']);
+  assert.equal(retry.code, 75, retry.out);
+  assert.deepEqual(await f.inbox(), ['req:orphan.json']);
+  assert.deepEqual(JSON.parse(await readFile(join(orchInbox(f.home), 'req:orphan.json'), 'utf8')), sent.request, 'published verbatim, from the original sender');
 });

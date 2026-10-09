@@ -8,9 +8,9 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { contentHash } from './kernel/ids.ts';
 import { readJournalSnapshot } from './kernel/journal.ts';
-import type { Outbox } from './kernel/mailbox.ts';
+import { publishRequest, type Outbox } from './kernel/mailbox.ts';
 import { OsLock } from './platform/lock.ts';
-import { orchLedger, outboxRoot } from './paths.ts';
+import { orchInbox, orchLedger, outboxRoot } from './paths.ts';
 import type { Conditions, Request, RequestKind } from './types.ts';
 
 export const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/;
@@ -42,6 +42,8 @@ export async function findRequest(home: string, rid: string): Promise<{ request:
   }
   return undefined;
 }
+/** A lock was not free within 10 s: nothing was submitted by this attempt; a retry with the same id is safe. */
+export class RequestsBusy extends Error { override name = 'RequestsBusy'; }
 export type Identified = { request: Request; digest: string; sent: boolean } | { conflict: Request; digest: string };
 /** R1, P5: Check-then-send under the home-wide request-id lock (innermost: taken after a sender's own lock), so no two
  *  senders publish one rid and no second envelope with an existing rid and other content reaches the inbox (it would
@@ -51,13 +53,17 @@ export async function sendIdentified(home: string, outbox: Outbox, sender: strin
   const digest = specDigest({ kind, body, cond }), path = join(home, 'requests.lock'), locker = new OsLock(), deadline = performance.now() + 10_000;
   let lock = await locker.tryAcquire(path);
   while (!lock && performance.now() < deadline) { await delay(25); lock = await locker.tryAcquire(path); }
-  if (!lock) throw new Error('request ids are busy; retry the command');
+  if (!lock) throw new RequestsBusy('request ids are busy; retry the command');
   try {
     const prior = await findRequest(home, rid);
     if (prior && specDigest(prior.request) !== digest) return { conflict: prior.request, digest: specDigest(prior.request) };
     if (prior) {
       // Its own envelope is re-offered verbatim (Outbox.send returns it and republishes it while pending).
-      const request = prior.request.from === sender ? await outbox.send(prior.request.to, prior.request.kind, prior.request.body, prior.request.cond, { rid }) : prior.request;
+      // Another sender's envelope not admitted yet is published verbatim (publishing is idempotent per rid): a sender
+      // that died between recording and publishing it would otherwise leave the id pending for ever.
+      let request = prior.request;
+      if (prior.request.from === sender) request = await outbox.send(prior.request.to, prior.request.kind, prior.request.body, prior.request.cond, { rid });
+      else if (!prior.admitted) await publishRequest(orchInbox(home), prior.request);
       return { request, digest, sent: false };
     }
     return { request: await outbox.send('orch', kind, body, cond, { rid }), digest, sent: true };
