@@ -4,7 +4,7 @@ import type { UiDeps } from "../agent/main.ts";
 import { UiActions, UiData } from "./data.ts";
 import { SubagentScreen } from "./screen.ts";
 import { oneLine } from "./frame.ts";
-import { dockLines, mainLine, modelLabel, orderWorkflows, otherWorkflows, type ViewState } from "./view.ts";
+import { dockLines, mainLine, modelLabel, orderWorkflows, otherWorkflows, othersLive, type ViewState } from "./view.ts";
 import { registerCards } from "./cards.ts";
 import { toolRenderers } from "./tool.ts";
 
@@ -54,15 +54,18 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     const refresh = () => {
       if (stopped) return;
       try {
-        data.refresh(); actions.reconcile();
-        for (const result of actions.resolutions.splice(0)) screen?.controlResult(result);
+        // Split by origin at once: nothing between the read and the split may leave other sessions' workflows among
+        // this session's (the screen also checks the origin itself before any change).
+        data.refresh();
         const own = `main:${ctx.sessionManager.getSessionId()}`;
         data.others = data.otherSessions ? otherWorkflows(data.workflows, own) : [];
         data.workflows = orderWorkflows(data.workflows, own);
+        actions.reconcile();
+        for (const result of actions.resolutions.splice(0)) screen?.controlResult(result);
         // UI §1: the dock — live rows per active agent plus a summary line ("auto"), only the summary ("line"), or nothing.
         const name = (model: string | undefined) => modelLabel(model, (p, id) => ctx.modelRegistry.find(p, id), data.aliases);
         const now = Date.now(), dock = data.dock;
-        const lines = (width: number) => dock === "off" ? [] : dock === "line" ? [mainLine(data.workflows, data.others) ?? ""].filter(Boolean) : dockLines(data.workflows, data.facts, name, width, now, 3, data.others);
+        const lines = (width: number) => dock === "off" ? [] : dock === "line" ? [mainLine(data.workflows, data.others, width) ?? ""].filter(Boolean) : dockLines(data.workflows, data.facts, name, width, now, 3, data.others);
         dockRows = lines;
         // The widget is installed once, at session start (and again only when its placement changes). pi stacks
         // widgets in the order they were set, so installing once keeps the dock where the extension load order puts
@@ -98,7 +101,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
       refresh();
       const open = (): "opened" | "empty" | "busy" => {
         if (stopped || opening) return "busy";
-        if (!data.workflows.length && !data.others.length) return "empty";
+        if (!data.workflows.length && !othersLive(data.others)) return "empty";
         opening = true;
         void (async () => { await ctx.ui.custom<void>((tui, theme, _keys, done) => {
           closeScreen = () => done();
@@ -109,7 +112,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
       };
       openList = open;
       unsubscribe = ctx.ui.onTerminalInput(key => {
-        if (stopped || opening || !matchesKey(key, "down") || ctx.ui.getEditorText() !== "" || !editorFocused() || !data.workflows.length && !data.others.length) return;
+        if (stopped || opening || !matchesKey(key, "down") || ctx.ui.getEditorText() !== "" || !editorFocused() || !data.workflows.length && !othersLive(data.others)) return;
         open();
         return { consume: true };
       });

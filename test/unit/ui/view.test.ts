@@ -393,7 +393,8 @@ test("a follow-up on a finished workflow is live: the dock, the summary and the 
 });
 
 test("other sessions: the dock counts their live calls apart from this session's, never as its own rows", async () => {
-  const { elsewhereText, otherWorkflows, originText } = await import("../../../src/ui/view.ts");
+  const { elsewhereText, otherWorkflows, originText, othersLive } = await import("../../../src/ui/view.ts");
+  const { truncateToWidth } = await import("@earendil-works/pi-tui");
   const own = "main:mine-1234567890";
   const cli = workflow([call("a", { callId: "c@1/a@1" }), call("b", { callId: "c@1/b@1", phase: "asking" })], { wid: "c", name: "driver", origin: "cli:me@host",
     attention: [{ kind: "question", id: "q", rev: 1, qid: "q", call: "c@1/b@1", wid: "c", text: "Which?" }] });
@@ -421,6 +422,15 @@ test("other sessions: the dock counts their live calls apart from this session's
   assert.equal(mainLine([], others), "elsewhere: 4 running (cli 2, 1 session 2) · ↓ subagents");
   assert.equal(mainLine([mine], others), "1 working · 0/1+ done · ↓ subagents · elsewhere: 4 running (cli 2, 1 session 2)");
   assert.equal(mainLine([mine]), "1 working · 0/1+ done · ↓ subagents");
+  // The one-line dock drops the elsewhere part whole when tight, never cutting it mid-word.
+  assert.equal(mainLine([mine], others, 50), "1 working · 0/1+ done · ↓ subagents");
+  assert.equal(mainLine([], others, 30), truncateToWidth("elsewhere: 4 running (cli 2, 1 session 2) · ↓ subagents", 30));
+  // Parked or follow-up-pending workflows without live calls: listed in the group, but they neither open the list nor
+  // show in the dock (one rule: live calls).
+  const parked = workflow([call("k", { callId: "k@1/k@1", phase: "sealed", endedAt: now - 1_000, result: { key: "k", gen: 1, status: "parked", ok: false, output: "" } })], { wid: "k", origin: "cli:me@host", status: "parked" });
+  assert.deepEqual(otherWorkflows([parked], own).map(w => w.wid), ["k"]);
+  assert.equal(othersLive([parked]), false); assert.equal(othersLive(others), true);
+  assert.deepEqual(dockLines([], new Map(), () => "M", 100, now, 3, [parked]), []);
 });
 
 test("other sessions: the list ends with a folded group; opened, it shows wid, name, origin, labels and live calls", async () => {
