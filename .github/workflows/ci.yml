@@ -13,6 +13,8 @@ jobs:
         # evaluator's CPU limit needs); the real-pi suite runs on 24.
         node: ["24", "22.19"]
     runs-on: ${{ matrix.os }}
+    # A hung run is killed by scripts/ci-test.mjs after 25 min; this bounds everything else (default is 6 h).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,8 +23,10 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint:imports
       # A failing file is rerun once; a pass on the rerun is a flaky warning annotation, a second failure fails.
-      - run: node scripts/ci-test.mjs unit.log 'test/unit/**/*.test.ts'
-      - run: node scripts/ci-test.mjs pi.log --test-concurrency=1 'test/pi/**/*.test.ts'
+      # A unit test that sets no timeout of its own fails after 2 min, naming itself instead of hanging the run;
+      # --test-force-exit ends a test file once its tests are done, even if a timed-out test left a timer or handle.
+      - run: node scripts/ci-test.mjs unit.log --test-timeout=120000 --test-force-exit 'test/unit/**/*.test.ts'
+      - run: node scripts/ci-test.mjs pi.log --test-concurrency=1 --test-force-exit 'test/pi/**/*.test.ts'
         if: matrix.node == '24'
       - run: npm run pack:smoke 2>&1 | tee pack.log; exit ${PIPESTATUS[0]}
         shell: bash
