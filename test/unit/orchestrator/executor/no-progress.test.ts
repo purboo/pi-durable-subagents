@@ -13,8 +13,9 @@ import { observeExecution, toolCommand } from "../../../../src/orchestrator/exec
 import { evidence, fatalProviderError, quotaExhausted } from "../../../../src/orchestrator/executor/session.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 
-/** The tracker runs on a 5 ms timer; a loaded machine (the full suite) can need longer than one tick to observe. */
-async function eventually<T>(fn: () => T, ms = 3000): Promise<T> {
+/** The tracker runs on a 5 ms timer; a loaded machine (the full suite, a shared CI runner) can need seconds to observe:
+ * a 3 s wait inside a 5 s test limit failed once on a slow CI runner. Waits return as soon as the condition holds. */
+async function eventually<T>(fn: () => T, ms = 15000): Promise<T> {
   const deadline = Date.now() + ms;
   for (;;) { const value = fn(); if (value || Date.now() > deadline) return value; await delay(10); }
 }
@@ -43,7 +44,7 @@ for (const [source, event] of [
   ["retry start", { type: "auto_retry_start", errorMessage: "quota exhausted " + "x".repeat(250) }],
   ["retry end", { type: "auto_retry_end", finalError: "quota exhausted " + "x".repeat(250) }],
   ["message error", { type: "message_end", message: { stopReason: "error", errorMessage: "quota exhausted " + "x".repeat(250), usage: { output: 99 } } }],
-] as const) test(`no-progress ignores ${source} and session growth, resolves and re-arms`, { timeout: 5000 }, async t => {
+] as const) test(`no-progress ignores ${source} and session growth, resolves and re-arms`, { timeout: 30000 }, async t => {
   const f = await fixture(t);
   await f.grow(); await f.tick(600001, event);
   const first = (await eventually(() => f.alerts()[0]))!;
@@ -56,7 +57,7 @@ for (const [source, event] of [
   assert.deepEqual(f.alerts().map(e => (e.item as AttentionItem).rev), [1, 2]);
 });
 
-for (const toolName of ["bash", "ask"]) test(`no-progress waits for open ${toolName} and starts a fresh horizon on end`, { timeout: 5000 }, async t => {
+for (const toolName of ["bash", "ask"]) test(`no-progress waits for open ${toolName} and starts a fresh horizon on end`, { timeout: 30000 }, async t => {
   const f = await fixture(t);
   await f.tick(1, { type: "tool_execution_start", toolCallId: "t", toolName });
   await f.tick(1200000, { type: "auto_retry_start", errorMessage: "529 overloaded" });
@@ -70,14 +71,14 @@ for (const event of [
   { type: "message_update" },
   { type: "tool_execution_update", toolCallId: "t", toolName: "bash" },
   { type: "message_end", message: { stopReason: "stop", usage: { output: 1 } } },
-]) test(`no-progress accepts ${event.type} progress`, { timeout: 5000 }, async t => {
+]) test(`no-progress accepts ${event.type} progress`, { timeout: 30000 }, async t => {
   const f = await fixture(t);
   for (const time of [500000, 1000000, 1500000]) await f.tick(time, event);
   assert.equal(f.alerts().length, 0);
   await f.tick(2100001); await eventually(() => f.alerts().length === 1); assert.equal(f.alerts().length, 1);
 });
 
-test("stall text names the running tool command and how long it has run, not an ask", { timeout: 5000 }, async t => {
+test("stall text names the running tool command and how long it has run, not an ask", { timeout: 30000 }, async t => {
   const f = await fixture(t);
   await f.tick(1, { type: "tool_execution_start", toolCallId: "q", toolName: "ask", args: { question: "x" } });
   await f.tick(2, { type: "tool_execution_end", toolCallId: "q", toolName: "ask" });
@@ -89,7 +90,7 @@ test("stall text names the running tool command and how long it has run, not an 
   assert.equal(toolCommand(undefined), "");
 });
 
-test("silence emits one warning, thinking resolves it and a later silence re-arms it", { timeout: 5000 }, async t => {
+test("silence emits one warning, thinking resolves it and a later silence re-arms it", { timeout: 30000 }, async t => {
   const f = await fixture(t);
   await f.tick(600001); assert.ok(await eventually(() => f.alerts().length));
   assert.equal(f.alerts("").length, 1);
@@ -102,7 +103,7 @@ test("silence emits one warning, thinking resolves it and a later silence re-arm
   assert.deepEqual(f.alerts().map(e => (e.item as AttentionItem).rev), [1, 2]);
 });
 
-test("an earlier activity warning suppresses the later progress warning until recovery", { timeout: 5000 }, async t => {
+test("an earlier activity warning suppresses the later progress warning until recovery", { timeout: 30000 }, async t => {
   const f = await fixture(t, 300000);
   await f.tick(300001); assert.ok(await eventually(() => f.alerts("stall:").length));
   await f.tick(600001); assert.equal(f.alerts("").length, 1);
@@ -113,7 +114,7 @@ test("an earlier activity warning suppresses the later progress warning until re
   assert.equal((f.alerts()[0]!.lastStream as { type: string }).type, "thinking_delta");
 });
 
-for (const type of ["thinking_delta", "text_delta"]) test(`continuous ${type} avoids warnings and checkpoints metadata only`, { timeout: 5000 }, async t => {
+for (const type of ["thinking_delta", "text_delta"]) test(`continuous ${type} avoids warnings and checkpoints metadata only`, { timeout: 30000 }, async t => {
   const f = await fixture(t);
   for (const time of [500000, 1000000, 1500000]) await f.tick(time, { type: "message_update", assistantMessageEvent: { type, delta: "private content" } });
   assert.equal(f.alerts("").length, 0);
