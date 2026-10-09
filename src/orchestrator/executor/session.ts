@@ -64,12 +64,25 @@ export function cutAskResult(m: Message | undefined): boolean {
   const text = typeof m.content === "string" ? m.content : (m.content ?? []).map(b => b.text ?? "").join("");
   return text === ASK_CUT.shutdown || text === ASK_CUT.aborted;
 }
+/** P28: the `ask` tool call that wrote the question at `index` (the child appends a question while that ask runs, after
+ *  the assistant message that called it; asks are sequential, so it is the last ask called before the question). */
+export function askOf(entries: readonly SessionEntry[], index: number): string | undefined {
+  for (let i = index - 1; i >= 0; i--) {
+    const m = entries[i]!.message;
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+    const ask = m.content.findLast(b => b.type === "toolCall" && b.name === "ask" && b.id);
+    if (ask) return ask.id;
+  }
+  return undefined;
+}
 /** P9: Derive evidence only after this execution's own launch receipt. */
 export function evidence(entries: SessionEntry[], exec: string) {
   const start = entries.findLastIndex(e => e.type === "custom" && e.customType === CT.exec && e.data?.exec === exec);
   const segment = start < 0 ? [] : entries.slice(start + 1);
   const report = segment.findLast(e => e.type === "custom" && e.customType === CT.report && e.data?.exec === exec && ["ok", "failed"].includes(String(e.data.outcome)))?.data;
   const tools = new Map<string, string>();
+  // P28: only an ask that wrote a question can be cut off while waiting; one aborted before that is an ordinary result.
+  const asked = new Set(segment.flatMap((e, i) => e.type === "custom" && e.customType === CT.question ? [askOf(segment, i)] : []));
   let text = "";
   const usage = { input: 0, output: 0, costUsd: 0 };
   for (const e of segment) {
@@ -83,8 +96,8 @@ export function evidence(entries: SessionEntry[], exec: string) {
       }
       usage.input += m.usage?.input ?? 0; usage.output += m.usage?.output ?? 0; usage.costUsd += m.usage?.cost?.total ?? 0;
     }
-    // P28: an ask cut off by shutdown or abort keeps an unknown outcome, like one with no result.
-    if (m?.role === "toolResult" && m.toolCallId && !(tools.get(m.toolCallId) === "ask" && cutAskResult(m))) tools.delete(m.toolCallId);
+    // P28: an ask cut off by shutdown or abort while its question waited keeps an unknown outcome, like one with no result.
+    if (m?.role === "toolResult" && m.toolCallId && !(asked.has(m.toolCallId) && cutAskResult(m))) tools.delete(m.toolCallId);
   }
   const budget = segment.some(e => e.type === "custom" && e.customType === CT.budget && e.data?.exec === exec);
   const last = segment.findLast(e => e.message?.role === "assistant")?.message;
