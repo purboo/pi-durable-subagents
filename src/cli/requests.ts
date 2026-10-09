@@ -8,7 +8,7 @@ import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { findRequest, REQUEST_ID, requestId, requestRid, RequestsBusy, specDigest, type Identified } from "../requests.ts";
-import { isLive, slotsView, workflowSnapshot, type CallSnapshot } from "../orchestrator/snapshot.ts";
+import { isLive, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { checkAgents, request } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
@@ -278,8 +278,11 @@ async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<num
     ctx.write(json ? JSON.stringify({ request: id, applied: false, reason: done.outcome.reason, spec_digest: done.sent.digest }) : `${id}: rejected ${done.outcome.reason}`);
     return EXIT.rejected;
   }
-  const reply = { request: id, wid: done.outcome.wid!, created: !done.earlier, spec_digest: done.sent.digest };
-  ctx.write(json ? JSON.stringify(reply) : `${id} → ${reply.wid} (${reply.created ? "created" : "existing"})`);
+  // Calls already queued behind a worktree's writer lock are named at once (read once; nothing waits for them).
+  const waits = writerWaits(ctx.home, done.outcome.wid!);
+  const reply = { request: id, wid: done.outcome.wid!, created: !done.earlier, spec_digest: done.sent.digest, ...(waits.length ? { writerWait: waits, hint: WRITER_WAIT_HINT } : {}) };
+  ctx.write(json ? JSON.stringify(reply) : [`${id} → ${reply.wid} (${reply.created ? "created" : "existing"})`,
+    ...waits.map(w => `  writerWait: ${writerWaitLine(w)}`), ...(waits.length ? [`  hint: ${WRITER_WAIT_HINT}`] : [])].join("\n"));
   return EXIT.ok;
 }
 /** `<run-id>` or `<wid>` → wid when that run id created one; `pending` when the run is known but has no workflow yet. */

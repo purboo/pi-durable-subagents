@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { main } from '../../../src/cli/main.ts';
 import { openJournal, readJournalSnapshot } from '../../../src/kernel/journal.ts';
 import { Outbox } from '../../../src/kernel/mailbox.ts';
-import { orchInbox, orchLedger, outboxRoot } from '../../../src/paths.ts';
+import { journalPath, orchInbox, orchLedger, outboxRoot } from '../../../src/paths.ts';
 import { Engine } from '../../../src/orchestrator/engine.ts';
 import { findRequest, requestRid, sendIdentified, specDigest } from '../../../src/requests.ts';
 import { lastFence } from '../../../src/cli/requests.ts';
@@ -281,6 +281,55 @@ test('The subagents tool shares request ids with the CLI: same content → same 
   assert.deepEqual(await call({ action: 'send', kind: 'answer', message: 'blue', request: 'tool-answer' }), answered);
   assert.equal(readJournalSnapshot(orchLedger(f.home)).filter(e => e.type === JT.admitted && e.rid === 'req:tool-answer').length, 1);
   assert.ok(!readJournalSnapshot(orchLedger(f.home)).some(e => e.type === 'orchestrator'), 'no orchestrator process was started');
+});
+
+test('A run whose call is queued behind another call\'s writer lock names it in the run reply (tool and CLI); status tail/grep through the tool', async t => {
+  const f = await fixture(t);
+  // A decided run (admitted request + created) whose call already waits for the writer lock another call holds.
+  const spec = { tasks: [{ task: 'edit' }, { task: 'read', key: 'r' }], agent: 'echo' };
+  const { request: normalize } = await import('../../../src/agent/main/tool.ts');
+  const body = normalize({ ...spec, action: 'run' }, f.cwd).body;
+  const ledger = await openJournal(orchLedger(f.home));
+  await ledger.append('request', { request: { rid: 'req:w1', kind: 'run', from: 'cli:other', to: 'orch', seq: 1, body } });
+  await ledger.append(JT.created, { rid: 'req:w1', wid: '01WW', origin: 'cli:other' });
+  await ledger.close();
+  const journal = await openJournal(journalPath(f.home, '01WW'));
+  await journal.append('wf-created', { revision: 1, origin: 'cli:other', cwd: f.cwd });
+  await journal.append('call', { key: 'tasks:0', gen: 1, spec: { agent: 'echo', task: 'edit' } });
+  await journal.append('call', { key: 'r', gen: 1, spec: { agent: 'echo', task: 'read' } });
+  await journal.append('sealed', { call: '01WW@1/r@1', result: { key: 'r', gen: 1, status: 'ok', ok: true, output: 'a\nRECEIPT ok\n' } });
+  await journal.append('writer-wait', { call: '01WW@1/tasks:0@1', root: '/repo', holder: '01HH@1/w@1' });
+  await journal.close();
+  const path = await f.spec('w.json', spec);
+  const json = await f.cli(['run', '--request', 'w1', '--spec', path, '--json'], { waitMs: 5000 });
+  assert.equal(json.code, 0, json.out);
+  const reply = JSON.parse(json.out);
+  assert.deepEqual(reply.writerWait, [{ call: '01WW/tasks:0', heldBy: '01HH/w', cwd: '/repo' }]);
+  assert.match(reply.hint, /writer:false .* or isolation:'worktree' opts out/);
+  const text = await f.cli(['run', '--request', 'w1', '--spec', path], { waitMs: 5000 });
+  assert.match(text.out, /^w1 → 01WW \(existing\)\n  writerWait: 01WW\/tasks:0 held by 01HH\/w \(\/repo\)\n  hint: .*opts out$/);
+  // The tool's run reply says the same.
+  const keys = ['HOME', 'DSA_HOME', 'PI_CODING_AGENT_DIR', 'PI_OFFLINE', 'DSA_ORCHESTRATOR_ENTRY'] as const;
+  const old = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  let tool: { execute: (...args: unknown[]) => Promise<{ details: unknown }> } | undefined;
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+  const context = { cwd: f.cwd, hasUI: false, isIdle: () => false, ui: { notify() {} },
+    sessionManager: { getSessionId: () => 'ww-session', getSessionFile: () => undefined, getLeafId: () => undefined } };
+  Object.assign(process.env, f.env);
+  f.defer(() => { for (const k of keys) if (old[k] === undefined) delete process.env[k]; else process.env[k] = old[k]; });
+  const { registerMain } = await import('../../../src/agent/main.ts');
+  registerMain({ on(name: string, fn: never) { handlers.set(name, fn); }, registerTool(value: never) { tool = value; }, sendMessage() {} } as never);
+  await handlers.get('session_start')!({}, context);
+  f.defer(() => handlers.get('session_shutdown')!({ reason: 'reload' }, context));
+  const call = async (args: Record<string, unknown>) => (await tool!.execute('id', args, undefined, undefined, context)).details as Record<string, unknown>;
+  const viaTool = await call({ ...spec, request: 'w1' });
+  assert.deepEqual(viaTool.writerWait, ['01WW/tasks:0 held by 01HH/w (/repo)']); assert.equal(viaTool.wid, '01WW');
+  assert.match(String(viaTool.hint), /opts out/);
+  // status wid with tail/grep through the tool; only with a wid; invalid regex is an error.
+  const selected = await call({ action: 'status', wid: '01WW', grep: 'RECEIPT', tail: 1 }) as { calls: { key: string; output?: string }[] };
+  assert.equal(selected.calls.find(c => c.key === 'r')!.output, 'RECEIPT ok');
+  await assert.rejects(call({ action: 'status', tail: 2 }), /give a wid/);
+  await assert.rejects(call({ action: 'status', wid: '01WW', grep: '(' }), /grep is not a valid regular expression/);
 });
 
 test('A failure after the envelope is recorded, or a busy lock, is pending (75), not a rejection (1)', async t => {

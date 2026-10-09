@@ -6,7 +6,7 @@ import { compileFanout } from "../../compat/fanout.ts";
 import { checkLabels } from "../../events/labels.ts";
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
-export const stepDefaults = ["model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once", "writer"];
+export const stepDefaults = ["agent", "model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once", "writer"];
 
 type Args = Record<string, unknown>;
 function string(args: Args, name: string): string {
@@ -39,14 +39,20 @@ export function sendReceipt(ledger: readonly Entry[], rid: string): { model?: st
 }
 export function request(args: Args, cwd: string): { kind: RequestKind; body: unknown; cond?: Conditions; replaces?: string[] } {
   // v12 §2: Infer run only when one launch form is present; never guess a control verb.
-  const launchForms = [args.agent !== undefined || args.task !== undefined, args.tasks !== undefined,
+  // A top-level agent without a task beside tasks/chain is the steps' default agent, not a launch form of its own.
+  const listRun = args.tasks !== undefined || args.chain !== undefined;
+  const launchForms = [args.task !== undefined || args.agent !== undefined && !listRun, args.tasks !== undefined,
     args.chain !== undefined, args.workflow !== undefined, args.source !== undefined];
   const action = args.action === undefined && launchForms.filter(Boolean).length === 1 ? "run" : args.action;
   if (typeof action !== "string" || !action) throw new Error("action is required: run, agents, send, stop, revise, status, resume, drain, restart");
   if (action === "run") {
     const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, labels, by: _by, request: _request, ...spec } = args;
-    const choices = [workflow, source, tasks, chain, spec.agent === undefined && spec.task === undefined ? undefined : spec];
-    if (choices.filter(v => v !== undefined).length !== 1) throw new Error("run requires exactly one of workflow, source, tasks, chain, or agent/task");
+    const steps = tasks !== undefined || chain !== undefined;
+    if (steps && spec.task !== undefined) throw new Error(`task cannot be set beside ${tasks !== undefined ? "tasks" : "chain"}: agent+task is a single call; give each step its own task (a top-level agent alone is the default agent of every step)`);
+    // With tasks/chain a top-level agent (no task) is the default agent of every step, like model or timeoutMs.
+    const single = spec.task !== undefined || spec.agent !== undefined && !steps;
+    const choices = [workflow, source, tasks, chain, single ? spec : undefined];
+    if (choices.filter(v => v !== undefined).length !== 1) throw new Error("run requires exactly one of workflow, source, tasks, chain, or agent/task (with tasks/chain, a top-level agent without task is the steps' default agent)");
     // A top-level cwd on a workflow/tasks/chain/source run is the run's directory: relative paths (the workflow file,
     // inputs, per-call cwd) resolve against it and calls default to it. It used to be ignored, so a relative
     // workflow path was looked up in the session's directory instead.

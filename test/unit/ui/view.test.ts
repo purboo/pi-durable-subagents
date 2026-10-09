@@ -35,6 +35,14 @@ test("grouping, proposal order, done paging, and narrow columns", () => {
   s.folded.add("w"); assert.equal(listRows([w], s, new Map(), () => "", 100, now).length, 1);
 });
 
+test("a workflow row shows the run labels when there is room (clipped)", () => {
+  const w = { ...workflow([call("a"), call("b")]), labels: { node: "A3", attempt: "2" } } as WorkflowSnapshot;
+  assert.match(listRows([w], state(), new Map(), () => "m", 100, now)[0]!.text, / · \[node=A3 attempt=2\]$/);
+  assert.doesNotMatch(listRows([w], state(), new Map(), () => "m", 30, now)[0]!.text, /node=/, "no room: no labels");
+  const long = { ...w, labels: { note: "x".repeat(300) } } as WorkflowSnapshot, text = listRows([long], state(), new Map(), () => "m", 200, now)[0]!.text;
+  assert.ok(visibleWidth(text.slice(text.indexOf("["))) <= 60, "clipped to 60 columns");
+});
+
 test("unviewed failures remain visible; finished workflows stay listed with their done rows", () => {
   const bad = call("bad", { phase: "sealed", endedAt: now, result: { key: "bad", gen: 1, status: "failed", ok: false, output: "", error: "merge conflict" } });
   const good = call("good", { phase: "sealed", endedAt: now - 1_000 });

@@ -8,7 +8,7 @@ import { openJournal } from '../../../../src/kernel/journal.ts';
 import { journalPath, orchLedger, pinnedDir } from '../../../../src/paths.ts';
 import { compileFanout } from '../../../../src/compat/fanout.ts';
 import { finishedText } from '../../../../src/orchestrator/engine.ts';
-import { compactWorkflow, eventsFromEntries, plannedFromScript, progressOf, renderEvent, snapshotFromEntries, pausedElsewhere, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid, workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
+import { compactWorkflow, eventsFromEntries, plannedFromScript, progressOf, renderEvent, snapshotFromEntries, pausedElsewhere, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid, workflowSnapshot, outputSelect, writerWaits } from '../../../../src/orchestrator/snapshot.ts';
 import { JT, type Entry } from '../../../../src/types.ts';
 
 const e = (seq: number, type: string, f: Record<string, unknown> = {}) => ({ seq, ts: 1_700_000_000_000 + seq, type, ...f }) as Entry;
@@ -291,6 +291,97 @@ test('tool status: paused workflows of this session and of other sessions are to
   await ledger.close();
   assert.equal(statusBrief(home, { origin: 'main:me' }).paused,
     "1 workflow of this session is paused (stop-all, drain or a quit pi); resume continues it; 1 workflow of other sessions paused (01B); resume wid=<wid> continues one");
+});
+
+test('labels: the brief status line, the compact view and the detail carry the run labels (clipped on a line)', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-labels-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const ledger = await openJournal(orchLedger(home));
+  const labels = { node: 'A3', attempt: '2', role: 'writer' }, long = { note: 'z'.repeat(200) };
+  for (const [wid, lab, done] of [['01L', labels, false], ['01M', long, true], ['01N', undefined, false]] as const) {
+    await ledger.append('request', { request: { rid: `r-${wid}`, kind: 'run', from: 'main:me', to: 'orch', body: { cwd: '/', call: { agent: 'x', task: 't' }, ...(lab ? { labels: lab } : {}) } } });
+    await ledger.append(JT.created, { rid: `r-${wid}`, wid, origin: 'main:me' });
+    const journal = await openJournal(journalPath(home, wid));
+    await journal.append('wf-created', { revision: 1, origin: 'main:me', name: 'job' });
+    await journal.append('call', { key: 'k', gen: 1, spec: { agent: 'x' } });
+    if (done) { await journal.append('sealed', { call: `${wid}@1/k@1`, result: res('k', 'ok') }); await journal.append('workflow-done', { status: 'done' }); }
+    await journal.close();
+  }
+  // A rejected labelled run leaves nothing behind.
+  await ledger.append('request', { request: { rid: 'r-x', kind: 'run', from: 'main:me', to: 'orch', body: { cwd: '/', labels: { a: 'b' } } } });
+  await ledger.append(JT.rejected, { rid: 'r-x', reason: 'no' });
+  await ledger.close();
+  const brief = statusBrief(home, { origin: 'main:me' });
+  assert.equal(brief.active.find(w => w.wid === '01L')!.labels, '[node=A3 attempt=2 role=writer]');
+  assert.equal(brief.active.find(w => w.wid === '01N')!.labels, undefined);
+  const finished = brief.finished.find(l => l.startsWith('01M'))!;
+  assert.match(finished, /^01M · \[note=z+…\] · job · done/);
+  assert.ok(finished.split(' · ')[1]!.length <= 60, 'clipped to 60 characters');
+  const view = statusView(home);
+  assert.deepEqual(view.workflows.find(w => w.wid === '01L')!.labels, labels);
+  assert.equal(view.workflows.find(w => w.wid === '01N')!.labels, undefined);
+  assert.deepEqual(statusDetail(home, '01L').labels, labels);
+  assert.deepEqual(statusCompactDetail(home, '01L').labels, labels);
+  const { renderView } = await import('../../../../src/cli/main.ts');
+  assert.match(renderView(view), /^01L@1 \[node=A3 attempt=2 role=writer\] job: running/m);
+});
+
+test('status wid with tail/grep: each call\'s selected lines, unclipped up to a cap; invalid selections are errors', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-select-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const ledger = await openJournal(orchLedger(home));
+  await ledger.append(JT.created, { rid: 'r-01S', wid: '01S', origin: 'main:me' });
+  await ledger.close();
+  const journal = await openJournal(journalPath(home, '01S'));
+  await journal.append('wf-created', { revision: 1, origin: 'main:me' });
+  const out = ['intro', 'x'.repeat(700), 'RECEIPT a=1', 'middle', 'RECEIPT b=2', 'last line', ''].join('\n');
+  await journal.append('call', { key: 'a', gen: 1, spec: { agent: 'x' } });
+  await journal.append('sealed', { call: '01S@1/a@1', result: res('a', 'ok', { output: out }) });
+  await journal.append('call', { key: 'big', gen: 1, spec: { agent: 'x' } });
+  await journal.append('sealed', { call: '01S@1/big@1', result: res('big', 'ok', { output: Array.from({ length: 100 }, (_, i) => `${i} ${'q'.repeat(80)}`).join('\n') }) });
+  await journal.append('call', { key: 'run', gen: 1, spec: { agent: 'x' } });
+  await journal.close();
+  const pick = (select: Parameters<typeof outputSelect>) => Object.fromEntries(statusCompactDetail(home, '01S', outputSelect(...select)).calls.map(c => [c.key, c.output]));
+  assert.deepEqual(pick([2, undefined]).a, 'RECEIPT b=2\nlast line');
+  assert.equal(pick([2, undefined]).run, undefined, 'a call without a result has no output');
+  assert.equal(pick([undefined, '^RECEIPT']).a, 'RECEIPT a=1\nRECEIPT b=2');
+  assert.equal(pick([1, '^RECEIPT']).a, 'RECEIPT b=2', 'grep first, then tail');
+  assert.equal(pick([undefined, 'receipt']).a, '', 'case-sensitive; no match is an empty output');
+  assert.equal(pick([3, undefined]).a, 'middle\nRECEIPT b=2\nlast line');
+  const whole = pick([2, 'x{700}']).a!;
+  assert.equal(whole.length, 700, 'not clipped to the 600 characters of the plain view');
+  const capped = pick([100, undefined]).big!;
+  assert.match(capped, /^\[\d+ earlier chars clipped\]\.\.\./); assert.ok(capped.endsWith(`99 ${'q'.repeat(80)}`));
+  assert.equal(capped.length - capped.indexOf('...') - 3, 4000);
+  assert.throws(() => outputSelect(undefined, '(unclosed'), /grep is not a valid regular expression/);
+  for (const tail of [0, -1, 1.5, '3']) assert.throws(() => outputSelect(tail, undefined), /tail must be a positive integer/);
+  assert.equal(outputSelect(undefined, undefined), undefined);
+  // CLI: status <wid> --tail/--grep; only with a wid; an invalid regex is a usage error.
+  const { main, parseArgs } = await import('../../../../src/cli/main.ts');
+  const lines: string[] = [];
+  assert.equal(await main(['status', '01S', '--grep', '^RECEIPT', '--tail', '1'], { env: { DSA_HOME: home }, write: l => lines.push(l) }), 0);
+  assert.match(lines.join('\n'), /\n  a@1 ok\n    \| RECEIPT b=2\n  big@1 ok\n  run@1 queued$/);
+  lines.length = 0;
+  await main(['status', '01S', '--tail', '1', '--json'], { env: { DSA_HOME: home }, write: l => lines.push(l) });
+  assert.equal(JSON.parse(lines.join('')).calls[0].output, 'last line');
+  assert.throws(() => parseArgs(['status', '--tail', '2']), /--tail and --grep select lines of one workflow's outputs/);
+  assert.throws(() => parseArgs(['status', '01S', '--grep', '[']), /grep is not a valid regular expression/);
+  assert.throws(() => parseArgs(['status', '01S', '--tail', '0']), /--tail needs a positive number/);
+  assert.throws(() => parseArgs(['tail', '01S', '--tail', '2']), /only supported by status/);
+});
+
+test('writerWaits: unsealed calls queued behind a writer lock, with holder and worktree root', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-ww-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const journal = await openJournal(journalPath(home, '01W'));
+  await journal.append('wf-created', { revision: 1, origin: 'main:me' });
+  for (const key of ['a', 'b', 'c']) await journal.append('call', { key, gen: 1, spec: { agent: 'x' } });
+  await journal.append('writer-wait', { call: '01W@1/b@1', root: '/repo', holder: '01H@1/w@1' });
+  await journal.append('writer-wait', { call: '01W@1/c@1', root: '/repo', holder: '01H@1/w@1' });
+  await journal.append('writer-acquired', { call: '01W@1/c@1', root: '/repo' });
+  await journal.close();
+  assert.deepEqual(writerWaits(home, '01W'), [{ call: '01W/b', heldBy: '01H/w', cwd: '/repo' }]);
+  assert.deepEqual(writerWaits(home, 'nope'), []);
 });
 
 test('a run rid stands for its wid once the workflow exists; other values pass through', () => {

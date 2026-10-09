@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { dsaHome } from "../paths.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger } from "../paths.ts";
-import { allWorkflows, eventsFromEntries, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, compactWorkflow } from "../orchestrator/snapshot.ts";
+import { allWorkflows, eventsFromEntries, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, compactWorkflow, labelsText, outputSelect, statusCompactDetail, type StatusCompactDetail } from "../orchestrator/snapshot.ts";
 import { resolution, start, startOrchestrator, submit, type Control } from "./control.ts";
 import { doctor, renderDoctor, size } from "./doctor.ts";
 import { smoke } from "./smoke.ts";
@@ -19,7 +19,7 @@ import type { RestartBody } from "../types.ts";
 
 const commands = ["smoke", "tail", "status", "events", "start", "resume", "drain", "stop", "stop-all", "prune", "restart", "leases", "doctor", "install-service", "uninstall-service", "help"] as const;
 type Command = typeof commands[number];
-export interface Arguments { command: Command; target?: string; json: boolean; dryRun?: boolean; olderThanDays?: number; force?: string | true; reason?: string }
+export interface Arguments { command: Command; target?: string; json: boolean; dryRun?: boolean; olderThanDays?: number; force?: string | true; reason?: string; tail?: number; grep?: string }
 /** P25: Reject ambiguous CLI arguments before any durable action. */
 export function parseArgs(args: string[]): Arguments {
   if (!args.length || (args.length === 1 && ["-h", "--help"].includes(args[0]!))) return { command: "help", json: false };
@@ -33,7 +33,18 @@ export function parseArgs(args: string[]): Arguments {
     if (value === undefined || !/^\d+(\.\d+)?$/.test(value)) throw new Error("--older-than needs a number of days");
     olderThanDays = Number(value); rest = [...rest.slice(0, at), ...rest.slice(at + 2)];
   }
-  let force: string | true | undefined, reason: string | undefined;
+  let force: string | true | undefined, reason: string | undefined, tail: number | undefined, grep: string | undefined;
+  for (const flag of ["--tail", "--grep"]) {
+    const index = rest.indexOf(flag);
+    if (index < 0) continue;
+    if (command !== "status") throw new Error(`${flag} is only supported by status <wid>`);
+    if (rest.filter(a => a === flag).length > 1) throw new Error("Unknown or repeated option");
+    const value = rest[index + 1];
+    if (value === undefined) throw new Error(`${flag} needs a value`);
+    if (flag === "--tail") { if (!/^[1-9]\d*$/.test(value)) throw new Error("--tail needs a positive number of lines"); tail = Number(value); }
+    else grep = value;
+    rest = [...rest.slice(0, index), ...rest.slice(index + 2)];
+  }
   for (const flag of ["--force", "--reason"]) {
     const index = rest.indexOf(flag);
     if (index < 0) continue;
@@ -55,13 +66,15 @@ export function parseArgs(args: string[]): Arguments {
   const target = targets[0];
   if (target && command !== "stop" && (!/^[^/\\\0]+$/.test(target) || target === "." || target === "..")) throw new Error("Invalid workflow id");
   if (target && olderThanDays !== undefined) throw new Error("prune takes a workflow id or --older-than, not both");
-  return { command, json, ...(force !== undefined ? { force } : {}), ...(reason !== undefined ? { reason } : {}), ...(dryRun ? { dryRun } : {}), ...(target ? { target } : {}), ...(olderThanDays !== undefined ? { olderThanDays } : {}) };
+  if ((tail !== undefined || grep !== undefined) && !target) throw new Error("--tail and --grep select lines of one workflow's outputs: status <wid> --tail <n> --grep <regex>");
+  if (grep !== undefined) outputSelect(undefined, grep); // an invalid regular expression is a usage error
+  return { command, json, ...(tail !== undefined ? { tail } : {}), ...(grep !== undefined ? { grep } : {}), ...(force !== undefined ? { force } : {}), ...(reason !== undefined ? { reason } : {}), ...(dryRun ? { dryRun } : {}), ...(target ? { target } : {}), ...(olderThanDays !== undefined ? { olderThanDays } : {}) };
 }
 const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
 /** P25, T10: Render journal-derived status (one line per call, last output line only) without live orchestrator memory. */
 export function renderStatus(wf: WorkflowSnapshot & { scriptLog?: string }): string {
   const sealed = wf.counts.sealed, total = wf.calls.length, used = wf.usage && (wf.usage.input || wf.usage.output || wf.usage.costUsd);
-  return [`${wf.wid}@${wf.rev}${wf.name ? ` ${wf.name}` : ""}: ${wf.status}${wf.error ? ` (${clip(wf.error, 300)})` : ""} · ${sealed}/${total} sealed${used ? ` · ${formatUsage(wf.usage!)}` : ""}`,
+  return [`${wf.wid}@${wf.rev}${wf.labels ? ` ${labelsText(wf.labels)}` : ""}${wf.name ? ` ${wf.name}` : ""}: ${wf.status}${wf.error ? ` (${clip(wf.error, 300)})` : ""} · ${sealed}/${total} sealed${used ? ` · ${formatUsage(wf.usage!)}` : ""}`,
     ...wf.calls.map(c => {
       const last = c.result?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1), err = c.result?.error;
       return `  ${c.key}@${c.gen} ${c.result?.status ?? c.phase}${c.model ? ` ${c.model}` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage && (c.usage.input || c.usage.output) ? ` ${formatUsage(c.usage)}` : ""}${last ? ` ${JSON.stringify(clip(last, 160))}` : err ? ` (${clip(err, 160)})` : ""}${c.sharedWorktree ? ` (shares worktree with ${c.sharedWorktree.join(", ")})` : ""}${c.writerWait && !c.result && c.phase !== "sealed" ? ` (waiting for writer lock: ${c.writerWait.root} held by ${c.writerWait.holder})` : ""}`;
@@ -69,9 +82,14 @@ export function renderStatus(wf: WorkflowSnapshot & { scriptLog?: string }): str
     ...wf.attention.map(a => `  ${a.kind}: ${JSON.stringify(clip(a.text, 300))}`),
     ...(wf.scriptLog ? [`  script log: ${wf.scriptLog}`] : [])].join("\n");
 }
+/** `status <wid> --tail/--grep`: the workflow line, then each call with its selected output lines. */
+export function renderSelected(wf: StatusCompactDetail): string {
+  return [`${wf.wid}@${wf.rev}${wf.labels ? ` ${labelsText(wf.labels)}` : ""}${wf.name ? ` ${wf.name}` : ""}: ${wf.status} · ${wf.done}/${wf.planned ?? wf.calls.length} done`,
+    ...wf.calls.flatMap(c => [`  ${c.key}@${c.gen} ${c.status ?? c.phase}`, ...(c.output ? c.output.split("\n").map(l => `    | ${l}`) : [])])].join("\n");
+}
 /** P25, T10: Render the compact status projection shared with the `subagents` tool. */
 export function renderView(view: StatusView): string {
-  const lines = view.workflows.map(w => [`${w.wid}@${w.rev}${w.name ? ` ${w.name}` : ""}: ${w.status}${w.followUps ? " (follow-up running)" : ""}${w.error ? ` (${clip(w.error, 200)})` : ""} · ${w.done}/${w.planned ?? w.calls.length}${w.planned === undefined && w.status === "running" ? "+" : ""} done${w.usage.input || w.usage.output || w.usage.costUsd ? ` · ${formatUsage(w.usage)}` : ""}`,
+  const lines = view.workflows.map(w => [`${w.wid}@${w.rev}${w.labels ? ` ${labelsText(w.labels)}` : ""}${w.name ? ` ${w.name}` : ""}: ${w.status}${w.followUps ? " (follow-up running)" : ""}${w.error ? ` (${clip(w.error, 200)})` : ""} · ${w.done}/${w.planned ?? w.calls.length}${w.planned === undefined && w.status === "running" ? "+" : ""} done${w.usage.input || w.usage.output || w.usage.costUsd ? ` · ${formatUsage(w.usage)}` : ""}`,
     ...w.calls.map(c => `  ${c.key}@${c.gen} ${c.status ?? c.phase}${c.hibernated ? " (hibernated, no slot)" : ""}${c.model ? ` ${c.model}` : ""}${c.switching ? ` → ${c.switching} (requested)` : ""}${c.switchFailed ? ` (switch refused: ${c.switchFailed})` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage ? ` ${formatUsage(c.usage)}` : ""}${c.lastLine ? ` ${JSON.stringify(c.lastLine)}` : c.error ? ` (${c.error})` : ""}${c.sharedWorktree ? ` (shares worktree with ${c.sharedWorktree.join(", ")})` : ""}${c.writerWait && c.phase !== "sealed" ? ` (waiting for writer lock: ${c.writerWait.root} held by ${c.writerWait.holder})` : ""}${c.lease && c.phase !== "sealed" ? ` (${c.lease})` : ""}`),
     ...w.attention.map(a => `  ${a.kind}: ${JSON.stringify(a.text.split("\n")[0])}`)].join("\n"));
   if (view.paused) lines.unshift(`${view.paused} (pi-durable-subagents resume)`);
@@ -102,7 +120,7 @@ export function serviceEntryError(entry: string): string | undefined {
   if (/[/\\]_npx[/\\]/.test(entry)) return `install-service refuses to run from an npx cache (${entry}); the cache can be pruned and the service would break. Install the CLI with \`npm i -g pi-durable-subagents\` and run \`pi-durable-subagents install-service\` again.`;
   return undefined;
 }
-export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | events <wid> [--json] | events --all [--since <cursor>] [--limit <n>] [--json] [--wait-ms <n>] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | run --request <id> --spec <file|-> [--labels <json>] [--cwd <dir>] [--json] [--wait-ms <n>] | send --request <id> --to <run-id|wid/key> [--call <key>] --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] [--message <text|@file>] [--model <m>] [--json] [--wait-ms <n>] | stop --request <id> <run-id|wid|wid/key> [--json] [--wait-ms <n>] | describe --key <id> | describe <wid> [--json] | prune [wid] [--older-than <days>] | restart [--force <token> --reason <text>] | hold <resource> [--shared] [--max-wait <s> | --no-wait] [--note <text>] -- <command…> | leases [--json] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
+export const HELP = "pi-durable-subagents: smoke | status [wid] [--json] | status <wid> [--tail <n>] [--grep <regex>] [--json] | events <wid> [--json] | events --all [--since <cursor>] [--limit <n>] [--json] [--wait-ms <n>] | tail [wid] [--json] | start | resume [wid] | drain | stop <wid|callId> | stop-all | run --request <id> --spec <file|-> [--labels <json>] [--cwd <dir>] [--json] [--wait-ms <n>] | send --request <id> --to <run-id|wid/key> [--call <key>] --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] [--message <text|@file>] [--model <m>] [--json] [--wait-ms <n>] | stop --request <id> <run-id|wid|wid/key> [--json] [--wait-ms <n>] | describe --key <id> | describe <wid> [--json] | prune [wid] [--older-than <days>] | restart [--force <token> --reason <text>] | hold <resource> [--shared] [--max-wait <s> | --no-wait] [--note <text>] -- <command…> | leases [--json] | doctor [--json] | install-service [--dry-run] | uninstall-service [--dry-run] | chaos [--scenario <1-9>] [--keep] [--json]";
 /** Restart: the orchestrator exits when no execution runs (or `force`) and the installed version takes over. */
 async function restartCommand(home: string, env: NodeJS.ProcessEnv, write: (line: string) => void, options: { force?: string | true; reason?: string; starter?: typeof startOrchestrator; waitMs?: number; pendingMs?: number }): Promise<number> {
   const body: RestartBody = { ...(typeof options.force === "string" ? { token: options.force } : options.force === true ? { force: true } : {}), ...(options.reason !== undefined ? { reason: options.reason } : {}), initiator: cliInitiator(env) };
@@ -155,7 +173,7 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     return args[0] === "run" ? requests.runCommand(args.slice(1), ctx) : args[0] === "send" ? requests.sendCommand(args.slice(1), ctx)
       : args[0] === "stop" ? requests.stopCommand(args.slice(1), ctx) : requests.describeCommand(args.slice(1), ctx);
   }
-  const { command, target, json, dryRun, olderThanDays, force, reason } = parseArgs(args), env = options.env ?? process.env;
+  const { command, target, json, dryRun, olderThanDays, force, reason, tail: lines, grep } = parseArgs(args), env = options.env ?? process.env;
   const home = dsaHome(env), write = options.write ?? (line => console.log(line));
   if (command === "help") { write(HELP); return 0; }
   // Quiet when idle: the optional service runs this every K1 and must not fill the system log.
@@ -168,7 +186,9 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     return report.execution.every(c => c.ok) ? 0 : 1;
   }
   if (command === "status") {
-    if (target) { const detail = statusDetail(home, target); write(json ? JSON.stringify(detail, null, 2) : renderStatus(detail)); }
+    const select = outputSelect(lines, grep);
+    if (target && select) { const detail = statusCompactDetail(home, target, select); write(json ? JSON.stringify(detail, null, 2) : renderSelected(detail)); }
+    else if (target) { const detail = statusDetail(home, target); write(json ? JSON.stringify(detail, null, 2) : renderStatus(detail)); }
     else { const view = statusView(home); write(json ? JSON.stringify(view, null, 2) : renderView(view)); }
     return 0;
   }

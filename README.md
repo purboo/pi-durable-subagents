@@ -77,9 +77,15 @@ subagents({ action: "status" })
 ```
 
 `status` without a wid is brief: what runs, what asks (with the address to
-answer) or failed, and one line per finished workflow. `status` with a wid
+answer) or failed, and one line per finished workflow, each with its run
+`labels` clipped to 60 characters (the `/subagents` list shows them on a
+workflow's row when they fit). `status` with a wid
 shows one workflow with outputs clipped; add `key` for one call's full result,
-or `full: true` for everything. When a run replies `{submitted: {rid}}`
+or `full: true` for everything. `tail: N` gives the last N lines of each call's
+result instead, and `grep: "<regex>"` only its lines matching a case-sensitive
+JavaScript regular expression (both: grep first, then the last N); either is
+unclipped up to 4000 characters per call, which suits a receipt on the last
+line of each output. An invalid regex is an error. When a run replies `{submitted: {rid}}`
 (its workflow was not created within 10 s), the rid works wherever a wid does.
 A call's `model` in `status` is the model its last provider request used; a
 requested switch not used yet shows as `switching`, a refused one as
@@ -87,10 +93,17 @@ requested switch not used yet shows as `switching`, a refused one as
 (`next-request`, `next-execution` or `next-generation`).
 A provider's refusal of the content (terms of service, usage policy) fails the
 call at once with that error instead of retrying it.
-With `tasks` or `chain`, top-level `model`, `timeoutMs`, `budget`, `isolation`,
-`context`, `tools`, `skills` and `once` apply to every step that does not set
-its own; other call fields there, and any of them beside a workflow script,
-are refused rather than ignored.
+With `tasks` or `chain`, top-level `agent`, `model`, `timeoutMs`, `budget`,
+`isolation`, `context`, `tools`, `skills`, `once` and `writer` apply to every
+step that does not set its own, e.g.
+`{ tasks: [{ task: "…" }, { task: "…" }], agent: "reviewer" }`. A top-level
+`task` beside a list is refused (agent + task is a single call); other call
+fields there, and any of them beside a workflow script, are refused rather
+than ignored.
+When a call of a new run already waits for its worktree's writer lock as the
+run reply is written, the reply names it: `writerWait: ["<wid>/<key> held by
+<wid>/<key> (<root>)"]` with a hint that `writer: false` or
+`isolation: "worktree"` opts out. The reply does not wait for this.
 
 Every run is asynchronous. The agent is woken once, when the workflow
 finishes (the notice carries each subagent's result) or when a subagent asks
@@ -234,6 +247,8 @@ unchanged, with zero edited lines.
 pi-durable-subagents smoke              check this machine and this pi (offline, < 60 s)
 pi-durable-subagents chaos              run the fault suite (offline, about 2 minutes)
 pi-durable-subagents status [wid] [--json]
+pi-durable-subagents status <wid> [--tail <n>] [--grep <regex>] [--json]
+                                        each call's last n lines and/or its lines matching regex
 pi-durable-subagents events <wid> [--json]   the meaningful timeline of one workflow
 pi-durable-subagents events --all [--since <cursor>] [--limit <n>] [--json]
                                         milestones of every workflow, read with a cursor (see below)
@@ -287,7 +302,7 @@ session and is rejected.
 
 | exit | meaning | `--json` reply |
 | --- | --- | --- |
-| 0 | decided and applied (a retry gets the same answer) | run: `{request, wid, created, spec_digest}`; send/stop: `{request, applied, generation?, call?, spec_digest}` |
+| 0 | decided and applied (a retry gets the same answer) | run: `{request, wid, created, spec_digest, writerWait?, hint?}` (`writerWait: [{call, heldBy, cwd}]`: calls already queued behind a writer lock); send/stop: `{request, applied, generation?, call?, spec_digest}` |
 | 1 | decided and rejected (`reason`), or refused before submission (usage error, invalid spec, unknown agent: this invocation submitted nothing) | `{request, applied: false, reason, spec_digest?}` (`spec_digest` once the content could be hashed) |
 | 3 | `request-conflict`: the id already names other content; nothing was sent | `{request, error, wid?, spec_digest, state}` (the original's digest and state) |
 | 75 | not decided yet: submitted but undecided in `--wait-ms` (default 60 s), submitted and then a later step failed (`reason` says which), or a lock was busy (`reason: "busy"`); an id already recorded is never refused again (the same content gets its first outcome, its agents are not rechecked; other content is a conflict); retry with the same id | `{request, pending: true, reason?}` |

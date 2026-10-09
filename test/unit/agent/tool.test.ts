@@ -82,6 +82,24 @@ test("run-level call fields: defaults for every tasks/chain step (a step's own v
   assert.deepEqual(request({ agent: "a", task: "t", model: "p/m", timeoutMs: 5 }, "/w").body, { cwd: "/w", call: { agent: "a", task: "t", model: "p/m", timeoutMs: 5 } });
 });
 
+test("a top-level agent without task is the default agent of every tasks/chain step; a step's own agent wins", () => {
+  const tasks = request({ tasks: [{ task: "t" }, { agent: "own", task: "u" }], agent: "reviewer", model: "p/m" }, "/w");
+  assert.equal(tasks.kind, "run", "action is inferred: agent beside tasks is not a second launch form");
+  assert.deepEqual((tasks.body as { tasks: unknown[] }).tasks, [{ agent: "reviewer", task: "t", model: "p/m" }, { agent: "own", task: "u", model: "p/m" }]);
+  const chain = request({ action: "run", chain: [{ task: "a" }, { task: "{previous}" }], agent: "w" }, "/w").body as { chain: unknown[] };
+  assert.deepEqual(chain.chain, [{ agent: "w", task: "a" }, { agent: "w", task: "{previous}" }]);
+  // The same input normalizes to the same body (and so the same spec digest).
+  assert.deepEqual(request({ tasks: [{ task: "t" }], agent: "r" }, "/w").body, request({ tasks: [{ task: "t" }], agent: "r" }, "/w").body);
+  // A step without an agent after defaults keeps its error.
+  assert.throws(() => request({ tasks: [{ task: "t" }] }, "/w"), /Invalid tasks\[0\]/);
+  // agent+task beside a list is refused with what to do; so is a task alone.
+  for (const args of [{ action: "run", tasks: [{ task: "t" }], agent: "a", task: "x" }, { action: "run", chain: [{ agent: "a", task: "t" }], task: "x" }])
+    assert.throws(() => request(args, "/w"), /task cannot be set beside (tasks|chain): agent\+task is a single call; give each step its own task/);
+  assert.throws(() => request({ tasks: [{ task: "t" }], agent: "a", task: "x" }, "/w"), /action is required/);
+  // A workflow or source run still takes no agent.
+  assert.throws(() => request({ action: "run", workflow: "x.js", agent: "a" }, "/w"), /run requires exactly one of/);
+});
+
 test("P12: a follow-up may name a model; a send naming one is answered with the model and when it applies", () => {
   assert.deepEqual(request({ action: "send", to: "w/a", kind: "follow-up", message: "go on", model: "p/m:high" }, "/w").body, { to: "w/a", kind: "follow-up", model: "p/m:high", message: "go on" });
   assert.deepEqual(request({ action: "send", to: "w/a", kind: "follow-up", message: "go on" }, "/w").body, { to: "w/a", kind: "follow-up", message: "go on" });
