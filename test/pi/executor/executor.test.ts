@@ -157,6 +157,30 @@ test("P28 hibernates without loss, binds once, resumes with one receipt", { time
   assert.deepEqual(await f.executor.forward({ ...req, rid: "retired" }, ctx), { action: "reject", reason: "retired" });
 });
 
+for (const once of [true, false]) test(`P28 a${once ? " once" : "n"} asker cut off before it hibernated hibernates on recovery (no loss${once ? ", not unknown" : ""}) and resumes with the answer`, { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 600000, trackerMs: 20 } });
+  const base = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
+  const ticket: CallTicket = { ...base, spec: { ...base.spec, once } };
+  const pending = f.executor.run(ticket);
+  const question = () => f.journal.entries().find(e => e.type === JT.attention && (e.item as { qid?: string }).qid)?.item as { qid: string; rev: number } | undefined;
+  await until(() => !!question());
+  // An orchestrator restart (or a crash) cuts the asker off before its planned hibernation.
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  const resumed = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  assert.equal(h.qid, question()!.qid);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.sealed).length, 0, "not sealed unknown");
+  const req: Request = { rid: "answer", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: "yes " + script([{ text: "resumed" }]) } };
+  assert.deepEqual(await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen }), { action: "apply" });
+  const result = await resumed;
+  assert.equal(result.status, "ok");
+  assert.equal(result.output, "resumed");
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.exec && e.call === ticket.callId).length, 2, "one execution asked, one resumed with the answer");
+});
+
 test("P28/P12 a model send to a hibernated asker is recorded and its resumed execution launches on that model", { timeout: 30000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
   const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
