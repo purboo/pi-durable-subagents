@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.23
 
 - An asker cut off by a restart (also `restart --force`) now hibernates and
   resumes with the answer, as documented. A graceful shutdown let its `ask`
