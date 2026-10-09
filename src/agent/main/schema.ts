@@ -18,10 +18,11 @@ export const parameters = Type.Object({
   usageBudget: Type.Optional(Type.Object({ tokens: Type.Optional(Type.Number()), costUsd: Type.Optional(Type.Number()) })),
   maxCalls: Type.Optional(Type.Integer({ minimum: 1 })), inputs: Type.Optional(Type.Record(Type.String(), Type.String())),
   name: Type.Optional(Type.String()),
+  labels: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "run: your labels, e.g. {node, attempt}: at most 32 keys [A-Za-z0-9_.:-]{1,64}, string values of at most 256 characters, 4096 bytes of JSON; part of the request's content (spec_digest), shown by describe and on its events." })),
   timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number). Omit unless a hard limit is needed; prefer budgets." })),
   key: Type.Optional(Type.String({ description: "A single agent/task run: the call's key. status with wid: that call's full result." })),
   full: Type.Optional(Type.Boolean({ description: "status: with wid, the complete workflow detail including every output." })),
-  force: Type.Optional(Type.Union([Type.String(), Type.Boolean()], { description: "restart: the token shown by a refusal. Show the user the list and obtain explicit approval first; boolean true is refused. Subagents cannot force a restart." })),
+  force: Type.Optional(Type.Union([Type.String(), Type.Boolean()], { description: "restart: the token shown by a refusal. Show the user the list and obtain explicit approval first; boolean true is refused. Subagents cannot force a restart (an environment-based rail against accidents, not a security boundary)." })),
   reason: Type.Optional(Type.String({ description: "restart: non-empty reason, at most 500 characters; required with force." })),
   request: Type.Optional(Type.String({ description: "run/send/stop: your own request id (1-124 chars [A-Za-z0-9][A-Za-z0-9._:-]*) making a retry safe: the same id with the same content gets the first outcome; other content is refused (request-conflict)." })),
 }, { additionalProperties: true });

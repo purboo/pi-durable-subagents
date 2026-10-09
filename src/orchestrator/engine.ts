@@ -29,6 +29,10 @@ import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts
 import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
 import { validateCallSpec } from '../compat/spec.ts';
 import { EventPump } from '../events/pump.ts';
+import { labelsProblem } from '../events/labels.ts';
+import { R7Tracker, r7Collector, startR7, type R7Seed } from '../events/r7.ts';
+import { readPage } from '../events/log.ts';
+import { eventsLog } from '../paths.ts';
 import { parseModel } from '../compat/model.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
@@ -98,6 +102,7 @@ export class Engine {
   readonly store: Store;
   /** R2: the cross-workflow event log's writer (derives milestones from the journals; R7 emits through it). */
   readonly events: EventPump;
+  private r7?: { stop(): Promise<void>; tick(): Promise<void> };
   private ledgers: Ledgers;
   private executor: Executor;
   private evaluator: EvaluatorTransport;
@@ -169,6 +174,24 @@ export class Engine {
       for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     }
     await this.intake();
+    this.startR7();
+  }
+  /** R7: every k.r7Ms, why each live call does not move, as `waiting`/`moving` events through the pump. The tracker
+   *  starts from the log's latest transition per call, so a restart repeats none (and a call that ended or started
+   *  moving meanwhile gets its `moving`). */
+  private startR7() {
+    if (this.closed || this.r7) return;
+    const latest = new Map<string, R7Seed>(), head = this.events.head;
+    if (head) for (let since = head.dropped, more = true; more;) {
+      const page = readPage(eventsLog(this.ledgers.home), since, 1000);
+      if (!page || page.epoch !== head.epoch) break;
+      for (const e of page.events) if ((e.type === 'waiting' || e.type === 'moving') && e.call) latest.set(e.call, e as R7Seed);
+      more = page.more && page.events.length > 0;
+      if (page.events.length) since = Number(page.events.at(-1)!.cursor.split(':')[1]);
+    }
+    const tracker = new R7Tracker(); tracker.seed(latest);
+    const collect = r7Collector({ home: this.ledgers.home, workflows: () => this.store.workflows.values(), orch: this.ledgers.orch, config: this.ledgers.config });
+    this.r7 = startR7({ collect: () => collect(), sink: this.events, intervalMs: this.ledgers.config.k?.r7Ms, tracker });
   }
   private async startHost() {
     await this.evaluator.start(message => this.background(() => this.message(message)), () => this.background(async () => {
@@ -277,6 +300,9 @@ export class Engine {
     }
     if (req.kind === 'run') {
       const created = this.ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid);
+      // R6: senders validate labels; a hand-written request must not bypass that.
+      const labels = (req.body as RunBody | null)?.labels, invalid = !created && labels !== undefined ? labelsProblem(labels) : undefined;
+      if (invalid) return { action: 'reject', reason: `invalid-labels: ${invalid}` };
       if (created && this.store.pruned().has(String(created.wid))) return { action: 'apply' }; // Never resurrect a pruned run.
       let wf = created ? this.store.workflows.get(created.wid as string) : undefined;
       if (!wf) {
@@ -634,6 +660,6 @@ export class Engine {
   /** A1, A2: Retire asynchronous producers before closing their journals. */
   async close(): Promise<void> {
     this.closed = true; this.watcher?.close(); clearInterval(this.poll);
-    await this.queue; await this.evaluator.close(); await this.executor.shutdown(); await this.events.close(); await this.store.close();
+    await this.r7?.stop(); await this.queue; await this.evaluator.close(); await this.executor.shutdown(); await this.events.close(); await this.store.close();
   }
 }

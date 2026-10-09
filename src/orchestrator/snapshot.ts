@@ -8,6 +8,7 @@ import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
 import { emptyLedger, foldLedger, type LedgerState } from "./ledger.ts";
+import type { Exhaustion } from "./providers.ts";
 import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
 import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
@@ -605,17 +606,25 @@ export function runningOrchestrator(home: string): { orchestrator?: string; vers
   return orchestratorView(state);
 }
 
+/** One `exhausted` line of the status views (R7 `provider-exhausted` uses it as its detail). */
+export function exhaustedLine(provider: string, x: Exhaustion, now: number): string {
+  return `${provider} exhausted since ${age(now - x.since)} ago (${clip(x.error, 80)}), ` +
+    (x.probe ? `probing with ${x.probe.split("#")[0]}` : x.nextTry > now ? `next try in ${age(x.nextTry - now)}` : "next call probes it");
+}
+/** One `slots` line of the status views: "<provider> <held>/<limit>" or "<provider> <held> (no limit)". */
+export function slotLine(provider: string, held: number, limit?: number): string {
+  return typeof limit === "number" ? `${provider} ${held}/${limit}` : `${provider} ${held} (no limit)`;
+}
 export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected" | "exhausted" | "orchestrator" | "versionNote"> {
   const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
   ledgerStates.set(path, state);
   const { held, config, rejected } = state, used = state.exhausted;
-  const exhausted = [...used].sort(([a], [b]) => a.localeCompare(b)).map(([p, x]) => `${p} exhausted since ${age(now - x.since)} ago (${clip(x.error, 80)}), ` +
-    (x.probe ? `probing with ${x.probe.split("#")[0]}` : x.nextTry > now ? `next try in ${age(x.nextTry - now)}` : "next call probes it"));
+  const exhausted = [...used].sort(([a], [b]) => a.localeCompare(b)).map(([p, x]) => exhaustedLine(p, x, now));
   const limits: Record<string, { slots?: number }> = config?.settings.providers ?? {};
   const holders = new Map<string, number>();
   for (const e of held.values()) if (e.pool !== "memory") holders.set(e.pool, (holders.get(e.pool) ?? 0) + 1);
   const names = [...new Set([...Object.keys(limits), ...holders.keys()])].sort();
-  const slots = names.map(p => { const n = holders.get(p) ?? 0, limit = limits[p]?.slots; return typeof limit === "number" ? `${p} ${n}/${limit}` : `${p} ${n} (no limit)`; });
+  const slots = names.map(p => slotLine(p, holders.get(p) ?? 0, limits[p]?.slots));
   return { ...orchestratorView(state, packageVersion(), now), ...(slots.length ? { slots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
     ...(exhausted.length ? { exhausted } : {}),
     ...(rejected ? { configRejected: `${clip(rejected.error, 200)} (${age(now - rejected.ts)} ago); ${config ? config.hash : "the start settings"} stay in effect` } : {}) };
