@@ -13,9 +13,9 @@ import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.t
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
 import { isLive, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid } from "../orchestrator/snapshot.ts";
-import { checkAgents, request, sendReceipt } from "./main/tool.ts";
+import { checkAgents, outcomeLine, request, sendReceipt } from "./main/tool.ts";
 import { parameters } from "./main/schema.ts";
-import { findRequest, requestRid, sendIdentified, type Identified } from "../requests.ts";
+import { findRequest, manyIds, namesMany, requestRid, sendIdentified, type Identified } from "../requests.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { restartInputError } from "../orchestrator/restart.ts";
 import { currentOrchestrator, legacyRestart, waitExit, type OrchestratorProcess } from "../cli/restart.ts";
@@ -185,9 +185,9 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       return { ...args, to: to ?? q.call, qid: q.qid, rev: args.rev ?? q.rev };
     }
     if (typeof args.to !== "string" || !args.to) {
-      const want = args.kind === "follow-up" ? (c: { phase: string }) => c.phase === "sealed" : (c: { phase: string }) => c.phase !== "sealed";
+      const want = args.kind === "follow-up" ? (c: { phase: string }) => c.phase === "sealed" : args.kind === "notify" ? () => true : (c: { phase: string }) => c.phase !== "sealed";
       const targets = own.flatMap(w => w.calls.filter(want).map(c => `${w.wid}/${c.key}`));
-      throw new Error(`to is required: '<wid>/<key>'${targets.length ? `; ${args.kind === "follow-up" ? "finished" : "running"}: ${targets.slice(0, 12).join(", ")}` : ""}`);
+      throw new Error(`to is required: '<wid>/<key>'${targets.length ? `; ${args.kind === "follow-up" ? "finished" : args.kind === "notify" ? "calls" : "running"}: ${targets.slice(0, 12).join(", ")}` : ""}`);
     }
     return args;
   }
@@ -206,7 +206,28 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     const others = pausedElsewhere(home, sender);
     return others.length ? `nothing-to-resume: nothing of this session is paused; paused in other sessions: ${others.slice(0, 8).join(", ")} — resume wid=<wid> continues one` : reason;
   }
+  /** A send to several calls: one request per target (the same kind, message and model), each decided on its own; the
+   *  reply lists every target's outcome. With a request id <id>, target i (1-based, in the order given) is sent as
+   *  <id>:<i>, so a retry with the same list gets the same outcomes; another list under that id is a request-conflict. */
+  async function sendMany(args: Record<string, unknown>, cwd: string, signal?: AbortSignal, wait = true): Promise<unknown> {
+    const targets = args.to as unknown[];
+    if (!targets.length || !targets.every(t => typeof t === "string" && t)) throw new Error("to must name a call '<wid>/<key>' or a nonempty list of them");
+    if (args.kind === "answer") throw new Error("answer goes to one call: give to as a single address");
+    if (targets.length === 1) return submit({ ...args, to: targets[0] }, cwd, signal, wait);
+    if (args.replaces !== undefined) throw new Error("replaces supersedes one earlier send: use it with a single target");
+    const id = args.request, ids = typeof id === "string" ? manyIds(id, targets.length) : undefined;
+    if (id !== undefined && !ids) throw new Error(REQUEST_USE);
+    if (ids && typeof id === "string" && (await findRequest(home, requestRid(id)) || await findRequest(home, requestRid(`${id}:${targets.length + 1}`))))
+      return { applied: false, reason: "request-conflict", request: id, note: "this request id was used for different content; use a new id" };
+    const results = await Promise.all(targets.map(async (to, i) => {
+      const request = ids ? { request: ids[i] } : {};
+      try { return { to, ...request, ...await submit({ ...args, to, ...request }, cwd, signal, wait) as Record<string, unknown> }; }
+      catch (error) { return { to, ...request, applied: false, reason: error instanceof Error ? error.message : String(error) }; }
+    }));
+    return { targets: results, summary: results.map(r => `${String(r.to)}: ${outcomeLine(r)}`).join("\n") };
+  }
   async function submit(args: Record<string, unknown>, cwd: string, signal?: AbortSignal, wait = true): Promise<unknown> {
+    if (args.action === "send" && Array.isArray(args.to)) return sendMany(args, cwd, signal, wait);
     // A run answers {submitted:{rid}} when its workflow is not created within 10 s; that rid then stands for the wid.
     for (const field of ["wid", "to", "target"]) if (typeof args[field] === "string") args = { ...args, [field]: ridToWid(args[field] as string) };
     if (args.request !== undefined && (args.action === "status" || args.action === "agents")) throw new Error(REQUEST_USE);
@@ -236,6 +257,9 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (args.request !== undefined && (typeof args.request !== "string" || !["run", "send", "stop"].includes(normalized.kind) || normalized.replaces?.length))
       throw new Error(REQUEST_USE);
     const rid = typeof args.request === "string" ? requestRid(args.request) : undefined;
+    // A single send under an id that already names a send to several calls (<id>:1 ...) is other content.
+    if (rid && normalized.kind === "send" && !await findRequest(home, rid) && await namesMany(home, String(args.request)))
+      return { applied: false, reason: "request-conflict", request: args.request, note: "this request id was used for a send to several calls; use a new id" };
     if (normalized.kind === "run") checkAgents(normalized.body as RunBody, () => agentsAt(cwd).map(agent => agent.name));
     // P33: any call of the run may fork the origin context, so the origin branch is always offered for pinning.
     const sessionFile = ctx?.sessionManager.getSessionFile();
@@ -304,7 +328,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       "Durable asynchronous subagents; run returns {wid} when created (or {submitted:{rid}} while pending). A finished workflow (its notice carries every agent's result) or a question wakes you, so after starting work end your turn: never poll with sleep or repeated status. Crash recovery resumes sessions, not external side effects. Background helper processes (orchestrator, evaluator) exit by themselves about 10 s after all work ends: never kill processes or delete files to 'clean up'. When the user quits pi, this session's running workflows pause (nothing is spent); resume continues them.",
       "run (action optional for exactly one launch form): agent+task; tasks:[call specs] parallel; chain:[call specs] sequential ({previous}); workflow:'./script.js' or source (runs.run(key,spec), runs.all([...]), emit(value), args, runs.input(name)). Optional name, cwd, usageBudget, maxCalls, inputs, labels. With tasks/chain, top-level model, timeoutMs, budget, isolation, context, tools, skills, once are defaults for every step (a step's own value wins); a workflow/source script sets them per runs.run call. timeoutMs is milliseconds of active time (a number); omit it unless a hard limit is needed. Explicit unknown agents are rejected BEFORE creation, with available names; unknown script agents fail only their call.",
       "agents: list names, descriptions, default models and source for this cwd; use these names for run.",
-      "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); a steer to a call waiting on its question interrupts the question and the subagent usually asks again — use answer to answer it; sealed → finished:<status> — use kind 'follow-up'. follow-up continues a sealed call as generation g+1 or queues after a running turn; follow-up model:'provider/id' or a pool name runs that generation on it. answer: give the qid (or just the call, or nothing when one question is open); to and rev are filled in. A question that needs the user's decision goes to the user; if you answer one yourself, tell the user what you chose. model ('provider/id' or a pool name — its first model not used up): a running call switches at its next provider request; an asking, hibernated or queued call launches on it when it runs again; the reply's model/effect (next-request|next-execution|next-generation) says which. status model = model actually used by the last request; switching = requested, not used yet; switchFailed = refused. A provider content refusal (ToS/usage policy) fails the call at once, not retried. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
+      "send to:'<wid>/<key>' (bare '<wid>' only for a single-call workflow): steer on a running call delivers at the next safe point (receipt in status/UI); a steer to a call waiting on its question interrupts the question and the subagent usually asks again — use answer to answer it; sealed → finished:<status> — use kind 'follow-up'. notify tells a call a decision without disturbing it; the reply's delivery says how: steered (running: it gets the note at its next safe point), held-until-answer (waiting on its question: never interrupts it, delivered after the answer) or noted (not running: nothing starts; the note is recorded and the call's next follow-up opens with every pending note; status shows notesPending). to may list several calls for steer, notify, follow-up and model: one request per call, each decided on its own, one result line per target (request:<id> sends <id>:1...<id>:n; a retry with the same list is safe). follow-up continues a sealed call as generation g+1 or queues after a running turn; follow-up model:'provider/id' or a pool name runs that generation on it. answer: give the qid (or just the call, or nothing when one question is open); to and rev are filled in. A question that needs the user's decision goes to the user; if you answer one yourself, tell the user what you chose. model ('provider/id' or a pool name — its first model not used up): a running call switches at its next provider request; an asking, hibernated or queued call launches on it when it runs again; the reply's model/effect (next-request|next-execution|next-generation) says which. status model = model actually used by the last request; switching = requested, not used yet; switchFailed = refused. A provider content refusal (ToS/usage policy) fails the call at once, not retried. Unknown targets list valid addresses. replaces:[rid] supersedes an earlier send.",
       "stop target:<wid|<wid>/<key>> is terminal stopped (usage and partial edits kept); a sealed call → already-sealed:<status>, a finished workflow → terminal:<status>. drain holds existing workflows reversibly (new runs unaffected); resume [wid] releases held workflows. restart (after an update) replaces the orchestrator with the installed version: refused with busy:<running executions> while any runs. Never force without the user's explicit approval: show the user the refusal's list first, then supply force:'<token>' and reason. Subagents cannot force; hibernated askers and queued calls do not block it. Never kill the orchestrator process. Commands that need the machine (benchmarks, timing) take a lease: tell the subagent to run them as `pi-durable-subagents hold machine [--shared] -- <command>` (FIFO; status lists lease holders and waiters). status: without wid, what runs, asks (with its answer address; hibernated:true holds no slot) or failed, writerWait: a call queued for its git worktree's writer lock (one call whose tools include edit/write runs per worktree; spec writer:false or isolation:'worktree' opts out), sharedWorktree names calls sharing observed edit/write roots (reminder), lease: a call holding or waiting for a resource lease, finished workflows one line each, provider slots held/limit, the config in effect and providers whose usage window is used up (avoided until a probe finds them answering again), and the orchestrator version (versionNote when it differs from the loaded one); wid: one workflow, outputs clipped; wid+key: one call's full result; full:true: everything. A run's rid from {submitted:{rid}} works wherever a wid is expected. revise wid + workflow/source/args starts a revision.",
       "Control replies are {applied:true,rid} or {applied:false,reason,rid} when decided; otherwise {submitted:{rid}} after 10s.",
       ...(agents ? [`Available agents: ${agents}.`] : []),

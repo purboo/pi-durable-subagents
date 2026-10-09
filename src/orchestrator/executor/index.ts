@@ -1,7 +1,8 @@
 // Private journal entries (A1): tracked{exec,pid,start}; loss{exec}; settled{exec};
 // stop-intent{call}; forward{rid,rid2,dest,hash,envelope:{to,kind,body,cond?}};
 // forward-delivered{rid,rid2,call,reason?}: the first observed child receipt of a forward (once per forward; reason when
-// the child resolved it as rejected, e.g. withdrawn); forward-retired{rid,rid2,reason}: sealed/retired without a receipt (P27).
+// the child resolved it as rejected, e.g. withdrawn); forward-retired{rid,rid2,reason}: sealed/retired without a receipt (P27);
+// an undelivered notify becomes a pending-note{rid,call,key,message} first (../notes.ts).
 // observation{exec,event}; selected{exec,model}; switch-observed{exec,rid,pool}.
 // P28 entries are documented in hibernate.ts; generation session publication in generation.ts.
 // session-corrupt{call,line}: a malformed native session line was skipped (once per line, E4).
@@ -34,6 +35,7 @@ import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 import { indexSweep, recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
 import { gateRetired } from "./effects/gate.ts";
 import { WorktreeIndex, worktreeCalls, worktreeLabel, worktreePair, worktreeRoots, type WorktreeWrite } from "./worktree.ts";
+import { PENDING_NOTE } from "../notes.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
 type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean;
@@ -282,8 +284,15 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     await forwardsDelivered(journal, call, entries);
     const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
     for (const e of journal.entries().filter(e => e.type === "forward" && e.dest === call)) {
-      if (!receipts.has(String(e.rid2)) && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2))
+      if (!receipts.has(String(e.rid2)) && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2)) {
+        // A notify the call never received is not lost: it becomes a pending note (before its forward is retired, so a
+        // crash in between finds the forward open again and the note is written once). A withdrawn one is not.
+        const envelope = e.envelope as Envelope, all = journal.entries();
+        const withdrawn = all.some(r => r.type === "forward" && r.dest === call && (r.envelope as Envelope).kind === "withdraw" && ((r.envelope as Envelope).body as { rids?: string[] }).rids?.includes(String(e.rid2)));
+        if (envelope.kind === "notify" && !withdrawn && !all.some(r => r.type === PENDING_NOTE && r.rid === e.rid))
+          await journal.append(PENDING_NOTE, { rid: e.rid, call, key: address(call).key, message: String((envelope.body as { message?: unknown } | undefined)?.message ?? "") });
         await journal.append("forward-retired", { rid: e.rid, rid2: e.rid2, reason: "retired-without-child-receipt" });
+      }
       await (await outbox).markResolved(String(e.rid2));
     }
   }
@@ -988,6 +997,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         } else if (req.kind === "send") {
           const send = req.body as SendBody; kind = send.kind;
           body = kind === "model" ? undefined : { message: send.message ?? "" };
+          // A notify is held by the child while its question is open (asking, or hibernated until the answer): the
+          // reply says which (orchestrator ledger `send-note`, once per rid, before the forward is recorded).
+          if (kind === "notify" && !orch.entries().some(e => e.type === "send-note" && e.rid === req.rid))
+            await orch.append("send-note", { rid: req.rid, delivery: openQuestion(await readCall(ctx.journal, dest)) ? "held-until-answer" : "steered" });
         } else return { action: "reject", reason: "unsupported" } as const;
         const cond = { ...req.cond }; delete cond.epoch;
         if (cond.after) {

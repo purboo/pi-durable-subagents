@@ -33,10 +33,28 @@ export function checkAgents(body: RunBody, available: () => string[]): void {
 /** P12: a send naming a model is answered with that model and when it applies — `next-request` (a running call switches
  *  at its next provider request), `next-execution` (a call with no live execution launches on it) or `next-generation`
  *  (a follow-up's new generation runs on it). From the orchestrator ledger's `send-note`. */
-export function sendReceipt(ledger: readonly Entry[], rid: string): { model?: string; effect?: string; pool?: string } {
+export function sendReceipt(ledger: readonly Entry[], rid: string): { model?: string; effect?: string; pool?: string; delivery?: Delivery; note?: string } {
   const note = ledger.find(e => e.type === "send-note" && e.rid === rid);
-  return note ? { model: String(note.model), effect: String(note.effect), ...(note.pool ? { pool: String(note.pool) } : {}) } : {};
+  if (!note) return {};
+  if (typeof note.delivery === "string") return { delivery: note.delivery as Delivery, note: DELIVERY_NOTE[note.delivery as Delivery] ?? note.delivery };
+  return { model: String(note.model), effect: String(note.effect), ...(note.pool ? { pool: String(note.pool) } : {}) };
 }
+/** One line of a reply per target: applied (with how a notify went), rejected with its reason, or not decided yet. */
+export function outcomeLine(r: Record<string, unknown>): string {
+  if (r.applied === true) return `applied${r.delivery ? ` (${String(r.delivery)}: ${String(r.note)})` : r.effect ? ` (model ${String(r.model)}, ${String(r.effect)})` : ""}`;
+  if (r.applied === false) return `rejected ${String(r.reason)}`;
+  if (r.submitted) return `submitted, not decided yet (${String((r.submitted as { rid?: string }).rid)})`;
+  return JSON.stringify(r);
+}
+/** How a notify went: `steered` (a running call gets it at its next safe point, like a steer), `held-until-answer` (the
+ *  call waits on its question; it gets the note at the first safe point after the answer) or `noted` (the call is not
+ *  running: a pending note, carried by its next follow-up; nothing was started). */
+export type Delivery = "steered" | "held-until-answer" | "noted";
+export const DELIVERY_NOTE: Record<Delivery, string> = {
+  steered: "the call is running; it gets the note at its next safe point",
+  "held-until-answer": "the call waits on its question; it gets the note after the answer",
+  noted: "the call is not running: recorded as a pending note for its next follow-up (nothing was started)",
+};
 export function request(args: Args, cwd: string): { kind: RequestKind; body: unknown; cond?: Conditions; replaces?: string[] } {
   // v12 §2: Infer run only when one launch form is present; never guess a control verb.
   const launchForms = [args.agent !== undefined || args.task !== undefined, args.tasks !== undefined,
@@ -89,7 +107,8 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   }
   if (action === "send") {
     const kind = string(args, "kind");
-    if (!["steer", "follow-up", "answer", "model"].includes(kind)) throw new Error("Unsupported send kind");
+    if (!["steer", "notify", "follow-up", "answer", "model"].includes(kind)) throw new Error("Unsupported send kind");
+    if (Array.isArray(args.to)) throw new Error("to names one call here; several targets are sent one request each");
     // follow-up may name the model its continuation runs on (P37); other kinds ignore one.
     const model = kind === "model" || kind === "follow-up" && args.model !== undefined ? { model: string(args, "model") } : {};
     const body = { to: string(args, "to"), kind, ...model, ...(kind === "model" ? {} : { message: string(args, "message") }), ...(args.by === "user" ? { by: "user" } : {}) };

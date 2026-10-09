@@ -15,7 +15,7 @@ import { registerLive } from './child/live.ts';
 
 // boundary = turn_end (steer lands between turns); settle = agent_before_settle (follow-ups land only here or idle).
 type Mode = 'idle' | 'boundary' | 'settle' | 'ask';
-const MESSAGES = ['task', 'steer', 'follow-up', 'continue'];
+const MESSAGES = ['task', 'steer', 'notify', 'follow-up', 'continue'];
 type SessionLike = { id?: string; type?: string; message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } } } };
 /** P31, P33, P37: Usage of this call only — assistant messages in segments opened by this call's executions,
  *  deduplicated by entry id. Context inherited from an earlier generation or a forked origin is not charged. */
@@ -69,7 +69,7 @@ export function registerChild(pi: ExtensionAPI): void {
     // Scan is asynchronous: recheck before using the idle delivery API.
     if (!active || (mode === 'idle' && !ctx.isIdle())) return [];
     let delivered = false;
-    const plans = planDecisions(state.records, candidates, req => {
+    const plans = planDecisions(state.records, candidates, (req, view) => {
       if (req.to !== call) return { action: 'reject', reason: 'wrong-recipient' };
       if ([...MESSAGES, 'answer'].includes(req.kind) && typeof (req.body as MessageBody)?.message !== 'string') return { action: 'reject', reason: 'malformed' };
       if (req.kind === 'answer') {
@@ -87,6 +87,10 @@ export function registerChild(pi: ExtensionAPI): void {
       }
       if (MESSAGES.includes(req.kind)) {
         if ((mode === 'idle' && delivered) || (req.kind === 'follow-up' && mode === 'boundary')) return { action: 'defer' };
+        // A notify never interrupts a question: while an answer waits to be delivered (a hibernated asker resumes with
+        // its answer as a continue) it goes after it, at the next safe point. In ask mode it was deferred above.
+        if (req.kind === 'notify' && candidates.some(other => !view.resolved.has(other.rid) && !view.tombstones.has(other.rid) &&
+          (other.kind === 'answer' && !state.answered.has(`${other.cond?.qid}@${other.cond?.rev}`) || other.kind === 'continue' && other.cond?.qid !== undefined))) return { action: 'defer' };
         delivered = true; return { action: 'apply' };
       }
       return { action: 'reject', reason: 'unsupported' };
