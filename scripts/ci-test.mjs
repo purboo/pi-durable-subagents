@@ -34,7 +34,7 @@ if (first.code === 0) process.exit(0);
 // Failing files: "test at <file>:<line>" (spec reporter) or a TAP "location: '<file>:<line>:<col>'".
 const files = new Set();
 const text = first.output.replace(/\x1b\[[0-9;]*m/g, "");
-// The spec reporter indents "test at" under a nested test; any test file extension node --test runs counts.
+// The spec reporter indents "test at" under a nested test; this repository names test files *.test.{ts,mts,js,mjs,…}.
 const testFile = /\.test\.[cm]?[jt]s$/;
 for (const m of text.matchAll(/^\s*test at (\S+?):\d+:\d+\s*$/gm)) files.add(m[1]);
 for (const m of text.matchAll(/location: '([^']+?):\d+:\d+'/g)) files.add(m[1]);
