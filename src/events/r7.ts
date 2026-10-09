@@ -260,7 +260,8 @@ export class R7Tracker {
     for (const [call, wait] of current) {
       const prev = this.last.get(call), m = meta.get(call) ?? prev?.meta;
       if (!wait || !m || prev?.wait.reason === wait.reason) continue;
-      out.push({ id: `${call}:waiting:${wait.reason}:${now}`, ts: wait.since, type: "waiting", ...base(m), reason: wait.reason, detail: wait.detail, since: wait.since });
+      // ts is when it was observed (retention and ordering read it); `since` keeps when the cause started.
+      out.push({ id: `${call}:waiting:${wait.reason}:${now}`, ts: now, type: "waiting", ...base(m), reason: wait.reason, detail: wait.detail, since: wait.since });
       this.last.set(call, { wait, meta: m });
     }
     return out;
