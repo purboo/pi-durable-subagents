@@ -269,7 +269,7 @@ pi-durable-subagents stop-all           pause every existing workflow now; journ
 pi-durable-subagents prune [wid] [--older-than <days>]
                                         delete finished workflows (done, failed, stopped); prints count and bytes freed
 pi-durable-subagents restart [--force <token> --reason <text>]  switch to the installed version (see "Updating Durable Subagents")
-pi-durable-subagents hold <resource> [--shared] [--max-wait <s> | --no-wait] [--note <text>] -- <command…>
+pi-durable-subagents hold <resource> [--shared | --slots <n>] [--max-wait <s> | --no-wait] [--note <text>] -- <command…>
                                         run one command while holding a resource lease (see below)
 pi-durable-subagents leases [--json]    who holds and who waits for each resource
 pi-durable-subagents doctor [--json]    read-only health check; exits 1 when something needs you
@@ -480,6 +480,7 @@ command:
 pi-durable-subagents hold machine -- make bench          # exclusive
 pi-durable-subagents hold machine --shared -- npm test   # with other shared holders, never with an exclusive one
 pi-durable-subagents hold machine --max-wait 600 --note "profile" -- ./measure.sh
+pi-durable-subagents hold build --slots 4 -- cargo test   # at most 4 at a time
 ```
 
 - The lease covers one command, not a whole call: a subagent that thinks
@@ -488,6 +489,15 @@ pi-durable-subagents hold machine --max-wait 600 --note "profile" -- ./measure.s
   everything before it, and keeps later shared requests out (no starvation).
   A waiting `hold` prints who holds the resource; `--max-wait` gives up with
   exit 75 without running the command.
+- `--slots N` (an integer of at least 1; not with `--shared`) makes the
+  resource a counting semaphore: a request runs once fewer than N holders
+  (slot or shared) hold it, no exclusive request is ahead of it, and no
+  earlier request of any kind still waits, so it never overtakes a waiter.
+  Shared requests are not limited by slots but occupy them. Each request
+  applies its own N, so use one N per resource name. `leases` shows
+  ``build 3/4 held: pid 123 `cargo test` (slot, 2m), ...; waiting: 2 (first: pid 456, 30s)``,
+  `leases --json` adds `slots` and `held` to the resource,
+  and a waiting `hold` prints its position and `held k/N`.
 - `--no-wait` (same as `--max-wait 0`) takes the lease now or not at all.
   It decides under the resource's lock. If it can run now, its request is
   written already granted. Otherwise nothing is written, and it exits 75
