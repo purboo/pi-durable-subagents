@@ -29,6 +29,10 @@ export interface Workflow { wid: string; revision: number; origin: string; cwd: 
 type SnapshotRef = { path: string; hash: string };
 /** pinned/<rN>/pins.json: the in-memory pins of a published revision, valid for the snapshot hash it names. */
 type PinRecord = { snapshot: string; digest: string; pins: Pins; inputs: Record<string, string>; origin: boolean; files: Record<string, string> };
+/** Every file publishPins writes for one revision, relative to its directory (inputs given relative too). */
+function publishedFiles(inputs: string[], origin: boolean): string[] {
+  return [...new Set(['script.js', 'args.json', 'agents.json', 'inputs.json', ...inputs, ...(origin ? ['origin.jsonl'] : [])])];
+}
 /** sha256 of a file, streamed. */
 async function fileHash(path: string): Promise<string> {
   const hash = createHash('sha256');
@@ -284,24 +288,24 @@ export class Store {
     const files = await this.publishPins(wid, revision, await this.pinned(intent));
     if (ref) {
       const hashes: Record<string, string> = {};
-      for (const path of [files.scriptPath, ...Object.values(files.inputs), ...(files.originPath ? [files.originPath] : [])]) hashes[relative(dir, path)] = await fileHash(path);
-      const record: PinRecord = { snapshot: ref.hash, digest: contentHash(files.pins), pins: files.pins,
+      for (const name of publishedFiles(Object.values(files.inputs).map(path => relative(dir, path)), files.originPath !== undefined)) hashes[name] = await fileHash(join(dir, name));
+      const body: Omit<PinRecord, 'digest'> = { snapshot: ref.hash, pins: files.pins,
         inputs: Object.fromEntries(Object.entries(files.inputs).map(([name, path]) => [name, relative(dir, path)])), origin: files.originPath !== undefined, files: hashes };
-      await replaceFile(dir, 'pins.json', JSON.stringify(record));
+      await replaceFile(dir, 'pins.json', JSON.stringify({ ...body, digest: contentHash(body) }));
     }
     return files;
   }
   /** The files `pins.json` in `dir` records for snapshot `hash`, when the record and every file verify; else undefined. */
   private async recorded(dir: string, hash: string): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'> | undefined> {
-    const record = JSON.parse(await readFile(join(dir, 'pins.json'), 'utf8')) as PinRecord;
-    if (record?.snapshot !== hash || typeof record.digest !== 'string' || !record.pins || typeof record.pins !== 'object' || contentHash(record.pins) !== record.digest) return undefined;
-    if (!record.inputs || typeof record.inputs !== 'object' || !record.files || typeof record.files !== 'object') return undefined;
-    const inputs = Object.fromEntries(Object.entries(record.inputs).map(([name, file]) => [name, join(dir, String(file))]));
-    const files = { pins: record.pins, scriptPath: join(dir, 'script.js'), inputs, originPath: record.origin === true ? join(dir, 'origin.jsonl') : undefined };
-    const paths = [files.scriptPath, ...Object.values(inputs), ...(files.originPath ? [files.originPath] : [])];
-    if (new Set(paths.map(path => relative(dir, path))).size !== Object.keys(record.files).length) return undefined;
-    for (const path of paths) if (record.files[relative(dir, path)] !== await fileHash(path)) return undefined;
-    return files;
+    const { digest, ...body } = JSON.parse(await readFile(join(dir, 'pins.json'), 'utf8')) as PinRecord;
+    // The digest covers everything the record decides (pins, input names → files, origin, file hashes).
+    if (body.snapshot !== hash || typeof digest !== 'string' || contentHash(body) !== digest) return undefined;
+    if (!body.pins || typeof body.pins !== 'object' || !body.inputs || typeof body.inputs !== 'object' || !body.files || typeof body.files !== 'object') return undefined;
+    const names = publishedFiles(Object.values(body.inputs).map(String), body.origin === true);
+    if (names.length !== Object.keys(body.files).length || names.some(name => !Object.hasOwn(body.files, name))) return undefined;
+    for (const name of names) if (body.files[name] !== await fileHash(join(dir, name))) return undefined;
+    return { pins: body.pins, scriptPath: join(dir, 'script.js'), inputs: Object.fromEntries(Object.entries(body.inputs).map(([name, file]) => [name, join(dir, String(file))])),
+      originPath: body.origin === true ? join(dir, 'origin.jsonl') : undefined };
   }
   /** P14, A2: Publish a new revision only after the engine has retired its predecessor. */
   async revise(intent: Entry): Promise<void> {
