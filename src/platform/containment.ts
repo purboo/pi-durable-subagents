@@ -56,22 +56,26 @@ export class Containment implements Contract {
     const all = await this.table.list(execs, options);
     for (const p of all) if (p.tag !== undefined) execs.add(p.tag);
     const result = new Map<ExecId, ProcInfo[]>(), liveStarts = new Map(all.map(p => [p.pid, p.start]));
-    const tagged = new Set(all.map(p => p.tag));
+    // One index of the table per scan: tagged processes and children by parent, so each execution costs its own tree.
+    const tagged = new Map<string, ProcInfo[]>(), children = new Map<number, ProcInfo[]>();
+    for (const p of all) {
+      if (p.tag !== undefined) { const list = tagged.get(p.tag); if (list) list.push(p); else tagged.set(p.tag, [p]); }
+      const list = children.get(p.ppid); if (list) list.push(p); else children.set(p.ppid, [p]);
+    }
     for (const exec of execs) {
       // Historical identities cannot select an absent/reused pid. Avoid allocating a string/Set entry for each one.
-      const ids = new Set<string>();
+      const ids = new Map<number, string>();
       for (const group of [known.get(exec) ?? [], this.launched.get(exec) ?? []])
-        for (const p of group) if (p.start !== "" && liveStarts.get(p.pid) === p.start) ids.add(identity(p));
-      // Nothing tagged and no live identity selects nothing: skip the table walks (most execs of a sweep are history).
-      if (!ids.size && !tagged.has(exec)) { result.set(exec, []); continue; }
-      const selected = new Map(all.filter(p => p.tag === exec || ids.has(identity(p))).map(p => [p.pid, p]));
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const p of all) if (!selected.has(p.pid) && selected.has(p.ppid)) {
-          selected.set(p.pid, p); changed = true;
-        }
-      }
+        for (const p of group) if (p.start !== "" && liveStarts.get(p.pid) === p.start) ids.set(p.pid, p.start);
+      const own = tagged.get(exec);
+      // Nothing tagged and no live identity selects nothing (most execs of a sweep are history).
+      if (!ids.size && !own) { result.set(exec, []); continue; }
+      // The tagged and the known live processes in table order, then every live descendant (breadth first).
+      const selected = new Map<number, ProcInfo>();
+      for (const p of all) if (p.tag === exec || ids.get(p.pid) === p.start) selected.set(p.pid, p);
+      const queue = [...selected.keys()];
+      for (let i = 0; i < queue.length; i++)
+        for (const c of children.get(queue[i]!) ?? []) if (!selected.has(c.pid)) { selected.set(c.pid, c); queue.push(c.pid); }
       result.set(exec, [...selected.values()]);
     }
     return result;

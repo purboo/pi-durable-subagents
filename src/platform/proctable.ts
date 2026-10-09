@@ -2,7 +2,7 @@
 // Known-id filtering assumes argv/other values do not impersonate the sole known
 // execution id. Multiple known ids are ambiguous; macOS verification awaits CI.
 import { readFile, readdir } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ProcInfo, ProcessTable as Table } from "../types.ts";
@@ -11,6 +11,16 @@ const exec = promisify(execFile);
 const vanished = (error: unknown) => ["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "");
 
 type Snapshot = ProcInfo[] | string;
+// /proc/<pid>/stat is one short line: one open/read/close into a reused buffer, not readFileSync's fstat, sized read
+// and EOF read (a scan reads it for every process of the machine every second).
+const statBuffer = Buffer.alloc(4096);
+function readStat(pid: string): string {
+  const fd = openSync(`/proc/${pid}/stat`, "r");
+  try {
+    const n = readSync(fd, statBuffer, 0, statBuffer.length, 0);
+    return n < statBuffer.length ? statBuffer.toString("latin1", 0, n) : readFileSync(`/proc/${pid}/stat`, "latin1");
+  } finally { closeSync(fd); }
+}
 type Observation = ProcInfo & { ambiguous?: true };
 
 /** C2, C3: Capture only the newly spawned pid; an absent or dead process has no token. */
@@ -88,7 +98,7 @@ export class ProcessTable implements Table {
       if (!/^\d+$/.test(name)) continue;
       try {
         // /proc stat is a tiny kernel snapshot; avoid four libuv round trips per cached identity.
-        const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+        const stat = readStat(name);
         const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
         // Zombies cannot act and may remain indefinitely under a non-reaping init.
         if (fields[0] === "Z" || fields[0] === "X") continue;
@@ -101,7 +111,7 @@ export class ProcessTable implements Table {
             tag = env.split("\0").find(value => value.startsWith("DSA_EXEC="))?.slice(9);
           } catch (error) { if (!vanished(error)) throw error; }
           // Do not attach an old environment to a reused pid; cached identities already include the start token.
-          const check = readFileSync(`/proc/${name}/stat`, "utf8");
+          const check = readStat(name);
           if (check.slice(check.lastIndexOf(")") + 2).split(" ")[19] !== start) continue;
         }
         cache.set(key, tag);

@@ -25,6 +25,9 @@ type Dependencies = {
   track(): Promise<ProcInfo[]>; fence(): Promise<void>;
   questions(entries: SessionEntry[]): Promise<void>;
   recordUsage(values: { id: string; usage: Usage }[]): Promise<void>;
+  /** This call's session usage (sessionUsage); an implementation that extends one array as the session grows lets each
+   *  scan record only the values appended since the last one. */
+  usage?(entries: SessionEntry[]): readonly { id: string; usage: Usage }[];
   switched(event: Record<string, unknown>): Promise<void>;
   /** An assistant message ended: an answer of a used-up provider makes it available again. */
   answered?(event: Record<string, unknown>): Promise<void>;
@@ -145,6 +148,7 @@ export async function observeExecution(d: Dependencies) {
     });
   });
   let scanning = false, sessionDirty = false, failingSince: number | undefined;
+  let usageList: readonly unknown[] | undefined, usageSent = 0;
   const scan = (processes = true) => {
     if (scanning) { if (!processes) sessionDirty = true; return; }
     scanning = true;
@@ -158,7 +162,11 @@ export async function observeExecution(d: Dependencies) {
       const nextSize = (await fileStat(session).catch(() => ({ size: 0 }))).size;
       if (nextSize > size) { clock.evidence(); size = nextSize; }
       const entries = await (d.read ? d.read() : readSession(session));
-      await d.questions(entries); await d.recordUsage(sessionUsage(entries, t.callId));
+      await d.questions(entries);
+      const values = d.usage ? d.usage(entries) : sessionUsage(entries, t.callId);
+      if (values !== usageList) { usageList = values; usageSent = 0; }
+      const count = values.length;
+      await d.recordUsage(values.slice(usageSent)); usageSent = count;
       await limits(); await stall(); await noProgress();
       if (performance.now() - checkpoint >= (config.k?.checkpointMs ?? 10000)) { await saveTime(); checkpoint = performance.now(); }
       const reservation = d.pendingSwitch();
