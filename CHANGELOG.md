@@ -10,15 +10,18 @@
   drives a run by request id from a package directory that cannot see pi.
 - `describe` reports `lastFence` only for an execution that was cut off; an
   execution that ended its turn, hibernated, or was stopped, timed out or
-  over budget is not an interruption. A `once` call sealed `unknown` and a call
+  over budget, or hibernated on its question (also when recovery finds only its
+  `ask` was running) is not an interruption. A `once` call sealed `unknown` and a call
   sealed after repeated losses still name their fence.
 - With `--json`, a `run`/`send`/`stop` refused before submission (unknown
   agent, invalid spec, usage) answers `{request, applied: false, reason,
   spec_digest?}` instead of plain text; exit code 1 as before. A failure after
   submission, and a retry of a recorded run whose agent has since gone, are
-  pending (75), never a refusal.
-- The import check parses with TypeScript and follows the executor, which the
-  orchestrator loads through `import(new URL(…))`.
+  pending (75), never a refusal; other content under a recorded id is a
+  `request-conflict` (3) before any agent check.
+- The import check parses with TypeScript, follows the executor, which the
+  orchestrator loads through `import(new URL(…))`, and treats only
+  `import type` as erased (`import { type X }` still loads the module).
 
 ## 1.0.21
 
