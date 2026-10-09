@@ -734,6 +734,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           return finish(journal, t.callId, exec, makeResult("timeout"));
         if (ev.budget || reached(totalUsage(journal.entries(), t.callId), t.spec.budget)) return finish(journal, t.callId, exec, makeResult("budget"));
         if (!bound) {
+        // P28: an execution cut off while its only unfinished tool call is the open question's `ask` (before it
+        // hibernated) was waiting, not working: it hibernates now and resumes with the answer, like a planned
+        // hibernation; it is neither a loss nor, for `once`, an unknown outcome.
+        const asking = openQuestion(entries);
+        if (asking && dangling.length && dangling.every(d => d.startsWith("ask (")) && hibernation(journal, t.callId)?.exec !== exec) {
+          await serial(() => journal.append("hibernated", { call: t.callId, exec, qid: asking.qid, rev: asking.rev }));
+          continue;
+        }
         if (ev.report) return finish(journal, t.callId, exec, buildCallResult({ key: t.key, gen: t.gen, status: ev.report.outcome as "ok" | "failed", output: ev.text, usage: ev.usage,
           ...(Object.hasOwn(ev.report, "data") ? { report: { data: ev.report.data } } : {}), ...(Array.isArray(ev.report.artifacts) ? { artifacts: ev.report.artifacts as string[] } : {}) }));
         if (t.spec.schema === undefined && has(journal, "settled", exec) && ev.text)
