@@ -488,6 +488,28 @@ test('a restart reads each revision\'s pins.json instead of parsing and re-publi
   await assert.rejects(recover(), /ENOENT/);
 });
 
+test('a pins.json that does not verify falls back to the staged snapshot; a changed pinned file is a conflict as before', async t => {
+  const evaluator = new ManualEvaluator(), { home, run, ledgers } = await fixture(t, evaluator);
+  const input = join(home, 'doc'); await writeFile(input, 'v1');
+  const wf = await run('return 1;', { args: { a: 1 }, inputs: { doc: input } });
+  const dir = pinnedDir(home, wf.wid), record = join(dir, 'pins.json'), good = await readFile(record, 'utf8');
+  const recover = async () => {
+    const again = new Engine(ledgers, fakeExecutor(ledgers), { discovery: { home, agentDir: join(home, 'config'), globalNpmRoot: null } });
+    try { await again.store.recover(); return again.store.workflows.get(wf.wid)!; } finally { await again.store.close(); }
+  };
+  for (const bad of ['{', '{}', JSON.stringify({ ...JSON.parse(good), inputs: undefined }), JSON.stringify({ ...JSON.parse(good), pins: { ...JSON.parse(good).pins, args: { changed: true } } })]) {
+    await writeFile(record, bad);
+    const recovered = await recover();
+    assert.deepEqual(recovered.pins.args, { a: 1 }, bad.slice(0, 40));
+    assert.equal(await readFile(record, 'utf8'), good, 'recorded again from the snapshot');
+  }
+  await writeFile(wf.scriptPath, 'return 999;');
+  await assert.rejects(recover(), /Pinned content conflict: .*script\.js/);
+  await writeFile(wf.scriptPath, 'return 1;');
+  await writeFile(wf.inputs.doc!, 'tampered');
+  await assert.rejects(recover(), /Pinned content conflict/);
+});
+
 test('revision re-pins inputs, reuses matching seals, allocates changed generations and rejects stale requests', async t => {
   const evaluator = new ManualEvaluator(), { home, run, engine, ledgers } = await fixture(t, evaluator);
   const input = join(home, 'document'); await writeFile(input, 'before');

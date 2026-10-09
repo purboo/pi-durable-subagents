@@ -5,8 +5,9 @@
 // revised {rid,revision,snapshot} commit publications; old pins remain immutable.
 // pruned {rid,wid,endedAt,bytes} (written by the engine) is decisive: the wid is gone, its create-intent and
 // created entries stay for identity (A1), and recovery finishes removing w/<wid> and its staging dirs.
-import { access, lstat, readdir, readFile, stat, rm } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { lstat, open, readdir, readFile, rename, stat, rm } from 'node:fs/promises';
+import { createReadStream, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { basename, extname, join, relative } from 'node:path';
 import { discoverAgents, type AgentDefinition, type DiscoveryOptions } from '../compat/agents.ts';
 import { parseFrontmatter } from '../compat/frontmatter.ts';
@@ -27,7 +28,20 @@ export interface Pins {
 export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string>; originPath?: string }
 type SnapshotRef = { path: string; hash: string };
 /** pinned/<rN>/pins.json: the in-memory pins of a published revision, valid for the snapshot hash it names. */
-type PinRecord = { snapshot: string; pins: Pins; inputs: Record<string, string>; origin: boolean };
+type PinRecord = { snapshot: string; digest: string; pins: Pins; inputs: Record<string, string>; origin: boolean; files: Record<string, string> };
+/** sha256 of a file, streamed. */
+async function fileHash(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+/** Replace `name` in `dir` atomically and durably (a cache record: last writer wins). */
+async function replaceFile(dir: string, name: string, text: string): Promise<void> {
+  const temp = join(dir, `.${ulid()}.tmp`), file = await open(temp, 'wx', 0o600);
+  try { await file.writeFile(text); await file.sync(); } finally { await file.close(); }
+  try { await rename(temp, join(dir, name)); } catch (error) { await rm(temp, { force: true }); throw error; }
+  await syncDirectory(dir);
+}
 type Snapshot = { hash: string; pins?: Pins; error?: string; warnings?: string[] };
 
 // E3: errors of the machine rather than of the request; only these propagate, so the next intake retries the request.
@@ -254,27 +268,39 @@ export class Store {
     const { origin, inputs: _bytes, ...kept } = pins;
     return { pins: { ...kept, inputs: {} }, scriptPath: join(dir, 'script.js'), inputs, originPath: origin === undefined ? undefined : join(dir, 'origin.jsonl') };
   }
-  /** A1: The pinned files of one revision. The first publication verifies the staged snapshot and ends with `pins.json`
-   *  (the in-memory pins, keyed by the snapshot hash); later starts read that small record instead of parsing and
-   *  re-publishing the snapshot, which can hold a multi-megabyte origin branch per workflow. */
+  /** A1: The pinned files of one revision. The first publication verifies the staged snapshot and ends with `pins.json`:
+   *  the in-memory pins and the sha256 of every published file, keyed by the snapshot hash. Later starts read that small
+   *  record instead of parsing and re-publishing the snapshot (which can hold a multi-megabyte origin branch per
+   *  workflow), and use it only when it is well formed, names this snapshot, its pins hash to its digest and every file
+   *  hashes as recorded — otherwise they take the snapshot path, whose byte comparison reports a changed file as a
+   *  conflict, and record it again. */
   private async pinnedFiles(wid: string, revision: number, intent: Entry): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'>> {
     const dir = revision === 1 ? pinnedDir(this.ledgers.home, wid) : join(pinnedDir(this.ledgers.home, wid), `r${revision}`);
     const ref = intent.pins ? undefined : intent.snapshot as SnapshotRef | undefined;
     if (ref) {
-      const record = await readFile(join(dir, 'pins.json'), 'utf8').then(text => JSON.parse(text) as PinRecord, () => undefined);
-      if (record?.snapshot === ref.hash) {
-        const files = { pins: record.pins, scriptPath: join(dir, 'script.js'), inputs: Object.fromEntries(Object.entries(record.inputs).map(([name, file]) => [name, join(dir, file)])),
-          originPath: record.origin ? join(dir, 'origin.jsonl') : undefined };
-        const present = await Promise.all([files.scriptPath, ...Object.values(files.inputs), ...(files.originPath ? [files.originPath] : [])].map(path => access(path).then(() => true, () => false)));
-        if (present.every(Boolean)) return files;
-      }
+      const files = await this.recorded(dir, ref.hash).catch(() => undefined);
+      if (files) return files;
     }
     const files = await this.publishPins(wid, revision, await this.pinned(intent));
     if (ref) {
-      const record: PinRecord = { snapshot: ref.hash, pins: files.pins, inputs: Object.fromEntries(Object.entries(files.inputs).map(([name, path]) => [name, relative(dir, path)])), origin: files.originPath !== undefined };
-      await publishFile(dir, 'pins.json', JSON.stringify(record), existing => { try { return (JSON.parse(existing.toString('utf8')) as PinRecord).snapshot === ref.hash; } catch { return false; } })
-        .then(outcome => { if (outcome === 'conflict') return rm(join(dir, 'pins.json'), { force: true }).then(() => publishFile(dir, 'pins.json', JSON.stringify(record))); });
+      const hashes: Record<string, string> = {};
+      for (const path of [files.scriptPath, ...Object.values(files.inputs), ...(files.originPath ? [files.originPath] : [])]) hashes[relative(dir, path)] = await fileHash(path);
+      const record: PinRecord = { snapshot: ref.hash, digest: contentHash(files.pins), pins: files.pins,
+        inputs: Object.fromEntries(Object.entries(files.inputs).map(([name, path]) => [name, relative(dir, path)])), origin: files.originPath !== undefined, files: hashes };
+      await replaceFile(dir, 'pins.json', JSON.stringify(record));
     }
+    return files;
+  }
+  /** The files `pins.json` in `dir` records for snapshot `hash`, when the record and every file verify; else undefined. */
+  private async recorded(dir: string, hash: string): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'> | undefined> {
+    const record = JSON.parse(await readFile(join(dir, 'pins.json'), 'utf8')) as PinRecord;
+    if (record?.snapshot !== hash || typeof record.digest !== 'string' || !record.pins || typeof record.pins !== 'object' || contentHash(record.pins) !== record.digest) return undefined;
+    if (!record.inputs || typeof record.inputs !== 'object' || !record.files || typeof record.files !== 'object') return undefined;
+    const inputs = Object.fromEntries(Object.entries(record.inputs).map(([name, file]) => [name, join(dir, String(file))]));
+    const files = { pins: record.pins, scriptPath: join(dir, 'script.js'), inputs, originPath: record.origin === true ? join(dir, 'origin.jsonl') : undefined };
+    const paths = [files.scriptPath, ...Object.values(inputs), ...(files.originPath ? [files.originPath] : [])];
+    if (new Set(paths.map(path => relative(dir, path))).size !== Object.keys(record.files).length) return undefined;
+    for (const path of paths) if (record.files[relative(dir, path)] !== await fileHash(path)) return undefined;
     return files;
   }
   /** P14, A2: Publish a new revision only after the engine has retired its predecessor. */
