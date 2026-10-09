@@ -321,3 +321,21 @@ test('P28 a hibernated asker shows hibernated until its answer is bound, and nev
   assert.equal(snapshotFromEntries('w', bound).calls[0]!.hibernated, undefined);
   assert.equal(snapshotFromEntries('w', [...asked, e(8, 'sealed', { call, exec, result: res('a', 'stopped') })]).calls[0]!.hibernated, undefined);
 });
+
+test('events: a model switch names its target, and a failover also the used-up provider it left', () => {
+  const env = (body: Record<string, unknown>) => ({ to: 'w@1/b@1', kind: 'model', body });
+  const list = [
+    e(1, 'wf-created', { revision: 1 }), e(2, 'call', { key: 'b', gen: 1, spec: { agent: 'x' } }), e(3, 'exec', { call: 'w@1/b@1', exec: 'w@1/b@1#1.1' }),
+    e(4, 'selected', { exec: 'w@1/b@1#1.1', model: { provider: 'pa', id: 'm' }, pool: 'top' }),
+    e(5, 'forward', { rid: 'fo', rid2: 'x-fo', dest: 'w@1/b@1', hash: 'h', envelope: env({ provider: 'pb', model: 'm', exec: 'w@1/b@1#1.1' }), failover: 'pa' }),
+    e(6, 'forward', { rid: 'manual', rid2: 'x-manual', dest: 'w@1/b@1', hash: 'h', envelope: env({ provider: 'pc', model: 'n', thinking: 'high' }) }),
+    e(7, 'forward', { rid: 's', rid2: 'x-s', dest: 'w@1/b@1', hash: 'h', envelope: { to: 'w@1/b@1', kind: 'steer', body: { message: 'm' } } }),
+  ];
+  const forwards = eventsFromEntries(list).filter(x => x.event === 'forward');
+  assert.deepEqual(forwards.map(({ seq: _s, ts: _t, ...rest }) => rest), [
+    { event: 'forward', rid: 'fo', kind: 'model', dest: 'w@1/b@1', model: 'pb/m', failover: 'pa' },
+    { event: 'forward', rid: 'manual', kind: 'model', dest: 'w@1/b@1', model: 'pc/n' },
+    { event: 'forward', rid: 's', kind: 'steer', dest: 'w@1/b@1' },
+  ]);
+  assert.match(renderEvent(forwards[0]!), /forward +rid=fo kind=model dest=w@1\/b@1 model=pb\/m failover=pa$/);
+});
