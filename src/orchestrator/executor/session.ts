@@ -64,14 +64,17 @@ export function cutAskResult(m: Message | undefined): boolean {
   const text = typeof m.content === "string" ? m.content : (m.content ?? []).map(b => b.text ?? "").join("");
   return text === ASK_CUT.shutdown || text === ASK_CUT.aborted;
 }
-/** P28: the `ask` tool call that wrote the question at `index` (the child appends a question while that ask runs, after
- *  the assistant message that called it; asks are sequential, so it is the last ask called before the question). */
+/** P28: the `ask` tool call that wrote the question at `index`. The child appends a question while that ask runs, after
+ *  the assistant message that called it; a message with an ask runs its tools in order, so it is that message's first
+ *  ask with no result before the question. */
 export function askOf(entries: readonly SessionEntry[], index: number): string | undefined {
   for (let i = index - 1; i >= 0; i--) {
     const m = entries[i]!.message;
     if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
-    const ask = m.content.findLast(b => b.type === "toolCall" && b.name === "ask" && b.id);
-    if (ask) return ask.id;
+    const asks = m.content.filter(b => b.type === "toolCall" && b.name === "ask" && b.id);
+    if (!asks.length) continue;
+    const done = new Set(entries.slice(i + 1, index).map(e => e.message?.role === "toolResult" ? e.message.toolCallId : undefined));
+    return (asks.find(b => !done.has(b.id)) ?? asks.at(-1))!.id;
   }
   return undefined;
 }

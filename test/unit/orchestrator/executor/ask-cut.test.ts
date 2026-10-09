@@ -43,3 +43,17 @@ test("P28 a cut-off ask next to another unfinished tool still leaves that tool u
   const entries = [exec("c#1.1"), bash("X"), ask("A"), question("q1"), result("A", ASK_CUT.shutdown, true)];
   assert.deepEqual(evidence(entries, "c#1.1").dangling, ["bash (X)", "ask (A)"]);
 });
+
+test("P28 with several asks in one message, the question belongs to the first ask without a result before it", () => {
+  const two = (a: string, b: string): SessionEntry => ({ type: "message", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: a, name: "ask" }, { type: "toolCall", id: b, name: "ask" }] } });
+  // X wrote qX and a steer ended it; Y has not run yet: qX is not open, and Y wrote no question.
+  const steered = [exec("c#1.1"), two("X", "Y"), question("qX"), result("X", "do something else", false, { rid: "s1", kind: "steer" })];
+  assert.equal(openQuestion(steered), undefined);
+  // X wrote qX and was cut off; Y was aborted without a question: qX is open and X (not Y) is the unknown ask.
+  const cut = [exec("c#1.1"), two("X", "Y"), question("qX"), result("X", ASK_CUT.shutdown, true), result("Y", ASK_CUT.aborted, true)];
+  assert.deepEqual(openQuestion(cut), { qid: "qX", rev: 1, question: "qX?" });
+  assert.deepEqual(evidence(cut, "c#1.1").dangling, ["ask (X)"]);
+  // X answered by a steer, then Y wrote qY: qY belongs to Y.
+  const second = [exec("c#1.1"), two("X", "Y"), question("qX"), result("X", "steered", false, { rid: "s1", kind: "steer" }), question("qY")];
+  assert.deepEqual(openQuestion(second), { qid: "qY", rev: 1, question: "qY?" });
+});
