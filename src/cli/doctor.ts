@@ -9,7 +9,8 @@ import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { scanInbox } from "../kernel/mailbox.ts";
 import { OsLock } from "../platform/lock.ts";
 import { journalPath, orchInbox, orchLedger, orchLock } from "../paths.ts";
-import { snapshotFromEntries } from "../orchestrator/snapshot.ts";
+import { runningStats, snapshotFromEntries } from "../orchestrator/snapshot.ts";
+import { statsLine, type OrchestratorStats } from "../orchestrator/stats.ts";
 import { diskUsage } from "../orchestrator/store.ts";
 import { JT, isEntry } from "../types.ts";
 import { serviceFiles } from "./service.ts";
@@ -27,6 +28,8 @@ export interface DoctorReport {
   orphanStaging: string[];
   tmpFiles: string[];
   orchestrator: "running" | "not running" | "unknown";
+  /** What the running orchestrator costs (see status --json), when it published it. */
+  orchestratorStats?: OrchestratorStats;
   service: "installed" | "not installed" | "unavailable";
   findings: Finding[];
 }
@@ -53,7 +56,7 @@ export async function doctor(home: string, env: NodeJS.ProcessEnv = process.env,
   const ledger = readJournalSnapshot(orchLedger(home));
   const pruned = new Set(ledger.filter(e => e.type === "pruned").map(e => String(e.wid)));
   const report: DoctorReport = { home, bytes: await diskUsage(home), workflows: {}, ledger: { entries: ledger.length, bytes: await diskUsage(orchLedger(home)) },
-    largestJournals: [], parked: [], attention: [], fenceFailed: [], orphanStaging: [], tmpFiles: [], orchestrator: await lockHeld(home), service: "unavailable", findings: [] };
+    largestJournals: [], parked: [], attention: [], fenceFailed: [], orphanStaging: [], tmpFiles: [], orchestrator: await lockHeld(home), service: "unavailable", findings: [], ...runningStats(home) };
   const journals: { wid: string; bytes: number }[] = [];
   for (const wid of (await names(join(home, "w"))).filter(n => !n.startsWith(".") && !pruned.has(n)).sort()) {
     const entries = readJournalSnapshot(journalPath(home, wid)), snap = snapshotFromEntries(wid, entries);
@@ -128,7 +131,7 @@ export function renderDoctor(r: DoctorReport): string {
     ...list("unresolved fence failures", r.fenceFailed, f => `${f.wid} ${f.exec} ${age(f.ageMs)}`),
     ...list("orphan staging", r.orphanStaging, s => s),
     ...list("leftover tmp files", r.tmpFiles, s => s),
-    `orchestrator: ${r.orchestrator === "running" ? "running (holds the lock)" : r.orchestrator}`,
+    `orchestrator: ${r.orchestrator === "running" ? "running (holds the lock)" : r.orchestrator}${r.orchestratorStats ? `; ${statsLine(r.orchestratorStats)}` : ""}`,
     `service: ${r.service}`,
     ...(r.findings.length ? [`${r.findings.length} actionable finding(s):`, ...r.findings.flatMap(f => [`  ${f.kind}: ${f.detail}`, `    ${f.command}`])] : ["nothing actionable"]),
   ].join("\n");

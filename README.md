@@ -518,6 +518,25 @@ never comes back. `doctor` shows disk use, workflows by status, the largest
 journals, parked work, old open questions, and leftovers; each finding
 comes with one command to fix it.
 
+Finished workflows cost the orchestrator nothing while nobody touches them:
+once a workflow has ended (or parked) with no follow-up or execution open,
+its journal file is closed and nothing reads it periodically. A follow-up,
+resume, revise, stop or prune reopens it as needed. `status` and `doctor`
+show what the running orchestrator costs on one line,
+
+```text
+orchestrator: 3 live / 190 workflows, 3 journals open, 0.4 passes/s, read 12 MB
+```
+
+and `status --json` / `doctor --json` carry it as `orchestratorStats`:
+`workflows` (not pruned), `liveWorkflows` (with work still open),
+`openJournals` (journal files held open), `passesPerSecond` (intake passes
+that ran, averaged over the last minute; an idle orchestrator runs almost
+none), `readBytes` (bytes the process read since it started, from
+`/proc/self/io`; absent where there is none), `pid` and `at` (when it was
+written). The orchestrator writes these to `orchestrator-stats.json` every
+10 s; they are shown only while that process runs.
+
 ### Resource leases
 
 Benchmarks, timing measurements and big builds need the machine to

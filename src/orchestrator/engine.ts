@@ -36,6 +36,8 @@ import { readPage } from '../events/log.ts';
 import { eventsLog } from '../paths.ts';
 import { parseModel } from '../compat/model.ts';
 import { PENDING_NOTE, pendingNotes, unsettledNotify, withNotes } from './notes.ts';
+import { journalAppends } from '../kernel/journal.ts';
+import { STATS_EVERY_MS, readBytes, writeStats, type OrchestratorStats } from './stats.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
 const charged = (u?: { input: number; output: number; costUsd: number }) => u && (u.input || u.output || u.costUsd) ? formatUsage(u) : undefined;
@@ -142,8 +144,34 @@ export class Engine {
   private hold(wid: string) {
     this.running.set(wid, (this.running.get(wid) ?? 0) + 1);
     let released = false;
-    return () => { if (released) return; released = true; const n = this.running.get(wid)! - 1; if (n) this.running.set(wid, n); else this.running.delete(wid); };
+    return () => {
+      if (released) return; released = true; const n = this.running.get(wid)! - 1; if (n) this.running.set(wid, n); else this.running.delete(wid);
+      const wf = this.store.workflows.get(wid); if (wf) this.settle(wf);
+    };
   }
+  /** Nothing of the workflow is live: it ended (or parked), no script runs, no executor run or follow-up is open. */
+  private quiescent(wf: Workflow): boolean {
+    if (!this.terminal(wf) || this.states.has(wf.wid) || this.running.has(wf.wid) || this.openFollowUps(wf)) return false;
+    for (const id of this.generations) if (id.startsWith(`${wf.wid}@`)) return false;
+    return true;
+  }
+  /** A workflow with nothing live rests its journal: the descriptor closes and nothing reads it periodically; the next
+   *  append (a follow-up, resume, revise, stop, prune or a late executor record) reopens it. Only a descriptor is
+   *  released: the entries stay in memory, so every decision reads them as before. */
+  private settle(wf: Workflow) { if (!wf.journal.closed) wf.journal.resting = this.quiescent(wf); }
+  /** Intake passes that ran (ms timestamps of the last minute) and the ledger length after the last one. */
+  private passes: number[] = [];
+  private consumed?: { length: number; pending: boolean };
+  /** Counters of this process for status and doctor (published to orchestrator-stats.json). */
+  stats(now = Date.now()): OrchestratorStats {
+    while (this.passes.length && this.passes[0]! < now - 60_000) this.passes.shift();
+    let live = 0, open = 0;
+    for (const wf of this.store.workflows.values()) { if (!wf.journal.resting) live++; if (wf.journal.descriptorOpen !== false && !wf.journal.closed) open++; }
+    const rchar = readBytes(), since = Math.min(60_000, now - this.started);
+    return { pid: process.pid, at: now, workflows: this.store.workflows.size, liveWorkflows: live, openJournals: open,
+      passesPerSecond: Math.round(this.passes.length / Math.max(1, since / 1000) * 100) / 100, ...(rchar !== undefined ? { readBytes: rchar } : {}) };
+  }
+  private started = Date.now();
   private terminal(wf: Workflow) { return terminalEntry(revisionEntries(wf)); }
   private lifecycle(): DecisionRecord[] { return this.ledgers.orch.entries().filter(e => ['admitted', 'applied', 'rejected', 'withdrawn'].includes(e.type)) as unknown as DecisionRecord[]; }
   /** A2, P10: Recover executor authority before replaying each unfinished workflow. */
@@ -176,6 +204,7 @@ export class Engine {
       for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     }
     await this.intake();
+    for (const wf of this.store.workflows.values()) this.settle(wf);
     this.startWaiting();
   }
   /** Every k.waitCheckMs (read here, at orchestrator start), why each live call does not move, as `waiting`/`moving`
@@ -209,6 +238,7 @@ export class Engine {
   }
   private async startWorkflow(wf: Workflow) {
     if (this.terminal(wf)) return;
+    wf.journal.resting = false;
     await this.resolveFinished(wf);
     const log = revisionEntries(wf);
     const ev = Math.max(0, ...wf.journal.entries().filter(e => e.type === 'ev').map(e => e.n as number)) + 1;
@@ -220,11 +250,22 @@ export class Engine {
   }
   /** P5, P6, A3: Commit lifecycle decisions in kernel order before acknowledging intake. */
   intake(): Promise<void> { return this.serial(() => this.consume()); }
+  /** The 1 s poll behind the inbox watcher: a full pass only when a request file waits, the ledger changed since the
+   *  last pass, or an admitted request is unresolved; otherwise an idle orchestrator reads one empty directory. */
+  private async pollIntake() {
+    const files = await readdir(orchInbox(this.ledgers.home)).catch(error => { if (error.code === 'ENOENT') return [] as string[]; throw error; });
+    const last = this.consumed;
+    if (!files.length && last && !last.pending && last.length === this.ledgers.orch.entries().length) return;
+    await this.consume();
+  }
   private async consume() {
+    this.passes.push(Date.now());
     const scanned = (await scanInbox(orchInbox(this.ledgers.home))).filter(r => r.to === 'orch');
-    const retained = this.ledgers.orch.entries().filter(e => e.type === 'request').map(e => e.request as Request);
-    const candidates = [...retained, ...scanned];
     const before = reduceLifecycle(this.lifecycle()), staged = new Set<string>();
+    // Only unresolved admitted envelopes can still be decided: a resolved one only re-binds its own rid (A1), so the
+    // pass hashes and clones what is open, not the whole request history.
+    const retained = this.ledgers.orch.entries().filter(e => e.type === 'request' && !before.resolved.has((e.request as Request).rid)).map(e => e.request as Request);
+    const candidates = [...retained, ...scanned];
     for (const request of candidates) {
       if (!['run', 'revise'].includes(request.kind) || before.admitted.has(request.rid) || before.tombstones.has(request.rid) || staged.has(request.rid)) continue;
       await this.store.stage(request as Request<RunBody>, this.discovery);
@@ -263,6 +304,8 @@ export class Engine {
         await unlink(join(orchInbox(this.ledgers.home), `${req.rid}.json`)).catch(error => { if (error.code !== 'ENOENT') throw error; });
       }
     }
+    const after = reduceLifecycle(this.lifecycle());
+    this.consumed = { length: this.ledgers.orch.entries().length, pending: [...after.admitted.keys()].some(rid => !after.resolved.has(rid)) };
   }
   private findCall(to: string, bareWid = false): { wf: Workflow; entry: Entry } | undefined {
     for (const wf of this.store.workflows.values()) {
@@ -507,14 +550,14 @@ export class Engine {
   private dispatchGeneration(wf: Workflow, entry: Entry) {
     const ticket = this.ticket({ wf } as State, entry), id = ticket.callId;
     if (this.generations.has(id) || this.held(wf.wid) || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
-    this.generations.add(id);
+    this.generations.add(id); wf.journal.resting = false;
     void this.executor.run(ticket).then(() => this.background(async () => {
       if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);
       if (!wf.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`))
         await wf.journal.append(JT.attention, { item: { id: `finished:${id}`, rev: 1, kind: 'finished', wid: wf.wid, call: id, text: finishedText(wf.wid, wf.journal.entries(), id), origin: wf.origin } });
-      this.generations.delete(id);
+      this.generations.delete(id); this.settle(wf);
     }), error => {
-      this.generations.delete(id);
+      this.generations.delete(id); this.settle(wf);
       if (error instanceof Error && error.name === 'ExecutorShutdown') return;
       this.background(async () => { throw error; });
     });
@@ -697,6 +740,7 @@ export class Engine {
     const st = this.states.get(wf.wid);
     if (st) this.evaluator.send({ t: 'stop', wid: wf.wid, ev: st.ev });
     this.states.delete(wf.wid);
+    this.settle(wf);
   }
   /** K6, P5: Watch with polling fallback and exit only after continuous quiescence. */
   async loop(signal?: AbortSignal): Promise<void> {
@@ -704,7 +748,9 @@ export class Engine {
     await mkdir(inbox, { recursive: true });
     this.watcher = watch(inbox, () => this.background(() => this.consume()));
     this.watcher.on('error', () => { this.watcher?.close(); });
-    this.poll = setInterval(() => this.background(() => this.consume()), 1000);
+    this.poll = setInterval(() => this.background(() => this.pollIntake()), 1000);
+    const publish = () => { this.statsWritten = this.statsWritten.then(() => writeStats(this.ledgers.home, this.stats())).catch(error => console.error(`durable-subagents: orchestrator stats not written: ${String(error)}`)); };
+    publish(); this.publishing = setInterval(publish, STATS_EVERY_MS); this.publishing.unref?.();
     let idleSince = performance.now();
     try {
       while (!signal?.aborted && !this.closed && !this.restarting) {
@@ -712,15 +758,28 @@ export class Engine {
         if (this.failure) throw this.failure;
         const files = await readdir(inbox);
         // Held (drained) workflows cannot progress until a resume request, which restarts the orchestrator: they do not keep it alive.
-        if (this.generations.size || [...this.store.workflows.values()].some(w => !this.terminal(w) && !this.held(w.wid)) || this.executor.busy() || files.length) idleSince = performance.now();
+        if (this.generations.size || this.executor.busy() || files.length || this.unfinished()) idleSince = performance.now();
         else if (performance.now() - idleSince >= (this.ledgers.config.k?.idleExitMs ?? 10_000)) return;
         await delay(Math.min(100, this.ledgers.config.k?.idleExitMs ?? 100));
       }
-    } finally { this.watcher?.close(); clearInterval(this.poll); }
+    } finally { this.watcher?.close(); clearInterval(this.poll); clearInterval(this.publishing); await this.statsWritten; }
   }
+  private publishing?: ReturnType<typeof setInterval>;
+  private statsWritten: Promise<void> = Promise.resolve();
+  /** A workflow that can still progress (not terminal, not held). Both depend only on journal entries and the set of
+   *  workflows, so the answer is reused until this process appends to a journal or the set changes. */
+  private unfinished(): boolean {
+    const key = `${journalAppends()}:${this.store.workflows.size}`;
+    if (this.unfinishedAt?.key === key) return this.unfinishedAt.value;
+    let value = false;
+    for (const w of this.store.workflows.values()) if (!this.terminal(w) && !this.held(w.wid)) { value = true; break; }
+    this.unfinishedAt = { key, value };
+    return value;
+  }
+  private unfinishedAt?: { key: string; value: boolean };
   /** A1, A2: Retire asynchronous producers before closing their journals. */
   async close(): Promise<void> {
-    this.closed = true; this.watcher?.close(); clearInterval(this.poll);
+    this.closed = true; this.watcher?.close(); clearInterval(this.poll); clearInterval(this.publishing); await this.statsWritten;
     await this.waiting?.stop(); await this.queue; await this.evaluator.close(); await this.executor.shutdown(); await this.events.close(); await this.store.close();
   }
 }
