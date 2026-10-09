@@ -12,6 +12,7 @@ import type { Exhaustion } from "./providers.ts";
 import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
 import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
+import { PENDING_NOTE } from "./notes.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
 export type Usage = { input: number; output: number; costUsd: number };
@@ -53,6 +54,8 @@ export interface CallSnapshot {
   hibernated?: true;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
+  /** Notes (send kind "notify") recorded for this call while it was not running; its next follow-up carries them. */
+  notesPending?: number;
 }
 export interface WorkflowSnapshot {
   wid: string; rev: number; name?: string; origin?: string; cwd?: string;
@@ -116,7 +119,7 @@ function plannedTotal(home: string, wid: string, rev: number): number | undefine
 const zero = (): Usage => ({ input: 0, output: 0, costUsd: 0 });
 const nonzero = (u?: Usage) => !!u && (u.input > 0 || u.output > 0 || u.costUsd > 0);
 const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
-const MESSAGES = new Set(["steer", "follow-up", "answer", "continue", "task"]);
+const MESSAGES = new Set(["steer", "notify", "follow-up", "answer", "continue", "task"]);
 /** P7, P27: A pending send that carries a message to the agent (model switches and withdrawals are controls). */
 export const pendingMessage = (s: CallSend) => s.state === "pending" && MESSAGES.has(s.kind);
 /** P37: The display name of a call id `wid@r/key@g`: the key, with its generation when later than the first. */
@@ -147,6 +150,8 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
   const tools = new Map<string, number>();
   // P7, P27: forward / forward-delivered / forward-retired, by destination call; retirements carry only rid2.
   const sends = new Map<string, CallSend[]>(), byRid2 = new Map<string, CallSend>();
+  // Pending notes of the current revision by key (notes.ts): recorded rids, and those a generation carried.
+  const notes = new Map<string, Set<string>>(), carried = new Set<string>();
   function apply(batch: readonly Entry[], from = 0) {
     for (let i = from; i < batch.length; i++) {
       const e = batch[i]!;
@@ -156,7 +161,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
         const key = String(e.key), gen = Number(e.gen) || (e.type === "refused" ? 0 : 1);
         const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;
-        if (e.type === "generation") generations.add(callId);
+        if (e.type === "generation") { generations.add(callId); for (const rid of Array.isArray(e.notes) ? e.notes : []) carried.add(String(rid)); }
         const result = e.type === "refused" ? refusedResult(key, e.reason) :
           e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
         const wanted = (e.spec as { model?: unknown } | undefined)?.model;
@@ -165,6 +170,9 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
           ...(typeof wanted === "string" && wanted ? { model: wanted } : {}),
           phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),
           ...(e.type === "refused" ? { refused: String(e.reason) } : {}), ...(e.type === "reused" ? { reused: String(e.from) } : {}) });
+      } else if (e.type === PENDING_NOTE) {
+        if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
+        const set = notes.get(String(e.key)) ?? new Set<string>(); set.add(String(e.rid)); notes.set(String(e.key), set);
       } else if (e.type === "retired") { retired.add(String(e.call));
       } else if (e.type === JT.exec) {
         const call = calls.get(String(e.call)); if (!call) continue;
@@ -258,6 +266,10 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         if (last?.reason !== undefined) c.switchFailed = `${last.model} (${last.reason})`;
         else if (last && last.state !== "retired" && last.model !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = last.model;
       }
+    }
+    for (const [key, rids] of notes) {
+      const n = [...rids].filter(rid => !carried.has(rid)).length, call = list.findLast(c => c.key === key);
+      if (n && call) call.notesPending = n;
     }
     const after = done ? list.filter(c => generations.has(c.callId) && c.phase !== "sealed" && !retired.has(c.callId)) : [];
     for (const c of after) c.afterEnd = true;
@@ -420,6 +432,8 @@ export interface StatusCall {
   writerWait?: { root: string; holder: string };
   /** Resource leases (`pi-durable-subagents hold`): "holds lease machine" / "waiting for lease machine 3m". */
   lease?: string;
+  /** Notes (send kind "notify") recorded while the call was not running; its next follow-up carries them. */
+  notesPending?: number;
 }
 export interface StatusWorkflow {
   wid: string; name?: string; origin?: string; status: WorkflowSnapshot["status"]; rev: number;
@@ -464,7 +478,8 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
-        ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}) };
+        ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
+        ...(c.notesPending ? { notesPending: c.notesPending } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
     ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}),
@@ -526,6 +541,8 @@ export interface BriefCall {
   lease?: string;
   /** `model` is the model in use; `switching` one requested and not answering yet; `switchFailed` a refused request. */
   switching?: string; switchFailed?: string;
+  /** Notes (send kind "notify") recorded while the call was not running; its next follow-up carries them. */
+  notesPending?: number;
 }
 export interface BriefWorkflow {
   wid: string; name?: string; status: WorkflowSnapshot["status"]; paused?: true;
@@ -638,12 +655,14 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
   const mine = (w: WorkflowSnapshot) => !origin || w.origin === origin;
   const line = (w: WorkflowSnapshot) => {
     const p = progressOf(w), notOk = latestCalls(w).filter(c => c.result && !c.result.ok).length;
+    const notes = latestCalls(w).reduce((n, c) => n + (c.notesPending ?? 0), 0);
     return [w.wid, w.name, `${w.paused ? "paused" : w.followUps ? `${w.status}, follow-up running` : w.status}`, `${p.done}/${p.total}${p.plus ? "+" : ""} done`, notOk ? `${notOk} not ok` : "",
+      notes ? `${notes} note${notes > 1 ? "s" : ""} pending` : "",
       w.endedAt !== undefined ? `ended ${age(now - w.endedAt)} ago` : w.startedAt !== undefined ? `started ${age(now - w.startedAt)} ago` : ""].filter(Boolean).join(" · ");
   };
   const brief = (w: WorkflowSnapshot): BriefWorkflow => {
     const p = progressOf(w), open = w.attention.filter(a => a.kind !== "finished");
-    const calls = latestCalls(w).filter(c => c.phase !== "sealed" || (c.result && !c.result.ok)).map((c): BriefCall => {
+    const calls = latestCalls(w).filter(c => c.phase !== "sealed" || (c.result && !c.result.ok) || c.notesPending).map((c): BriefCall => {
       const live = c.phase !== "sealed", quiet = c.lastActivity !== undefined ? now - c.lastActivity : undefined;
       return { key: c.key, agent: c.agent, phase: c.phase, ...(c.model ? { model: c.model } : {}),
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
@@ -653,7 +672,8 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
         ...(c.hibernated ? { hibernated: true as const } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
         ...(live && byCall.get(c.callId) ? { lease: byCall.get(c.callId) } : {}),
-        ...(live && c.switching ? { switching: c.switching } : {}), ...(live && c.switchFailed ? { switchFailed: c.switchFailed } : {}) };
+        ...(live && c.switching ? { switching: c.switching } : {}), ...(live && c.switchFailed ? { switchFailed: c.switchFailed } : {}),
+        ...(c.notesPending ? { notesPending: c.notesPending } : {}) };
     });
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
       ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300) }));

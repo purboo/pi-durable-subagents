@@ -7,10 +7,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
-import { findRequest, REQUEST_ID, requestId, requestRid, RequestsBusy, specDigest, type Identified } from "../requests.ts";
+import { findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, specDigest, type Identified } from "../requests.ts";
 import { isLive, slotsView, workflowSnapshot, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
-import { checkAgents, request } from "../agent/main/tool.ts";
+import { checkAgents, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { JT, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
 import { startOrchestrator, submitIdentified } from "./control.ts";
@@ -25,20 +25,22 @@ export interface Context { home: string; env: NodeJS.ProcessEnv; write: (line: s
 type Flags = Record<string, string | true>;
 type Sent = Extract<Identified, { sent: boolean }>;
 
-/** Strict `--name value` / `--flag` parsing; unknown or repeated options are errors. */
-function flags(args: string[], spec: Record<string, "value" | "flag">): { values: Flags; positionals: string[] } {
-  const values: Flags = {}, positionals: string[] = [];
+/** Strict `--name value` / `--flag` parsing; unknown or repeated options are errors, except those given in `repeated`
+ *  (every value is kept, in order, in `lists`). */
+function flags(args: string[], spec: Record<string, "value" | "flag">, repeated: string[] = []): { values: Flags; positionals: string[]; lists: Record<string, string[]> } {
+  const values: Flags = {}, positionals: string[] = [], lists: Record<string, string[]> = {};
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (!arg.startsWith("--")) { positionals.push(arg); continue; }
     const name = arg.slice(2), kind = spec[name];
+    if (kind === "value" && repeated.includes(name) && args[i + 1] !== undefined) { (lists[name] ??= []).push(args[++i]!); values[name] = args[i]!; continue; }
     if (!kind || Object.hasOwn(values, name)) throw new Error(`Unknown or repeated option ${arg}`);
     if (kind === "flag") { values[name] = true; continue; }
     const value = args[++i];
     if (value === undefined) throw new Error(`${arg} needs a value`);
     values[name] = value;
   }
-  return { values, positionals };
+  return { values, positionals, lists };
 }
 const text = (values: Flags, name: string): string | undefined => typeof values[name] === "string" ? values[name] as string : undefined;
 function waitMs(values: Flags, ctx: Context): number {
@@ -194,7 +196,7 @@ async function outcome(home: string, rid: string, run: boolean, timeoutMs: numbe
 async function conflict(ctx: Context, id: string, original: string, json: boolean): Promise<number> {
   const d = await describe(ctx.home, { request: id });
   const reply = { request: id, error: "request-conflict", ...(d.wid ? { wid: d.wid } : {}), spec_digest: original, state: d.state };
-  ctx.write(json ? JSON.stringify(reply) : `${id}: request-conflict — this id names other content (${d.state}${d.wid ? `, ${d.wid}` : ""}); retry with the stored spec bytes or use a new id`);
+  ctx.write(json ? JSON.stringify(reply) : `${id}: request-conflict - this id names other content (${d.state}${d.wid ? `, ${d.wid}` : ""}); retry with the stored spec bytes or use a new id`);
   return EXIT.conflict;
 }
 function pending(ctx: Context, id: string, json: boolean, why = ""): number {
@@ -305,14 +307,63 @@ async function target(home: string, to: string, call: string | undefined, prior:
   if (keys.length === 1) return { to: `${resolved.wid}/${keys[0]}` };
   throw new Error(`${to} has ${keys.length ? `calls ${keys.join(", ")}` : "no calls yet"}; name one with --call <key> or --to <wid>/<key>`);
 }
-/** `send --request <id> --to <…> --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>]`. */
-export const sendCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, sendRequest);
+const SEND_FLAGS = { request: "value", to: "value", call: "value", kind: "value", qid: "value", rev: "value", message: "value", model: "value", json: "flag", "wait-ms": "value" } as const;
+const SEND_USAGE = "usage: send --request <id> --to <run-id|wid/key> [--to ...] --kind follow-up|answer|steer|notify|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]";
+/** `send --request <id> --to <...> --kind follow-up|answer|steer|notify|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>]`.
+ *  A repeated --to sends one request per call (see sendMany). */
+export const sendCommand = (args: string[], ctx: Context): Promise<number> => {
+  const at = args.flatMap((a, i) => a === "--to" ? [i] : []);
+  return at.length > 1 ? sendMany(args, at, ctx) : refusable(args, ctx, sendRequest);
+};
+/** A send to several calls (repeated --to): one request per target, `<id>:1` ... `<id>:n` in the order given, each decided
+ *  on its own; one line (or, with --json, one entry of `targets`) per target. Exit 3 when the id or one target's id names
+ *  other content, else 75 when one is not decided yet, else 1 when one was rejected, else 0. */
+async function sendMany(args: string[], at: number[], ctx: Context): Promise<number> {
+  const json = args.includes("--json");
+  let id: string, targets: string[], ids: string[];
+  try {
+    const parsed = flags(args, SEND_FLAGS, ["to"]);
+    if (text(parsed.values, "kind") === "answer") throw new Error("answer goes to one call: give a single --to");
+    if (!text(parsed.values, "request") || parsed.positionals.length) throw new Error(SEND_USAGE);
+    id = text(parsed.values, "request")!; targets = parsed.lists.to!; ids = manyIds(id, targets.length);
+  } catch (error) {
+    if (!json) throw error;
+    const at = args.indexOf("--request");
+    ctx.write(JSON.stringify({ request: at >= 0 && at + 1 < args.length ? args[at + 1] : null, applied: false, reason: (error as Error).message }));
+    return EXIT.rejected;
+  }
+  if (await findRequest(ctx.home, requestRid(id)) || await findRequest(ctx.home, requestRid(`${id}:${targets.length + 1}`))) {
+    ctx.write(json ? JSON.stringify({ request: id, error: "request-conflict" }) : `${id}: request-conflict - this id names other content; retry with the same targets or use a new id`);
+    return EXIT.conflict;
+  }
+  const rest = args.filter((_, i) => !at.includes(i) && !at.includes(i - 1));
+  const request = rest.indexOf("--request");
+  const results = await Promise.all(targets.map(async (to, i) => {
+    const lines: string[] = [], own = [...rest.slice(0, request + 1), ids[i]!, ...rest.slice(request + 2), "--to", to, ...(json ? [] : ["--json"])];
+    let code: number;
+    try { code = await refusable(own, { ...ctx, write: line => lines.push(line) }, sendRequest); }
+    catch (error) { return { code: EXIT.rejected as number, reply: { request: ids[i], applied: false, reason: (error as Error).message } as Record<string, unknown>, to }; }
+    let reply: Record<string, unknown>;
+    try { reply = JSON.parse(lines.join("")); } catch { reply = { request: ids[i], output: lines.join("\n") }; }
+    return { code, reply, to };
+  }));
+  const codes = results.map(r => r.code);
+  const code = codes.includes(EXIT.conflict) ? EXIT.conflict : codes.includes(EXIT.pending) ? EXIT.pending : codes.some(c => c !== EXIT.ok) ? EXIT.rejected : EXIT.ok;
+  if (json) ctx.write(JSON.stringify({ request: id, targets: results.map(r => ({ to: r.to, ...r.reply })) }));
+  else for (const r of results) ctx.write(`${r.to}: ${r.reply.error === "request-conflict" ? "request-conflict" : r.reply.pending ? `submitted, not decided yet${r.reply.reason ? ` (${String(r.reply.reason)})` : ""}` : outcomeLine(r.reply)} [${String(r.reply.request)}]`);
+  return code;
+}
 async function sendRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
-  const { values, positionals } = flags(args, { request: "value", to: "value", call: "value", kind: "value", qid: "value", rev: "value", message: "value", model: "value", json: "flag", "wait-ms": "value" });
+  const { values, positionals } = flags(args, SEND_FLAGS);
   const id = text(values, "request"), to = text(values, "to"), kind = text(values, "kind"), json = values.json === true, wait = waitMs(values, ctx);
   seen.id = id; seen.json = json;
-  if (!id || !to || !kind || positionals.length) throw new Error("usage: send --request <id> --to <run-id|wid/key> --kind follow-up|answer|steer|model [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]");
+  if (!id || !to || !kind || positionals.length) throw new Error(SEND_USAGE);
   const rid = requestRid(id), prior = (await findRequest(ctx.home, rid))?.request;
+  // A single send under an id that names a send to several calls (<id>:1 ...) is other content.
+  if (!prior && await namesMany(ctx.home, id)) {
+    ctx.write(json ? JSON.stringify({ request: id, error: "request-conflict" }) : `${id}: request-conflict - this id names a send to several calls; use a new id`);
+    return EXIT.conflict;
+  }
   const where = await target(ctx.home, to, text(values, "call"), prior);
   if ("pending" in where) return pending(ctx, id, json, `run ${to.split("/")[0]} has no workflow yet`);
   const raw = text(values, "message"), message = raw?.startsWith("@") ? readFileSync(resolve(ctx.cwd ?? process.cwd(), raw.slice(1)), "utf8") : raw;
@@ -364,7 +415,10 @@ function decided(ctx: Context, id: string, done: { sent: Sent; outcome: Outcome 
   const wid = typeof body.to === "string" ? body.to.split("/")[0]!.split("@")[0]! : undefined;
   const opened = done.sent.request.kind === "send" && wid && existsSync(journalPath(ctx.home, wid))
     ? (readJournalSnapshot(journalPath(ctx.home, wid)) as Entry[]).find(e => e.type === "generation" && e.rid === done.sent.request.rid) : undefined;
-  const reply = { request: id, applied: true, ...(opened ? { generation: Number(opened.gen), call: `${wid}/${String(opened.key)}` } : {}), spec_digest: done.sent.digest };
-  ctx.write(json ? JSON.stringify(reply) : `${id}: applied${opened ? ` (follow-up generation ${reply.generation} of ${reply.call})` : ""}`);
+  // A notify says how it went (steered, held-until-answer or noted); a model send which model and when it applies.
+  const notified = done.sent.request.kind === "send" ? sendReceipt(ledger(ctx.home), done.sent.request.rid) : {};
+  const receipt = notified.delivery ? { delivery: notified.delivery, note: notified.note } : {};
+  const reply = { request: id, applied: true, ...(opened ? { generation: Number(opened.gen), call: `${wid}/${String(opened.key)}` } : {}), ...receipt, spec_digest: done.sent.digest };
+  ctx.write(json ? JSON.stringify(reply) : `${id}: applied${opened ? ` (follow-up generation ${reply.generation} of ${reply.call})` : ""}${receipt.delivery ? ` (${receipt.delivery}: ${receipt.note})` : ""}`);
   return EXIT.ok;
 }
