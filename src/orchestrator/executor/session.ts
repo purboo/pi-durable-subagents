@@ -110,8 +110,9 @@ export function evidence(entries: SessionEntry[], exec: string) {
 /** Only explicit payment failures are terminal; rate limits, overload and transport errors still retry, and a used-up
  *  usage window (`quotaExhausted`) waits for the provider or moves to another one. */
 export function fatalProviderError(text: string): boolean {
-  // 余额 (balance), not 剩余额度 (remaining quota): "当前剩余额度为 0。额度将于次日 00:00:00自动重置" is a daily window.
-  return /\b402\b|insufficient[_ ]?(quota|balance|funds)|billing|credit balance|(?<!剩)余额/i.test(text);
+  // Chinese "balance", but not inside "remaining quota": "remaining quota is 0, resets at 00:00 the next day" is a daily
+  // window. CJK text is written as \u escapes (the repository is ASCII-only English).
+  return /\b402\b|insufficient[_ ]?(quota|balance|funds)|billing|credit balance|(?<!\u5269)\u4f59\u989d/i.test(text);
 }
 /** A provider's usage window is used up: its requests are refused (and not counted) until the window resets, hours
  *  later. Seen as a gateway's `503 No available accounts` once pi's own retries are spent, or a usage-limit message.
@@ -122,7 +123,7 @@ export function quotaExhausted(text: string): boolean {
   // A request rate limit clears in seconds ("rate limit exceeded; resets in 1 second", "quota exceeded for requests
   // per minute"): pi's retries and the lost-execution path handle it; it must not take the provider out for minutes.
   if (/rate.?limit|too many requests|request limit|per (second|minute)|\b[RT]PM\b|resets? in \d+ ?(ms|s|secs?|seconds?|minutes?)\b/i.test(text)) return false;
-  return /usage limit|quota (exceeded|exhausted)|exceeded your (current )?(usage|quota)|limit (reached|exceeded)[^.]*resets?\b|额度/i.test(text);
+  return /usage limit|quota (exceeded|exhausted)|exceeded your (current )?(usage|quota)|limit (reached|exceeded)[^.]*resets?\b|\u989d\u5ea6/i.test(text);
 }
 /** A refusal of the request's content (terms of service, usage or content policy): the same request is refused again,
  *  on this provider and usually on another, so it is reported at once instead of retried as a lost execution. */

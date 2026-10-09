@@ -23,7 +23,7 @@ test('journal serializes concurrent appends; snapshots cannot mutate committed e
 });
 test('crash recovery truncates torn and CRC-invalid tails; snapshot stays read-only', async t => {
   const path = join(await fixture(t), 'journal');
-  let journal = await openJournal(path); await journal.append('kept', { text: '中文' }); await journal.close();
+  let journal = await openJournal(path); await journal.append('kept', { text: '\u4e2d\u6587' }); await journal.close();
   const good = await readFile(path);
   for (const tail of ['1234 {"seq":2', '00000000 {"seq":2,"ts":1,"type":"bad"}\n']) {
     await appendFile(path, tail);
@@ -154,7 +154,7 @@ test('A3, C11: requests with a long or unsafe rid are never admitted (no path ca
   const { scanInbox } = await import('../../../src/kernel/mailbox.ts');
   const dir = await mkdtemp(join(tmpdir(), 'dsa-rid-')), bad: string[] = [];
   const base = { from: 's', to: 'orch', sseq: 1, kind: 'run', body: {} };
-  for (const rid of ['ok-01:a.b', 'x'.repeat(129), '任务'.repeat(40), '-leading']) await writeFile(join(dir, `${rid}.json`), JSON.stringify({ ...base, rid }));
+  for (const rid of ['ok-01:a.b', 'x'.repeat(129), '\u4efb\u52a1'.repeat(40), '-leading']) await writeFile(join(dir, `${rid}.json`), JSON.stringify({ ...base, rid }));
   const admitted = await scanInbox(dir, path => bad.push(path));
   assert.deepEqual(admitted.map(r => r.rid), ['ok-01:a.b']); assert.equal(bad.length, 3);
 });

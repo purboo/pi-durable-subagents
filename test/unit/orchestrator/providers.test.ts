@@ -24,9 +24,9 @@ test("used-up providers: exhausted until an answer; one probe, freed by its rele
 });
 
 test("quota-class errors are told apart from billing errors and transient ones", () => {
-  for (const text of ['503 {"error":{"message":"No available accounts: no available accounts","type":"api_error"}}', "You have reached your usage limit; it resets at 19:00", "quota exceeded", "额度已用完"])
+  for (const text of ['503 {"error":{"message":"No available accounts: no available accounts","type":"api_error"}}', "You have reached your usage limit; it resets at 19:00", "quota exceeded", "\u989d\u5ea6\u5df2\u7528\u5b8c"])
     assert.ok(quotaExhausted(text) && !fatalProviderError(text), text);
-  for (const text of ["402 Payment Required", "insufficient_quota", "insufficient balance", "余额不足"])
+  for (const text of ["402 Payment Required", "insufficient_quota", "insufficient balance", "\u4f59\u989d\u4e0d\u8db3"])
     assert.ok(fatalProviderError(text) && !quotaExhausted(text), text);
   for (const text of ["Request timed out.", "Anthropic stream ended without a stop reason", "503 Service Unavailable", "429 Too Many Requests", "429 rate limit exceeded; resets in 1 second", "429 request limit reached; reset in 10 seconds", "Quota exceeded for quota metric 'requests per minute'", "usage limit exceeded, resets in 30 seconds"])
     assert.ok(!quotaExhausted(text) && !fatalProviderError(text), text);
@@ -36,13 +36,13 @@ test("quota-class errors are told apart from billing errors and transient ones",
 test("real provider errors: daily windows fail over, rate and concurrency limits do not", () => {
   for (const text of [
     '503 {"error":{"message":"No available accounts: no available accounts","type":"api_error"},"type":"error"}',
-    // A daily window, not a balance: 剩余额度 contains 余额, but the quota resets at midnight.
-    '{"error":{"message":"您的2026-10-02额度已使用完毕，当前剩余额度为 0。额度将于次日 00:00:00自动重置。如需申请提额：https://credit.example/apply","type":"payment_required"},"type":"error"}',
+    // A daily window, not a balance: "remaining quota" contains the word for "balance", but the quota resets at midnight.
+    '{"error":{"message":"\u60a8\u76842026-10-02\u989d\u5ea6\u5df2\u4f7f\u7528\u5b8c\u6bd5\uff0c\u5f53\u524d\u5269\u4f59\u989d\u5ea6\u4e3a 0\u3002\u989d\u5ea6\u5c06\u4e8e\u6b21\u65e5 00:00:00\u81ea\u52a8\u91cd\u7f6e\u3002\u5982\u9700\u7533\u8bf7\u63d0\u989d\uff1ahttps://credit.example/apply","type":"payment_required"},"type":"error"}',
   ]) assert.ok(quotaExhausted(text) && !fatalProviderError(text), text);
-  assert.ok(fatalProviderError("账户余额不足") && fatalProviderError("余额不足，当前剩余额度为 0"), "a balance is still terminal");
+  assert.ok(fatalProviderError("\u8d26\u6237\u4f59\u989d\u4e0d\u8db3") && fatalProviderError("\u4f59\u989d\u4e0d\u8db3\uff0c\u5f53\u524d\u5269\u4f59\u989d\u5ea6\u4e3a 0"), "a balance is still terminal");
   for (const text of [
-    "rate_limit_exceeded: 您的账户已达到速率限制，请您控制请求频率[0123456789abcdef]",
-    "rate_limit_exceeded: App:**0000在模型:deepseek-v4-flash每分钟请求次数超过限制",
+    "rate_limit_exceeded: \u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387[0123456789abcdef]",
+    "rate_limit_exceeded: App:**0000\u5728\u6a21\u578b:deepseek-v4-flash\u6bcf\u5206\u949f\u8bf7\u6c42\u6b21\u6570\u8d85\u8fc7\u9650\u5236",
     "gateway_concurrency_limit: Concurrency limit exceeded for user, please retry later (rate limit)",
     'friday API error (429): {"message":"Too many concurrent responses create requests; global concurrency limit reached (96/96)","type":"rate_limit_error","param":null,"code":"request_rate_limited"}',
     '429 {"error":{"message":"Upstream rate limit exceeded, please retry later","type":"rate_limit_error"},"type":"error"}',

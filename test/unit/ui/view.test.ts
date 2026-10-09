@@ -103,8 +103,8 @@ test("thinking summaries never display partial prose or expose empty expansion",
 });
 
 test("thought summaries match the sentence rule exactly and stay linear on long unpunctuated thoughts", () => {
-  const rule = (t: string) => t.match(/[^.!?。！？]+[.!?。！？](?=\s|$)/gu)?.at(-1)?.trim() ?? "";
-  const parts = ["a", "b c", " ", "\n", ".", "!", "?", "。", "！", "？", "\u00a0", "\u3000", "😀", "\t", "x.y", "...", ". "];
+  const rule = (t: string) => t.match(/[^.!?\u3002\uff01\uff1f]+[.!?\u3002\uff01\uff1f](?=\s|$)/gu)?.at(-1)?.trim() ?? "";
+  const parts = ["a", "b c", " ", "\n", ".", "!", "?", "\u3002", "\uff01", "\uff1f", "\u00a0", "\u3000", "😀", "\t", "x.y", "...", ". "];
   let seed = 7; const next = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
   for (let i = 0; i < 20000; i++) {
     const text = Array.from({ length: Math.floor(next() * 12) }, () => parts[Math.floor(next() * parts.length)]).join("");
@@ -117,10 +117,10 @@ test("thought summaries match the sentence rule exactly and stay linear on long 
 test("session tails tolerate split UTF-8, partial and corrupt lines, replacement and truncation", () => {
   const path = join(root, "tail.jsonl"), tail = new SessionTail();
   assert.deepEqual(tail.read(path), []);
-  const bytes = Buffer.from(JSON.stringify({ type: "custom", id: "a", data: "你好" }) + "\n");
-  const split = bytes.indexOf(Buffer.from("你")) + 1;
+  const bytes = Buffer.from(JSON.stringify({ type: "custom", id: "a", data: "\u4f60\u597d" }) + "\n");
+  const split = bytes.indexOf(Buffer.from("\u4f60")) + 1;
   writeFileSync(path, bytes.subarray(0, split)); assert.deepEqual(tail.read(path), []);
-  appendFileSync(path, bytes.subarray(split)); assert.equal((tail.read(path)[0] as { data?: unknown }).data, "你好");
+  appendFileSync(path, bytes.subarray(split)); assert.equal((tail.read(path)[0] as { data?: unknown }).data, "\u4f60\u597d");
   assert.equal(tail.read(path).length, 1);
   writeFileSync(path, ""); assert.equal(tail.read(path).length, 0);
   writeFileSync(path + ".new", '{"type":"custom","id":"b"}\n'); renameSync(path + ".new", path);

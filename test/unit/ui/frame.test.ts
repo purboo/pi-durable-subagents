@@ -11,7 +11,7 @@ const ansi = { fg: (c: string, s: string) => `\x1b[${codes[c] ?? 37}m${s}\x1b[39
 
 test("frame draws a heavy-bordered panel in the theme accent colour with title and hints", () => {
   for (const [width, height] of [[8, 3], [20, 6], [61, 10], [120, 40]] as const) {
-    const lines = frame(["a", `\x1b[31m${"wide ".repeat(40)}\x1b[39m`, "日本語のテキスト".repeat(10)], width, height, ansi, "exec-0927 › E02", "3m · Esc back");
+    const lines = frame(["a", `\x1b[31m${"wide ".repeat(40)}\x1b[39m`, "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8".repeat(10)], width, height, ansi, "exec-0927 › E02", "3m · Esc back");
     assert.equal(lines.length, height);
     for (const line of lines) assert.equal(visibleWidth(line), width, JSON.stringify(line));
     const text = lines.map(line => stripVTControlCharacters(line));
