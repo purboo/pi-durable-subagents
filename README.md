@@ -73,6 +73,7 @@ subagents({ tasks: [{ agent: "scout", task: "…" }, { agent: "reviewer", task: 
 subagents({ chain: [{ agent: "worker", task: "…" }, { agent: "reviewer", task: "Review: {previous}" }] })
 subagents({ workflow: "./batch.js", args: { … }, usageBudget: { costUsd: 20 } })
 subagents({ action: "send", to: "<wid>/<key>", kind: "steer", message: "Don't touch the tests yet" })
+subagents({ action: "send", to: ["<wid>/a", "<wid>/b"], kind: "notify", message: "Config is TOML from now on" })
 subagents({ action: "status" })
 ```
 
@@ -113,11 +114,38 @@ it something. Each verb means one thing, and a refusal says what would work:
 |---|---|---|
 | `run` | — | Start one subagent, `tasks` in parallel, a `chain`, or a workflow script. An unknown agent name is refused before anything starts, with the list of agents. |
 | `send steer` | a running subagent | Reaches it at its next safe point. To a finished one: refused, use `follow-up`; To one waiting on its question: it interrupts the question, and the subagent usually asks again; `answer` answers it. |
+| `send notify` | any subagent | Tells it a decision without disturbing it. The reply's `delivery` says how: `steered` (running: it gets the note at its next safe point, like a steer), `held-until-answer` (waiting on its question: never interrupts it; it gets the note at the first safe point after the answer) or `noted` (not running: nothing starts; the note is recorded, and the call's next follow-up opens with it). |
 | `send follow-up` | a finished subagent | Continues the same session as a new generation (`key@2`). With `model` (a model or a pool's name), that generation runs on it. |
 | `send answer` | an open question | Answers it once. |
 | `send model` | any subagent | A running one switches at its next request; one asking, hibernated or waiting for a slot launches on it when it runs again. A pool's name picks its first model that is not used up (and, for a running call, has a free slot); the reply names the model picked, and a call from that pool stays in it. |
 | `stop` | a subagent or a workflow | Final: `stopped`, usage kept, edits left as they are. |
 | `drain` / `resume` | existing workflows | A reversible hold; runs started later are not held. |
+
+Notes recorded for a call that is not running are durable and pending until
+its next follow-up, whose opening message carries all of them, in order, before
+its own message:
+
+```text
+Notes recorded after your last turn:
+- Config is TOML from now on
+- Keep the old parser for one release
+
+<the follow-up's message>
+```
+
+Each note is delivered once, also across orchestrator restarts and retried
+requests. A notify accepted for a running call that seals before it gets the
+note becomes a pending note too. `status` shows them on the call
+(`b@1 ok "..." · 2 notes pending`; JSON `notesPending`).
+
+`to` may list several calls for `steer`, `notify`, `follow-up` and `model`
+(`answer` takes one). Each call gets its own request and is decided on its
+own: an unknown or refused target does not affect the others, and the reply
+has one entry per target (`targets`, plus a `summary` line each). With
+`request: "<id>"`, the target at position i (1-based, in the order given) is
+sent as `<id>:<i>`, so a retry with the same list gets the same outcomes and
+sends nothing twice; another message or list under that id is a
+`request-conflict`.
 
 ### Workflow scripts
 
@@ -259,7 +287,7 @@ pi-durable-subagents drain              hold existing workflows: running calls f
 pi-durable-subagents stop <wid|call>
 pi-durable-subagents run --request <id> --spec <file|-> [--labels <json>] [--cwd <dir>] [--json] [--wait-ms <n>]
                                         start a run under a caller-chosen id; safe to retry (see below)
-pi-durable-subagents send --request <id> --to <run-id|wid/key> --kind follow-up|answer|steer|model
+pi-durable-subagents send --request <id> --to <run-id|wid/key> [--to ...] --kind follow-up|answer|steer|notify|model
                          [--call <key>] [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]
 pi-durable-subagents stop --request <id> <run-id|wid|wid/key|call> [--json]
 pi-durable-subagents describe --key <run-id> | <wid> [--json]
@@ -312,6 +340,13 @@ ran. A conflicting id stays conflicting forever, also after `prune`: the
 tombstone keeps the final status, the id and the digest. Any sender's retry
 completes a submission another one recorded but did not publish (it died in
 between), so a retry with the same content always converges.
+
+A send with several `--to` (not for `answer`) sends `<id>:1` ... `<id>:n`, one
+per target in the order given, and prints one line per target (`--json`:
+`{request, targets: [{to, request, applied, ...}]}`). Its exit code is 3 when the
+id or one target names other content, else 75 when one target is not decided
+yet, else 1 when one was rejected, else 0. A notify's reply adds `delivery`
+(`steered`, `held-until-answer` or `noted`) and a `note` that says what it means.
 
 From the `subagents` tool, `request` works the same, with one difference: a
 run's origin session (what `context: "fork"` copies, and where notices go) is

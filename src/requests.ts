@@ -22,6 +22,19 @@ export function requestRid(id: string): string {
 }
 /** The request id of a `req:<id>` rid; undefined for any other rid (ULIDs never contain ':'). */
 export function requestId(rid: string): string | undefined { return rid.startsWith(PREFIX) ? rid.slice(PREFIX.length) : undefined; }
+/** The request ids of one send to `n` calls under `<id>`: `<id>:1` ... `<id>:n`, one per target in the order given
+ *  (each is an ordinary request id, so a retry with the same list gets the same outcomes). */
+export function manyIds(id: string, n: number): string[] {
+  const ids = Array.from({ length: n }, (_, i) => `${id}:${i + 1}`);
+  for (const derived of ids) if (!REQUEST_ID.test(derived)) throw new Error(`request id ${JSON.stringify(id)} is too long for a send to ${n} calls (${derived} exceeds 124 characters)`);
+  requestRid(id);
+  return ids;
+}
+/** Whether `<id>` already names a send to several calls (its first derived id `<id>:1` is recorded). */
+export async function namesMany(home: string, id: string): Promise<boolean> {
+  const first = `${id}:1`;
+  return REQUEST_ID.test(first) && await findRequest(home, requestRid(first)) !== undefined;
+}
 /** Spec_digest = contentHash({kind, body, cond}) (cond omitted when absent). A run's body.origin (the pi session
  *  branch offered for context:"fork") is delivery metadata, not spec: it differs on every turn, so it is not hashed. */
 export function specDigest(req: Pick<Request, 'kind' | 'body' | 'cond'>): string {
