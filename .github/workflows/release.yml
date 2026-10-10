@@ -1,37 +1,50 @@
 name: release
 # One release per tag: the full CI matrix (Linux + macOS, Node 24 and the 22.19 floor, real pi suite, packaged
-# smoke) must pass, then the exact tagged commit is STAGED on npm with provenance (a stage-only token cannot
-# publish; the owner approves the staged version with 2FA on npmjs.com or `npm stage approve <id>`), and a GitHub
-# Release is created from that version's CHANGELOG section.
+# smoke) must pass, then the exact tagged commit is published to npm with provenance through npm trusted publishing
+# (GitHub OIDC; no npm token is stored anywhere), and a GitHub Release is created from that version's CHANGELOG
+# section. npm trusts only this workflow file in the `npm` environment of purboo/pi-durable-subagents; the
+# environment admits only `v*` tags.
 on:
   push:
     tags: ["v*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
   publish:
     needs: ci
     runs-on: ubuntu-latest
+    environment: npm
     permissions:
-      contents: write
-      id-token: write
+      contents: read
+      id-token: write # the OIDC token npm exchanges for a short-lived publish credential
     steps:
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
       - uses: actions/setup-node@v4
         with: { node-version: "24", registry-url: "https://registry.npmjs.org" }
-      - run: npm install -g npm@latest # staged publishing needs npm >= 11.15
+      - run: npm install -g npm@latest # trusted publishing needs npm >= 11.5.1
       - run: npm ci
       - name: Tag matches package version
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
-      - name: Stage on npm (a re-run skips a version that is already published or staged)
+      - name: Publish on npm (a re-run skips a version that is already published)
         run: |
           name="$(node -p "require('./package.json').name")"
           if npm view "$name@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "already published"; exit 0; fi
-          if npm stage list "$name" 2>/dev/null | grep -q "${GITHUB_REF_NAME#v}"; then echo "already staged"; exit 0; fi
-          npm stage publish --provenance --access public
-          echo "::notice::Staged $name@${GITHUB_REF_NAME#v}; approve it on npmjs.com (or npm stage approve <id>) to publish."
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          npm publish --provenance --access public
+          echo "::notice::Published $name@${GITHUB_REF_NAME#v}"
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
       - name: GitHub Release from the CHANGELOG
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -40,3 +53,4 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
