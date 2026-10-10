@@ -116,8 +116,10 @@ export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, wa
     blocking.push(text);
   }
   if (blocking.length) throw new Error(blocking.join('\n'));
+  // P33: only a run that can ask for context "fork" pins the origin branch (tens of MB for a long session); a call of
+  // any other run that asks for it anyway fails with "fork requested but the run has no origin session".
   return { source, args: body.args ?? null, agents: found.agents, inputs, inputSources: body.inputs ?? {},
-    ...(body.origin ? { origin: await pinOrigin(body.origin) } : {}),
+    ...(body.origin && usableNames(source, body.args, [])('fork') ? { origin: await pinOrigin(body.origin) } : {}),
     ...(body.usageBudget ? { usageBudget: body.usageBudget } : {}), ...(body.maxCalls !== undefined ? { maxCalls: body.maxCalls } : {}) };
 }
 

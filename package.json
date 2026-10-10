@@ -1,6 +1,6 @@
 {
   "name": "pi-durable-subagents",
-  "version": "1.0.32",
+  "version": "1.0.33",
   "description": "Subagents for pi that never lose work and never do it twice. Crash-safe workflows, automatic recovery, and a live view just like the main agent.",
   "type": "module",
   "license": "MIT",

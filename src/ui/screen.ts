@@ -4,7 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { callName, doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { callName, workflowName, doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
 import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
@@ -220,9 +220,9 @@ export class SubagentScreen implements Component {
         else if (key === "f" && c?.phase === "sealed") this.beginListInput("follow-up", row!);
         else if (key === "a" && c && asking) this.beginListInput("answer", row!);
         else if (key === "m" && c) this.modelMenu(c);
-        else if (key === "r" && w?.paused) this.listAction({ action: "resume", wid: w.wid }, `resume ${w.name ?? w.wid}`);
+        else if (key === "r" && w?.paused) this.listAction({ action: "resume", wid: w.wid }, `resume ${workflowName(w) ?? w.wid}`);
         else if (key === "x" && (c && c.phase !== "sealed" || row?.kind === "workflow" && w?.status === "running")) {
-          this.stopTarget = c ? { id: c.callId, name: callName(w!, c) } : { id: w!.wid, name: w!.name ?? w!.wid };
+          this.stopTarget = c ? { id: c.callId, name: callName(w!, c) } : { id: w!.wid, name: workflowName(w!) ?? w!.wid };
         }
         // Typing that is not a list key is meant for pi (a message typed with the list still open would
         // otherwise have its Enter open a watch view): close the list and hand the text to the editor.
@@ -415,6 +415,6 @@ export class SubagentScreen implements Component {
     }
     this.inputRow = 1 + head.length + available + 1;
     // pi's own keys for the transcript, spelled out: thinking and tool output expand in place.
-    return panel([...head, ...body, rule, ...editor, hint], new Set(w.calls.map(x => x.key)).size === 1 && w.name ? callName(w, c) : `${w.name ?? w.wid} › ${callName(w, c)}`, `${duration(Date.now() - (c.startedAt ?? Date.now()))} · ctrl+t thinking · ctrl+o tools · Esc back`);
+    return panel([...head, ...body, rule, ...editor, hint], new Set(w.calls.map(x => x.key)).size === 1 && workflowName(w) ? callName(w, c) : `${workflowName(w) ?? w.wid} › ${callName(w, c)}`, `${duration(Date.now() - (c.startedAt ?? Date.now()))} · ctrl+t thinking · ctrl+o tools · Esc back`);
   }
 }
