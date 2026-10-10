@@ -18,13 +18,13 @@ export const models = [
   { provider: "openai", id: "gpt-6", name: "GPT-6" },
   { provider: "bedrock-claude", id: "claude-opus", name: "Opus 5.5" },
 ];
-export const ctx = { cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "test" }, modelRegistry: { find: (p: string, id: string) => models.find(m => m.provider === p && m.id === id), getAvailable: () => models } } as unknown as ExtensionContext;
+export const ctx = { cwd: root, mode: "tui", hasUI: true, modelRegistry: { find: (p: string, id: string) => models.find(m => m.provider === p && m.id === id), getAvailable: () => models } } as unknown as ExtensionContext;
 export const state = () => ({ folded: new Set<string>(), done: new Map<string, number>(), viewed: new Set<string>(), finished: false });
 export function call(key: string, extra: Partial<CallSnapshot> = {}): CallSnapshot {
   return { key, gen: 1, callId: `w@1/${key}@1`, agent: "worker", phase: "running", startedAt: now - 180_000, lastActivity: now - 20_000, model: "openai/gpt-6", ...extra };
 }
 export function workflow(calls: CallSnapshot[], extra: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
-  return { wid: "w", rev: 1, name: "exec-0927", origin: "main:test", status: "running", startedAt: now - 3720_000, calls, attention: [], counts: { queued: 0, running: calls.length, asking: 0, sealed: 0 }, ...extra };
+  return { wid: "w", rev: 1, name: "exec-0927", status: "running", startedAt: now - 3720_000, calls, attention: [], counts: { queued: 0, running: calls.length, asking: 0, sealed: 0 }, ...extra };
 }
 export function session(): SessionEntry[] {
   const stamp = new Date(now - 20_000).toISOString();

@@ -74,13 +74,10 @@ export function elsewhereText(others: readonly WorkflowSnapshot[]): string | und
   const parts = [cli ? `cli ${cli}` : "", inSessions ? `${plural(sessions.size, "session")} ${inSessions}` : "", unknown ? `other ${unknown}` : ""].filter(Boolean);
   return `elsewhere: ${total} running (${parts.join(", ")})`;
 }
-/** Whether other origins have live calls: the one rule for the dock's elsewhere count and for opening the list. */
-export const othersLive = (others: readonly WorkflowSnapshot[]) => others.some(w => liveCalls(w).length > 0);
 /** A summary line with the elsewhere count appended when it fits; it is the first part dropped when the width is tight. */
 function withElsewhere(line: string, elsewhere: string | undefined, width: number): string {
   const both = elsewhere ? `${line} · ${elsewhere}` : line;
-  const fit = visibleWidth(both) <= width ? both : line;
-  return Number.isFinite(width) ? truncateToWidth(fit, Math.max(1, width)) : fit;
+  return truncateToWidth(visibleWidth(both) <= width ? both : line, Math.max(1, width));
 }
 /** UI §2: Done rows newest result first by immutable end time; ties keep snapshot order, so rows never reshuffle. */
 export function doneOrder(calls: readonly CallSnapshot[]): CallSnapshot[] {
@@ -186,10 +183,9 @@ export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
   return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", s.queued ? `${s.queued} queued` : "", s.paused ? `${s.paused} paused` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
 }
 /** The one-line dock: this session's summary (or completion sentence), plus the elsewhere count of other origins. */
-export function mainLine(workflows: readonly WorkflowSnapshot[], others: readonly WorkflowSnapshot[] = [], width = Infinity): string | undefined {
+export function mainLine(workflows: readonly WorkflowSnapshot[], others: readonly WorkflowSnapshot[] = []): string | undefined {
   const own = ownLine(workflows), elsewhere = elsewhereText(others);
-  if (own) return withElsewhere(own, elsewhere, width);
-  return elsewhere ? withElsewhere(`${elsewhere} · ↓ subagents`, undefined, width) : undefined;
+  return own && elsewhere ? `${own} · ${elsewhere}` : own ?? (elsewhere ? `${elsewhere} · ↓ subagents` : undefined);
 }
 function ownLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
