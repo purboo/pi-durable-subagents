@@ -206,10 +206,12 @@ another extension's editor bar (a powerline bar, for example), list
 pi-durable-subagents before that extension in `packages`.
 
 Press `↓` on an empty editor, or type `/subagents`, to open the list, a floating panel: this
-session's workflows (sessions are independent), newest first, every
-subagent with its model, what it is doing and for how long, and its latest
-line. Finished ones stay there,
-dimmed, with their conclusion. A session's workflows include runs started
+session's workflows (sessions are independent), working ones first (newest
+first), every subagent with its model, what it is doing and for how long, and
+its latest line. Finished ones follow, most recently ended first, dimmed, with
+their conclusion. A workflow's only subagent is named after the workflow; in a
+fan-out, a generated key (`tasks:0`) shows as its agent (`worker 1`,
+`reviewer`). The key remains the address for `send` and the CLI. A session's workflows include runs started
 through the CLI by a process this session launched (a background driver, a
 script run from its bash tool): pi exports `DSA_SESSION`, and `run` names that
 session (see `--session` below). Other sessions' and a terminal's runs are

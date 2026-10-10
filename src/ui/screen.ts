@@ -4,7 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, label, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { callName, doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
 import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
@@ -75,7 +75,7 @@ export class SubagentScreen implements Component {
   private beginListInput(kind: "steer" | "follow-up" | "answer", row: ListRow) {
     const c = row.call!, w = row.workflow!;
     const q = w.attention.find(a => a.kind === "question" && a.call === c.callId);
-    this.listInput = { kind, call: c, workflow: w, editor: new Input({ prompt: `${kind} ${label(c)}: ` }), ...(kind === "answer" && q ? { qid: q.qid, rev: q.rev } : {}) };
+    this.listInput = { kind, call: c, workflow: w, editor: new Input({ prompt: `${kind} ${callName(w, c)}: ` }), ...(kind === "answer" && q ? { qid: q.qid, rev: q.rev } : {}) };
     this.listInput.editor.focused = this.focused;
     this.listNotice = undefined;
   }
@@ -83,8 +83,8 @@ export class SubagentScreen implements Component {
     const draft = this.listInput; if (!draft || this.busy) return;
     const message = draft.editor.getValue().trim(); if (!message) return;
     this.listInput = undefined;
-    const { call: c, kind } = draft;
-    this.listAction({ action: "send", to: c.callId, kind, message, ...(kind === "answer" ? { qid: draft.qid, rev: draft.rev } : {}) }, `${kind} ${label(c)}: ${JSON.stringify(message)}`);
+    const { call: c, workflow: w, kind } = draft;
+    this.listAction({ action: "send", to: c.callId, kind, message, ...(kind === "answer" ? { qid: draft.qid, rev: draft.rev } : {}) }, `${kind} ${callName(w, c)}: ${JSON.stringify(message)}`);
   }
   dispose() { this.disposed = true; }
   refresh() { if (!this.disposed) this.tui.requestRender(); }
@@ -184,7 +184,7 @@ export class SubagentScreen implements Component {
     const q = w.attention.find(a => a.kind === "question" && a.call === c.callId);
     const kind = followUp ? "follow-up" : q ? "answer" : "steer";
     void this.send({ action: "send", to: c.callId, kind, message, ...(kind === "answer" ? { qid: q!.qid, rev: q!.rev } : {}) },
-      `${kind === "answer" ? "replied to" : followUp ? "queued follow-up for" : c.phase === "sealed" ? "continued" : "steered"} ${label(c)}: ${JSON.stringify(message)}`);
+      `${kind === "answer" ? "replied to" : followUp ? "queued follow-up for" : c.phase === "sealed" ? "continued" : "steered"} ${callName(w, c)}: ${JSON.stringify(message)}`);
   }
   handleInput(key: string) {
     if (this.disposed) return;
@@ -222,7 +222,7 @@ export class SubagentScreen implements Component {
         else if (key === "m" && c) this.modelMenu(c);
         else if (key === "r" && w?.paused) this.listAction({ action: "resume", wid: w.wid }, `resume ${w.name ?? w.wid}`);
         else if (key === "x" && (c && c.phase !== "sealed" || row?.kind === "workflow" && w?.status === "running")) {
-          this.stopTarget = c ? { id: c.callId, name: label(c) } : { id: w!.wid, name: w!.name ?? w!.wid };
+          this.stopTarget = c ? { id: c.callId, name: callName(w!, c) } : { id: w!.wid, name: w!.name ?? w!.wid };
         }
         // Typing that is not a list key is meant for pi (a message typed with the list still open would
         // otherwise have its Enter open a watch view): close the list and hand the text to the editor.
@@ -248,8 +248,8 @@ export class SubagentScreen implements Component {
     if (event.type !== "click" || event.button !== "left" || !this.watching || this.doneTab) return;
     // Panel coordinates: row 0 is the top border, column 2 is the first content column.
     if (event.y === 2) {
-      const { c } = this.current(); if (!c) return;
-      const facts = this.data.facts.get(c.callId), model = `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾ · `;
+      const { c, w } = this.current(); if (!c || !w) return;
+      const facts = this.data.facts.get(c.callId), model = `${callName(w, c)} · ${this.name(facts?.model ?? c.model)} ▾ · `;
       const x = event.x - 2;
       if (x < visibleWidth(model)) this.modelMenu();
       else if (x < visibleWidth(`${model}${facts?.thinking ?? "off"} ▾`)) this.thinkingMenu();
@@ -360,7 +360,7 @@ export class SubagentScreen implements Component {
       const rowWidth = Math.max(1, size.width - 2);
       this.rows = this.doneTab && w ? doneOrder(w.calls).map(c => {
         const f = this.data.facts.get(c.callId);
-        return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", label(c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], rowWidth) };
+        return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", callName(w, c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], rowWidth) };
       }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, rowWidth);
       height = this.height(Math.max(1, this.rows.length) + footerRows); size = inner(width, height); // inner width does not depend on height
       this.selected = keepSelection(this.rows, this.selectedId, this.selected);
@@ -388,10 +388,10 @@ export class SubagentScreen implements Component {
     const { c, w } = this.current();
     if (!c || !w) return panel(["Subagent is no longer in the current revision"], "Subagents", "Esc back");
     const facts = this.data.facts.get(c.callId), active = w.calls.filter(c => c.phase !== "sealed"), done = w.calls.length - active.length;
-    const tabs = size.width < 60 ? `${c.key} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${[...active.map(c => c.key), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
+    const tabs = size.width < 60 ? `${callName(w, c)} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${[...active.map(c => callName(w, c)), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
     const tools = toolCount(facts?.tools), pending = pendingText(c.pending), rule = this.theme.fg("borderMuted", "─".repeat(size.width));
     const switching = c.switching ? ` → ${this.name(c.switching)} (requested)` : "";
-    const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾${switching} · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
+    const head = [tabs, `${callName(w, c)} · ${this.name(facts?.model ?? c.model)} ▾${switching} · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
       this.theme.fg("dim", this.spend(c, facts)), rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
     const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
@@ -415,6 +415,6 @@ export class SubagentScreen implements Component {
     }
     this.inputRow = 1 + head.length + available + 1;
     // pi's own keys for the transcript, spelled out: thinking and tool output expand in place.
-    return panel([...head, ...body, rule, ...editor, hint], `${w.name ?? w.wid} › ${label(c)}`, `${duration(Date.now() - (c.startedAt ?? Date.now()))} · ctrl+t thinking · ctrl+o tools · Esc back`);
+    return panel([...head, ...body, rule, ...editor, hint], new Set(w.calls.map(x => x.key)).size === 1 && w.name ? callName(w, c) : `${w.name ?? w.wid} › ${callName(w, c)}`, `${duration(Date.now() - (c.startedAt ?? Date.now()))} · ctrl+t thinking · ctrl+o tools · Esc back`);
   }
 }
