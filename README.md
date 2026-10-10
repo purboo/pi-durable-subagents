@@ -205,25 +205,11 @@ lines above the editor in extension load order, so to keep the dock above
 another extension's editor bar (a powerline bar, for example), list
 pi-durable-subagents before that extension in `packages`.
 
-Subagents that another pi session or the CLI started never get rows in this
-dock; while they run, the summary line adds a count, e.g.
-`elsewhere: 4 running (cli 2, 1 session 2)` (dropped first when the line is
-tight, and shown alone when this session has nothing running).
-
 Press `↓` on an empty editor, or type `/subagents`, to open the list, a floating panel: this
 session's workflows (sessions are independent), newest first, every
 subagent with its model, what it is doing and for how long, and its latest
 line. Finished ones stay there,
 dimmed, with their conclusion.
-
-Live workflows of other sessions and the CLI follow in one group at the end,
-`Other sessions (2 workflows, 4 running)`, folded until you press `Enter` on
-it. Each shows its wid, name, origin (`cli:<user>@<host>` or a short session
-id), labels and live calls. You can watch them, but not change them here:
-steer, stop, model, answer and follow-up are refused with a hint to use the
-session or CLI that started them (or the tool's `send` with an explicit
-address). `"ui": { "otherSessions": false }` hides both the count and the
-group.
 
 The list is also where you act. The footer shows the keys for the selected
 row: `Enter` watch, `s` steer, `f` follow-up, `x` stop (asks `y` first),

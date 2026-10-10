@@ -49,13 +49,6 @@ const FINAL_MS = 10_000;
 /** A1, P25: Read the UI's data from durable workflow snapshots and native session tails only. */
 export class UiData {
   workflows: WorkflowSnapshot[] = [];
-  /** Every workflow read by the last refresh, before the owning session splits them (a watched call of another
-   *  origin stays watchable after its workflow settles). */
-  all: WorkflowSnapshot[] = [];
-  /** Live workflows of other origins (other pi sessions, the CLI), split off by the session that owns this data. */
-  others: WorkflowSnapshot[] = [];
-  /** Whether other origins' live work is shown (the dock's elsewhere count, the list's Other sessions group). */
-  otherSessions = true;
   /** Facts and session branch per call id; a finished call's are read on first `get` (see refresh). */
   facts: Map<string, Facts> = new Map();
   sessions: Map<string, readonly SessionEntry[]> = new Map();
@@ -133,15 +126,14 @@ export class UiData {
     // Warm the history a slice at a time, so opening the list later finds it read without one long stall now.
     const until = performance.now() + this.warmMs;
     for (const load of [...deferred.values()]) { if (performance.now() >= until) break; load(); }
-    this.workflows = workflows; this.all = workflows; this.facts = facts; this.sessions = sessions;
+    this.workflows = workflows; this.facts = facts; this.sessions = sessions;
     // UI-only optional aliases; absence or invalid config must not break execution (P21).
     try {
       const config = JSON.parse(readFileSync(join(this.home, "config.json"), "utf8"));
       this.aliases = Object.fromEntries(Object.entries(config.ui?.modelAliases ?? {}).filter(([, v]) => typeof v === "string")) as Record<string, string>;
       this.dock = ["auto", "line", "off"].includes(config.ui?.dock) ? config.ui.dock : "auto";
       this.dockAt = config.ui?.dockAt === "below" ? "below" : "above";
-      this.otherSessions = config.ui?.otherSessions !== false;
-    } catch { this.aliases = {}; this.dock = "auto"; this.dockAt = "above"; this.otherSessions = true; }
+    } catch { this.aliases = {}; this.dock = "auto"; this.dockAt = "above"; }
   }
 }
 

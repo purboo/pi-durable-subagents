@@ -7,12 +7,9 @@ import { oneLine } from "./frame.ts";
 export type Facts = ReturnType<typeof sessionFacts>;
 export interface ViewState {
   folded: Set<string>; done: Map<string, number>; viewed: Set<string>; finished: boolean;
-  /** The "Other sessions" group is folded until opened (Enter on its row). */
-  others?: boolean;
   observed?: Map<string, { working: number; failures: Set<string> }>;
 }
-export interface ListRow { id: string; kind: "workflow" | "call" | "preview" | "done" | "more" | "finished" | "others"; text: string; workflow?: WorkflowSnapshot; call?: CallSnapshot; failed?: boolean; /** v12 §5: rows of finished workflows are dimmed, never hidden. */ dim?: boolean;
-  /** A row of another session's (or the CLI's) workflow: watchable, never changed from here. */ other?: boolean }
+export interface ListRow { id: string; kind: "workflow" | "call" | "preview" | "done" | "more" | "finished"; text: string; workflow?: WorkflowSnapshot; call?: CallSnapshot; failed?: boolean; /** v12 §5: rows of finished workflows are dimmed, never hidden. */ dim?: boolean }
 export type ModelName = (model: string | undefined) => string;
 
 /** UI §2: Render compact wall-clock durations; never present these as charged active time. */
@@ -45,39 +42,6 @@ export const pendingMarker = (n: number | undefined) => n ? `${n} pending` : "";
 export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt" | "status">>(workflows: readonly T[], own?: string): T[] {
   return workflows.filter(w => own === undefined || w.origin === own)
     .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0) || (a.wid < b.wid ? 1 : a.wid > b.wid ? -1 : 0));
-}
-/** Live workflows started elsewhere (another pi session, the CLI or an unknown origin), newest first. A workflow of
- *  another origin counts while it is not settled (as in the status tool's otherSessions): running, parked, or
- *  finished with an open follow-up. */
-export function otherWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt" | "status" | "followUps">>(workflows: readonly T[], own: string): T[] {
-  return orderWorkflows(workflows.filter(w => w.origin !== own && (isLive(w) || w.status === "parked")));
-}
-/** Who started a workflow, short: `cli:<user>@<host>` as is, a pi session by the head of its id. */
-export function originText(origin: string | undefined): string {
-  if (!origin) return "unknown origin";
-  return origin.startsWith("main:") ? `session ${origin.slice(5, 13)}` : origin;
-}
-const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
-/** Live calls of other origins in a few words, e.g. "elsewhere: 4 running (cli 2, 1 session 2)"; undefined when none. */
-export function elsewhereText(others: readonly WorkflowSnapshot[]): string | undefined {
-  let cli = 0, unknown = 0, inSessions = 0;
-  const sessions = new Set<string>();
-  for (const w of others) {
-    const n = liveCalls(w).length;
-    if (!n) continue;
-    if (w.origin?.startsWith("cli:")) cli += n;
-    else if (w.origin?.startsWith("main:")) { inSessions += n; sessions.add(w.origin); }
-    else unknown += n;
-  }
-  const total = cli + inSessions + unknown;
-  if (!total) return undefined;
-  const parts = [cli ? `cli ${cli}` : "", inSessions ? `${plural(sessions.size, "session")} ${inSessions}` : "", unknown ? `other ${unknown}` : ""].filter(Boolean);
-  return `elsewhere: ${total} running (${parts.join(", ")})`;
-}
-/** A summary line with the elsewhere count appended when it fits; it is the first part dropped when the width is tight. */
-function withElsewhere(line: string, elsewhere: string | undefined, width: number): string {
-  const both = elsewhere ? `${line} · ${elsewhere}` : line;
-  return truncateToWidth(visibleWidth(both) <= width ? both : line, Math.max(1, width));
 }
 /** UI §2: Done rows newest result first by immutable end time; ties keep snapshot order, so rows never reshuffle. */
 export function doneOrder(calls: readonly CallSnapshot[]): CallSnapshot[] {
@@ -182,12 +146,7 @@ export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
   if (!s.total) return finished ? `${finished} finished` : "nothing running";
   return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", s.queued ? `${s.queued} queued` : "", s.paused ? `${s.paused} paused` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
 }
-/** The one-line dock: this session's summary (or completion sentence), plus the elsewhere count of other origins. */
-export function mainLine(workflows: readonly WorkflowSnapshot[], others: readonly WorkflowSnapshot[] = []): string | undefined {
-  const own = ownLine(workflows), elsewhere = elsewhereText(others);
-  return own && elsewhere ? `${own} · ${elsewhere}` : own ?? (elsewhere ? `${elsewhere} · ↓ subagents` : undefined);
-}
-function ownLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
+export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
   if (!workflows.length) return undefined;
   const s = summary(workflows);
   // The key that opens the list is spelled out: a bare arrow is easy to miss.
@@ -206,10 +165,7 @@ const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "�
 /** UI §1: The dock above the editor. While agents work: one row per active agent (questions first, at most `rows`),
  *  then one summary line; afterwards only the completion sentence for ten minutes; otherwise nothing. Activity spins
  *  only while there is fresh evidence, so a quiet agent visibly stops moving. */
-/** Other origins' live calls never become rows here: they add an "elsewhere" count to the summary line (alone when this
- *  session has nothing to show). */
-export function dockLines(workflows: readonly WorkflowSnapshot[], facts: ReadonlyMap<string, Facts>, name: ModelName, width: number, now = Date.now(), rows = 3, others: readonly WorkflowSnapshot[] = []): string[] {
-  const elsewhere = elsewhereText(others);
+export function dockLines(workflows: readonly WorkflowSnapshot[], facts: ReadonlyMap<string, Facts>, name: ModelName, width: number, now = Date.now(), rows = 3): string[] {
   const live = workflows.filter(isLive);
   const active = live.flatMap(w => {
     const latest = new Map<string, CallSnapshot>(); for (const c of w.calls) latest.set(c.key, c);
@@ -218,9 +174,8 @@ export function dockLines(workflows: readonly WorkflowSnapshot[], facts: Readonl
   }).sort((a, b) => Number(b.asking) - Number(a.asking));
   if (!active.length) {
     const ended = workflows.filter(w => !isLive(w)).sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
-    const line = ended && now - (ended.endedAt ?? 0) < 10 * 60_000 ? ownLine(workflows) : undefined;
-    if (line) return [withElsewhere(line, elsewhere, width)];
-    return elsewhere ? [truncateToWidth(`${elsewhere} · ↓ subagents`, Math.max(1, width))] : [];
+    const line = ended && now - (ended.endedAt ?? 0) < 10 * 60_000 ? mainLine(workflows) : undefined;
+    return line ? [truncateToWidth(line, Math.max(1, width))] : [];
   }
   const cols = { key: Math.min(14, Math.max(...active.map(a => visibleWidth(label(a.c))))), model: Math.min(20, Math.max(...active.map(a => visibleWidth(name(facts.get(a.c.callId)?.model ?? a.c.model))))) };
   const shown = active.slice(0, rows);
@@ -232,7 +187,7 @@ export function dockLines(workflows: readonly WorkflowSnapshot[], facts: Readonl
     return rowText(`${mark} `, label(c), name(f?.model ?? c.model), phrase, [], width, cols);
   });
   const more = active.length - shown.length;
-  lines.push(withElsewhere(`${more ? `+${more} more · ` : ""}${summaryText(workflows)} · ↓ subagents`, elsewhere, width));
+  lines.push(truncateToWidth(`${more ? `+${more} more · ` : ""}${summaryText(workflows)} · ↓ subagents`, Math.max(1, width)));
   return lines;
 }
 
@@ -247,9 +202,7 @@ export function toggleOpen(w: WorkflowSnapshot, state: ViewState): void {
   if (isOpen(w, state)) state.folded.add(w.wid);
   else { state.folded.delete(w.wid); if (!isLive(w)) state.done.set(w.wid, Math.max(8, state.done.get(w.wid) ?? 0)); }
 }
-/** `others` (live workflows of other origins) follow in one "Other sessions" group at the end, folded until opened;
- *  their rows are marked `other` and never feed this session's reopen-on-failure state. */
-export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewState, facts: ReadonlyMap<string, Facts>, name: ModelName, width: number, now = Date.now(), others: readonly WorkflowSnapshot[] = []): ListRow[] {
+export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewState, facts: ReadonlyMap<string, Facts>, name: ModelName, width: number, now = Date.now()): ListRow[] {
   const rows: ListRow[] = [];
   state.observed ??= new Map();
   for (const w of workflows) {
@@ -268,17 +221,17 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
   const unviewed = (w: WorkflowSnapshot) => w.calls.some(c => failed(c) && !state.viewed.has(c.callId));
   const visible = workflows; // caller order (newest first), unchanged when a workflow finishes
   // Aligned columns across the whole list (UI §2): key and model start at the same column on every row.
-  const shownCalls = [...visible.flatMap(w => w.calls), ...(state.others ? others.flatMap(liveCalls) : [])];
+  const shownCalls = visible.flatMap(w => w.calls);
   const cols = { key: Math.min(18, Math.max(0, ...shownCalls.map(c => visibleWidth(label(c))))),
     model: Math.min(26, Math.max(0, ...shownCalls.map(c => visibleWidth(name(facts.get(c.callId)?.model ?? c.model))))) };
-  const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string, dim = false, other = false) => {
+  const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string, dim = false) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
     // A requested switch shows at once (it applies when the current step ends; until then it would look as if it had failed).
     const shown = c.switching ? `${name(f?.model ?? c.model)} → ${name(c.switching)}` : name(f?.model ?? c.model);
     const text = rowText(indent, label(c), shown, statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
-    rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), dim, text, ...(other ? { other } : {}) });
+    rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), dim, text });
     // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.
-    if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, dim, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)).replaceAll("\x1b[0m", ""), ...(other ? { other } : {}) });
+    if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, dim, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)).replaceAll("\x1b[0m", "") });
   };
   for (const v of visible) {
     // One row per key: the newest generation (key@2) stands for the agent; older ones open from its watch view (← →).
@@ -305,21 +258,6 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     const more = count && done.length > count;
     shown.forEach((c, i) => callRow(w, c, i === shown.length - 1 && !more ? "      └ " : "      ├ ", undefined, dim));
     if (more) rows.push({ id: `${w.wid}:more`, kind: "more", workflow: w, dim, text: `      └ … ${done.length - count} more` });
-  }
-  if (!others.length) return rows;
-  // Other sessions: one folded group; inside, each workflow (wid, name, origin, labels) and its live calls only.
-  const running = others.reduce((n, w) => n + liveCalls(w).length, 0);
-  rows.push({ id: "others", kind: "others", text: `${state.others ? "▾" : "▸"} Other sessions (${plural(others.length, "workflow")}, ${running} running)` });
-  if (!state.others) return rows;
-  for (const w of others) {
-    const folded = state.folded.has(w.wid), open = liveCalls(w), latest = new Map<string, CallSnapshot>();
-    for (const c of open) latest.set(c.key, c);
-    const calls = [...latest.values()];
-    const head = `  ${folded ? "▸" : "▾"} ${[w.wid, w.name, originText(w.origin)].filter(Boolean).join(" · ")}`;
-    const room = Math.min(60, width - visibleWidth(head) - 3);
-    rows.push({ id: w.wid, kind: "workflow", workflow: w, other: true, dim: !calls.length, text: w.labels && room >= 12 ? `${head} · ${labelsText(w.labels, room)}` : head });
-    if (folded) continue;
-    calls.forEach((c, i) => callRow(w, c, i === calls.length - 1 ? "    └ " : "    ├ ", undefined, false, true));
   }
   return rows;
 }
