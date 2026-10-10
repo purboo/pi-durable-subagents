@@ -6,7 +6,8 @@ import { JT, type CallResult } from '../../../../src/types.ts';
 import type { CallTicket, Executor, Ledgers } from '../../../../src/orchestrator/contract.ts';
 
 /** P9, P14: Seal synthetic outcomes and model retirement without launching pi. */
-export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => number; hold?: string } = {}): Executor {
+/** forwards: a follow-up is recorded as a real `forward` and, never delivered, retired at the seal as the executor does. */
+export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => number; hold?: string; forwards?: boolean } = {}): Executor {
   if (process.env.DSA_FAKE_CRASH_WINDOW === 'admitted') {
     const append = ledgers.orch.append.bind(ledgers.orch);
     ledgers.orch.append = async (type, fields) => {
@@ -40,12 +41,19 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
       const result: CallResult = { key: ticket.key, gen: ticket.gen, status: reason === 'retired' ? 'stopped' : 'ok', ok: reason !== 'retired', output: ticket.spec.task,
         ...(reason === 'retired' ? { error: 'retired' } : {}) };
       if (reason !== 'retired') await ticket.journal.append(JT.sealed, { call: ticket.callId, exec: `${ticket.callId}#1.1`, result });
+      if (opts.forwards) for (const f of ticket.journal.entries().filter(e => e.type === 'forward' && e.dest === ticket.callId))
+        await ticket.journal.append('forward-retired', { rid: f.rid, rid2: f.rid2, reason: 'undelivered-follow-up' });
       return result;
     } finally { clearTimeout(timer); live.delete(ticket.callId); active.delete(ticket.callId); pending.delete(ticket.callId); }
   }
   return {
     run(ticket) { let run = pending.get(ticket.callId); if (!run) { run = execute(ticket); pending.set(ticket.callId, run); } return run; },
-    async forward(req, ctx) { await ctx.journal.append('fake-forward', { rid: req.rid, key: ctx.key }); return { action: 'apply' }; },
+    async forward(req, ctx) {
+      await ctx.journal.append('fake-forward', { rid: req.rid, key: ctx.key });
+      const body = req.body as { kind?: string; message?: string }, dest = `${ctx.widRev}/${ctx.key}@${ctx.gen}`;
+      if (opts.forwards && body.kind === 'follow-up') await ctx.journal.append('forward', { rid: req.rid, rid2: `${req.rid}'`, dest, hash: 'h', envelope: { to: dest, kind: 'follow-up', body: { message: body.message ?? '' } } });
+      return { action: 'apply' };
+    },
     async stop(target) { await ledgers.orch.append('fake-stop', { target }); },
     async recover(wid) { await ledgers.orch.append('fake-recover', { wid }); },
     async retire(widRev) {

@@ -36,7 +36,7 @@ import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 import { indexSweep, recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
 import { gateRetired } from "./effects/gate.ts";
 import { WorktreeIndex, worktreeCalls, worktreeLabel, worktreePair, worktreeRoots, type WorktreeWrite } from "./worktree.ts";
-import { PENDING_NOTE } from "../notes.ts";
+import { PENDING_NOTE, UNDELIVERED_FOLLOW_UP } from "../notes.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
 type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean;
@@ -294,7 +294,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const withdrawn = all.some(r => r.type === "forward" && r.dest === call && (r.envelope as Envelope).kind === "withdraw" && ((r.envelope as Envelope).body as { rids?: string[] }).rids?.includes(String(e.rid2)));
         if (envelope.kind === "notify" && !withdrawn && !all.some(r => r.type === PENDING_NOTE && r.rid === e.rid))
           await journal.append(PENDING_NOTE, { rid: e.rid, call, key: address(call).key, message: String((envelope.body as { message?: unknown } | undefined)?.message ?? "") });
-        await journal.append("forward-retired", { rid: e.rid, rid2: e.rid2, reason: "retired-without-child-receipt" });
+        // A follow-up the call never took is not lost either: the orchestrator opens the next generation with it (or a
+        // later follow-up takes it along). A stop is final and drops it; a withdrawn one is gone.
+        const reopen = envelope.kind === "follow-up" && !withdrawn && sealed(journal, call)?.status !== "stopped";
+        await journal.append("forward-retired", { rid: e.rid, rid2: e.rid2, reason: reopen ? UNDELIVERED_FOLLOW_UP : "retired-without-child-receipt" });
       }
       await (await outbox).markResolved(String(e.rid2));
     }

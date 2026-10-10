@@ -119,7 +119,7 @@ it something. Each verb means one thing, and a refusal says what would work:
 | `run` | — | Start one subagent, `tasks` in parallel, a `chain`, or a workflow script. An unknown agent name is refused before anything starts, with the list of agents. |
 | `send steer` | a running subagent | Reaches it at its next safe point. To a finished one: refused, use `follow-up`; To one waiting on its question: it interrupts the question, and the subagent usually asks again; `answer` answers it. |
 | `send notify` | any subagent | Tells it a decision without disturbing it. The reply's `delivery` says how: `steered` (running: it gets the note at its next safe point, like a steer), `held-until-answer` (waiting on its question: never interrupts it; it gets the note at the first safe point after the answer) or `noted` (not running: nothing starts; the note is recorded, and the call's next follow-up opens with it). |
-| `send follow-up` | a finished subagent | Continues the same session as a new generation (`key@2`). With `model` (a model or a pool's name), that generation runs on it. |
+| `send follow-up` | any subagent | A finished one continues in the same session as a new generation (`key@2`); the reply names it (`generation`, `call`). A running one gets it after its current turn; the reply says `delivery: forwarded` and names the running generation (`call: <wid>/<key>@<gen>`). With `model` (a model or a pool's name), the generation that takes it runs on it. |
 | `send answer` | an open question | Answers it once. |
 | `send model` | any subagent | A running one switches at its next request; one asking, hibernated or waiting for a slot launches on it when it runs again. A pool's name picks its first model that is not used up (and, for a running call, has a free slot); the reply names the model picked, and a call from that pool stays in it. |
 | `stop` | a subagent or a workflow | Final: `stopped`, usage kept, edits left as they are. |
@@ -141,6 +141,14 @@ Each note is delivered once, also across orchestrator restarts and retried
 requests. A notify accepted for a running call that seals before it gets the
 note becomes a pending note too. `status` shows them on the call
 (`b@1 ok "..." · 2 notes pending`; JSON `notesPending`).
+
+A follow-up queued into running work is not lost when that generation ends
+before taking it: the next generation opens with it, after any pending notes,
+as if it had been sent just after the end. A follow-up sent to the finished call
+in the meantime opens that generation and takes the queued ones along (in the
+order sent, before its own message). A retry of the same request then names the
+generation it went into. Only a stop drops it, because a stop is final; a
+withdrawn follow-up is gone too.
 
 `to` may list several calls for `steer`, `notify`, `follow-up` and `model`
 (`answer` takes one). Each call gets its own request and is decided on its
@@ -229,7 +237,8 @@ subagents of one workflow. Scrolling up pauses following; pi's
 `↓ Jump to latest message · End` badge (or `End`, or a click) brings you back.
 
 Typing steers the subagent you are watching (`Alt+Enter` queues a
-follow-up instead), or answers it if it is asking you something. `/model`
+follow-up instead), answers it if it is asking you something, and continues
+it (a follow-up) if it has finished. `/model`
 switches its model. Steers, answers and model switches are journaled as
 coming from you, and the main agent sees a note at its next turn.
 

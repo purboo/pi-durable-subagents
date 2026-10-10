@@ -182,7 +182,8 @@ export class SubagentScreen implements Component {
     if (message === "/stop") { void this.send({ action: "stop", target: c.callId }, `stopped ${c.key}`); return; }
     if (message.startsWith("/")) { this.notice = "Commands: /model, /stop"; return; }
     const q = w.attention.find(a => a.kind === "question" && a.call === c.callId);
-    const kind = followUp ? "follow-up" : q ? "answer" : "steer";
+    // A finished call cannot be steered: typing to it continues it (a follow-up), as the note says.
+    const kind = followUp || c.phase === "sealed" ? "follow-up" : q ? "answer" : "steer";
     void this.send({ action: "send", to: c.callId, kind, message, ...(kind === "answer" ? { qid: q!.qid, rev: q!.rev } : {}) },
       `${kind === "answer" ? "replied to" : followUp ? "queued follow-up for" : c.phase === "sealed" ? "continued" : "steered"} ${callName(w, c)}: ${JSON.stringify(message)}`);
   }

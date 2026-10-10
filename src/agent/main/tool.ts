@@ -1,5 +1,9 @@
 import { restartInputError } from "../../orchestrator/restart.ts";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { readJournalSnapshot } from "../../kernel/journal.ts";
+import { generationRids } from "../../orchestrator/notes.ts";
+import { journalPath } from "../../paths.ts";
 import type { CallSpec, Conditions, Entry, RequestKind, RunBody } from "../../types.ts";
 import { validateCallSpec } from "../../compat/spec.ts";
 import { compileFanout } from "../../compat/fanout.ts";
@@ -40,11 +44,28 @@ export function sendReceipt(ledger: readonly Entry[], rid: string): { model?: st
   if (typeof note.delivery === "string") return { delivery: note.delivery as Delivery, note: DELIVERY_NOTE[note.delivery as Delivery] ?? note.delivery };
   return { model: String(note.model), effect: String(note.effect), ...(note.pool ? { pool: String(note.pool) } : {}) };
 }
+/** Where an applied follow-up went. It opened a generation: `generation` and `call` (`<wid>/<key>`), from the workflow
+ *  journal, under the request's rid or, for one forwarded into running work that sealed first, in `follows` of the
+ *  generation that took it along. It was queued into unfinished work: `delivery: "forwarded"` and `call`
+ *  (`<wid>/<key>@<gen>`, the running generation). If that generation ends before taking it, the message opens the next
+ *  generation (unless a stop ended it), and a retry of the same request then names that generation. */
+export function followUpReceipt(home: string, rid: string, body: unknown): { generation?: number; call?: string; delivery?: "forwarded"; note?: string } {
+  const send = body as { to?: unknown; kind?: unknown } | undefined;
+  if (send?.kind !== "follow-up" || typeof send.to !== "string") return {};
+  const wid = send.to.split("/")[0]!.split("@")[0]!, path = journalPath(home, wid);
+  if (!existsSync(path)) return {};
+  const log = readJournalSnapshot(path) as Entry[], opened = log.find(e => e.type === "generation" && generationRids(e).includes(rid));
+  if (opened) return { generation: Number(opened.gen), call: `${wid}/${String(opened.key)}` };
+  const queued = log.find(e => e.type === "forward" && e.rid === rid);
+  if (!queued) return {};
+  const into = `${wid}/${String(queued.dest).slice(String(queued.dest).indexOf("/") + 1)}`;
+  return { delivery: "forwarded", call: into, note: `queued into running ${into}; if it ends before taking it, it opens the next generation` };
+}
 /** The internal argument through which a send to several calls passes its `batch` (not a tool parameter). */
 export const BATCH = Symbol("batch");
 /** One line of a reply per target: applied (with how a notify went), rejected with its reason, or not decided yet. */
 export function outcomeLine(r: Record<string, unknown>): string {
-  if (r.applied === true) return `applied${r.delivery ? ` (${String(r.delivery)}: ${String(r.note)})` : r.effect ? ` (model ${String(r.model)}, ${String(r.effect)})` : ""}`;
+  if (r.applied === true) return `applied${r.generation !== undefined ? ` (follow-up generation ${String(r.generation)} of ${String(r.call)})` : ""}${r.delivery ? ` (${String(r.delivery)}: ${String(r.note)})` : r.effect ? ` (model ${String(r.model)}, ${String(r.effect)})` : ""}`;
   if (r.applied === false) return `rejected ${String(r.reason)}`;
   if (r.submitted) return `submitted, not decided yet (${String((r.submitted as { rid?: string }).rid)})`;
   return JSON.stringify(r);

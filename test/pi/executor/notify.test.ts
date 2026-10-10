@@ -132,3 +132,18 @@ test("a crash between the seal and the note: recovery records the note once", { 
   assert.ok(g.journal.entries().some(e => e.type === JT.sealed));
   assert.ok(!g.journal.entries().some(e => e.type === "pending-note"));
 });
+
+for (const end of ["timeout", "stop"] as const) test(`a follow-up forwarded into running work that ends by ${end} before taking it is ${end === "stop" ? "dropped (a stop is final)" : "kept for the next generation"}`, { timeout: 90000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 25 } });
+  const base = f.ticket(script([{ tool: "bash", args: { command: "sleep 20" } }, { text: "never" }]));
+  const ticket = { ...base, spec: { ...base.spec, ...(end === "timeout" ? { timeoutMs: 1500 } : {}) } };
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  const req: Request = { rid: `fu-${end}`, from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "follow-up", message: "after the tool" } };
+  assert.deepEqual(await f.executor.forward(req, f.ctx), { action: "apply" });
+  if (end === "stop") await f.executor.stop({ wid: f.wid });
+  assert.equal((await pending).status, end === "stop" ? "stopped" : "timeout");
+  const retired = f.journal.entries().find(e => e.type === "forward-retired" && e.rid === req.rid);
+  assert.equal(retired?.reason, end === "stop" ? "retired-without-child-receipt" : "undelivered-follow-up");
+  assert.ok(!f.journal.entries().some(e => e.type === "forward-delivered" && e.rid === req.rid), "the child never took it");
+});
