@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.30
+
+- The pi UI shows only the subagents this pi session started again: the
+  dock's `elsewhere: ...` count and the `Other sessions` group from 1.0.29 are
+  removed, and the `ui.otherSessions` setting is ignored. Other sessions' and
+  the CLI's work remains visible through `status` and the CLI.
+
 ## 1.0.29
 
 - The pi UI shows subagents that other sessions or the CLI started, kept apart
