@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.32
+
+- `/subagents` lists working workflows first (newest first) and finished ones
+  after them (most recently ended first), so running work is never buried
+  under a page of finished rows. The cursor stays on its row when a workflow
+  moves.
+- Rows name subagents the way people know them: a workflow's only subagent by
+  the workflow's name, a generated key (`tasks:0`, `chain:1`) by its agent,
+  numbered when repeated (`worker 1`, `worker 2`). Applies to the list, the
+  dock, the watch view and the input prompts; tools and the CLI keep the key
+  as the address. A name longer than the key column is clipped so columns
+  stay aligned.
+
 ## 1.0.31
 
 - A run can be shown in the pi session it was started for, not only the one

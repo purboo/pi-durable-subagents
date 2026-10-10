@@ -169,11 +169,11 @@ test("row order is stable across refreshes while activity changes", () => {
   calls[1]!.startedAt = undefined; calls[1]!.phase = "queued"; assert.deepEqual(ids(), first); // dispatch timing does not reorder
   const a = { wid: "a", origin: "main:other", startedAt: 3, status: "running" as const }, b = { wid: "b", origin: "main:me", startedAt: 5, status: "done" as const };
   const c = { wid: "c", origin: "main:other", startedAt: 1, status: "done" as const }, d = { wid: "d", origin: "main:me", startedAt: 2, status: "running" as const };
-  assert.deepEqual(orderWorkflows([a, b, c, d], "main:me").map(x => x.wid), ["b", "d"], "only this session's workflows, newest first; finishing never reorders");
-  assert.deepEqual(orderWorkflows(orderWorkflows([a, b, c, d], "main:me"), "main:me").map(x => x.wid), ["b", "d"]);
+  assert.deepEqual(orderWorkflows([a, b, c, d], "main:me").map(x => x.wid), ["d", "b"], "only this session's workflows, working before finished");
+  assert.deepEqual(orderWorkflows(orderWorkflows([a, b, c, d], "main:me"), "main:me").map(x => x.wid), ["d", "b"]);
   // A CLI run started from this session (it named the session) is this session's; one naming another session is not.
   const e = { wid: "e", origin: "cli:u@h", session: "me", startedAt: 4, status: "running" as const }, g = { wid: "g", origin: "cli:u@h", session: "other", startedAt: 6, status: "running" as const };
-  assert.deepEqual(orderWorkflows([a, b, c, d, e, g], "main:me").map(x => x.wid), ["b", "e", "d"]);
+  assert.deepEqual(orderWorkflows([a, b, c, d, e, g], "main:me").map(x => x.wid), ["e", "d", "b"]);
 });
 
 test("done rows are newest first and never reshuffle when failures are viewed or results arrive", () => {
@@ -392,4 +392,31 @@ test("a follow-up on a finished workflow is live: the dock, the summary and the 
   assert.equal(sealed.followUps, undefined);
   assert.deepEqual(dockLines([sealed], new Map(), () => "M", 100, later), []);
   assert.equal(summaryText([sealed]), "1 finished");
+});
+
+test("working workflows come first (newest start first), finished ones after (most recently ended first)", () => {
+  const w = (wid: string, status: "running" | "done" | "failed", startedAt: number, endedAt?: number, followUps?: number) => ({ wid, origin: "main:me", status, startedAt, ...(endedAt ? { endedAt } : {}), ...(followUps ? { followUps } : {}) });
+  const list = [w("old-run", "running", 1), w("new-done", "done", 9, 10), w("new-run", "running", 5), w("old-done", "failed", 2, 20), w("reopened", "done", 3, 4, 1)];
+  assert.deepEqual(orderWorkflows(list, "main:me").map(x => x.wid), ["new-run", "reopened", "old-run", "old-done", "new-done"]);
+  // The list puts every working row above every finished row.
+  const rows = listRows(orderWorkflows([workflow([call("a", { phase: "sealed", endedAt: now - 1_000 })], { wid: "f", status: "done", endedAt: now - 1_000 }),
+    workflow([call("b")], { wid: "r", startedAt: now - 9_000_000 })]), state(), new Map(), () => "m", 100, now);
+  assert.deepEqual(rows.filter(r => r.kind === "call").map(r => r.workflow!.wid), ["r", "f"]);
+});
+
+test("rows name agents the way people know them, not by generated keys", async () => {
+  const { callName } = await import("../../../src/ui/view.ts");
+  const solo = workflow([call("tasks:0", { agent: "reviewer" })], { name: "dsa-1.0.28-review" });
+  assert.equal(callName(solo, solo.calls[0]!), "dsa-1.0.28-review", "a workflow's only agent goes by the workflow's name");
+  assert.equal(callName(solo, { ...solo.calls[0]!, gen: 3 }), "dsa-1.0.28-review@3");
+  assert.equal(callName({ calls: solo.calls }, solo.calls[0]!), "reviewer", "unnamed workflow: the agent");
+  const fan = workflow([call("tasks:1", { agent: "worker" }), call("tasks:0", { agent: "worker" }), call("tasks:2", { agent: "reviewer" }), call("plan", { agent: "worker" })]);
+  assert.deepEqual(fan.calls.map(c => callName(fan, c)), ["worker 2", "worker 1", "reviewer", "plan"], "generated keys by agent, numbered by position when repeated; named keys kept");
+  const text = listRows([solo, fan], state(), new Map(), () => "m", 100, now).map(r => r.text).join("\n");
+  assert.ok(!/tasks:\d/.test(text), text);
+  assert.match(dockLines([solo], new Map(), () => "m", 100, now)[0]!, /dsa-1\.0\.28-review/);
+  // A name longer than the key column is clipped, so the model column stays aligned.
+  const long = workflow([call("tasks:0")], { name: "x".repeat(60) }), short = workflow([call("k")], { wid: "s" });
+  const cols = listRows([long, short], state(), new Map(), () => "Model", 120, now).map(r => r.text.indexOf("Model"));
+  assert.equal(new Set(cols).size, 1, String(cols));
 });

@@ -38,11 +38,15 @@ export const pendingText = (n: number | undefined) => n ? `${n} message${n === 1
 /** UI §2, P7: The list row's small pending marker (the watch header spells it out). */
 export const pendingMarker = (n: number | undefined) => n ? `${n} pending` : "";
 /** UI §2: Sessions are independent: only this session's workflows (it started them, or a run started from it named it
- *  as its session, e.g. a CLI driver launched from this pi), newest first by start time. Start times never change, so
- *  the order is stable while you read, also when a workflow finishes. */
-export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "session" | "startedAt" | "status">>(workflows: readonly T[], own?: string): T[] {
+ *  as its session, e.g. a CLI driver launched from this pi). Working ones come first, newest start first; finished ones
+ *  follow, most recently ended first. A workflow moves once, when it finishes (or a follow-up reopens it); the list
+ *  keeps the selection on the same row id, so the cursor follows it. */
+export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "session" | "startedAt" | "endedAt" | "status" | "followUps">>(workflows: readonly T[], own?: string): T[] {
+  const tie = (a: T, b: T) => (a.wid < b.wid ? 1 : a.wid > b.wid ? -1 : 0);
   return workflows.filter(w => own === undefined || ownedBy(w, own))
-    .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0) || (a.wid < b.wid ? 1 : a.wid > b.wid ? -1 : 0));
+    .sort((a, b) => Number(isLive(b)) - Number(isLive(a))
+      || (isLive(a) ? (b.startedAt ?? 0) - (a.startedAt ?? 0) : (b.endedAt ?? b.startedAt ?? 0) - (a.endedAt ?? a.startedAt ?? 0))
+      || tie(a, b));
 }
 /** UI §2: Done rows newest result first by immutable end time; ties keep snapshot order, so rows never reshuffle. */
 export function doneOrder(calls: readonly CallSnapshot[]): CallSnapshot[] {
@@ -61,7 +65,7 @@ export function rowText(indent: string, key: string, model: string, phrase: stri
   const end = tail.filter(Boolean).join(" · ");
   // A long phrase (a long command) is clipped; the tail (tools, age) stays. Under pressure the model column goes first.
   for (const showModel of width >= 40 ? [true, false] : [false]) {
-    const head = `${indent}${pad(key, cols.key)}  ${showModel ? `${pad(short, width < 70 ? 0 : cols.model)}  ` : ""}`;
+    const head = `${indent}${pad(cols.key ? truncateToWidth(key, cols.key).replaceAll("\x1b[0m", "") : key, cols.key)}  ${showModel ? `${pad(short, width < 70 ? 0 : cols.model)}  ` : ""}`;
     const room = width - visibleWidth(head) - (end ? visibleWidth(end) + 2 : 0);
     // truncateToWidth closes its ellipsis with an SGR reset; drop it so a dimmed row stays dim to its end (tools, age).
     if (end && room >= 8) return `${head}${pad(truncateToWidth(phrase, room).replaceAll("\x1b[0m", ""), room)}  ${end}`;
@@ -124,6 +128,19 @@ function failed(c: CallSnapshot) { return c.phase === "sealed" && c.result && !c
 
 /** UI §2, P37: Calls are named by key; later generations of a key carry their generation. */
 export const label = (c: { key: string; gen: number }) => c.gen > 1 ? `${c.key}@${c.gen}` : c.key;
+/** A key the spec did not name: generated from the launch form's position (tasks:0, chain:1). */
+const GENERATED = /^(?:tasks|chain):(\d+)$/;
+/** UI §2: How a person knows a call. A workflow's only agent goes by the workflow's name; a generated key (tasks:0) by
+ *  its agent, numbered when the workflow runs that agent more than once; a named key as is. "@2" marks a later
+ *  generation. The key stays the address for tools and the CLI; only the UI shows this name. */
+export function callName(w: Pick<WorkflowSnapshot, "name" | "calls">, c: Pick<CallSnapshot, "key" | "gen" | "agent">): string {
+  const keys = [...new Set(w.calls.map(x => x.key))], gen = c.gen > 1 ? `@${c.gen}` : "";
+  if (keys.length === 1 && w.name) return `${w.name}${gen}`;
+  if (!GENERATED.test(c.key)) return `${c.key}${gen}`;
+  const peers = keys.filter(k => GENERATED.test(k) && w.calls.find(x => x.key === k)?.agent === c.agent)
+    .sort((a, b) => Number(GENERATED.exec(a)![1]) - Number(GENERATED.exec(b)![1]));
+  return `${c.agent}${peers.length > 1 ? ` ${peers.indexOf(c.key) + 1}` : ""}${gen}`;
+}
 
 const WORDS: Record<CallStatus, string> = { ok: "done", stopped: "stopped", failed: "failed", "gate-failed": "failed", timeout: "timeout", budget: "budget", unknown: "unknown", skipped: "skipped", parked: "parked" };
 /** v12 §4: The result word of a sealed status — a stopped call is never called failed; timeout/budget/unknown are named as such. */
@@ -178,14 +195,14 @@ export function dockLines(workflows: readonly WorkflowSnapshot[], facts: Readonl
     const line = ended && now - (ended.endedAt ?? 0) < 10 * 60_000 ? mainLine(workflows) : undefined;
     return line ? [truncateToWidth(line, Math.max(1, width))] : [];
   }
-  const cols = { key: Math.min(14, Math.max(...active.map(a => visibleWidth(label(a.c))))), model: Math.min(20, Math.max(...active.map(a => visibleWidth(name(facts.get(a.c.callId)?.model ?? a.c.model))))) };
+  const cols = { key: Math.min(20, Math.max(...active.map(a => visibleWidth(callName(a.w, a.c))))), model: Math.min(20, Math.max(...active.map(a => visibleWidth(name(facts.get(a.c.callId)?.model ?? a.c.model))))) };
   const shown = active.slice(0, rows);
   const lines = shown.map(({ w, c, asking }) => {
     // A running tool is activity; otherwise a minute without new evidence (no message, no tool) stops the spinner.
     const f = facts.get(c.callId), fresh = Boolean(f?.activity) || now - Math.max(c.lastActivity ?? 0, f?.lastActivity ?? 0, c.startedAt ?? 0) < 60_000;
     const mark = asking ? "?" : c.phase === "queued" ? "·" : fresh ? SPIN[Math.floor(now / 500) % SPIN.length]! : "…";
     const phrase = asking ? `asks: ${w.attention.find(a => a.kind === "question" && a.call === c.callId)!.text}` : statusPhrase(c, w, f, now);
-    return rowText(`${mark} `, label(c), name(f?.model ?? c.model), phrase, [], width, cols);
+    return rowText(`${mark} `, callName(w, c), name(f?.model ?? c.model), phrase, [], width, cols);
   });
   const more = active.length - shown.length;
   lines.push(truncateToWidth(`${more ? `+${more} more · ` : ""}${summaryText(workflows)} · ↓ subagents`, Math.max(1, width)));
@@ -220,16 +237,16 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
     state.observed.set(w.wid, { working, failures });
   }
   const unviewed = (w: WorkflowSnapshot) => w.calls.some(c => failed(c) && !state.viewed.has(c.callId));
-  const visible = workflows; // caller order (newest first), unchanged when a workflow finishes
+  const visible = workflows; // caller order: working first, then finished (orderWorkflows)
   // Aligned columns across the whole list (UI §2): key and model start at the same column on every row.
-  const shownCalls = visible.flatMap(w => w.calls);
-  const cols = { key: Math.min(18, Math.max(0, ...shownCalls.map(c => visibleWidth(label(c))))),
-    model: Math.min(26, Math.max(0, ...shownCalls.map(c => visibleWidth(name(facts.get(c.callId)?.model ?? c.model))))) };
+  const shownCalls = visible.flatMap(w => w.calls.map(c => ({ w, c })));
+  const cols = { key: Math.min(24, Math.max(0, ...shownCalls.map(({ w, c }) => visibleWidth(callName(w, c))))),
+    model: Math.min(26, Math.max(0, ...shownCalls.map(({ c }) => visibleWidth(name(facts.get(c.callId)?.model ?? c.model))))) };
   const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string, dim = false) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
     // A requested switch shows at once (it applies when the current step ends; until then it would look as if it had failed).
     const shown = c.switching ? `${name(f?.model ?? c.model)} → ${name(c.switching)}` : name(f?.model ?? c.model);
-    const text = rowText(indent, label(c), shown, statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
+    const text = rowText(indent, callName(w, c), shown, statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
     rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), dim, text });
     // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.
     if (preview !== undefined && c.phase !== "sealed" && f?.latest) rows.push({ id: `${c.callId}:preview`, kind: "preview", workflow: w, call: c, dim, text: truncateToWidth(`${preview}${f.latest}`, Math.max(1, width)).replaceAll("\x1b[0m", "") });
