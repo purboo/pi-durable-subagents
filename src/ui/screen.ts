@@ -90,11 +90,7 @@ export class SubagentScreen implements Component {
   refresh() { if (!this.disposed) this.tui.requestRender(); }
   private name = (model: string | undefined) => modelLabel(model, (p, id) => this.ctx.modelRegistry.find(p, id), this.data.aliases);
   /** A workflow another session or the CLI started: watchable here, never changed from here. */
-  private foreign(w: WorkflowSnapshot | undefined): boolean {
-    // Decided by origin, not by list membership: a refresh interrupted before the split must not make them editable.
-    const id = this.ctx.sessionManager?.getSessionId?.();
-    return !!w && (id === undefined || w.origin !== `main:${id}`);
-  }
+  private foreign(w: WorkflowSnapshot | undefined): boolean { return !!w && !this.data.workflows.some(x => x.wid === w.wid); }
   private readOnly(w: WorkflowSnapshot): string {
     return `read-only: started by ${originText(w.origin)}; change it from that session or the CLI (or send with an explicit address)`;
   }
@@ -231,7 +227,7 @@ export class SubagentScreen implements Component {
       else if (!this.busy) {
         const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined, w = row?.workflow;
         const asking = c && w?.attention.some(a => a.kind === "question" && a.call === c.callId);
-        if (key.length === 1 && "sfamxr".includes(key) && (row?.other || this.foreign(w))) this.listNotice = { text: this.readOnly(w!), until: Date.now() + 6000 };
+        if (key.length === 1 && "sfamxr".includes(key) && (row?.other || this.doneTab && this.foreign(w))) this.listNotice = { text: this.readOnly(w!), until: Date.now() + 6000 };
         else if (key === "s" && c && c.phase !== "sealed") this.beginListInput("steer", row!);
         else if (key === "f" && c?.phase === "sealed") this.beginListInput("follow-up", row!);
         else if (key === "a" && c && asking) this.beginListInput("answer", row!);
@@ -374,17 +370,12 @@ export class SubagentScreen implements Component {
       // A two-column gutter carries the selection marker: a background alone is invisible in some themes and in
       // plain-text captures, and x must show which row it would stop.
       const rowWidth = Math.max(1, size.width - 2);
-      const before = this.rows.find(r => r.id === this.selectedId), wasOther = Boolean(before?.other || before?.kind === "others");
       this.rows = this.doneTab && w ? doneOrder(w.calls).map(c => {
         const f = this.data.facts.get(c.callId);
         return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", label(c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], rowWidth) };
       }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, rowWidth, Date.now(), this.data.others);
       height = this.height(Math.max(1, this.rows.length) + footerRows); size = inner(width, height); // inner width does not depend on height
-      // A vanished row of another session (its workflow ended, or the whole group went) never hands the selection to
-      // a different row of this session by position, where x or r would act on it: the group header takes it, or no
-      // row is selected (-1) until ↑/↓ chooses one.
-      if (wasOther && !this.rows.some(r => r.id === this.selectedId)) this.selected = this.rows.findIndex(r => r.kind === "others");
-      else if (this.selected >= 0 || this.selectedId !== undefined) this.selected = keepSelection(this.rows, this.selectedId, this.selected);
+      this.selected = keepSelection(this.rows, this.selectedId, this.selected);
       while (this.rows[this.selected]?.kind === "preview" && this.selected > 0) this.selected--;
       this.selectedId = this.rows[this.selected]?.id;
       const start = Math.max(0, this.selected - size.height + 1);
@@ -395,7 +386,7 @@ export class SubagentScreen implements Component {
       });
       const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined;
       const asking = c && row?.workflow?.attention.some(a => a.kind === "question" && a.call === c.callId);
-      const narrow = size.width < 72, readOnly = row?.other || this.foreign(row?.workflow) || this.doneTab && this.foreign(w);
+      const narrow = size.width < 72, readOnly = row?.other || this.doneTab && this.foreign(w);
       const keys = readOnly ? [narrow ? "↑↓" : "↑ ↓ select", row?.kind === "workflow" ? `Enter ${narrow ? "" : this.state.folded.has(row.workflow!.wid) ? "expand" : "collapse"}`.trim() : row?.kind === "call" ? (narrow ? "Enter" : "Enter watch") : "",
         narrow ? "read-only" : `read-only: started by ${originText(row?.workflow?.origin ?? w?.origin)}; change it there`, "Esc back"].filter(Boolean).join(" · ") : [narrow ? "↑↓" : "↑ ↓ select", row && row.kind !== "preview" ? `Enter ${narrow ? "" : row.kind === "workflow" ? (isOpen(row.workflow!, this.state) ? "collapse" : "expand") : row.kind === "call" ? "watch" : row.kind === "others" ? (this.state.others ? "collapse" : "expand") : "open"}`.trim() : "",
         c && c.phase !== "sealed" ? (narrow ? "s" : "s steer") : "", c?.phase === "sealed" ? (narrow ? "f" : "f follow-up") : "",
