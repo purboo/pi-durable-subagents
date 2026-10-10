@@ -35,7 +35,7 @@ jobs:
         run: |
           name="$(node -p "require('./package.json').name")"
           if npm view "$name@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then echo "already published"; exit 0; fi
-          npm publish --provenance --access public
+          npm publish --provenance --access public --loglevel verbose # verbose: a failed OIDC exchange says why
           echo "::notice::Published $name@${GITHUB_REF_NAME#v}"
   github-release:
     needs: publish
