@@ -99,6 +99,15 @@ test("v12 §5 list inputs accept typing and bracketed paste, cancel, and submit 
   assert.deepEqual(requests[3], { action: "send", to: "w@1/E01@1", kind: "model", model: "openai/gpt-6:off" });
 });
 
+test("typing to a finished subagent in its watch view continues it (follow-up), never a steer it would refuse", async () => {
+  const { screen, requests } = setup(); screen.state.done.set("w", 8);
+  (screen as unknown as { selectedId: string }).selectedId = "w@1/E01@1";
+  screen.render(100); screen.handleInput("\r"); assert.match(plain(screen), /E01/);
+  screen.handleInput("go on"); screen.handleInput("\r"); await tick();
+  assert.deepEqual(requests[0], { action: "send", to: "w@1/E01@1", kind: "follow-up", message: "go on" });
+  assert.match(plain(screen), /Submitted/);
+});
+
 test("v12 §5 stop confirmation cancels on any non-y key and resolves actual control result", async () => {
   const { screen, requests } = setup(async args => { requests.push(args); return { applied: requests.length !== 2, reason: "already-sealed", rid: String(requests.length) }; });
   screen.render(100); screen.handleInput("x"); assert.match(plain(screen), /Stop exec-0927\? y confirm/);

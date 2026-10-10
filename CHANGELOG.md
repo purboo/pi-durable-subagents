@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.34
+
+- A follow-up queued into running work is no longer lost when that generation ends before taking it. The next
+  generation opens with it, after any pending notes. A follow-up sent to the finished call in the meantime takes the
+  queued ones along, in the order sent (`generation.follows`). Restarts open it once. Only a stop drops it, because
+  a stop is final; a withdrawn one is gone too. The executor marks such a forward `forward-retired` with reason
+  `undelivered-follow-up`.
+- The send reply says where a follow-up went. One that opened a generation has `generation` and `call`, from the CLI
+  and now also from the pi tool. One queued into running work has `delivery: "forwarded"` and
+  `call: "<wid>/<key>@<gen>"`. A retry of the same request names the generation it went into.
+- Typing in the watch view to a finished subagent sends a follow-up. Before, it sent a steer, which the orchestrator
+  refused with `finished:<status> — use kind "follow-up"`.
+
 ## 1.0.33
 
 - A run copies its origin session branch only when it can use it: its script

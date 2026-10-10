@@ -10,7 +10,7 @@ import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
 import { NOTIFY_SINCE, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
-import { BATCH, checkAgents, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
+import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { JT, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
 import { startOrchestrator, submitIdentified } from "./control.ts";
@@ -429,15 +429,14 @@ function decided(ctx: Context, id: string, done: { sent: Sent; outcome: Outcome 
     ctx.write(json ? JSON.stringify({ request: id, applied: false, reason: done.outcome.reason, spec_digest: done.sent.digest }) : `${id}: rejected ${done.outcome.reason}`);
     return EXIT.rejected;
   }
-  // A follow-up opens a new generation: the orchestrator records it in the workflow journal under the request's rid.
-  const body = done.sent.request.body as { to?: string; kind?: string };
-  const wid = typeof body.to === "string" ? body.to.split("/")[0]!.split("@")[0]! : undefined;
-  const opened = done.sent.request.kind === "send" && wid && existsSync(journalPath(ctx.home, wid))
-    ? (readJournalSnapshot(journalPath(ctx.home, wid)) as Entry[]).find(e => e.type === "generation" && e.rid === done.sent.request.rid) : undefined;
+  // A follow-up opened a generation, or was queued into unfinished work (followUpReceipt).
+  const followed = done.sent.request.kind === "send" ? followUpReceipt(ctx.home, done.sent.request.rid, done.sent.request.body) : {};
+  const opened = followed.generation !== undefined ? followed : undefined;
   // A notify says how it went (steered, held-until-answer or noted); a model send which model and when it applies.
   const notified = done.sent.request.kind === "send" ? sendReceipt(ledger(ctx.home), done.sent.request.rid) : {};
-  const receipt = notified.delivery ? { delivery: notified.delivery, note: notified.note } : {};
-  const reply = { request: id, applied: true, ...(opened ? { generation: Number(opened.gen), call: `${wid}/${String(opened.key)}` } : {}), ...receipt, spec_digest: done.sent.digest };
+  const receipt = notified.delivery ? { delivery: notified.delivery, note: notified.note }
+    : followed.delivery ? { delivery: followed.delivery, call: followed.call, note: followed.note } : {};
+  const reply = { request: id, applied: true, ...(opened ? { generation: opened.generation, call: opened.call } : {}), ...receipt, spec_digest: done.sent.digest };
   ctx.write(json ? JSON.stringify(reply) : `${id}: applied${opened ? ` (follow-up generation ${reply.generation} of ${reply.call})` : ""}${receipt.delivery ? ` (${receipt.delivery}: ${receipt.note})` : ""}`);
   return EXIT.ok;
 }

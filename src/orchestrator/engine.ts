@@ -35,7 +35,7 @@ import { WaitTracker, waitCollector, startWaiting, type WaitSeed } from '../even
 import { readPage } from '../events/log.ts';
 import { eventsLog } from '../paths.ts';
 import { parseModel } from '../compat/model.ts';
-import { PENDING_NOTE, pendingNotes, unsettledNotify, withNotes } from './notes.ts';
+import { PENDING_NOTE, generationRids, openingMessage, pendingFollowUps, pendingNotes, unsettledForward, unsettledNotify } from './notes.ts';
 import { journalAppends } from '../kernel/journal.ts';
 import { STATS_EVERY_MS, readBytes, writeStats, type OrchestratorStats } from './stats.ts';
 
@@ -202,6 +202,7 @@ export class Engine {
       if (!this.terminal(wf)) await this.startWorkflow(wf);
       else await this.attention(wf);
       for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
+      await this.reopenForwarded(wf);
     }
     await this.intake();
     for (const wf of this.store.workflows.values()) this.settle(wf);
@@ -372,7 +373,7 @@ export class Engine {
       await this.revise(await this.store.revisionIntent(req as Request<ReviseBody>, wf));
       if (!this.states.has(wf.wid) && !this.terminal(wf)) await this.startWorkflow(wf);
     } else if (req.kind === 'send') {
-      const existing = [...this.store.workflows.values()].flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && e.rid === req.rid).map(entry => ({ wf, entry })))[0];
+      const existing = [...this.store.workflows.values()].flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && generationRids(e).includes(req.rid)).map(entry => ({ wf, entry })))[0];
       if (existing) { this.dispatchGeneration(existing.wf, existing.entry); return { action: 'apply' }; }
       const target = this.findCall((req.body as SendBody)?.to, true);
       if (!target) return { action: 'reject', reason: this.unknownCall((req.body as SendBody)?.to) };
@@ -388,18 +389,11 @@ export class Engine {
         catch { return { action: 'reject', reason: 'unknown-model' }; }
       }
       if (seal && send.kind === 'follow-up') {
-        // Pending notes ride on the opening message, recorded in the same entry (consumed exactly once). A notify whose
-        // fate the seal has not settled yet may still become a note: wait for it.
-        const log = revisionEntries(wf);
-        if (unsettledNotify(log, from)) return { action: 'defer' };
-        const notes = pendingNotes(log, String(entry.key));
-        const gen = Math.max(0, ...wf.journal.entries().filter(e => ['call', 'generation'].includes(e.type) && e.key === entry.key).map(e => Number(e.gen))) + 1;
-        // A follow-up's model replaces the continued session's for this generation and those continuing it.
-        const spec = send.model !== undefined ? { ...(entry.spec as CallSpec), model: send.model } : entry.spec;
+        // Pending notes and undelivered follow-ups ride on the opening message, recorded in the same entry (consumed
+        // exactly once). A notify or follow-up whose fate the seal has not settled yet may still become one: wait for it.
+        if (unsettledForward(revisionEntries(wf), from)) return { action: 'defer' };
         if (send.model !== undefined) await this.note(req.rid, send.model, 'next-generation');
-        const message = withNotes(notes.map(n => String(n.message)), send.message ?? '');
-        const opened = await wf.journal.append('generation', { rid: req.rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid: req.rid, kind: send.kind, message },
-          ...(notes.length ? { notes: notes.map(n => String(n.rid)) } : {}), ...(send.model !== undefined && !pool ? { model: send.model } : {}) });
+        const opened = await this.openGeneration(wf, entry, from, { rid: req.rid, message: send.message ?? '', ...(send.model !== undefined ? { model: send.model } : {}) });
         this.dispatchGeneration(wf, opened); return { action: 'apply' };
       }
       // A follow-up naming a model, queued on unfinished work: the executor records its model request with the message.
@@ -549,12 +543,44 @@ export class Engine {
     try { await this.store.remove(wf.wid); }
     catch (error) { console.error(`durable-subagents: removal of pruned workflow ${wf.wid} failed, retrying at next start: ${String(error)}`); }
   }
+  /** Open the next generation of `entry`'s key (its latest call), continuing sealed call `from`. The opening message
+   *  carries the key's pending notes, then its undelivered follow-ups, then `own` (a follow-up sent to the sealed call;
+   *  without one the undelivered follow-ups open it by themselves). The latest model named replaces the session's. */
+  private async openGeneration(wf: Workflow, entry: Entry, from: string, own?: { rid: string; message: string; model?: string }): Promise<Entry> {
+    const log = revisionEntries(wf), key = String(entry.key), notes = pendingNotes(log, key), carried = pendingFollowUps(log, key);
+    const asked = (rid: string) => ((this.ledgers.orch.entries().findLast(e => e.type === 'request' && (e.request as Request | undefined)?.rid === rid)?.request as Request | undefined)?.body as SendBody | undefined)?.model;
+    const model = [...carried.map(c => asked(c.rid)), own?.model].filter((m): m is string => typeof m === 'string').at(-1);
+    const pools = this.ledgers.config.pools, pool = model !== undefined && pools && Object.hasOwn(pools, model);
+    const rid = own?.rid ?? carried[0]!.rid, follows = carried.map(c => c.rid).filter(r => r !== rid);
+    const gen = Math.max(0, ...wf.journal.entries().filter(e => ['call', 'generation'].includes(e.type) && e.key === entry.key).map(e => Number(e.gen))) + 1;
+    // A follow-up's model replaces the continued session's for this generation and those continuing it.
+    const spec = model !== undefined ? { ...(entry.spec as CallSpec), model } : entry.spec;
+    const message = openingMessage(notes.map(n => String(n.message)), [...carried.map(c => c.message), own?.message ?? '']);
+    return wf.journal.append('generation', { rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid, kind: 'follow-up', message },
+      ...(notes.length ? { notes: notes.map(n => String(n.rid)) } : {}), ...(follows.length ? { follows } : {}), ...(model !== undefined && !pool ? { model } : {}) });
+  }
+  /** Follow-ups forwarded into running work whose call sealed before taking them (`undelivered-follow-up`) open the
+   *  key's next generation, as a follow-up sent after the seal would: once its latest generation has sealed, unless a
+   *  later follow-up took them along. Idempotent; run after every seal and at start. */
+  private async reopenForwarded(wf: Workflow): Promise<void> {
+    const log = revisionEntries(wf);
+    if (!log.some(e => e.type === 'forward-retired' && e.reason === 'undelivered-follow-up')) return;
+    for (const key of new Set(log.filter(e => e.type === 'call' || e.type === 'generation').map(e => String(e.key)))) {
+      if (!pendingFollowUps(revisionEntries(wf), key).length) continue;
+      const latest = revisionEntries(wf).findLast(e => (e.type === 'call' || e.type === 'generation') && String(e.key) === key)!;
+      const from = `${wf.wid}@${wf.revision}/${key}@${latest.gen}`, entries = wf.journal.entries();
+      if (!entries.some(e => e.type === JT.sealed && e.call === from) || entries.some(e => e.type === 'retired' && e.call === from)) continue;
+      if (unsettledForward(revisionEntries(wf), from)) continue;
+      this.dispatchGeneration(wf, await this.openGeneration(wf, latest, from));
+    }
+  }
   private dispatchGeneration(wf: Workflow, entry: Entry) {
     const ticket = this.ticket({ wf } as State, entry), id = ticket.callId;
     if (this.generations.has(id) || this.held(wf.wid) || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
     this.generations.add(id); wf.journal.resting = false;
     void this.executor.run(ticket).then(() => this.background(async () => {
       if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);
+      await this.reopenForwarded(wf);
       if (!wf.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`))
         await wf.journal.append(JT.attention, { item: { id: `finished:${id}`, rev: 1, kind: 'finished', wid: wf.wid, call: id, text: finishedText(wf.wid, wf.journal.entries(), id), origin: wf.origin } });
       this.generations.delete(id); this.settle(wf);
@@ -629,6 +655,7 @@ export class Engine {
     const release = this.hold(st.wf.wid);
     void this.executor.run(this.ticket(st, entry)).then(() => this.background(async () => {
       try {
+        if (this.states.get(st.wf.wid) === st) await this.reopenForwarded(st.wf);
         if (this.states.get(st.wf.wid) !== st || this.terminal(st.wf)) return;
         const result = this.sealed(st, entry);
         if (!result) throw new Error(`Executor returned without seal: ${entry.key}`);
