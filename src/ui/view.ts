@@ -1,5 +1,5 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { isLive, labelsText, liveCalls, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { isLive, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import type { CallStatus } from "../types.ts";
 import type { sessionFacts } from "./session.ts";
 import { oneLine } from "./frame.ts";
@@ -37,10 +37,11 @@ export const toolCount = (n: number | undefined) => n ? `${n} tool${n === 1 ? ""
 export const pendingText = (n: number | undefined) => n ? `${n} message${n === 1 ? "" : "s"} pending` : "";
 /** UI §2, P7: The list row's small pending marker (the watch header spells it out). */
 export const pendingMarker = (n: number | undefined) => n ? `${n} pending` : "";
-/** UI §2: Sessions are independent: only this session's workflows, newest first by start time. Start times never
- *  change, so the order is stable while you read, also when a workflow finishes. */
-export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "startedAt" | "status">>(workflows: readonly T[], own?: string): T[] {
-  return workflows.filter(w => own === undefined || w.origin === own)
+/** UI §2: Sessions are independent: only this session's workflows (it started them, or a run started from it named it
+ *  as its session, e.g. a CLI driver launched from this pi), newest first by start time. Start times never change, so
+ *  the order is stable while you read, also when a workflow finishes. */
+export function orderWorkflows<T extends Pick<WorkflowSnapshot, "wid" | "origin" | "session" | "startedAt" | "status">>(workflows: readonly T[], own?: string): T[] {
+  return workflows.filter(w => own === undefined || ownedBy(w, own))
     .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0) || (a.wid < b.wid ? 1 : a.wid > b.wid ? -1 : 0));
 }
 /** UI §2: Done rows newest result first by immutable end time; ties keep snapshot order, so rows never reshuffle. */

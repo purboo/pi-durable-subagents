@@ -11,6 +11,7 @@ const home = process.env.DSA_HOME!;
 const lock = await new OsLock().tryAcquire(orchLock(home));
 if (lock) {
   await appendFile(join(home, "spawn.log"), `${process.pid}\n`);
+  await appendFile(join(home, "spawn-session.log"), `${process.env.DSA_SESSION ?? "-"}\n`);
   const ledger = await openJournal(orchLedger(home));
   const seen = new Set<string>();
   try {

@@ -204,6 +204,10 @@ export interface RunBody {
   origin?: { sessionFile: string; leafId?: string | null };
   /** Caller labels (flat string map), part of the spec digest and echoed on every event of the workflow. */
   labels?: Record<string, string>;
+  /** The pi session that shows this run as its own (SESSION_ID): the CLI takes it from --session or from $DSA_SESSION,
+   *  which a pi session exports to the processes it starts. Display only: notices, questions' routing, pause on quit and
+   *  restart grouping keep following the sender. Not part of the spec digest. */
+  session?: string;
 }
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
 export interface SendBody {

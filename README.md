@@ -209,7 +209,11 @@ Press `↓` on an empty editor, or type `/subagents`, to open the list, a floati
 session's workflows (sessions are independent), newest first, every
 subagent with its model, what it is doing and for how long, and its latest
 line. Finished ones stay there,
-dimmed, with their conclusion.
+dimmed, with their conclusion. A session's workflows include runs started
+through the CLI by a process this session launched (a background driver, a
+script run from its bash tool): pi exports `DSA_SESSION`, and `run` names that
+session (see `--session` below). Other sessions' and a terminal's runs are
+not shown.
 
 The list is also where you act. The footer shows the keys for the selected
 row: `Enter` watch, `s` steer, `f` follow-up, `x` stop (asks `y` first),
@@ -299,7 +303,7 @@ pi-durable-subagents start              start the orchestrator if work is pendin
 pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)
 pi-durable-subagents drain              hold existing workflows: running calls finish, nothing new starts in them
 pi-durable-subagents stop <wid|call>
-pi-durable-subagents run --request <id> --spec <file|-> [--labels <json>] [--cwd <dir>] [--json] [--wait-ms <n>]
+pi-durable-subagents run --request <id> --spec <file|-> [--labels <json>] [--session <id>] [--cwd <dir>] [--json] [--wait-ms <n>]
                                         start a run under a caller-chosen id; safe to retry (see below)
 pi-durable-subagents send --request <id> --to <run-id|wid/key> [--to ...] --kind follow-up|answer|steer|notify|model
                          [--call <key>] [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]
@@ -481,6 +485,17 @@ Invalid labels exit 1 and submit nothing, and the orchestrator rejects a
 request that carries invalid ones (`invalid-labels: …`). `describe` returns
 them as `labels` (also after `prune`), and every event of the run carries
 them.
+
+`--session <pi session id>` shows the run in that pi session's dock and
+`/subagents` list as one of its own; without it, `run` takes `$DSA_SESSION`,
+which a pi session exports to every process it starts (a subagent's
+processes never pass it on). It decides where the run is listed (the dock,
+`/subagents` and that session's `status`), and you act on it there like on
+any row; the run still belongs to its sender: that session's main agent gets
+no completion notices for it, quitting that pi does not pause it, and the
+session is not part of the content, so a retry from another session gets the
+first outcome. An invalid `--session` exits 1; an invalid inherited value
+is ignored.
 
 When an unsealed call does not move, its `waiting` in `describe` adds
 `reason`, `detail` (the status line for that cause, e.g. `waiting for a slot:

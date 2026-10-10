@@ -87,7 +87,8 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (!lock) return;
     await lock.release();
     const entry = process.env.DSA_ORCHESTRATOR_ENTRY ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../orchestrator/main.ts" : "../orchestrator/main.js", import.meta.url));
-    const child = spawn(process.execPath, [entry], { detached: true, stdio: "ignore", env: { ...process.env, DSA_HOME: home } });
+    const { DSA_SESSION: _session, ...env } = process.env;
+    const child = spawn(process.execPath, [entry], { detached: true, stdio: "ignore", env: { ...env, DSA_HOME: home } });
     await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
     child.unref();
   }
@@ -129,6 +130,9 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   }
   async function start(context: ExtensionContext) {
     await close(); ctx = context; sender = `main:${context.sessionManager.getSessionId()}`; stopped = false;
+    // Processes this session starts (bash, a detached CLI driver) inherit it: their CLI runs name this session, which
+    // then shows them as its own. A subagent's pi is not a user's session and exports nothing.
+    if (!process.env.DSA_EXEC) process.env.DSA_SESSION = context.sessionManager.getSessionId();
     outbox = await Outbox.open(outboxRoot(home), sender, () => orchInbox(home)); noteSink = sink;
     await reconcile(); await outbox.republishPending(); await starter(); lastStarter = Date.now();
     try { tellVersion(); } catch (error) { console.error("durable-subagents:", error); }

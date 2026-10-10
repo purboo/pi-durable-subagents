@@ -22,7 +22,9 @@ export async function startOrchestrator(home: string, env: NodeJS.ProcessEnv): P
   if (!lock) return;
   await lock.release();
   const entry = env.DSA_ORCHESTRATOR_ENTRY ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../orchestrator/main.ts" : "../orchestrator/main.js", import.meta.url));
-  const child = spawn(process.execPath, [entry], { detached: true, stdio: "ignore", env: { ...env, DSA_HOME: home } });
+  // The orchestrator serves every session: it never carries the starting pi session's $DSA_SESSION to its children.
+  const { DSA_SESSION: _session, ...rest } = env;
+  const child = spawn(process.execPath, [entry], { detached: true, stdio: "ignore", env: { ...rest, DSA_HOME: home } });
   await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
   child.unref();
 }

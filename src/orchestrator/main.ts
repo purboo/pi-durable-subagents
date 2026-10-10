@@ -23,6 +23,8 @@ export interface MainOptions extends EngineOptions {
 /** P2, C4, K6: Acquire the single authority before opening ledgers, recover, and idle-exit. Resolves `restart` when an
  *  applied restart request ended it (the caller starts the successor once the lock is released). */
 export async function main(options: MainOptions = {}): Promise<{ restart?: true }> {
+  // Serves every session: whichever pi session started it, its children and their CLI runs must not name that session.
+  delete process.env.DSA_SESSION;
   const home = options.home ?? dsaHome();
   await mkdir(home, { recursive: true });
   const lock = await new OsLock().tryAcquire(orchLock(home));
