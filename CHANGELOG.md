@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.31
+
+- A run can be shown in the pi session it was started for, not only the one
+  that sent it. pi exports `DSA_SESSION=<session id>` to the processes it
+  starts, and `run` takes `--session <id>` (default: an inherited
+  `$DSA_SESSION`, ignored inside a subagent). A tool or script started from a
+  pi session therefore has its runs listed in that session's dock and
+  `/subagents`, sorted first in `status`. Display and ownership only:
+  completion notices and attention still go to the sender, quitting pi does not
+  pause these runs, and `session` is not part of a request's digest. An invalid
+  `--session` exits 1; the engine rejects an invalid id with `invalid-session`.
+
 ## 1.0.30
 
 - The pi UI shows only the subagents this pi session started again: the

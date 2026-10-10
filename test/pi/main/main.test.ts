@@ -81,6 +81,15 @@ test("run publishes pinned call body through the durable outbox and returns crea
   assert.equal(readFileSync(join(home, "spawn.log"), "utf8").trim().split("\n").length, 1);
 });
 
+test("a pi session exports DSA_SESSION to the processes it starts, but not to the orchestrator it starts", { timeout: 30000 }, async t => {
+  const { home, launch } = setup(t), pi = launch(), out = join(home, "bash-session.txt");
+  await prompt(pi, [{ tool: "bash", args: { command: `printf %s "$DSA_SESSION" > ${out}` } }, { text: "done" }]);
+  assert.equal(readFileSync(out, "utf8"), sessionId, "a CLI run from this session's bash names this session");
+  await prompt(pi, [{ tool: "subagents", args: { agent: "worker", task: "Implement" } }, { text: "done" }]); // starts the orchestrator
+  await until(() => existsSync(join(home, "spawn-session.log")));
+  assert.deepEqual(readFileSync(join(home, "spawn-session.log"), "utf8").trim().split("\n"), ["-"], "the orchestrator serves every session");
+});
+
 test("v12 §2/§6 agents lists cwd-scoped definitions without publishing, and rejects unknown calls before creation", { timeout: 30000 }, async t => {
   const { home, launch } = setup(t), pi = launch();
   const dir = join(pi.dir, "work/.pi/agents"); mkdirSync(dir, { recursive: true });

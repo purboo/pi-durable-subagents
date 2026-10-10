@@ -46,11 +46,14 @@ export async function namesMany(home: string, id: string): Promise<boolean> {
   const first = `${id}:1`;
   return REQUEST_ID.test(first) && await findRequest(home, requestRid(first)) !== undefined;
 }
+/** A pi session id as a run's `session`: what a pi session exports as $DSA_SESSION. */
+export const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 /** Spec_digest = contentHash({kind, body, cond}) (cond omitted when absent). A run's body.origin (the pi session
- *  branch offered for context:"fork") is delivery metadata, not spec: it differs on every turn, so it is not hashed. */
+ *  branch offered for context:"fork") is delivery metadata, not spec: it differs on every turn, so it is not hashed;
+ *  nor is body.session (which pi session shows the run): a retry from another session is the same request. */
 export function specDigest(req: Pick<Request, 'kind' | 'body' | 'cond'>): string {
   let body = req.body;
-  if (req.kind === 'run' && body && typeof body === 'object' && !Array.isArray(body)) { const { origin: _, ...rest } = body as Record<string, unknown>; body = rest; }
+  if (req.kind === 'run' && body && typeof body === 'object' && !Array.isArray(body)) { const { origin: _, session: _s, ...rest } = body as Record<string, unknown>; body = rest; }
   if (req.kind === 'send' && body && typeof body === 'object' && !Array.isArray(body)) { const { caller: _, ...rest } = body as Record<string, unknown>; body = rest; }
   return contentHash({ kind: req.kind, body, cond: req.cond });
 }

@@ -20,7 +20,7 @@ import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
-import { requestId, specDigest } from '../requests.ts';
+import { SESSION_ID, requestId, specDigest } from '../requests.ts';
 import { JT, attentionEntries, isEntry, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type RestartBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
@@ -354,6 +354,8 @@ export class Engine {
       // Senders validate labels; a hand-written request must not bypass that.
       const labels = (req.body as RunBody | null)?.labels, invalid = !created && labels !== undefined ? labelsProblem(labels) : undefined;
       if (invalid) return { action: 'reject', reason: `invalid-labels: ${invalid}` };
+      const session = (req.body as RunBody | null)?.session;
+      if (!created && session !== undefined && (typeof session !== 'string' || !SESSION_ID.test(session))) return { action: 'reject', reason: 'invalid-session: a pi session id' };
       if (created && this.store.pruned().has(String(created.wid))) return { action: 'apply' }; // Never resurrect a pruned run.
       let wf = created ? this.store.workflows.get(created.wid as string) : undefined;
       if (!wf) {

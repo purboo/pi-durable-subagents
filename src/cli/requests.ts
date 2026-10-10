@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
-import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, specDigest, type Identified } from "../requests.ts";
+import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
 import { NOTIFY_SINCE, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { BATCH, checkAgents, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
@@ -247,14 +247,24 @@ async function refusable(args: string[], ctx: Context, run: (args: string[], ctx
 const forks = (spec: Record<string, unknown>) => [spec, ...["tasks", "chain"].flatMap(k => Array.isArray(spec[k]) ? spec[k] as unknown[] : [])]
   .some(s => s && typeof s === "object" && (s as { context?: unknown }).context === "fork");
 
-/** `run --request <id> --spec <file|-> [--cwd <dir>] [--json] [--wait-ms <n>]`. The spec is the `subagents` run
+/** The pi session a CLI run is shown in: --session, else $DSA_SESSION (exported by a pi session to what it starts)
+ *  unless this process runs inside a subagent call. An unusable inherited value is ignored; a bad flag is an error. */
+export function runSession(flag: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
+  if (flag !== undefined) {
+    if (!SESSION_ID.test(flag)) throw new Error("--session must be a pi session id ([A-Za-z0-9._:-], at most 128 characters)");
+    return flag;
+  }
+  const inherited = env.DSA_CALL || env.DSA_EXEC ? undefined : env.DSA_SESSION;
+  return inherited && SESSION_ID.test(inherited) ? inherited : undefined;
+}
+/** `run --request <id> --spec <file|-> [--session <id>] [--cwd <dir>] [--json] [--wait-ms <n>]`. The spec is the `subagents` run
  *  form ({agent,task,…} or {tasks|chain:[…],…}); it is validated by the tool's own normalizer and agent check. */
 export const runCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, runRequest);
 async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
-  const { values, positionals } = flags(args, { request: "value", spec: "value", cwd: "value", labels: "value", json: "flag", "wait-ms": "value" });
+  const { values, positionals } = flags(args, { request: "value", spec: "value", cwd: "value", labels: "value", session: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), file = text(values, "spec"), json = values.json === true, wait = waitMs(values, ctx);
   seen.id = id; seen.json = json;
-  if (!id || !file || positionals.length) throw new Error("usage: run --request <id> --spec <file|-> [--labels <json>] [--cwd <dir>] [--json] [--wait-ms <n>]");
+  if (!id || !file || positionals.length) throw new Error("usage: run --request <id> --spec <file|-> [--labels <json>] [--session <pi session id>] [--cwd <dir>] [--json] [--wait-ms <n>]");
   requestRid(id);
   const raw = text(values, "labels"), labels = raw !== undefined ? parseLabels(raw) : undefined;
   const bytes = file === "-" ? await (ctx.stdin ?? stdin)() : readFileSync(resolve(ctx.cwd ?? process.cwd(), file), "utf8");
@@ -269,6 +279,8 @@ async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<num
   const base = resolve(ctx.cwd ?? process.cwd(), text(values, "cwd") ?? "."), dir = typeof spec.cwd === "string" && spec.cwd ? resolve(base, spec.cwd) : base;
   const normalized = request({ ...spec, action: "run", ...(typeof spec.cwd === "string" && spec.cwd ? { cwd: dir } : {}), ...(labels ? { labels } : {}) }, dir);
   const body = normalized.body as RunBody;
+  const session = runSession(text(values, "session"), ctx.env);
+  if (session) body.session = session;
   seen.digest = specDigest({ kind: "run", body });
   // An id already recorded is decided by that record: the same content gets its first outcome (the agents it named may
   // have changed since), other content is a request-conflict. Only a new id is checked here.

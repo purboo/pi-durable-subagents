@@ -78,6 +78,8 @@ export interface WorkflowSnapshot {
   usage?: Usage;
   /** The run's labels (from its run request in the orchestrator ledger), when it has any. */
   labels?: Record<string, string>;
+  /** The pi session that shows the run as its own besides its origin (RunBody.session), when the run named one. */
+  session?: string;
 }
 
 /** A workflow has live work: it runs, or follow-ups opened on it after it finished have not ended yet. */
@@ -352,6 +354,8 @@ export interface LedgerIndex {
   labels: Map<string, Record<string, string>>;
   /** Run requests with labels, by rid, until their workflow is created. */
   runLabels: Map<string, Record<string, string>>;
+  /** The pi session each workflow's run request named (RunBody.session), and the same by rid until creation. */
+  sessions: Map<string, string>; runSessions: Map<string, string>;
   /** Last drain/undrain without scope, per `wid` and per `origin`. */
   global?: number; byWid: Map<unknown, number>; byOrigin: Map<unknown, number>;
   lastDrain?: number;
@@ -361,7 +365,7 @@ const ledgerIndexes = new WeakMap<readonly Entry[], Folded>();
 export function ledgerIndex(ledger: readonly Entry[]): LedgerIndex {
   let ix = ledgerIndexes.get(ledger);
   if (!ix || ix.length > ledger.length || (ix.length && ledger[ix.length - 1] !== ix.last)) {
-    ix = { length: 0, created: new Map(), pruned: new Set(), labels: new Map(), runLabels: new Map(), byWid: new Map(), byOrigin: new Map() };
+    ix = { length: 0, created: new Map(), pruned: new Set(), labels: new Map(), runLabels: new Map(), sessions: new Map(), runSessions: new Map(), byWid: new Map(), byOrigin: new Map() };
     ledgerIndexes.set(ledger, ix);
   }
   for (let i = ix.length; i < ledger.length; i++) {
@@ -370,11 +374,15 @@ export function ledgerIndex(ledger: readonly Entry[]): LedgerIndex {
       if (!ix.created.has(e.wid)) ix.created.set(e.wid, e);
       const labels = ix.runLabels.get(String(e.rid));
       if (labels) { if (!ix.labels.has(String(e.wid))) ix.labels.set(String(e.wid), labels); ix.runLabels.delete(String(e.rid)); }
+      const session = ix.runSessions.get(String(e.rid));
+      if (session) { if (!ix.sessions.has(String(e.wid))) ix.sessions.set(String(e.wid), session); ix.runSessions.delete(String(e.rid)); }
     } else if (e.type === "request") {
       const r = e.request as { rid?: unknown; kind?: unknown; body?: unknown } | undefined, labels = r?.kind === "run" ? labelsOf(r.body) : undefined;
       if (labels && typeof r?.rid === "string") ix.runLabels.set(r.rid, labels);
-    } else if (e.type === JT.rejected) ix.runLabels.delete(String(e.rid));
-    else if (e.type === "pruned") { ix.pruned.add(String(e.wid)); ix.labels.delete(String(e.wid)); }
+      const session = r?.kind === "run" ? (r.body as { session?: unknown } | null)?.session : undefined;
+      if (typeof session === "string" && session && typeof r?.rid === "string") ix.runSessions.set(r.rid, session);
+    } else if (e.type === JT.rejected) { ix.runLabels.delete(String(e.rid)); ix.runSessions.delete(String(e.rid)); }
+    else if (e.type === "pruned") { ix.pruned.add(String(e.wid)); ix.labels.delete(String(e.wid)); ix.sessions.delete(String(e.wid)); }
     else if (e.type === "drain" || e.type === "undrain") {
       if (e.type === "drain") ix.lastDrain = i;
       if (e.wid === undefined && e.origin === undefined) ix.global = i;
@@ -405,16 +413,21 @@ export function holdOf(ledger: readonly Entry[], wid: string, origin?: string): 
   return !created || created.seq < last.seq ? last : undefined;
 }
 /** Drain: the workflows a drain (stop-all, a quit pi) holds until resume, and since when. */
-export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean; labels: (wid: string) => Record<string, string> | undefined } {
+export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean; labels: (wid: string) => Record<string, string> | undefined; session: (wid: string) => string | undefined } {
   const ledger = readJournalSnapshot(orchLedger(home)), ix = ledgerIndex(ledger);
   const origin = (wid: string) => ix.created.get(wid)?.origin as string | undefined;
   const hold = (wid: string) => holdOf(ledger, wid, origin(wid));
   const since = ix.lastDrain !== undefined ? ledger[ix.lastDrain]!.ts : undefined;
-  return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined, labels: wid => ix.labels.get(wid) };
+  return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined, labels: wid => ix.labels.get(wid), session: wid => ix.sessions.get(wid) };
 }
-/** The workflow with its run's labels, when it has any. */
-function labelled<T extends WorkflowSnapshot>(wf: T, labels: Record<string, string> | undefined): T {
-  return labels ? { ...wf, labels } : wf;
+/** The workflow with its run's labels and session, when it has them. */
+function labelled<T extends WorkflowSnapshot>(wf: T, labels: Record<string, string> | undefined, session?: string): T {
+  return labels || session ? { ...wf, ...(labels ? { labels } : {}), ...(session ? { session } : {}) } : wf;
+}
+/** Whether `origin` ("main:<pi session id>") shows the workflow as its own: it started it, or the run named that pi
+ *  session (RunBody.session, e.g. a CLI driver started from that session). */
+export function ownedBy(w: Pick<WorkflowSnapshot, "origin" | "session">, origin: string): boolean {
+  return w.origin === origin || (w.session !== undefined && `main:${w.session}` === origin);
 }
 /** Labels clipped for one status line: "[k=v k2=v2]", at most `width` characters (empty without labels). */
 export function labelsText(labels: Record<string, string> | undefined, width = 60): string {
@@ -425,8 +438,8 @@ export function labelsText(labels: Record<string, string> | undefined, width = 6
 
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
 export function allWorkflows(home: string): WorkflowSnapshot[] {
-  const { held, labels } = heldWorkflows(home);
-  return workflowIds(home).sort().reverse().map(wid => { const wf = labelled(workflowSnapshot(home, wid), labels(wid)); return isLive(wf) && held(wid) ? { ...wf, paused: true } : wf; });
+  const { held, labels, session } = heldWorkflows(home);
+  return workflowIds(home).sort().reverse().map(wid => { const wf = labelled(workflowSnapshot(home, wid), labels(wid), session(wid)); return isLive(wf) && held(wid) ? { ...wf, paused: true } : wf; });
 }
 
 /** P10/P11: Per-workflow script console log written by the orchestrator (bounded, human-readable). */
@@ -525,10 +538,10 @@ function origins(home: string): Map<string, string | undefined> {
 
 /** Every workflow with its origin and hold, own session first, then newest first. */
 function snapshots(home: string, origin?: string): { all: WorkflowSnapshot[]; since?: number } {
-  const own = (w: WorkflowSnapshot) => Number(!!origin && w.origin === origin);
-  const { since, held, labels } = heldWorkflows(home);
+  const own = (w: WorkflowSnapshot) => Number(!!origin && ownedBy(w, origin));
+  const { since, held, labels, session } = heldWorkflows(home);
   const all = [...origins(home)].sort(([a], [b]) => a < b ? 1 : a > b ? -1 : 0).map(([wid, origin]) => {
-    const wf = labelled(workflowSnapshot(home, wid), labels(wid)), withOrigin = wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
+    const wf = labelled(workflowSnapshot(home, wid), labels(wid), session(wid)), withOrigin = wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
     return isLive(withOrigin) && held(wid) ? { ...withOrigin, paused: true } : withOrigin;
   }).sort((a, b) => own(b) - own(a));
   return { all, ...(since !== undefined ? { since } : {}) };
@@ -703,7 +716,7 @@ export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "sl
 export function statusBrief(home: string, options: { origin?: string; keep?: number; now?: number } = {}): StatusBrief {
   const keep = options.keep ?? 5, now = options.now ?? Date.now(), origin = options.origin;
   const { all } = snapshots(home, origin), leases = leaseState(home), byCall = leaseCalls(leases, now);
-  const mine = (w: WorkflowSnapshot) => !origin || w.origin === origin;
+  const mine = (w: WorkflowSnapshot) => !origin || ownedBy(w, origin);
   const line = (w: WorkflowSnapshot) => {
     const p = progressOf(w), notOk = latestCalls(w).filter(c => c.result && !c.result.ok).length;
     const notes = latestCalls(w).reduce((n, c) => n + (c.notesPending ?? 0), 0);
@@ -836,7 +849,7 @@ export function statusCallDetail(home: string, wid: string, key: string): Status
 export function statusDetail(home: string, wid: string): StatusDetail {
   const origin = origins(home);
   if (!origin.has(wid)) throw new Error(prunedIds(home).has(wid) ? `Workflow ${wid} was pruned` : `Unknown workflow: ${wid}`);
-  const wf = labelled(workflowSnapshot(home, wid), heldWorkflows(home).labels(wid)), log = scriptLogPath(home, wid);
+  const held = heldWorkflows(home), wf = labelled(workflowSnapshot(home, wid), held.labels(wid), held.session(wid)), log = scriptLogPath(home, wid);
   return { ...wf, ...(wf.origin === undefined && origin.get(wid) !== undefined ? { origin: origin.get(wid) } : {}), ...(existsSync(log) ? { scriptLog: log } : {}) };
 }
 
