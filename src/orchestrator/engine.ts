@@ -102,6 +102,10 @@ type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Se
 export interface EngineOptions { evaluator?: EvaluatorTransport; discovery?: DiscoveryOptions }
 
 /** A1, P2, P10, P11: Serialize decisions while executions run independently. */
+/** A key's latest call in the current revision: its first call or its newest generation. */
+function latestCall(wf: Workflow, key: string): Entry | undefined {
+  return revisionEntries(wf).findLast(e => (e.type === 'call' || e.type === 'generation') && String(e.key) === key);
+}
 export class Engine {
   readonly store: Store;
   /** The cross-workflow event log's writer (derives milestones from the journals; waiting/moving emits through it). */
@@ -117,6 +121,8 @@ export class Engine {
   private closed = false;
   private restarting = false;
   private generations = new Set<string>();
+  /** The tail of each workflow's generation openings, see serialOpen. */
+  private opening = new Map<string, Promise<void>>();
   // wid -> executor runs whose follow-up has not run yet (prune never closes a journal they may still append to).
   private running = new Map<string, number>();
   /** Drain: held by a drain that applies to it (all, its session's origin, or itself) and recorded after its creation. */
@@ -388,14 +394,16 @@ export class Engine {
         try { if (!parseModel(send.model).provider) throw new Error('missing provider'); }
         catch { return { action: 'reject', reason: 'unknown-model' }; }
       }
-      if (seal && send.kind === 'follow-up') {
+      if (seal && send.kind === 'follow-up') return this.serialOpen(wf.wid, async () => {
+        // A generation opened meanwhile (undelivered follow-ups after a seal) is the call this follow-up now reaches.
+        if (latestCall(wf, String(entry.key))?.gen !== entry.gen) return { action: 'defer' } as const;
         // Pending notes and undelivered follow-ups ride on the opening message, recorded in the same entry (consumed
         // exactly once). A notify or follow-up whose fate the seal has not settled yet may still become one: wait for it.
-        if (unsettledForward(revisionEntries(wf), from)) return { action: 'defer' };
+        if (unsettledForward(revisionEntries(wf), from)) return { action: 'defer' } as const;
         if (send.model !== undefined) await this.note(req.rid, send.model, 'next-generation');
         const opened = await this.openGeneration(wf, entry, from, { rid: req.rid, message: send.message ?? '', ...(send.model !== undefined ? { model: send.model } : {}) });
-        this.dispatchGeneration(wf, opened); return { action: 'apply' };
-      }
+        this.dispatchGeneration(wf, opened); return { action: 'apply' } as const;
+      });
       // A follow-up naming a model, queued on unfinished work: the executor records its model request with the message.
       return this.executor.forward(req, this.context(wf, entry));
     } else if (req.kind === 'stop') {
@@ -562,17 +570,26 @@ export class Engine {
   /** Follow-ups forwarded into running work whose call sealed before taking them (`undelivered-follow-up`) open the
    *  key's next generation, as a follow-up sent after the seal would: once its latest generation has sealed, unless a
    *  later follow-up took them along. Idempotent; run after every seal and at start. */
-  private async reopenForwarded(wf: Workflow): Promise<void> {
+  private reopenForwarded(wf: Workflow): Promise<void> { return this.serialOpen(wf.wid, () => this.reopenForwardedNow(wf)); }
+  private async reopenForwardedNow(wf: Workflow): Promise<void> {
     const log = revisionEntries(wf);
     if (!log.some(e => e.type === 'forward-retired' && e.reason === 'undelivered-follow-up')) return;
     for (const key of new Set(log.filter(e => e.type === 'call' || e.type === 'generation').map(e => String(e.key)))) {
       if (!pendingFollowUps(revisionEntries(wf), key).length) continue;
-      const latest = revisionEntries(wf).findLast(e => (e.type === 'call' || e.type === 'generation') && String(e.key) === key)!;
+      const latest = latestCall(wf, key)!;
       const from = `${wf.wid}@${wf.revision}/${key}@${latest.gen}`, entries = wf.journal.entries();
       if (!entries.some(e => e.type === JT.sealed && e.call === from) || entries.some(e => e.type === 'retired' && e.call === from)) continue;
       if (unsettledForward(revisionEntries(wf), from)) continue;
       this.dispatchGeneration(wf, await this.openGeneration(wf, latest, from));
     }
+  }
+  /** One generation opening at a time per workflow, so the check that a key's latest call is sealed and unopened and
+   *  the `generation` it appends are one step. Otherwise the reopen at start, the one after a seal and a follow-up's
+   *  each see the key unopened and open it twice. */
+  private async serialOpen<T>(wid: string, fn: () => Promise<T>): Promise<T> {
+    const run = (this.opening.get(wid) ?? Promise.resolve()).then(fn), tail = run.then(() => {}, () => {});
+    this.opening.set(wid, tail);
+    try { return await run; } finally { if (this.opening.get(wid) === tail) this.opening.delete(wid); }
   }
   private dispatchGeneration(wf: Workflow, entry: Entry) {
     const ticket = this.ticket({ wf } as State, entry), id = ticket.callId;

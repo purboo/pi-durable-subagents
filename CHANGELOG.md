@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.35
+
+- Generation openings of one workflow are serialized. The reopen of undelivered follow-ups at orchestrator start, the
+  one after each seal and a follow-up sent to a sealed call could each find the same key unopened and open its next
+  generation twice (seen after a restart while a reopened generation sealed). A follow-up that finds a generation
+  opened meanwhile is deferred and then reaches that generation.
+- Releases publish to npm through trusted publishing (OIDC, no token) from the `npm` environment, with provenance.
+  Workflows run with read-only permissions by default.
+
 ## 1.0.34
 
 - A follow-up queued into running work is no longer lost when that generation ends before taking it. The next
