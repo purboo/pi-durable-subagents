@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.33
+
+- A run copies its origin session branch only when it can use it: its script
+  quotes `"fork"` or a string in its `args` is `"fork"`. Before, every run
+  started from pi copied the whole branch (tens of MB for a long session)
+  into `pinned/origin.jsonl` and its staging snapshot, read it at admission
+  and hashed it at every orchestrator start, although almost no run forks.
+  Existing workflows keep their copies until they are pruned.
+- `orchestratorStats.readBytes` counts the orchestrator's own reads (its
+  threads' `rchar`). It used `/proc/self/io`, where Linux adds every reaped
+  child's I/O to the parent: each finished call added everything its
+  subagent's builds and tests had read, which looked like the orchestrator
+  reading gigabytes per second.
+- A workflow started without `name` is shown by its label values
+  (`ipc-qa c4811f14`) in the dock, `/subagents`, the watch view and the
+  completion notice, instead of by its agent name.
+
 ## 1.0.32
 
 - `/subagents` lists working workflows first (newest first) and finished ones

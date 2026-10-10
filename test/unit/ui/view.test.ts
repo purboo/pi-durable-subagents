@@ -410,6 +410,8 @@ test("rows name agents the way people know them, not by generated keys", async (
   assert.equal(callName(solo, solo.calls[0]!), "dsa-1.0.28-review", "a workflow's only agent goes by the workflow's name");
   assert.equal(callName(solo, { ...solo.calls[0]!, gen: 3 }), "dsa-1.0.28-review@3");
   assert.equal(callName({ calls: solo.calls }, solo.calls[0]!), "reviewer", "unnamed workflow: the agent");
+  assert.equal(callName({ calls: solo.calls, labels: { lane: "ipc-qa", sha: "c4811f14" } }, solo.calls[0]!), "ipc-qa c4811f14", "unnamed but labelled: the label values");
+  assert.equal(callName({ name: "n", calls: solo.calls, labels: { lane: "x" } }, solo.calls[0]!), "n", "a name wins over labels");
   const fan = workflow([call("tasks:1", { agent: "worker" }), call("tasks:0", { agent: "worker" }), call("tasks:2", { agent: "reviewer" }), call("plan", { agent: "worker" })]);
   assert.deepEqual(fan.calls.map(c => callName(fan, c)), ["worker 2", "worker 1", "reviewer", "plan"], "generated keys by agent, numbered by position when repeated; named keys kept");
   const text = listRows([solo, fan], state(), new Map(), () => "m", 100, now).map(r => r.text).join("\n");

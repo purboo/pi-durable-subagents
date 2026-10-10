@@ -133,9 +133,15 @@ const GENERATED = /^(?:tasks|chain):(\d+)$/;
 /** UI §2: How a person knows a call. A workflow's only agent goes by the workflow's name; a generated key (tasks:0) by
  *  its agent, numbered when the workflow runs that agent more than once; a named key as is. "@2" marks a later
  *  generation. The key stays the address for tools and the CLI; only the UI shows this name. */
-export function callName(w: Pick<WorkflowSnapshot, "name" | "calls">, c: Pick<CallSnapshot, "key" | "gen" | "agent">): string {
-  const keys = [...new Set(w.calls.map(x => x.key))], gen = c.gen > 1 ? `@${c.gen}` : "";
-  if (keys.length === 1 && w.name) return `${w.name}${gen}`;
+/** A workflow's display name: its run name, else its label values ("ipc-qa c4811f14"), else undefined. */
+export function workflowName(w: Pick<WorkflowSnapshot, "name" | "labels">): string | undefined {
+  if (w.name) return w.name;
+  const values = Object.values(w.labels ?? {}).map(v => String(v).replace(/\s+/g, " ").trim()).filter(Boolean);
+  return values.length ? values.join(" ") : undefined;
+}
+export function callName(w: Pick<WorkflowSnapshot, "name" | "labels" | "calls">, c: Pick<CallSnapshot, "key" | "gen" | "agent">): string {
+  const keys = [...new Set(w.calls.map(x => x.key))], gen = c.gen > 1 ? `@${c.gen}` : "", name = workflowName(w);
+  if (keys.length === 1 && name) return `${name}${gen}`;
   if (!GENERATED.test(c.key)) return `${c.key}${gen}`;
   const peers = keys.filter(k => GENERATED.test(k) && w.calls.find(x => x.key === k)?.agent === c.agent)
     .sort((a, b) => Number(GENERATED.exec(a)![1]) - Number(GENERATED.exec(b)![1]));
@@ -176,7 +182,7 @@ export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undef
   const words = new Map<string, number>();
   for (const c of latest) { const r = c.result; if (r) words.set(resultWord(r.status), (words.get(resultWord(r.status)) ?? 0) + 1); }
   const parts = WORD_ORDER.filter(word => words.has(word)).map(word => `${words.get(word)} ${word}`);
-  return `${w.name ?? w.wid} finished: ${parts.join(" · ") || w.status} · ↓ subagents`;
+  return `${workflowName(w) ?? w.wid} finished: ${parts.join(" · ") || w.status} · ↓ subagents`;
 }
 
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

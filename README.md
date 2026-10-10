@@ -209,7 +209,8 @@ Press `↓` on an empty editor, or type `/subagents`, to open the list, a floati
 session's workflows (sessions are independent), working ones first (newest
 first), every subagent with its model, what it is doing and for how long, and
 its latest line. Finished ones follow, most recently ended first, dimmed, with
-their conclusion. A workflow's only subagent is named after the workflow; in a
+their conclusion. A workflow's only subagent is named after the workflow (its
+`name`, else its label values, e.g. `ipc-qa c4811f14`); in a
 fan-out, a generated key (`tasks:0`) shows as its agent (`worker 1`,
 `reviewer`). The key remains the address for `send` and the CLI. A session's workflows include runs started
 through the CLI by a process this session launched (a background driver, a
@@ -371,7 +372,10 @@ yet, else 1 when one was rejected, else 0. A notify's reply adds `delivery`
 
 From the `subagents` tool, `request` works the same, with one difference: a
 run's origin session (what `context: "fork"` copies, and where notices go) is
-not part of the digest. A retry of the same id from another session therefore
+not part of the digest. Only a run that can fork copies the origin branch: its
+script quotes `"fork"` or a string in its `args` is `"fork"`; any other run
+copies nothing, and a call of it that builds `context: "fork"` some other way
+fails with "fork requested but the run has no origin session". A retry of the same id from another session therefore
 gets the first session's workflow, its notices and its forked context. A
 retried answer may leave out `to`, `qid` and `rev`: it addresses the question
 the first attempt answered.
@@ -551,8 +555,11 @@ and `status --json` / `doctor --json` carry it as `orchestratorStats`:
 `workflows` (not pruned), `liveWorkflows` (with work still open),
 `openJournals` (journal files held open), `passesPerSecond` (intake passes
 that ran, averaged over the last minute; an idle orchestrator runs almost
-none), `readBytes` (bytes the process read since it started, from
-`/proc/self/io`; absent where there is none), `pid` and `at` (when it was
+none), `readBytes` (bytes the orchestrator's own threads read since it
+started, summed from `/proc/self/task/*/io`; absent where there is none.
+Not `/proc/<pid>/io` of the orchestrator: Linux adds every reaped child's I/O
+to its parent there, so it grows by whatever the subagents and their builds
+read, in a burst each time a call ends), `pid` and `at` (when it was
 written). The orchestrator writes these to `orchestrator-stats.json` every
 10 s; they are shown only while that process runs.
 

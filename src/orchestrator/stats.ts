@@ -1,7 +1,7 @@
 // What the running orchestrator costs, for `status --json` and `doctor`: the orchestrator writes these counters of its
 // own process to $DSA_HOME/orchestrator-stats.json every STATS_EVERY_MS (atomic replace, no fsync: a lost write only
 // shows older numbers). Readers show them only when the pid in the file is the orchestrator the ledger records as running.
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -15,16 +15,26 @@ export interface OrchestratorStats {
   openJournals: number;
   /** Intake passes (inbox and ledger scans that ran) per second over the last minute. */
   passesPerSecond: number;
-  /** Bytes the process read since it started (/proc/self/io rchar; absent where unavailable). */
+  /** Bytes the orchestrator's own threads read since it started (rchar of /proc/self/task/<tid>/io, summed; absent
+   *  where unavailable). Not /proc/self/io: Linux adds the I/O of every reaped child to its parent there, so it would
+   *  count everything the subagents (and their builds and tests) read. */
   readBytes?: number;
 }
 export const statsPath = (home: string) => join(home, "orchestrator-stats.json");
 
-/** /proc/self/io rchar, or undefined where there is none. */
+/** The summed rchar of this process's live threads, or undefined where there is none (see OrchestratorStats.readBytes). */
 export function readBytes(): number | undefined {
   if (process.platform !== "linux") return undefined;
-  try { const match = /^rchar:\s*(\d+)$/m.exec(readFileSync("/proc/self/io", "utf8")); return match ? Number(match[1]) : undefined; }
-  catch { return undefined; }
+  try {
+    let total = 0, found = false;
+    for (const tid of readdirSync("/proc/self/task")) {
+      try {
+        const match = /^rchar:\s*(\d+)$/m.exec(readFileSync(`/proc/self/task/${tid}/io`, "utf8"));
+        if (match) { total += Number(match[1]); found = true; }
+      } catch { /* a thread that just exited */ }
+    }
+    return found ? total : undefined;
+  } catch { return undefined; }
 }
 export async function writeStats(home: string, stats: OrchestratorStats): Promise<void> {
   const path = statsPath(home), temp = join(home, `.orchestrator-stats.${process.pid}.tmp`);

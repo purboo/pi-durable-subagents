@@ -435,12 +435,25 @@ test('real evaluator continues past a refusal and returns its failed result', as
   assert.equal(wf.journal.entries().filter(e => e.type === 'fake-run').length, 0);
 });
 
+test('only a run that can ask for context "fork" pins the origin branch', async t => {
+  const evaluator = new ManualEvaluator(), { home, run } = await fixture(t, evaluator);
+  const session = join(home, 'origin.jsonl');
+  await writeFile(session, [{ type: 'session', version: 3, id: 'origin' }, { type: 'message', id: 'a', parentId: null, message: { role: 'user', content: 'x' } }].map(e => JSON.stringify(e)).join('\n') + '\n');
+  const plain = await run('return runs.run("c", {agent: "a", task: "t"})', { origin: { sessionFile: session } });
+  assert.equal(plain.originPath, undefined);
+  assert.equal(existsSync(join(pinnedDir(home, plain.wid), 'origin.jsonl')), false, 'nothing copied for a run that never forks');
+  const quoted = await run("return runs.run('c', {agent: 'a', task: 't', context: 'fork'})", { origin: { sessionFile: session } }, 2);
+  assert.equal(quoted.originPath, join(pinnedDir(home, quoted.wid), 'origin.jsonl'), 'a quoted "fork" in the source');
+  const viaArgs = await run('return runs.run("c", {agent: "a", task: "t", context: args.context})', { origin: { sessionFile: session }, args: { context: 'fork' } }, 3);
+  assert.equal(viaArgs.originPath, join(pinnedDir(home, viaArgs.wid), 'origin.jsonl'), '"fork" as a string in args');
+});
+
 test('origin branch and input bytes stay on disk, not in memory, across revision and recovery', async t => {
   const evaluator = new ManualEvaluator(), { home, run, engine, ledgers } = await fixture(t, evaluator);
   const session = join(home, 'origin.jsonl'), input = join(home, 'doc');
   await writeFile(session, [{ type: 'session', version: 3, id: 'origin' }, { type: 'message', id: 'a', parentId: null, message: { role: 'user', content: 'x'.repeat(1000) } }].map(e => JSON.stringify(e)).join('\n') + '\n');
   await writeFile(input, 'bytes');
-  const wf = await run('source', { origin: { sessionFile: session }, inputs: { doc: input } });
+  const wf = await run('source /* context: "fork" */', { origin: { sessionFile: session }, inputs: { doc: input } });
   const pinned = join(pinnedDir(home, wf.wid), 'origin.jsonl');
   assert.equal(wf.pins.origin, undefined); assert.deepEqual(wf.pins.inputs, {});
   assert.equal(wf.originPath, pinned);
