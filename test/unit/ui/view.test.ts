@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { root, clean, now, call, workflow, state, session } from "./fixture.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
-import type { ViewState } from "../../../src/ui/view.ts";
 import type { CallStatus } from "../../../src/types.ts";
 const { listRows, toggleOpen, dockLines, duration, mainLine, modelLabel, statusPhrase, orderWorkflows, keepSelection, rowText, toolCount, summaryText, summary, resultPhrase, resultWord } = await import("../../../src/ui/view.ts");
 const { visibleWidth } = await import("@earendil-works/pi-tui");
@@ -390,64 +389,4 @@ test("a follow-up on a finished workflow is live: the dock, the summary and the 
   assert.equal(sealed.followUps, undefined);
   assert.deepEqual(dockLines([sealed], new Map(), () => "M", 100, later), []);
   assert.equal(summaryText([sealed]), "1 finished");
-});
-
-test("other sessions: the dock counts their live calls apart from this session's, never as its own rows", async () => {
-  const { elsewhereText, otherWorkflows, originText } = await import("../../../src/ui/view.ts");
-  const own = "main:mine-1234567890";
-  const cli = workflow([call("a", { callId: "c@1/a@1" }), call("b", { callId: "c@1/b@1", phase: "asking" })], { wid: "c", name: "driver", origin: "cli:me@host",
-    attention: [{ kind: "question", id: "q", rev: 1, qid: "q", call: "c@1/b@1", wid: "c", text: "Which?" }] });
-  const peer = workflow([call("p", { callId: "p@1/p@1" }), call("q", { callId: "p@1/q@1", phase: "queued" })], { wid: "p", origin: "main:peer-abcdefghij", labels: { task: "T7" } });
-  const ended = workflow([call("z", { callId: "z@1/z@1", phase: "sealed", endedAt: now - 1_000, result: { key: "z", gen: 1, status: "ok", ok: true, output: "" } })], { wid: "z", origin: "cli:me@host", status: "done", endedAt: now - 1_000 });
-  const mine = workflow([call("m", { callId: "m@1/m@1", lastActivity: now - 1_000 })], { wid: "m", origin: own });
-  const others = otherWorkflows([mine, cli, peer, ended], own);
-  assert.deepEqual(others.map(w => w.wid).sort(), ["c", "p"], "finished workflows of other origins are not listed");
-  assert.equal(elsewhereText(others), "elsewhere: 4 running (cli 2, 1 session 2)");
-  assert.equal(originText("main:peer-abcdefghij"), "session peer-abc"); assert.equal(originText("cli:me@host"), "cli:me@host");
-  // Only other origins live: the dock is just the elsewhere line (it showed nothing before).
-  assert.deepEqual(dockLines([], new Map(), () => "M", 100, now, 3, others), ["elsewhere: 4 running (cli 2, 1 session 2) · ↓ subagents"]);
-  // Both: this session's rows and counts are unchanged; the elsewhere count follows in the summary line.
-  const both = dockLines([mine], new Map(), () => "M", 120, now, 3, others);
-  assert.equal(both.length, 2); assert.match(both[0]!, / m /);
-  assert.equal(both[1], "1 working · 0/1+ done · ↓ subagents · elsewhere: 4 running (cli 2, 1 session 2)");
-  assert.deepEqual(dockLines([mine], new Map(), () => "M", 120, now).slice(0, 1), both.slice(0, 1));
-  assert.deepEqual(summary([mine]), { working: 1, asking: 0, queued: 0, paused: 0, done: 0, total: 1, plus: true }, "the other session's question is not counted as this session's");
-  // Tight width: the elsewhere part goes first, this session's summary stays whole.
-  assert.equal(dockLines([mine], new Map(), () => "M", 50, now, 3, others)[1], "1 working · 0/1+ done · ↓ subagents");
-  // Nothing when the others have ended.
-  assert.deepEqual(dockLines([], new Map(), () => "M", 100, now, 3, otherWorkflows([ended], own)), []);
-  assert.equal(elsewhereText([ended]), undefined);
-  // The one-line dock carries the same count.
-  assert.equal(mainLine([], others), "elsewhere: 4 running (cli 2, 1 session 2) · ↓ subagents");
-  assert.equal(mainLine([mine], others), "1 working · 0/1+ done · ↓ subagents · elsewhere: 4 running (cli 2, 1 session 2)");
-  assert.equal(mainLine([mine]), "1 working · 0/1+ done · ↓ subagents");
-});
-
-test("other sessions: the list ends with a folded group; opened, it shows wid, name, origin, labels and live calls", async () => {
-  const { otherWorkflows } = await import("../../../src/ui/view.ts");
-  const own = "main:mine";
-  const cli = workflow([call("a", { callId: "c@1/a@1" }), call("b", { callId: "c@1/b@1" }), call("d", { callId: "c@1/d@1", phase: "sealed", endedAt: now - 1_000, result: { key: "d", gen: 1, status: "failed", ok: false, output: "" } })],
-    { wid: "c01", name: "driver", origin: "cli:me@host", labels: { task: "T7", step: "build" }, startedAt: now - 60_000 });
-  const peer = workflow([call("p", { callId: "p@1/p@1" }), call("q", { callId: "p@1/q@1" })], { wid: "p01", origin: "main:peer-abcdefghij" });
-  const mine = workflow([call("m", { callId: "m@1/m@1" })], { wid: "m01", origin: own });
-  const others = otherWorkflows([mine, cli, peer], own), s: ViewState = state();
-  const rows = listRows([mine], s, new Map(), () => "M", 100, now, others);
-  assert.equal(rows.at(-1)!.kind, "others");
-  assert.equal(rows.at(-1)!.text, "▸ Other sessions (2 workflows, 4 running)");
-  assert.deepEqual(rows.slice(0, -1).map(r => r.id), listRows([mine], state(), new Map(), () => "M", 100, now).map(r => r.id), "own rows unchanged");
-  assert(!s.done.has("c01") && !s.observed!.has("c01"), "another session's failure does not touch this session's view state");
-  s.others = true;
-  const open = listRows([mine], s, new Map(), () => "M", 100, now, others), group = open.slice(open.findIndex(r => r.kind === "others") + 1);
-  assert.equal(open.find(r => r.kind === "others")!.text, "▾ Other sessions (2 workflows, 4 running)");
-  assert.deepEqual(group.map(r => r.id), ["c01", "c@1/a@1", "c@1/b@1", "p01", "p@1/p@1", "p@1/q@1"], "live calls only");
-  assert(group.every(r => r.other), "rows are marked as another origin's");
-  assert.match(group[0]!.text, /^ {2}▾ c01 · driver · cli:me@host · \[task=T7 step=build\]$/);
-  assert.match(group[3]!.text, /^ {2}▾ p01 · exec-0927 · session peer-abc/);
-  assert.match(group[1]!.text, /^ {4}├ a /);
-  assert(open.every(r => visibleWidth(r.text) <= 100));
-  const narrow = listRows([mine], s, new Map(), () => "M", 50, now, others);
-  assert(narrow.every(r => visibleWidth(r.text) <= 50), "labels are clipped to the row");
-  s.folded.add("c01");
-  assert.deepEqual(listRows([mine], s, new Map(), () => "M", 100, now, others).filter(r => r.other).map(r => r.id), ["c01", "p01", "p@1/p@1", "p@1/q@1"]);
-  assert.equal(listRows([mine], state(), new Map(), () => "M", 100, now, []).some(r => r.kind === "others"), false, "no group without other live work");
 });

@@ -4,7 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { doneOrder, isOpen, originText, plainReason, toggleOpen, duration, keepSelection, summaryText, label, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, label, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
 import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
@@ -89,13 +89,8 @@ export class SubagentScreen implements Component {
   dispose() { this.disposed = true; }
   refresh() { if (!this.disposed) this.tui.requestRender(); }
   private name = (model: string | undefined) => modelLabel(model, (p, id) => this.ctx.modelRegistry.find(p, id), this.data.aliases);
-  /** A workflow another session or the CLI started: watchable here, never changed from here. */
-  private foreign(w: WorkflowSnapshot | undefined): boolean { return !!w && !this.data.workflows.some(x => x.wid === w.wid); }
-  private readOnly(w: WorkflowSnapshot): string {
-    return `read-only: started by ${originText(w.origin)}; change it from that session or the CLI (or send with an explicit address)`;
-  }
   private current() {
-    const w = this.data.workflows.find(w => w.wid === this.workflow) ?? this.data.all.find(w => w.wid === this.workflow);
+    const w = this.data.workflows.find(w => w.wid === this.workflow);
     let c = w?.calls.find(c => c.callId === this.watching);
     // P37: watching a key follows its newest generation (a continued call reopens on the same session).
     const newest = c && w!.calls.filter(x => x.key === c!.key && x.gen > c!.gen).sort((a, b) => b.gen - a.gen)[0];
@@ -117,9 +112,7 @@ export class SubagentScreen implements Component {
   private selectRow(row: ListRow | undefined) {
     if (!row) return;
     if (row.kind === "call") this.open(row.workflow!, row.call!);
-    else if (row.kind === "workflow" && row.other) { const wid = row.workflow!.wid; if (!this.state.folded.delete(wid)) this.state.folded.add(wid); }
     else if (row.kind === "workflow") toggleOpen(row.workflow!, this.state);
-    else if (row.kind === "others") this.state.others = !this.state.others;
     else if (row.kind === "finished") this.state.finished = !this.state.finished;
     else if (row.workflow) {
       const w = row.workflow, count = this.state.done.get(w.wid) ?? (w.calls.every(c => c.phase === "sealed") || w.calls.some(c => c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped" && !this.state.viewed.has(c.callId)) ? 8 : 0);
@@ -136,7 +129,6 @@ export class SubagentScreen implements Component {
   }
   private modelMenu(target?: CallSnapshot) {
     const c = target ?? this.current().c; if (!c) return;
-    if (!target && this.foreign(this.current().w)) { this.notice = this.readOnly(this.current().w!); return; }
     this.menuTitle = `Model for ${c.key}`;
     const models = this.ctx.modelRegistry.getAvailable();
     this.menuItems = models.map(m => ({ value: `${m.provider}/${m.id}`, label: this.name(`${m.provider}/${m.id}`) }));
@@ -160,8 +152,7 @@ export class SubagentScreen implements Component {
     this.menu.onSelect = onSelect; this.menu.onCancel = onCancel;
   }
   private thinkingMenu() {
-    const { c, w } = this.current(); if (!c) return;
-    if (this.foreign(w)) { this.notice = this.readOnly(w!); return; }
+    const { c } = this.current(); if (!c) return;
     const model = this.data.facts.get(c.callId)?.model ?? c.model; if (!model) return;
     this.menuTitle = `Thinking for ${c.key}`;
     this.menuItems = levels.map(value => ({ value, label: value }));
@@ -174,8 +165,7 @@ export class SubagentScreen implements Component {
     };
   }
   private cycleThinking() {
-    const { c, w } = this.current(); if (!c) return;
-    if (this.foreign(w)) { this.notice = this.readOnly(w!); return; }
+    const { c } = this.current(); if (!c) return;
     const facts = this.data.facts.get(c.callId), model = facts?.model ?? c.model;
     if (!model) { this.notice = "Model not yet recorded"; return; }
     const level = levels[(levels.indexOf(facts?.thinking ?? "off") + 1) % levels.length]!;
@@ -184,7 +174,6 @@ export class SubagentScreen implements Component {
   private submit(followUp = false) {
     const { w, c } = this.current(); if (!w || !c) return;
     const message = this.input.getValue().trim(); if (!message) return;
-    if (this.foreign(w)) { this.notice = this.readOnly(w); return; }
     if (message === "/model") { this.modelMenu(); this.input.setValue(""); return; }
     if (message.startsWith("/model ")) {
       const model = message.slice(7).trim();
@@ -227,8 +216,7 @@ export class SubagentScreen implements Component {
       else if (!this.busy) {
         const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined, w = row?.workflow;
         const asking = c && w?.attention.some(a => a.kind === "question" && a.call === c.callId);
-        if (key.length === 1 && "sfamxr".includes(key) && (row?.other || this.doneTab && this.foreign(w))) this.listNotice = { text: this.readOnly(w!), until: Date.now() + 6000 };
-        else if (key === "s" && c && c.phase !== "sealed") this.beginListInput("steer", row!);
+        if (key === "s" && c && c.phase !== "sealed") this.beginListInput("steer", row!);
         else if (key === "f" && c?.phase === "sealed") this.beginListInput("follow-up", row!);
         else if (key === "a" && c && asking) this.beginListInput("answer", row!);
         else if (key === "m" && c) this.modelMenu(c);
@@ -373,7 +361,7 @@ export class SubagentScreen implements Component {
       this.rows = this.doneTab && w ? doneOrder(w.calls).map(c => {
         const f = this.data.facts.get(c.callId);
         return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", label(c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], rowWidth) };
-      }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, rowWidth, Date.now(), this.data.others);
+      }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, rowWidth);
       height = this.height(Math.max(1, this.rows.length) + footerRows); size = inner(width, height); // inner width does not depend on height
       this.selected = keepSelection(this.rows, this.selectedId, this.selected);
       while (this.rows[this.selected]?.kind === "preview" && this.selected > 0) this.selected--;
@@ -386,9 +374,8 @@ export class SubagentScreen implements Component {
       });
       const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined;
       const asking = c && row?.workflow?.attention.some(a => a.kind === "question" && a.call === c.callId);
-      const narrow = size.width < 72, readOnly = row?.other || this.doneTab && this.foreign(w);
-      const keys = readOnly ? [narrow ? "↑↓" : "↑ ↓ select", row?.kind === "workflow" ? `Enter ${narrow ? "" : this.state.folded.has(row.workflow!.wid) ? "expand" : "collapse"}`.trim() : row?.kind === "call" ? (narrow ? "Enter" : "Enter watch") : "",
-        narrow ? "read-only" : `read-only: started by ${originText(row?.workflow?.origin ?? w?.origin)}; change it there`, "Esc back"].filter(Boolean).join(" · ") : [narrow ? "↑↓" : "↑ ↓ select", row && row.kind !== "preview" ? `Enter ${narrow ? "" : row.kind === "workflow" ? (isOpen(row.workflow!, this.state) ? "collapse" : "expand") : row.kind === "call" ? "watch" : row.kind === "others" ? (this.state.others ? "collapse" : "expand") : "open"}`.trim() : "",
+      const narrow = size.width < 72;
+      const keys = [narrow ? "↑↓" : "↑ ↓ select", row && row.kind !== "preview" ? `Enter ${narrow ? "" : row.kind === "workflow" ? (isOpen(row.workflow!, this.state) ? "collapse" : "expand") : row.kind === "call" ? "watch" : "open"}`.trim() : "",
         c && c.phase !== "sealed" ? (narrow ? "s" : "s steer") : "", c?.phase === "sealed" ? (narrow ? "f" : "f follow-up") : "",
         c && c.phase !== "sealed" || row?.kind === "workflow" && row.workflow?.status === "running" ? (narrow ? "x" : "x stop") : "",
         c ? (narrow ? "m" : "m model") : "", asking ? (narrow ? "a" : "a answer") : "", row?.workflow?.paused ? (narrow ? "r" : "r resume") : "", "Esc back"].filter(Boolean).join(" · ");
@@ -407,8 +394,7 @@ export class SubagentScreen implements Component {
     const head = [tabs, `${label(c)} · ${this.name(facts?.model ?? c.model)} ▾${switching} · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
       this.theme.fg("dim", this.spend(c, facts)), rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
-    const placeholder = this.foreign(w) ? `Read-only: started by ${originText(w.origin)}`
-      : `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
+    const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
     const empty = new Input({ prompt: "", placeholder, placeholderStyle: text => this.theme.fg("dim", text) });
     empty.focused = this.focused;
     const editor = this.input.getValue() ? this.input.render(size.width) : empty.render(size.width);
