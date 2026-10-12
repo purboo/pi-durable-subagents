@@ -2,10 +2,14 @@
 // Known-id filtering assumes argv/other values do not impersonate the sole known
 // execution id. Multiple known ids are ambiguous; macOS verification awaits CI.
 import { readFile, readdir } from "node:fs/promises";
-import { closeSync, openSync, readFileSync, readSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ProcInfo, ProcessTable as Table } from "../types.ts";
+
+/** `ps` by its absolute path where it has one (macOS and Linux: /bin/ps), so a minimal PATH (a service unit, a test
+ *  that hides `pi`) does not take the process table away. */
+export const PS = existsSync("/bin/ps") ? "/bin/ps" : "ps";
 
 const exec = promisify(execFile);
 const vanished = (error: unknown) => ["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "");
@@ -37,7 +41,7 @@ export async function captureStart(pid: number): Promise<string> {
   }
   if (process.platform === "darwin") {
     try {
-      const { stdout } = await exec("ps", ["-o", "lstart=", "-p", String(pid)],
+      const { stdout } = await exec(PS, ["-o", "lstart=", "-p", String(pid)],
         { env: { ...process.env, LC_ALL: "C" }, timeout: 2000 });
       return stdout.trim().replace(/\s+/g, " ");
     } catch (error) {
@@ -62,7 +66,7 @@ export class ProcessTable implements Table {
 
   constructor(options: { platform?: NodeJS.Platform; ps?: () => Promise<string> } = {}) {
     this.platform = options.platform ?? process.platform;
-    this.ps = options.ps ?? (async () => (await exec("ps",
+    this.ps = options.ps ?? (async () => (await exec(PS,
       ["-axEww", "-o", "pid=,ppid=,lstart=,time=,stat=,command="],
       // The whole table with environments is large; 2 s proved too short on loaded macOS machines.
       { env: { ...process.env, LC_ALL: "C" }, timeout: 10_000, maxBuffer: 32 * 1024 * 1024 })).stdout);
