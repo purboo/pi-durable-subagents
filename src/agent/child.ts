@@ -8,7 +8,6 @@ import { readJournalSnapshot } from '../kernel/journal.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, type DecisionRecord } from '../kernel/lifecycle.ts';
-import { openness } from '../kernel/guards.ts';
 import { recover, type Question } from './child/history.ts';
 import { validate } from './child/schema.ts';
 import { registerLive } from './child/live.ts';
@@ -76,7 +75,10 @@ export function registerChild(pi: ExtensionAPI): void {
         const qid = req.cond?.qid, rev = req.cond?.rev, question = qid ? state.questions.get(qid) : undefined;
         if (state.answered.has(`${qid}@${rev}`)) return { action: 'reject', reason: 'already-answered' };
         if (!question || question.rev !== rev) return { action: 'reject', reason: 'stale-rev' };
-        if (mode !== 'ask' || delivered || !openness({ open: [...state.questions.values()], blocked }, { qid: qid!, rev: rev! })) return { action: 'defer' };
+        // The blocked ask takes the answer to its own question (V4), or to an earlier question still open (current
+        // revision, unanswered, checked above: its ask was ended by a steer, or the child asked a reminder while it
+        // waited): a newer question does not orphan an older one's answer.
+        if (mode !== 'ask' || delivered || !blocked) return { action: 'defer' };
         delivered = true; return { action: 'apply' };
       }
       if (mode === 'ask' && (req.kind !== 'steer' || delivered)) return { action: 'defer' };
@@ -123,10 +125,13 @@ export function registerChild(pi: ExtensionAPI): void {
           record(CT.model, { rid: req.rid, provider: body.provider, model: body.model, ...(body.thinking ? { thinking: body.thinking } : {}) });
         } else if (mode === 'ask' && waiter) {
           const text = (req.body as MessageBody).message;
+          const qid = req.cond?.qid ?? waiter.qid, rev = req.cond?.rev ?? waiter.rev, own = qid === waiter.qid && rev === waiter.rev;
+          // An answer to an earlier question says which one it answers; the blocked question stays open.
+          const earlier = own ? '' : `${JSON.stringify({ answers_earlier_question: qid, open: waiter.qid })}\nQuestion: ${state.questions.get(qid)?.question ?? qid}\nAnswer: `;
           answer = req.kind === 'answer'
-            ? { content: [{ type: 'text', text }], details: { rid: req.rid, qid: waiter.qid, rev: waiter.rev } }
+            ? { content: [{ type: 'text', text: `${earlier}${text}` }], details: { rid: req.rid, qid, rev } }
             : { content: [{ type: 'text', text: `${JSON.stringify({ interrupted_by: 'steer', open: waiter.qid })}\n${text}` }], details: { rid: req.rid, kind: 'steer' } };
-          if (req.kind === 'answer') state.answered.add(`${waiter.qid}@${waiter.rev}`);
+          if (req.kind === 'answer') state.answered.add(`${qid}@${rev}`);
         } else {
           // P28: a continue bound to a question (hibernation resume) is that question's answer receipt.
           const bound = req.kind === 'continue' && req.cond?.qid && req.cond.rev ? { qid: req.cond.qid, rev: req.cond.rev } : undefined;
