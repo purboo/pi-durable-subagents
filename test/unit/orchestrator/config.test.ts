@@ -22,12 +22,22 @@ test("configProblem accepts pi-side keys and names the first invalid orchestrato
   assert.equal(configProblem({ writerLock: "block" }), 'writerLock must be "queue" or "off"');
   assert.equal(configProblem({ providers: { a: { slots: -1 } } }), "providers.a.slots must be a nonnegative integer");
   assert.equal(configProblem({ providers: { a: 3 } }), "providers.a.slots must be a nonnegative integer");
-  assert.equal(configProblem({ pools: { p: [] } }), 'pools.p must be a nonempty list of "provider/id[:thinking]"');
+  assert.equal(configProblem({ pools: { p: [] } }), 'pools.p must be a nonempty list of "provider/id[:thinking]" or { model, afterMs }');
   assert.equal(configProblem({ k: { trackerMs: 0 } }), "k.trackerMs must be a positive number");
   assert.match(String(configProblem({ k: { tracker: 1 } })), /^k\.tracker is not a K-parameter/);
   assert.equal(configProblem({ defaultModel: 1 }), "defaultModel must be a string");
   // Only the orchestrator's keys identify its settings: a ui change is not a new config.
   assert.equal(configHash({ providers: { a: { slots: 1 } } }), configHash({ providers: { a: { slots: 1 } }, ui: { dock: "off" } } as OrchestratorConfig));
+});
+
+test("configProblem accepts a pool entry that waits ({ model, afterMs }) and names what is wrong with one", () => {
+  assert.equal(configProblem({ pools: { p: ["a/x", { model: "b/y:high", afterMs: 600000 }, { model: "q" }], q: ["c/z"] } }), undefined);
+  assert.equal(configProblem({ pools: { p: ["a/x", { model: "b/y", afterMs: 0 }] } }), "pools.p[1].afterMs must be a positive number of milliseconds");
+  assert.equal(configProblem({ pools: { p: [{ model: "b/y", afterMs: "10m" }] } }), "pools.p[0].afterMs must be a positive number of milliseconds");
+  assert.equal(configProblem({ pools: { p: [{ afterMs: 5 }] } }), 'pools.p[0].model must be "provider/id[:thinking]" or a pool name');
+  assert.equal(configProblem({ pools: { p: [{ model: "b/y", after: 5 }] } }), "pools.p[0].after is not a pool entry key (model, afterMs)");
+  assert.equal(configProblem({ pools: { p: ["a/x", 3] } }), 'pools.p[1] must be "provider/id[:thinking]" (or a pool name) or { model, afterMs }');
+  assert.equal(configProblem({ pools: { p: [""] } }), 'pools.p[0] must be "provider/id[:thinking]" (or a pool name) or { model, afterMs }');
 });
 
 test("watchConfig applies a valid change in place, records it once, and rejects an invalid one without applying it", async t => {
@@ -121,4 +131,19 @@ test("slotsView counts held provider slots against the limits in effect, without
   const view = slotsView(home);
   assert.deepEqual(view.slots, ["a 1/2", "b 1 (no limit)", "c 0/1"]);
   assert.match(String(view.config), /^abc since \d+s ago$/);
+});
+
+test("slotsView names the holders per workflow origin when more than one origin holds a provider", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-slots-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const orch = await openJournal(orchLedger(home));
+  t.after(() => orch.close());
+  await orch.append("config", { hash: "abc", config: { providers: { a: { slots: 5 }, b: { slots: 2 } } } });
+  await orch.append("created", { rid: "r1", wid: "W1", origin: "cli:alice@host" });
+  await orch.append("created", { rid: "r2", wid: "W2", origin: "main:01a11a3b-5c6d-4e7f" });
+  for (const [slot, exec] of ["W1@1/k1@1#1.1", "W1@1/k2@1#1.1", "W1@1/k3@1#1.1", "W2@1/k@1#1.2", "W2@1/j@2#1.1"].entries())
+    await orch.append("hold", { pool: "a", slot, exec });
+  await orch.append("hold", { pool: "b", slot: 0, exec: "W2@1/k@1#1.2" });
+  await orch.append("hold", { pool: "memory", slot: 0, exec: "W1@1/k1@1#1.1" });
+  assert.deepEqual(slotsView(home).slots, ["a 5/5 (3 cli:alice@host, 2 session 01a11a3b)", "b 1/2"]);
 });

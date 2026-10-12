@@ -2,14 +2,16 @@
 // Parent-owned. Both run inside the single orchestrator process (P2), which holds the OS lock and is the
 // only writer of orchestrator.jsonl and every w/<wid>/journal.jsonl (A2). They share JournalHandles.
 import type { AgentDefinition } from "../compat/agents.ts";
+import type { PoolEntry } from "../compat/model.ts";
 import type { CallId, CallResult, CallSpec, JournalHandle, Request, Wid, WidRev } from "../types.ts";
 
 /** User configuration: $DSA_HOME/config.json (all optional). */
 export interface OrchestratorConfig {
   /** Default model when neither the call nor the agent names one (before pi's own settings default). */
   defaultModel?: string;
-  /** Model pools: name -> ordered "provider/id[:thinking]" candidates (P12, D10). */
-  pools?: Record<string, string[]>;
+  /** Model pools: name -> ordered "provider/id[:thinking]" candidates (P12, D10); an entry `{ model, afterMs }` is
+   *  taken only by a call that has waited `afterMs` for a slot. */
+  pools?: Record<string, PoolEntry[]>;
   /** Provider slot capacities (V1). Missing provider = unlimited. */
   providers?: Record<string, { slots: number }>;
   memory?: { reserveMb?: number; perChildMb?: number };

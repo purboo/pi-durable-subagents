@@ -34,8 +34,18 @@ export function configProblem(raw: unknown): string | undefined {
   if (defaultModel !== undefined && typeof defaultModel !== "string") return "defaultModel must be a string";
   if (pools !== undefined) {
     if (!record(pools)) return "pools must map names to model lists";
-    for (const [name, list] of Object.entries(pools))
-      if (!Array.isArray(list) || !list.length || !list.every(m => typeof m === "string" && m)) return `pools.${name} must be a nonempty list of "provider/id[:thinking]"`;
+    for (const [name, list] of Object.entries(pools)) {
+      if (!Array.isArray(list) || !list.length) return `pools.${name} must be a nonempty list of "provider/id[:thinking]" or { model, afterMs }`;
+      for (const [i, m] of list.entries()) {
+        if (typeof m === "string" && m) continue;
+        const at = `pools.${name}[${i}]`;
+        if (!record(m)) return `${at} must be "provider/id[:thinking]" (or a pool name) or { model, afterMs }`;
+        if (typeof m.model !== "string" || !m.model) return `${at}.model must be "provider/id[:thinking]" or a pool name`;
+        if (m.afterMs !== undefined && !(count(m.afterMs) && Number(m.afterMs) > 0)) return `${at}.afterMs must be a positive number of milliseconds`;
+        const extra = Object.keys(m).find(k => k !== "model" && k !== "afterMs");
+        if (extra) return `${at}.${extra} is not a pool entry key (model, afterMs)`;
+      }
+    }
   }
   if (providers !== undefined) {
     if (!record(providers)) return "providers must map provider names to { slots }";

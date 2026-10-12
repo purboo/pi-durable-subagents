@@ -696,16 +696,34 @@ export function exhaustedLine(provider: string, x: Exhaustion, now: number): str
 export function slotLine(provider: string, held: number, limit?: number): string {
   return typeof limit === "number" ? `${provider} ${held}/${limit}` : `${provider} ${held} (no limit)`;
 }
+/** A workflow origin as one short holder name: a pi session "main:<id>" as "session <first 8 of id>"; others as is. */
+export function originLabel(origin: string | undefined): string {
+  if (origin === undefined) return "unknown";
+  return origin.startsWith("main:") ? `session ${origin.slice(5, 13)}` : clip(restartLine(origin), 40);
+}
 export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected" | "exhausted" | "orchestrator" | "versionNote"> {
-  const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
+  const path = orchLedger(home), entries = readJournalSnapshot(path), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), entries);
   ledgerStates.set(path, state);
   const { held, config, rejected } = state, used = state.exhausted;
   const exhausted = [...used].sort(([a], [b]) => a.localeCompare(b)).map(([p, x]) => exhaustedLine(p, x, now));
   const limits: Record<string, { slots?: number }> = config?.settings.providers ?? {};
-  const holders = new Map<string, number>();
-  for (const e of held.values()) if (e.pool !== "memory") holders.set(e.pool, (holders.get(e.pool) ?? 0) + 1);
+  const holders = new Map<string, number>(), byOrigin = new Map<string, Map<string, number>>();
+  const created = ledgerIndex(entries).created;
+  for (const e of held.values()) if (e.pool !== "memory") {
+    holders.set(e.pool, (holders.get(e.pool) ?? 0) + 1);
+    // exec "<wid>@<rev>/<key>@<gen>#<n>" -> the origin of its workflow
+    const origin = originLabel(created.get(e.exec.slice(0, e.exec.indexOf("@")))?.origin as string | undefined);
+    const counts = byOrigin.get(e.pool) ?? new Map<string, number>(); byOrigin.set(e.pool, counts);
+    counts.set(origin, (counts.get(origin) ?? 0) + 1);
+  }
+  // Who holds a provider's slots, when more than one workflow origin does: "(3 cli:alice@host, 2 session 01a11a3b)".
+  const who = (p: string) => {
+    const counts = byOrigin.get(p);
+    if (!counts || counts.size < 2) return "";
+    return ` (${[...counts].sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).map(([o, n]) => `${n} ${o}`).join(", ")})`;
+  };
   const names = [...new Set([...Object.keys(limits), ...holders.keys()])].sort();
-  const slots = names.map(p => slotLine(p, holders.get(p) ?? 0, limits[p]?.slots));
+  const slots = names.map(p => slotLine(p, holders.get(p) ?? 0, limits[p]?.slots) + who(p));
   return { ...orchestratorView(state, packageVersion(), now), ...(slots.length ? { slots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
     ...(exhausted.length ? { exhausted } : {}),
     ...(rejected ? { configRejected: `${clip(rejected.error, 200)} (${age(now - rejected.ts)} ago); ${config ? config.hash : "the start settings"} stay in effect` } : {}) };
