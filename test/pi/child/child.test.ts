@@ -135,6 +135,24 @@ test('ask steer interruption keeps question open, defers answers, and re-ask rej
   await until(() => toolResults(pi).some(m => m.details?.rid === answer.rid));
 });
 
+test('an answer to an earlier open question resolves a later blocked ask (a reminder does not orphan it)', { timeout: 45000 }, async t => {
+  const f = await fixture(t);
+  await f.send('task', { message: script([{ tool: 'ask', args: { question: 'First?' } }, { tool: 'ask', args: { question: 'Reminder?' } }, { text: 'done' }]) });
+  const pi = f.start(), q1 = await question(pi);
+  await f.send('steer', { message: 'still waiting' });
+  const q2 = await until(() => pi.sessionEntries().find(e => e.customType === CT.question && e.data.question === 'Reminder?')?.data);
+  assert.notEqual(q2.qid, q1.qid);
+  const answer = await f.send('answer', { message: 'first answered' }, { qid: q1.qid, rev: q1.rev });
+  const result = await until(() => toolResults(pi).find(m => m.details?.rid === answer.rid));
+  assert.deepEqual(result.details, { rid: answer.rid, qid: q1.qid, rev: 1 });
+  assert.match(result.content[0].text, /First\?[^]*first answered/);
+  await pi.waitFor(settled);
+  // q1 is answered once; q2 stays open (its ask ended without its answer).
+  const again = await f.send('answer', { message: 'again' }, { qid: q1.qid, rev: 1 });
+  await until(() => pi.sessionEntries().some(e => e.customType === CT.rejected && e.data.rid === again.rid && e.data.reason === 'already-answered'));
+  assert.ok(!toolResults(pi).some(m => m.details?.qid === q2.qid));
+});
+
 test('ask abort releases the blocked queue and model stays deferred until boundary', { timeout: 40000 }, async t => {
   const f = await fixture(t);
   await f.send('task', { message: script([{ tool: 'ask', args: { question: 'Abort?' } }, { text: 'after' }]) });

@@ -68,6 +68,14 @@ test('the session fold equals the whole-session functions at every length, visit
   check(fold, reread.slice(0, 5), 'after truncation');
 });
 
+test('the questions of a call are those its own executions asked, not an earlier generation\'s or a foreign segment\'s', () => {
+  const next = 'W@1/k@2';
+  const entries = [exec(`${call}#1.1`), askCall('t1'), question('carried', 1), exec('W@1/other@1#1.1'), question('foreign', 1),
+    exec(`${next}#1.1`), askCall('t2'), question('own', 1)];
+  assert.deepEqual(new SessionFold(next).update(entries).questions.map(q => q.qid), ['own']);
+  assert.deepEqual(new SessionFold(call).update(entries).questions.map(q => q.qid), ['carried']);
+});
+
 test('observing a growing session costs the appended entries, not the session size', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dsa-digest-')), path = join(dir, 'session.jsonl');
   t.after(async () => { forgetSession(path); await rm(dir, { recursive: true, force: true }); });
