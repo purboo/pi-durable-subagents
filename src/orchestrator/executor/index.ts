@@ -6,6 +6,8 @@
 // observation{exec,event}; selected{exec,model}; switch-observed{exec,rid,pool}.
 // P28 entries are documented in hibernate.ts; generation session publication in generation.ts.
 // session-corrupt{call,line}: a malformed native session line was skipped (once per line, E4).
+// spawn-env-failed{exec,call,command,error}: launching the child failed for a reason of the environment (ENOENT, EACCES:
+// pi or its interpreter missing or not executable); the call stays queued and launches again after a backoff.
 // fence-failed{exec,error} is documented in sweep.ts. The orchestrator ledger owns hold/release{pool,slot,exec}
 // and mem{available,admitted,exec} (every admission; a repeated refusal at most every 30 s per call). All transitions are serialized before publication.
 import { mkdir, open, readdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
@@ -104,11 +106,19 @@ export function continueMessage(dangling: readonly string[]): string {
 /** An asker hibernates while it waits (its execution is stopped to free the provider slot), so the answer says so. */
 export const HIBERNATED_NOTE = "While you waited for the answer below your execution was stopped; processes your tools had " +
   "started (background ones included) were stopped with it. Check them before relying on them.";
+/** A launch failure the environment causes (the command or its interpreter is missing or not executable): fixing the
+ *  environment, or another orchestrator started from a better one, makes the same launch work. */
+export const environmentSpawnError = (error: unknown) => ["ENOENT", "EACCES"].includes(String((error as NodeJS.ErrnoException | undefined)?.code));
+/** The default wait before an environment launch failure is retried (an orchestrator restart retries at once). */
+export const SPAWN_RETRY_MS = 60_000;
 export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects; containment?: Containment;
+  /** The pi subagents run (absolute; the orchestrator resolved it at start); a bare `pi` from PATH without one. */
+  pi?: string; spawnRetryMs?: number;
   /** Observes each slot attempt that admitted nothing: the execution and the providers it found full. */
   attempted?: (exec: string, full: readonly string[]) => void } = {}): Executor {
   const { home, config, orch } = ledgers;
   const containment = options.containment ?? serialContainment(), effects = options.effects ?? createEffects(ledgers);
+  const piCommand = options.pi ?? "pi";
   const active = new Map<string, Active>(), completed = new Map<string, Promise<CallResult>>(), journals = new Map<string, JournalHandle>();
   let queue: Promise<unknown> = Promise.resolve(), closed = false;
   let suspending: Promise<void> | undefined;
@@ -753,6 +763,32 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   function pendingSwitch(exec: string) {
     return holdings().find(h => h.exec === exec && h.reserved && !folded().observed.has(`${exec}\n${h.rid}`));
   }
+  /** Serial sections only: record an environment launch failure and raise one `environment` alert for the call (a new
+   *  revision only after an earlier one was resolved by a launch that worked). */
+  async function spawnEnvFailed(t: CallTicket, exec: string, cwd: string, error: unknown) {
+    const message = String(error).slice(0, 300);
+    if (!has(t.journal, "spawn-env-failed", exec)) await t.journal.append("spawn-env-failed", { exec, call: t.callId, command: piCommand, error: message });
+    console.error(`durable-subagents: launching ${exec} failed: ${message}; retrying`);
+    const id = `environment:${t.callId}`, items = attentionEntries(t.journal.entries(), id), last = items.at(-1)?.item;
+    if (last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev)) return;
+    const pi = piCommand === "pi" ? "`pi` from the orchestrator's PATH (no absolute pi was resolved; set DSA_PI_BIN, or start the orchestrator from an environment whose PATH has pi)"
+      : `${piCommand} (DSA_PI_BIN / the PATH the orchestrator started with)`;
+    const text = `${worktreeLabel(t.callId)} could not start: ${message}. It runs ${pi} in ${cwd}. ` +
+      `The call retries every minute (and at once when the orchestrator restarts); stop it to give up`;
+    await t.journal.append(JT.attention, { item: { id, rev: (last?.rev ?? 0) + 1, kind: "environment", text, wid: t.wid, call: t.callId } });
+  }
+  /** Serial sections only: a launch worked, so the call's open environment alert is resolved. */
+  async function spawnEnvResolved(t: CallTicket) {
+    const id = `environment:${t.callId}`, last = attentionEntries(t.journal.entries(), id).at(-1)?.item;
+    if (last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev))
+      await t.journal.append(JT.attentionResolved, { id, rev: last.rev, resolution: "launched" });
+  }
+  /** Wait before launching again after an environment failure; a stop, retirement, suspension or shutdown ends it early. */
+  async function retryWait(a: Active) {
+    const until = Date.now() + (options.spawnRetryMs ?? SPAWN_RETRY_MS);
+    while (!interrupted(a) && Date.now() < until)
+      await new Promise<void>(resolve => { const timer = setTimeout(resolve, Math.min(until - Date.now(), config.k?.trackerMs ?? 1000)); a.wake = () => { clearTimeout(timer); resolve(); }; });
+  }
   async function execute(a: Active): Promise<CallResult> {
     const t = a.ticket, journal = t.journal;
     const session = callSession(home, t.wid, t.key, t.gen), dir = callDir(home, t.wid, t.key, t.gen);
@@ -800,7 +836,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs)
           return finish(journal, t.callId, exec, makeResult("timeout"));
         if (ev.budget || reached(totalUsage(journal.entries(), t.callId), t.spec.budget)) return finish(journal, t.callId, exec, makeResult("budget"));
-        if (!bound) {
+        // A child that never started (its launch failed for a reason of the environment) lost nothing: launch again.
+        if (!bound && !has(journal, "spawn-env-failed", exec)) {
         // P28: an execution cut off while its only unfinished tool call is the open question's `ask` (before it
         // hibernated) was waiting, not working: it hibernates now and resumes with the answer, like a planned
         // hibernation; it is neither a loss nor, for `once`, an unknown outcome.
@@ -879,12 +916,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       let child: Spawned;
       try {
-        child = await containment.spawn({ exec, command: "pi", args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
+        child = await containment.spawn({ exec, command: piCommand, args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
           env: { DSA_HOME: home, PATH: [binDir(home), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
       } catch (error) {
         await fence(journal, exec, { park: a }); a.live = undefined;
-        return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
+        if (!environmentSpawnError(error)) return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
+        await release(exec);
+        await serial(() => spawnEnvFailed(t, exec!, cwd, error));
+        await retryWait(a);
+        continue;
       }
+      await serial(() => spawnEnvResolved(t));
       try {
         await track(journal, exec, [{ pid: child.pid, start: child.start, ppid: process.pid }]);
         await observeExecution({ home, config, ticket: t, exec, child, serial, read: () => readCall(journal, t.callId),

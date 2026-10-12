@@ -13,6 +13,7 @@ const HEAD: Record<AttentionItem["kind"], { icon: string; title: string; tone: T
   unknown: { icon: "!", title: "outcome unknown", tone: "warning" },
   conflict: { icon: "!", title: "shares a worktree", tone: "warning" },
   budget: { icon: "$", title: "budget reached", tone: "warning" },
+  environment: { icon: "!", title: "could not start", tone: "warning" },
 };
 const keyOf = (item: AttentionItem) => item.call ? item.call.split("/").at(-1)!.replace(/@1$/, "") : item.wid;
 
