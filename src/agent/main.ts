@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -9,6 +8,7 @@ import { Outbox, scanInbox } from "../kernel/mailbox.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
+import { launchOrchestrator } from "../platform/launch.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
@@ -87,10 +87,8 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (!lock) return;
     await lock.release();
     const entry = process.env.DSA_ORCHESTRATOR_ENTRY ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../orchestrator/main.ts" : "../orchestrator/main.js", import.meta.url));
-    const { DSA_SESSION: _session, ...env } = process.env;
-    const child = spawn(process.execPath, [entry], { detached: true, stdio: "ignore", env: { ...env, DSA_HOME: home } });
-    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
-    child.unref();
+    // Inside pi: started even when pi cannot be resolved here (the orchestrator falls back to its own lookup).
+    await launchOrchestrator(entry, process.env, { home });
   }
   // Version visibility: say once per orchestrator process when it runs another version than this pi loaded (after an
   // update its running work stays on the old one); status shows the same note.
