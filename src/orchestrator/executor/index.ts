@@ -876,10 +876,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const settleClosed = async (u: Entry | undefined, session: readonly SessionEntry[]) => {
         if (!u || answerSettled(u, session)) return;
         const d = digestOf(t.callId, session), key = answerKey(u.qid, u.rev);
-        if (!d.answered.has(key) && !d.superseded.has(key)) return;
+        // D6: a newer revision of the question (the child asked it again, a steer having ended the ask, before the fence)
+        // closes the bound one too: the child would refuse it as stale.
+        const reason = d.answered.has(key) ? "answered-in-session" : d.superseded.has(key) ? "superseded-in-session" :
+          d.questions.some(q => q.qid === u.qid && q.rev > Number(u.rev)) ? "newer-revision" : undefined;
+        if (!reason) return;
         await serial(async () => {
           if (!journal.entries().some(e => e.type === "answer-settled" && e.call === t.callId && e.rid2 === u.rid2))
-            await journal.append("answer-settled", { call: t.callId, rid2: u.rid2, qid: u.qid, rev: u.rev, reason: d.answered.has(key) ? "answered-in-session" : "superseded-in-session" });
+            await journal.append("answer-settled", { call: t.callId, rid2: u.rid2, qid: u.qid, rev: u.rev, reason });
         });
       };
       const sleeping = hibernation(journal, t.callId);
@@ -901,6 +905,18 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (exec) {
         await fence(journal, exec, { park: a });
         await questions(t, entries = await readCall(journal, t.callId));
+        // D6: after the fence the session is final. A bound answer it closed (answered, superseded, or re-asked as a newer
+        // revision) is settled; if the session still has an open question of this call, the call does not launch: it
+        // hibernates again on that question (its attention is open, so the parent is asked), and resumes only on a new
+        // binding. Otherwise it launches with the plain continue. Each step is idempotent across a crash between them.
+        if (bound) {
+          await settleClosed(bound, entries);
+          const asking = answerSettled(bound, entries) ? digestOpenQuestion(entries, digestOf(t.callId, entries)) : undefined;
+          if (asking && !journal.entries().some(e => e.type === "hibernated" && e.call === t.callId && e.seq > bound!.seq)) {
+            await serial(() => journal.append("hibernated", { call: t.callId, exec, qid: asking.qid, rev: asking.rev, reason: "rebound-settled" }));
+            continue;
+          }
+        }
         await recordUsage(t, sessionUsage(entries, t.callId));
         const ev = evidence(entries, exec); dangling = ev.dangling;
         if (closed || a.suspended || a.retired) throw shutdownError();

@@ -202,6 +202,8 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         const call = calls.get(String(e.call));
         if (call?.exec && call.exec === e.exec) {
           hibernating.set(call.callId, call.exec); if (fenced.has(call.exec)) call.hibernated = true;
+          // D6: hibernated again after a bound answer the session had already closed: it waits for a new answer.
+          if (call.phase !== "sealed") delete call.answered;
         }
       } else if (e.type === "answer-bound") {
         resolved.add(`q:${e.call}:${e.qid}@${e.rev}`);
