@@ -115,7 +115,9 @@ test('ask answer persists immediate meta records, rejects duplicate answers, and
   assert.equal(persisted.filter(e => e.message?.toolName === 'ask' && e.message.details?.rid === answer.rid).length, 1);
 });
 
-test('ask steer interruption keeps question open, defers answers, and re-ask rejects stale revisions', { timeout: 45000 }, async t => {
+// D1 (1.0.38): an answer to a question whose ask a steer ended is no longer deferred until the question is asked again:
+// it is delivered to the idle child as a message, once; a re-ask is a new revision with its own answer.
+test('ask steer interruption keeps question open; its later answer is delivered idle, once; a re-ask takes a new revision', { timeout: 45000 }, async t => {
   const f = await fixture(t);
   await f.send('task', { message: script([{ tool: 'ask', args: { question: 'Open?' } }, { text: 'interrupted' }]) });
   const pi = f.start(), q = await question(pi);
@@ -125,17 +127,20 @@ test('ask steer interruption keeps question open, defers answers, and re-ask rej
   assert.deepEqual(result.details, { rid: steer.rid, kind: 'steer' });
   assert.match(result.content[0].text, /interrupted_by.*steer/);
   assert.equal(receipts(pi, steer.rid).length, 0);
-  const deferred = await f.send('answer', { message: 'late answer' }, { qid: q.qid, rev: 1 });
-  await until(() => pi.sessionEntries().some(e => e.customType === CT.admitted && e.data.rid === deferred.rid));
-  assert.ok(!pi.sessionEntries().some(e => e.customType === CT.rejected && e.data.rid === deferred.rid));
+  const late = await f.send('answer', { message: 'late answer' }, { qid: q.qid, rev: 1 });
+  const delivered = await until(() => pi.sessionEntries().find(e => e.type === 'custom_message' && e.details?.rid === late.rid));
+  assert.deepEqual(delivered.details, { rid: late.rid, kind: 'answer', from: 'orch', qid: q.qid, rev: 1 });
+  assert.match(String(delivered.content), /Question: Open\?\nAnswer: late answer/);
+  await pi.waitFor(settled);
+  const again = await f.send('answer', { message: 'again' }, { qid: q.qid, rev: 1 });
+  await until(() => pi.sessionEntries().some(e => e.customType === CT.rejected && e.data.rid === again.rid && e.data.reason === 'already-answered'));
   await f.send('continue', { message: script([{ tool: 'ask', args: { question: 'Open?' } }, { text: 'reasked' }]) });
   const q2 = await question(pi, 2); assert.equal(q2.qid, q.qid);
-  await until(() => pi.sessionEntries().some(e => e.customType === CT.rejected && e.data.rid === deferred.rid && e.data.reason === 'stale-rev'));
   const answer = await f.send('answer', { message: 'fresh answer' }, { qid: q2.qid, rev: 2 });
   await until(() => toolResults(pi).some(m => m.details?.rid === answer.rid));
 });
 
-test('an answer to an earlier open question resolves a later blocked ask (a reminder does not orphan it)', { timeout: 45000 }, async t => {
+test('an answer to an earlier open question resolves a later blocked ask and supersedes it (a reminder does not orphan it)', { timeout: 45000 }, async t => {
   const f = await fixture(t);
   await f.send('task', { message: script([{ tool: 'ask', args: { question: 'First?' } }, { tool: 'ask', args: { question: 'Reminder?' } }, { text: 'done' }]) });
   const pi = f.start(), q1 = await question(pi);
@@ -144,12 +149,14 @@ test('an answer to an earlier open question resolves a later blocked ask (a remi
   assert.notEqual(q2.qid, q1.qid);
   const answer = await f.send('answer', { message: 'first answered' }, { qid: q1.qid, rev: q1.rev });
   const result = await until(() => toolResults(pi).find(m => m.details?.rid === answer.rid));
-  assert.deepEqual(result.details, { rid: answer.rid, qid: q1.qid, rev: 1 });
-  assert.match(result.content[0].text, /First\?[^]*first answered/);
+  assert.deepEqual(result.details, { rid: answer.rid, qid: q1.qid, rev: 1, superseded: [{ qid: q2.qid, rev: 1 }] });
+  assert.match(result.content[0].text, /Reminder\?" is withdrawn[^]*Question: First\?\nAnswer: first answered/);
   await pi.waitFor(settled);
-  // q1 is answered once; q2 stays open (its ask ended without its answer).
+  // q1 is answered once; q2 is superseded: a later answer to either is rejected.
   const again = await f.send('answer', { message: 'again' }, { qid: q1.qid, rev: 1 });
   await until(() => pi.sessionEntries().some(e => e.customType === CT.rejected && e.data.rid === again.rid && e.data.reason === 'already-answered'));
+  const late = await f.send('answer', { message: 'late' }, { qid: q2.qid, rev: 1 });
+  await until(() => pi.sessionEntries().some(e => e.customType === CT.rejected && e.data.rid === late.rid && e.data.reason === 'stale-rev'));
   assert.ok(!toolResults(pi).some(m => m.details?.qid === q2.qid));
 });
 

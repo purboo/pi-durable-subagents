@@ -107,7 +107,8 @@ export interface Conditions {
   after?: Rid;
   /** Application requires this workflow revision / evaluator incarnation to be current. V3. */
   epoch?: string;
-  /** Answer application requires this open question revision. V4. */
+  /** Answer application (an `answer`, or a `continue` resuming a hibernated asker) requires this question revision to
+   *  be open: asked by the call, current, not answered or superseded. V4. */
   qid?: Qid;
   rev?: number;
 }

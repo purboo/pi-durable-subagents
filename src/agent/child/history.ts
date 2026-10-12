@@ -7,7 +7,12 @@ export interface Question { qid: string; rev: number; question: string }
  *  session of the previous one (P37), but request sequences are per recipient (P5): records addressed to an earlier
  *  generation stay in history and are skipped here: segments opened by another call's execution marker are foreign. */
 export function recover(entries: readonly SessionEntry[], call?: string) {
-  const records: DecisionRecord[] = [], questions = new Map<string, Question>(), answered = new Set<string>();
+  const records: DecisionRecord[] = [], questions = new Map<string, Question>(), answered = new Set<string>(), superseded = new Set<string>();
+  // D2: an answer to another question that ended a blocked ask (or resumed a hibernated one) supersedes that question.
+  const supersede = (details: { superseded?: unknown } | undefined) => {
+    if (Array.isArray(details?.superseded)) for (const s of details.superseded)
+      if (typeof s?.qid === 'string' && typeof s.rev === 'number') superseded.add(`${s.qid}@${s.rev}`);
+  };
   let foreign = false;
   for (const entry of entries) {
     if (entry.type === 'custom' && entry.customType === CT.exec) {
@@ -27,15 +32,17 @@ export function recover(entries: readonly SessionEntry[], call?: string) {
       if (entry.customType === CT.model) records.push({ type: 'applied', rid: data.rid });
       if (entry.customType === CT.question) questions.set(data.qid, data as unknown as Question);
     } else if (entry.type === 'custom_message' && entry.customType === CT.msg) {
-      const details = entry.details as { rid: string; qid?: string; rev?: number };
+      const details = entry.details as { rid: string; qid?: string; rev?: number; superseded?: unknown };
       records.push({ type: 'applied', rid: details.rid });
+      supersede(details);
       // P28: a hibernation resume delivers the answer as a continue message; its receipt answers qid@rev.
       if (details.qid && details.rev) answered.add(`${details.qid}@${details.rev}`);
     } else if (entry.type === 'message' && entry.message.role === 'toolResult' && entry.message.toolName === 'ask') {
-      const details = entry.message.details as { rid?: string; qid?: string; rev?: number } | undefined;
+      const details = entry.message.details as { rid?: string; qid?: string; rev?: number; superseded?: unknown } | undefined;
       if (details?.rid) records.push({ type: 'applied', rid: details.rid });
+      supersede(details);
       if (details?.qid && details.rev) answered.add(`${details.qid}@${details.rev}`);
     }
   }
-  return { records, questions, answered };
+  return { records, questions, answered, superseded };
 }

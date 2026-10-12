@@ -3,11 +3,12 @@ import { readFile } from 'node:fs/promises';
 import { Type } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from '@earendil-works/pi-coding-agent';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
-import { ASK_CUT, CT, ENV, JT, type MessageBody, type ModelBody } from '../types.ts';
+import { ASK_CUT, CT, ENV, JT, type MessageBody, type ModelBody, type Request } from '../types.ts';
 import { readJournalSnapshot } from '../kernel/journal.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, type DecisionRecord } from '../kernel/lifecycle.ts';
+import { openness } from '../kernel/guards.ts';
 import { recover, type Question } from './child/history.ts';
 import { validate } from './child/schema.ts';
 import { registerLive } from './child/live.ts';
@@ -15,6 +16,18 @@ import { registerLive } from './child/live.ts';
 // boundary = turn_end (steer lands between turns); settle = agent_before_settle (follow-ups land only here or idle).
 type Mode = 'idle' | 'boundary' | 'settle' | 'ask';
 const MESSAGES = ['task', 'steer', 'notify', 'follow-up', 'continue'];
+type Cond = { qid: string; rev: number };
+/** D2: the questions a bound continue supersedes: the hibernated asker's own question when it resumes with the answer
+ *  to another one (the orchestrator names it in the body). */
+function supersededOf(req: Request): Cond[] {
+  const list = req.kind === 'continue' ? (req.body as { superseded?: unknown } | undefined)?.superseded : undefined;
+  return Array.isArray(list) ? list.filter((s): s is Cond => typeof s?.qid === 'string' && typeof s?.rev === 'number').map(s => ({ qid: s.qid, rev: s.rev })) : [];
+}
+/** The question an envelope answers: an `answer`, or a `continue` that resumes a hibernated asker with its answer (P28). */
+export function answers(req: { kind: string; cond?: { qid?: string; rev?: number } }): Cond | undefined {
+  const qid = req.cond?.qid, rev = req.cond?.rev;
+  return (req.kind === 'answer' || req.kind === 'continue') && typeof qid === 'string' && typeof rev === 'number' ? { qid, rev } : undefined;
+}
 type SessionLike = { id?: string; type?: string; message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } } } };
 /** P31, P33, P37: Usage of this call only — assistant messages in segments opened by this call's executions,
  *  deduplicated by entry id. Context inherited from an earlier generation or a forked origin is not charged. */
@@ -68,18 +81,39 @@ export function registerChild(pi: ExtensionAPI): void {
     // Scan is asynchronous: recheck before using the idle delivery API.
     if (!active || (mode === 'idle' && !ctx.isIdle())) return [];
     let delivered = false;
+    // Revisions answered by a decision of this intake count as answered for the rest of it (one delivery each, D3).
+    const taken = new Set<string>();
+    const closed = () => new Set([...state.answered, ...state.superseded, ...taken]);
+    const open = (q: Cond) => openness({ open: [...state.questions.values()], closed: closed() }, q);
+    const pending = (req: { rid: string }, view: { resolved: ReadonlyMap<string, unknown>; tombstones: ReadonlySet<string>; admitted: ReadonlyMap<string, unknown> }) =>
+      view.admitted.has(req.rid) && !view.resolved.has(req.rid) && !view.tombstones.has(req.rid);
+    // An answer to an open question (or a bound continue, P28) that waits to be delivered.
+    const waiting = (req: Request, view: Parameters<typeof pending>[1]) => {
+      const q = answers(req);
+      return !!q && pending(req, view) && (open(q) || req.kind === 'continue' && !state.questions.has(q.qid));
+    };
     const plans = planDecisions(state.records, candidates, (req, view) => {
       if (req.to !== call) return { action: 'reject', reason: 'wrong-recipient' };
       if ([...MESSAGES, 'answer'].includes(req.kind) && typeof (req.body as MessageBody)?.message !== 'string') return { action: 'reject', reason: 'malformed' };
-      if (req.kind === 'answer') {
-        const qid = req.cond?.qid, rev = req.cond?.rev, question = qid ? state.questions.get(qid) : undefined;
-        if (state.answered.has(`${qid}@${rev}`)) return { action: 'reject', reason: 'already-answered' };
-        if (!question || question.rev !== rev) return { action: 'reject', reason: 'stale-rev' };
-        // The blocked ask takes the answer to its own question (V4), or to an earlier question still open (current
-        // revision, unanswered, checked above: its ask was ended by a steer, or the child asked a reminder while it
-        // waited): a newer question does not orphan an older one's answer.
-        if (mode !== 'ask' || delivered || !blocked) return { action: 'defer' };
-        delivered = true; return { action: 'apply' };
+      const q = answers(req);
+      // D1, D3, V4: one rule for answers (an `answer`, or a bound `continue`): an open question takes its answer at the
+      // first opportunity, once; any further envelope for an answered or superseded revision is dropped with a receipt.
+      if (q) {
+        const key = `${q.qid}@${q.rev}`;
+        if (state.answered.has(key) || taken.has(key)) return { action: 'reject', reason: 'already-answered' };
+        if (state.superseded.has(key)) return { action: 'reject', reason: 'stale-rev' };
+        if (!open(q)) {
+          if (req.kind === 'answer') return { action: 'reject', reason: 'stale-rev' };
+        } else {
+          if (delivered && mode !== 'boundary' && mode !== 'settle') return { action: 'defer' };
+          // A blocked ask prefers its own answer when answers to several open questions wait.
+          if (mode === 'ask' && blocked && !(q.qid === blocked.qid && q.rev === blocked.rev) && candidates.some(other => pending(other, view) &&
+            answers(other)?.qid === blocked!.qid && answers(other)?.rev === blocked!.rev)) return { action: 'defer' };
+          // Follow-ups ordered before it enter first (fix C): at a boundary they ride ahead (below); here it waits.
+          if (mode !== 'ask' && candidates.some(other => other.kind === 'follow-up' && pending(other, view) && view.order.get(other.rid)! < view.order.get(req.rid)!))
+            return { action: 'defer' };
+          delivered = true; taken.add(key); return { action: 'apply' };
+        }
       }
       if (mode === 'ask' && (req.kind !== 'steer' || delivered)) return { action: 'defer' };
       if (req.kind === 'model') {
@@ -91,13 +125,11 @@ export function registerChild(pi: ExtensionAPI): void {
         // A resumed turn can reach this boundary before an idle intake. Older follow-ups must ride ahead of its
         // bound answer; otherwise continue bypasses them and the model sees stale instructions after the answer.
         const beforeResume = mode === 'boundary' && req.kind === 'follow-up' && candidates.some(other =>
-          other.kind === 'continue' && other.cond?.qid !== undefined && !view.resolved.has(other.rid) && !view.tombstones.has(other.rid) &&
-          view.order.get(req.rid)! < (view.order.get(other.rid) ?? -1));
+          waiting(other, view) && view.order.get(req.rid)! < (view.order.get(other.rid) ?? -1));
         if ((mode === 'idle' && delivered) || (req.kind === 'follow-up' && mode === 'boundary' && !beforeResume)) return { action: 'defer' };
         // A notify never interrupts a question: while an answer waits to be delivered (a hibernated asker resumes with
         // its answer as a continue) it goes after it, at the next safe point. In ask mode it was deferred above.
-        if (req.kind === 'notify' && candidates.some(other => !view.resolved.has(other.rid) && !view.tombstones.has(other.rid) &&
-          (other.kind === 'answer' && !state.answered.has(`${other.cond?.qid}@${other.cond?.rev}`) || other.kind === 'continue' && other.cond?.qid !== undefined))) return { action: 'defer' };
+        if (req.kind === 'notify' && candidates.some(other => waiting(other, view))) return { action: 'defer' };
         delivered = true; return { action: 'apply' };
       }
       return { action: 'reject', reason: 'unsupported' };
@@ -105,7 +137,7 @@ export function registerChild(pi: ExtensionAPI): void {
     // Idle delivery starts pi immediately. Commit only through that message's receipt;
     // later decisions must be reconsidered at the next boundary, in history order.
     if (mode === 'idle') {
-      const firstMessage = plans.findIndex(d => d.type === 'applied' && MESSAGES.includes(byRid.get(d.rid)!.kind));
+      const firstMessage = plans.findIndex(d => d.type === 'applied' && [...MESSAGES, 'answer'].includes(byRid.get(d.rid)!.kind));
       if (firstMessage >= 0) plans.splice(firstMessage + 1);
     }
     const entries: SessionBoundaryDraft[] = [];
@@ -129,19 +161,29 @@ export function registerChild(pi: ExtensionAPI): void {
           target = `${body.provider}/${body.model}`;
           record(CT.model, { rid: req.rid, provider: body.provider, model: body.model, ...(body.thinking ? { thinking: body.thinking } : {}) });
         } else if (mode === 'ask' && waiter) {
-          const text = (req.body as MessageBody).message;
-          const qid = req.cond?.qid ?? waiter.qid, rev = req.cond?.rev ?? waiter.rev, own = qid === waiter.qid && rev === waiter.rev;
-          // An answer to an earlier question says which one it answers; the blocked question stays open.
-          const earlier = own ? '' : `${JSON.stringify({ answers_earlier_question: qid, open: waiter.qid })}\nQuestion: ${state.questions.get(qid)?.question ?? qid}\nAnswer: `;
-          answer = req.kind === 'answer'
-            ? { content: [{ type: 'text', text: `${earlier}${text}` }], details: { rid: req.rid, qid, rev } }
-            : { content: [{ type: 'text', text: `${JSON.stringify({ interrupted_by: 'steer', open: waiter.qid })}\n${text}` }], details: { rid: req.rid, kind: 'steer' } };
-          if (req.kind === 'answer') state.answered.add(`${qid}@${rev}`);
+          const text = (req.body as MessageBody).message, q = answers(req);
+          if (q) {
+            const carried = supersededOf(req);
+            // D2: an answer to another open question ends the blocked ask too; the blocked question is superseded (the
+            // model is told so), and a later answer to it is rejected.
+            const own = q.qid === waiter.qid && q.rev === waiter.rev;
+            const note = own ? '' : `${JSON.stringify({ answers_earlier_question: q.qid, withdrawn: waiter.qid })}\n` +
+              `Your question "${waiter.question}" is withdrawn: this answers your earlier question instead. Ask again if you still need it answered.\n` +
+              (req.kind === 'answer' ? `Question: ${state.questions.get(q.qid)?.question ?? q.qid}\nAnswer: ` : '');
+            const superseded = [...carried, ...(own ? [] : [{ qid: waiter.qid, rev: waiter.rev }])];
+            answer = { content: [{ type: 'text', text: `${note}${text}` }], details: { rid: req.rid, qid: q.qid, rev: q.rev, ...(superseded.length ? { superseded } : {}) } };
+            state.answered.add(`${q.qid}@${q.rev}`);
+            for (const s of superseded) state.superseded.add(`${s.qid}@${s.rev}`);
+          } else answer = { content: [{ type: 'text', text: `${JSON.stringify({ interrupted_by: 'steer', open: waiter.qid })}\n${text}` }], details: { rid: req.rid, kind: 'steer' } };
         } else {
-          // P28: a continue bound to a question (hibernation resume) is that question's answer receipt.
-          const bound = req.kind === 'continue' && req.cond?.qid && req.cond.rev ? { qid: req.cond.qid, rev: req.cond.rev } : undefined;
-          if (bound) state.answered.add(`${bound.qid}@${bound.rev}`);
-          entries.push({ type: 'custom_message', customType: CT.msg, content: (req.body as MessageBody).message, display: true, details: { rid: req.rid, kind: req.kind, from: req.from, ...bound } });
+          // P28: a continue bound to a question (hibernation resume) is that question's answer receipt; D1: so is an
+          // answer delivered outside an ask (its ask ended by a steer or a reminder), as a message at this boundary.
+          const q = answers(req), body = req.body as MessageBody, superseded = supersededOf(req);
+          if (q) state.answered.add(`${q.qid}@${q.rev}`);
+          for (const s of superseded) state.superseded.add(`${s.qid}@${s.rev}`);
+          const content = req.kind === 'answer'
+            ? `The answer to your earlier question arrived.\nQuestion: ${state.questions.get(q!.qid)?.question ?? q!.qid}\nAnswer: ${body.message}` : body.message;
+          entries.push({ type: 'custom_message', customType: CT.msg, content, display: true, details: { rid: req.rid, kind: req.kind, from: req.from, ...q, ...(superseded.length ? { superseded } : {}) } });
         }
       }
     }

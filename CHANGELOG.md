@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.38
+
+- An answer to any open question of a call reaches it. A call whose question was interrupted (by a steer) and that
+  asked again in other words while waiting no longer orphans the answer to the first question: a waiting subagent
+  takes it as the result of its current question, a hibernated one resumes with it (also when the answer was sent
+  before it hibernated), and a subagent that is not waiting gets it as a message at its next safe point. Before, an
+  answer to a question other than the one the subagent waited on was held until a later ask, usually forever, and
+  then retired.
+- One rule for answers: an answer (or the answer a hibernated asker resumes with) to an open question is delivered
+  once, at the first chance, never held. A waiting subagent prefers the answer to the question it waits on when
+  several are pending. Follow-ups sent before a pending answer still enter ahead of it, notifies after it.
+- An answer to an earlier question that ends the wait on a later one supersedes the later question: the subagent is
+  told it was withdrawn and to ask again if it still needs it, its attention item resolves `superseded` (at once when
+  the answer is bound to a hibernated call), `status` no longer shows the call `asking`, and a later answer to it is
+  refused `stale-rev`.
+- A question revision gets at most one answer receipt. An answer sent before the call hibernated and bound to the
+  hibernation is withdrawn from the subagent's inbox; any further envelope for an answered or superseded revision is
+  dropped with a receipt, so nothing waits on it.
+- A follow-up generation no longer re-opens the questions of the session it continues (its subagent would refuse
+  their answers). Items that 1.0.37 re-opened in a running generation are resolved `carried` at orchestrator start.
+- Follow-ups queued while a call waited on its question reach the resumed model before the answer, in send order.
+
 ## 1.0.37
 
 - The process table runs `ps` by its absolute path (`/bin/ps`), so an orchestrator started with a minimal PATH keeps

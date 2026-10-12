@@ -18,6 +18,8 @@ export interface SessionDigest {
   questions: Question[];
   /** JSON [qid, rev] of every entry whose details carry qid and rev and that is a receipt (an answer). */
   answered: Set<string>;
+  /** JSON [qid, rev] of every question a receipt names as superseded (details.superseded, D2). */
+  superseded: Set<string>;
   /** Index of the last custom question entry (any data), as findLastIndex finds it. */
   lastQuestion: number;
   /** Last index of an entry with customType question per data.qid (any type), for "asked after the segment". */
@@ -28,6 +30,10 @@ export interface SessionDigest {
   results: Map<string, SessionEntry>;
 }
 export const answerKey = (qid: unknown, rev: unknown) => JSON.stringify([qid, rev]);
+/** D2: the questions an answer receipt superseded (`details.superseded`: the blocked or hibernated asker's question). */
+export function supersededBy(details: { superseded?: unknown } | undefined): { qid: string; rev: number }[] {
+  return Array.isArray(details?.superseded) ? details.superseded.filter(q => typeof q?.qid === "string" && typeof q?.rev === "number") : [];
+}
 
 /** A fold of one session for one call, extended over appended entries. */
 export class SessionFold {
@@ -42,7 +48,7 @@ export class SessionFold {
   state: SessionDigest;
   constructor(call: string) { this.call = call; this.state = SessionFold.empty(); }
   private static empty(): SessionDigest {
-    return { usage: [], receipts: new Map(), questions: [], answered: new Set(), lastQuestion: -1, questionAt: new Map(), execAt: new Map(), results: new Map() };
+    return { usage: [], receipts: new Map(), questions: [], answered: new Set(), superseded: new Set(), lastQuestion: -1, questionAt: new Map(), execAt: new Map(), results: new Map() };
   }
   update(entries: readonly SessionEntry[]): SessionDigest {
     if (entries === this.entries) return this.state;
@@ -69,6 +75,7 @@ export class SessionFold {
       }
       const details = e.message?.details ?? e.details;
       if (details && rid !== undefined) s.answered.add(answerKey(details.qid, details.rev));
+      if (rid !== undefined) for (const q of supersededBy(details)) s.superseded.add(answerKey(q.qid, q.rev));
       const m = e.message;
       if (m?.role === "toolResult" && typeof m.toolCallId === "string" && !s.results.has(m.toolCallId)) s.results.set(m.toolCallId, e);
     }
@@ -81,7 +88,7 @@ export class SessionFold {
 export function digestOpenQuestion(entries: readonly SessionEntry[], s: SessionDigest): Question & { question: string } | undefined {
   const at = s.lastQuestion, q = entries[at]?.data;
   if (!q || typeof q.qid !== "string" || typeof q.rev !== "number") return;
-  if (s.answered.has(answerKey(q.qid, q.rev))) return;
+  if (s.answered.has(answerKey(q.qid, q.rev)) || s.superseded.has(answerKey(q.qid, q.rev))) return;
   const ask = askOf(entries, at);
   const result = ask === undefined ? undefined : s.results.get(ask);
   if (ask === undefined || result && !cutAskResult(result.message)) return;

@@ -115,7 +115,8 @@ orchestrator and the session agents.
 - V1: capacity and headroom;
 - V2: seal;
 - V3: currency;
-- V4: openness, including the hibernated case;
+- V4: openness: the current, unanswered and not superseded revision of a
+  question the call asked (blocked, interrupted or hibernated alike);
 - V5: dependency (also used by the lifecycle);
 - V6: monotone time;
 - V7: single presentation;
