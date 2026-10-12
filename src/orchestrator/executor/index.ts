@@ -19,7 +19,7 @@ import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, forwardRid } from "../../kernel/ids.ts";
 import { capacity, seal } from "../../kernel/guards.ts";
 import { buildPiArgs } from "../../compat/pi-args.ts";
-import { parseModel, resolveModel, type Model } from "../../compat/model.ts";
+import { parseModel, plainModel, resolveModel, type Model } from "../../compat/model.ts";
 import { buildCallResult } from "../../compat/result.ts";
 import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts";
 import createEffects from "./effects/index.ts";
@@ -104,7 +104,9 @@ export function continueMessage(dangling: readonly string[]): string {
 /** An asker hibernates while it waits (its execution is stopped to free the provider slot), so the answer says so. */
 export const HIBERNATED_NOTE = "While you waited for the answer below your execution was stopped; processes your tools had " +
   "started (background ones included) were stopped with it. Check them before relying on them.";
-export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects; containment?: Containment } = {}): Executor {
+export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects; containment?: Containment;
+  /** Observes each slot attempt that admitted nothing: the execution and the providers it found full. */
+  attempted?: (exec: string, full: readonly string[]) => void } = {}): Executor {
   const { home, config, orch } = ledgers;
   const containment = options.containment ?? serialContainment(), effects = options.effects ?? createEffects(ledgers);
   const active = new Map<string, Active>(), completed = new Map<string, Promise<CallResult>>(), journals = new Map<string, JournalHandle>();
@@ -504,26 +506,73 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     });
     wake();
   }
+  /** The origin of a workflow (its `wf-created` entry, else the orchestrator ledger's `created`), cached once known. */
+  const origins = new Map<string, string>();
+  function originOf(wid: string): string | undefined {
+    let o = origins.get(wid);
+    if (o === undefined) {
+      const journal = journals.get(wid);
+      const value = journal?.entries().find(e => e.type === "wf-created")?.origin ?? orch.entries().find(e => e.type === JT.created && e.wid === wid)?.origin;
+      if (typeof value === "string") origins.set(wid, o = value);
+    }
+    return o;
+  }
+  const widOf = (exec: string) => exec.slice(0, exec.indexOf("@"));
+  /** Slot precedence: every acquisition waiting now. `blockedOn`: the providers its latest attempt (at `at`) found full. */
+  const acquiring = new Map<string, { a: Active; call: string; origin?: string; since: number; resume: boolean; blockedOn: ReadonlySet<string>; at: number }>();
+  /** Whether another waiter with precedence for `provider` found it full on a recent attempt: then `exec` leaves the
+   *  free slot to it. Precedence: a call that ran before (its session, cache and worktree are ready; a parent waits on it)
+   *  before a fresh one; then the workflow origin holding fewer of the provider's slots; then the longer wait; then call id. */
+  function yields(exec: string, provider: string): boolean {
+    const me = acquiring.get(exec); if (!me) return false;
+    const recent = 3 * (config.k?.trackerMs ?? 1000), now = Date.now();
+    let held: Map<string | undefined, number> | undefined;
+    const heldBy = (origin: string | undefined) => {
+      if (!held) { held = new Map(); for (const h of holdings()) if (h.pool === provider) { const o = originOf(widOf(h.exec)); held.set(o, (held.get(o) ?? 0) + 1); } }
+      return held.get(origin) ?? 0;
+    };
+    for (const [other, w] of acquiring) {
+      if (other === exec || !w.blockedOn.has(provider) || now - w.at >= recent || interrupted(w.a)) continue;
+      if (w.resume !== me.resume) { if (w.resume) return true; continue; }
+      const mine = heldBy(me.origin), theirs = heldBy(w.origin);
+      if (theirs !== mine) { if (theirs < mine) return true; continue; }
+      if (w.since !== me.since ? w.since < me.since : w.call < me.call) return true;
+    }
+    return false;
+  }
   /** Wait for a slot. The candidates are decided again on every attempt, inside the serial section that also applies
    *  config.json changes: a queued call follows a reloaded defaultModel, pool or limit, never a mix of two versions. */
   async function acquire(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>, writer?: string): Promise<{ model?: Model; continuation: boolean }> {
+    const t = a.ticket, since = Date.now();
+    const resume = !!t.continueFrom || t.journal.entries().some(e => e.type === JT.exec && e.call === t.callId && e.exec !== exec);
+    const mine = { a, call: t.callId, origin: originOf(t.wid), since, resume, blockedOn: new Set<string>() as ReadonlySet<string>, at: since };
+    acquiring.set(exec, mine);
+    try { return await acquireLoop(a, exec, decide, mine, writer); }
+    finally { acquiring.delete(exec); }
+  }
+  async function acquireLoop(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>,
+    mine: { since: number; blockedOn: ReadonlySet<string>; at: number }, writer?: string): Promise<{ model?: Model; continuation: boolean }> {
     let continuation = false;
     for (;;) {
       let signal!: () => void;
       const changed = new Promise<void>(resolve => { signal = resolve; waiters.add(resolve); });
-      const chosen = await serial(async () => {
+      const blocked = new Set<string>();
+      const chosen = await serial(async () => { try {
         if (interrupted(a) || await workflowReached(a.ticket)) return;
         if (writer && !await writerAdmit(a, writer)) return;
         const decision = await decide(), models = decision.candidates, pool = decision.pool;
         continuation = decision.continuation;
         for (const model of models) {
           if (!continuation && pool && models.length > 1 && skipped(pool, model)) continue;
+          // A pool entry with afterMs waits its turn: it is taken only once this acquisition has waited that long.
+          if (model.afterMs !== undefined && Date.now() - mine.since < model.afterMs) continue;
           const provider = model.provider;
           if (unavailable(provider)) continue;
           const probe = provider !== undefined && folded().exhausted.has(provider);
           const holders = holdings().filter(e => e.pool === provider);
           const limit = settings().providers?.[provider ?? ""]?.slots ?? Infinity;
-          if (!capacity({ kind: "provider", holders: holders.length, capacity: limit })) continue;
+          if (!capacity({ kind: "provider", holders: holders.length, capacity: limit })) { if (provider) blocked.add(provider); continue; }
+          if (provider && yields(exec, provider)) continue;
           // A burst of dispatches all read the same MemAvailable before any child has grown: subtract the children
           // admitted in the last 30 s (their memory is not visible yet), so a burst cannot over-commit the headroom.
           const perChild = settings().memory?.perChildMb ?? 300;
@@ -545,10 +594,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             // either goes through (the provider is available again) or is refused, which uses no quota.
             if (probe) await orch.append("provider-probe", { provider, exec });
           }
-          await a.ticket.journal.append("selected", { exec, model, ...(pool ? { pool } : {}) });
-          return model;
+          const plain = plainModel(model);
+          await a.ticket.journal.append("selected", { exec, model: plain, ...(pool ? { pool } : {}) });
+          return plain;
         }
-      });
+      } finally { mine.blockedOn = blocked; mine.at = Date.now(); } });
+      if (!chosen) options.attempted?.(exec, [...blocked]);
       if (chosen || interrupted(a) || reached(totalUsage(a.ticket.journal.entries()), a.ticket.workflowBudget)) { waiters.delete(signal); return { model: chosen, continuation }; }
       const timer = setTimeout(signal, config.k?.trackerMs ?? 1000);
       try { await changed; } finally { clearTimeout(timer); waiters.delete(signal); }
@@ -650,15 +701,15 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     wake();
   }
   /** Switch a running execution off a used-up provider: to the first model of its pool on another provider that is
-   *  neither used up nor full, reserving that slot as a requested switch does. Without one, pi's retries go on and
-   *  the call waits for the provider once they end. */
+   *  neither used up nor full and has no afterMs (such an entry is for calls that waited for a slot), reserving that
+   *  slot as a requested switch does. Without one, pi's retries go on and the call waits for the provider once they end. */
   async function failover(t: CallTicket, exec: string, provider: string) {
     if (pendingSwitch(exec)) return;
     const pool = t.journal.entries().findLast(e => e.type === "selected" && e.exec === exec)?.pool as string | undefined, pools = settings().pools;
     if (!pool || !pools?.[pool]) return;
     let models: Model[]; try { models = resolveModel(pool, pools); } catch { return; }
     for (const m of models) {
-      if (!m.provider || m.provider === provider || unavailable(m.provider) || skipped(pool, m)) continue;
+      if (!m.provider || m.provider === provider || m.afterMs !== undefined || unavailable(m.provider) || skipped(pool, m)) continue;
       const rid = contentHash([exec, "failover", provider]);
       if (t.journal.entries().some(e => e.type === "forward" && e.rid === rid)) return;
       const probe = folded().exhausted.has(m.provider); // its next try is due (`unavailable` said so): this is its probe

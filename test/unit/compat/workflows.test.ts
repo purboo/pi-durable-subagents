@@ -17,6 +17,9 @@ test("model parsing preserves provider paths and non-thinking colons, resolves o
   assert.deepEqual(resolveModel("fast", { fast: ["p/a:low", "backup"], backup: ["q/b"] }), [{ provider: "p", id: "a", thinking: "low" }, { provider: "q", id: "b" }]);
   assert.throws(() => resolveModel("x", { x: ["y"], y: ["x"] }), /Cyclic/);
   assert.throws(() => resolveModel("x", { x: [] }), /Empty/);
+  // A waiting entry carries afterMs to every model it expands to; nested twice, the larger value wins.
+  assert.deepEqual(resolveModel("opus", { opus: ["a/s", { model: "weak", afterMs: 100 }, { model: "c/w", afterMs: 50 }], weak: ["b/w", { model: "d/w", afterMs: 300 }, { model: "e/w", afterMs: 20 }] }),
+    [{ provider: "a", id: "s" }, { provider: "b", id: "w", afterMs: 100 }, { provider: "d", id: "w", afterMs: 300 }, { provider: "e", id: "w", afterMs: 100 }, { provider: "c", id: "w", afterMs: 50 }]);
   for (const invalid of ["", "/id", "p/", "bad model", ":high"]) assert.throws(() => parseModel(invalid));
 });
 

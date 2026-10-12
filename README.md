@@ -654,6 +654,16 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   file or a model send). The first candidate with a free slot is
   used, and a candidate that keeps failing is skipped for 10 minutes. The
   order is the preference: list the provider you want to use first.
+- **Waiting before spilling over:** a pool entry can also be
+  `{ "model": "<provider/id[:thinking]> or pool name", "afterMs": <ms> }`. A
+  waiting call takes it only after it has waited `afterMs` for a slot; until
+  then it waits for the entries before it. In
+  `"opus": ["a/strong", "b/strong", {"model": "c/weaker", "afterMs": 600000}]`
+  a call uses `c/weaker` only after 10 minutes without a free `a` or `b` slot.
+  A nested pool's `afterMs` applies to every model it lists (the larger value
+  wins when nested twice). It does not apply to a call that continues its own
+  session's model or was asked for a model, and a running call that moves off
+  a used-up provider skips such entries.
 - **A used-up provider** is not sent new calls until its next try, 15 minutes
   after it last refused (`"k": { "probeMs": 900000 }`). Then one call at a
   time goes to it, so finding out costs no extra request. A call that moved to
@@ -677,7 +687,14 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   Interrupted (Ctrl-C), it stops what it started and cleans up the same way
   (exit 130, or 143 for SIGTERM).
 - **Provider slots:** never exceeded, including while a model switch is in
-  progress.
+  progress. When several calls wait for a provider, a freed slot goes first to
+  a call that ran before (resumed after an answer, a follow-up generation, a
+  call recovered after a restart; its session and prompt cache are ready),
+  then to the workflow origin (pi session or CLI) that holds fewer of that
+  provider's slots, then to the call that has waited longest. A call yields
+  only to waiters that found the provider full on a recent attempt, so a slot
+  never stays free. `status` names the holders per origin when more than one
+  holds a provider: `anthropic 4/4 (3 cli:alice@host, 1 session 01a11a3b)`.
 - **Memory:** new subagents wait while memory is short. Running ones are
   never stopped for memory.
 - **Writer lock:** `"queue"` (default) runs one writing call per git
