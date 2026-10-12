@@ -80,7 +80,9 @@ subagents({ action: "status" })
 `status` without a wid is brief: what runs, what asks (with the address to
 answer) or failed, and one line per finished workflow, each with its run
 `labels` clipped to 60 characters (the `/subagents` list shows them on a
-workflow's row when they fit). `status` with a wid
+workflow's row when they fit). A workflow's `status` is its run's result;
+`active: true` means a latest-generation call is still queued, running or
+asking, including a follow-up on a finished run. `status` with a wid
 shows one workflow with outputs clipped; add `key` for one call's full result,
 or `full: true` for everything. `tail: N` gives the last N lines of each call's
 result instead, and `grep: "<regex>"` only its lines matching a case-sensitive
@@ -532,10 +534,10 @@ that applies wins:
 | `silent` | is running (launched, not stopped) without visible activity: the stall notice of that execution, with the command running and for how long |
 
 A call whose current execution asked a question (also while it hibernates
-until the answer) is `asking`, not waiting. Once the answer arrives the call
-launches again, and from then on it waits like any call (for a slot, the
-writer lock, …) even though `describe` still lists the question as open until
-the new execution reads it (its `state` stays `asking`). A drained call
+until the answer) is `asking`, not waiting. Once its answer is bound, it is
+`queued` with `answered: "<qid>"` and no open question, retaining
+`hibernated: true` while it holds no slot until its next execution starts.
+It waits like any queued call (for a slot, the writer lock, ...). A drained call
 (no execution running) is never `silent`; a sealed call never waits. `provider-exhausted`, `writer-lock`, `lease` and `slot` are queues
 that clear by themselves; `silent` and `unconfirmed-stop` may need a look.
 

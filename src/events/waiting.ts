@@ -19,9 +19,8 @@
 //   silent             an open `stall:`/`noprogress:` attention item (kind stall; its text names the running command) of
 //                      the current execution while it works (selected, not fenced): a drained call is not waiting.
 // An asking call is not waiting, a sealed one never. Asking = an open question raised in the call's current execution
-// (the call's latest `exec` before the question's attention entry is its current one), hibernated or not; once the
-// answer is bound the executor appends a new exec, and the call's waits count again although the item stays open until
-// the new execution reads it (describe's `state: "asking"` still follows the open item).
+// (the call's latest `exec` before the question's attention entry is its current one), hibernated or not. Binding an
+// answer closes that question immediately and queues the call; its waits count before its next execution starts.
 import { JT, type AttentionItem, type Entry, type JournalHandle, type Request, type RunBody } from "../types.ts";
 import { EVENT_SEQ_SKIP, WAIT_REASONS, type EventDraft, type EventSink, type WaitReason } from "./types.ts";
 import { emptyLedger, foldLedger, settingsOf, type LedgerState } from "../orchestrator/ledger.ts";
@@ -96,6 +95,8 @@ export interface CallFacts {
   /** The model of its latest `selected`/`model-used` ("provider/id"). */
   model?: string;
   exec?: string; selected?: boolean; fenced?: boolean;
+  /** A bound answer queues the call before its next exec is appended; that exec replaces this synthetic wait. */
+  answered?: string;
   /** Since when the current execution waits for its slot: its `exec`, or a later `writer-acquired`. */
   queued?: number;
   writer?: { root: string; holder: string; since: number };
@@ -121,18 +122,31 @@ function applyWait(f: WaitFold, e: Entry): void {
     case "wf-created": f.rev = Number(e.revision) || 1; break;
     case "revised": f.rev = Number(e.revision) || f.rev; f.calls.clear(); f.items.clear(); f.done = false; break;
     case JT.done: f.done = true; break;
-    case "resumed": if (!e.call) f.done = false; break;
+    case "resumed": {
+      if (!e.call) f.done = false;
+      else {
+        const c = f.calls.get(String(e.call));
+        if (c && (!e.exec || c.exec === e.exec)) { c.selected = true; c.fenced = false; delete c.answered; }
+      }
+      break;
+    }
     case "call": case "generation": {
       const key = String(e.key), gen = Number(e.gen) || 1, call = `${f.wid}@${f.rev}/${key}@${gen}`, spec = e.spec as { agent?: unknown; model?: unknown } | undefined;
       const wanted = typeof e.model === "string" && e.model ? e.model : typeof spec?.model === "string" && spec.model ? spec.model : undefined;
       f.calls.set(call, { call, key, gen, generation: e.type === "generation", ...(typeof spec?.agent === "string" ? { agent: spec.agent } : {}), ...(wanted ? { wanted } : {}) });
       break;
     }
-    case JT.exec: { const c = f.calls.get(String(e.call)); if (c) { c.exec = String(e.exec); c.queued = e.ts; c.selected = false; c.fenced = false; } break; }
+    case JT.exec: { const c = f.calls.get(String(e.call)); if (c) { c.exec = String(e.exec); c.queued = e.ts; c.selected = false; c.fenced = false; delete c.answered; } break; }
+    case "answer-bound": {
+      const c = f.calls.get(String(e.call)), id = `q:${e.call}:${e.qid}`, item = f.items.get(id);
+      if (item?.rev === e.rev) f.items.delete(id);
+      if (c) { c.answered = String(e.qid); c.queued = e.ts; }
+      break;
+    }
     case "selected": case "model-used": {
       const c = ofExec(f, e.exec), model = modelName(e.model);
       if (c && model) c.model = model;
-      if (c && e.type === "selected") c.selected = true;
+      if (c && e.type === "selected") { c.selected = true; delete c.answered; }
       break;
     }
     case JT.fenced: { const c = ofExec(f, e.exec); if (c) c.fenced = true; break; }
@@ -189,7 +203,7 @@ export function leaseWaits(state: ReturnType<typeof leaseState>, now: number): M
 const providerOf = (model?: string) => { if (!model) return undefined; try { return parseModel(model).provider; } catch { return undefined; } };
 /** The call's state as `whyWaiting` reads it. `agentModel` names the model of a pinned agent (for a call naming none). */
 export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: (agent: string) => string | undefined): WaitInput {
-  const settings = settingsOf(env.ledger, env.config ?? {}), live = c.exec && !c.fenced;
+  const settings = settingsOf(env.ledger, env.config ?? {}), live = c.exec && (!c.fenced || c.answered !== undefined), selected = c.selected && c.answered === undefined;
   const attention: { id: string; kind: string; text: string; since: number; exec?: string }[] = [];
   let asking = false;
   for (const [id, item] of f.items) if (item.call === c.call) {
@@ -197,7 +211,7 @@ export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: 
     if (item.kind === "question" && item.exec === c.exec) asking = true;
   }
   let providers: string[] = [];
-  if (live && c.selected) { const p = providerOf(c.model); if (p) providers = [p]; }
+  if (live && selected) { const p = providerOf(c.model); if (p) providers = [p]; }
   else if (live) {
     // A pool call may launch on any of its pool's models; anything else continues on the model it ran on, or the one
     // it asks for (its spec, its agent's, the configured default). A model pi's own settings choose is not known here.
@@ -205,17 +219,17 @@ export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: 
     if (raw && Object.hasOwn(pools, raw)) { try { providers = [...new Set(resolveModel(raw, pools).map(m => m.provider).filter((p): p is string => !!p))]; } catch { /* an invalid pool: unknown */ } }
     else { const p = providerOf(c.model ?? raw); if (p) providers = [p]; }
   }
-  let full = live && !c.selected && providers.length > 0;
-  const slot = live && !c.selected && providers.length ? providers.map(p => {
+  let full = live && !selected && providers.length > 0;
+  const slot = live && !selected && providers.length ? providers.map(p => {
     let held = 0; for (const h of env.ledger.held.values()) if (h.pool === p) held++;
     const limit = settings.providers?.[p]?.slots;
     if (limit === undefined || held < limit) full = false;
     return slotLine(p, held, limit);
   }).join(", ") : undefined;
-  const lease = live && c.selected ? env.leases?.get(c.call) : undefined;
+  const lease = live && selected ? env.leases?.get(c.call) : undefined;
   return {
     asking,
-    ...(live ? { exec: { id: c.exec!, since: c.queued ?? 0, selected: !!c.selected } } : {}),
+    ...(live ? { exec: { id: c.exec!, since: c.queued ?? 0, selected: !!selected } } : {}),
     ...(providers.length ? { providers } : {}), exhausted: env.ledger.exhausted,
     ...(c.writer ? { writerWait: c.writer } : {}), ...(lease ? { lease } : {}),
     ...(attention.length ? { attention } : {}), ...(slot ? { slot } : {}), ...(full ? { full } : {}),

@@ -92,13 +92,18 @@ export function deriveEntry(wid: string, entries: readonly Entry[], i: number, o
     const parts = callParts(item.call);
     return [{ ...base("asking"), type: "asking", ...onCall(item.call), qid: item.qid, rev: item.rev, question: item.text, to: `${wid}/${parts?.key ?? ""}` }];
   }
-  if (isEntry(e, JT.attentionResolved)) {
-    if (e.resolution !== "answered") return [];
+  if (e.type === "answer-bound" || isEntry(e, JT.attentionResolved)) {
+    const bound = e.type === "answer-bound";
+    if (!bound && e.resolution !== "answered") return [];
+    const questionId = bound ? `q:${e.call}:${e.qid}` : e.id;
     let item: Entry | undefined;
-    for (let j = i - 1; j >= 0 && !item; j--) { const a = entries[j]!; if (isEntry(a, JT.attention) && a.item.id === e.id && a.item.rev === e.rev) item = a; }
-    const q = (item as Entry & { item: { kind: string; call?: string; qid?: string; rev: number } } | undefined)?.item;
+    for (let j = i - 1; j >= 0 && !item; j--) { const a = entries[j]!; if (isEntry(a, JT.attention) && a.item.id === questionId && a.item.rev === e.rev) item = a; }
+    const q = (item as Entry & { item: { id: string; kind: string; call?: string; qid?: string; rev: number } } | undefined)?.item;
     if (!q || q.kind !== "question" || !q.call || q.qid === undefined) return [];
-    const answer = answerOf(entries, i, before(orch, e), q.call, q.qid, q.rev);
+    // The binding reports answered immediately; a later child receipt or duplicate resolution reports nothing.
+    if (entries.slice(0, i).some(a => a.type === "answer-bound" && a.call === q.call && a.qid === q.qid && a.rev === q.rev ||
+      a.type === JT.attentionResolved && a.id === q.id && a.rev === q.rev && a.resolution === "answered")) return [];
+    const answer = answerOf(entries, bound ? i + 1 : i, before(orch, e), q.call, q.qid, q.rev);
     return [{ ...base("answered"), type: "answered", ...onCall(q.call), qid: q.qid, rev: q.rev, ...answeredBy(answer.request),
       digest: createHash("sha256").update(answer.text, "utf8").digest("hex"), length: answer.text.length }];
   }
