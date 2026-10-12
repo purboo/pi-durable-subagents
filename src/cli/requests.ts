@@ -8,7 +8,7 @@ import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
-import { NOTIFY_SINCE, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
@@ -124,7 +124,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   const admitted = id ? run : undefined;
   const lstate = leaseState(home), slots = slotsView(home, now), leases = leaseCalls(lstate, now);
   // The same fold and decision the orchestrator's collector uses, from the disk snapshots.
-  const waits = waitsOf(foldWaits(wid, journal), { now, ledger: foldLedger(emptyLedger(), entries), leases: leaseWaits(lstate, now) }, pinnedAgentModel(home, wid, wf.rev));
+  const waits = waitsOf(foldWaits(wid, journal), { now, ledger: foldLedger(emptyLedger(), entries), held: heldIn(entries), leases: leaseWaits(lstate, now) }, pinnedAgentModel(home, wid, wf.rev));
   const line = (lines: string[] | undefined, model?: string) => { const provider = model?.split("/")[0]; return provider ? lines?.find(l => l.startsWith(`${provider} `)) : undefined; };
   const latest = [...new Map(wf.calls.map(c => [c.key, c] as const)).values()];
   const calls = latest.map((c): DescribedCall => {

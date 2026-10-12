@@ -162,6 +162,19 @@ test("failover: a model send may name a pool: its first model not used up, and t
   assert.deepEqual(f.journal.entries().filter(e => e.type === "selected" && String(e.exec).includes("/b@")).map(e => [(e.model as { provider: string }).provider, e.pool]), [["qb", "top"]]);
 });
 
+test("failover: a model send naming a pool skips its entries with afterMs, as failover does", { timeout: 60000 }, async t => {
+  const f = await setup(t, { pools: { top: ["qa/m", { model: "qb/m", afterMs: 600000 }, "qc/m"], late: ["qa/m", { model: "qb/m", afterMs: 600000 }] } });
+  await f.exhaust(true);
+  assert.equal((await f.executor.run(f.ticket("a", "top"))).output, "answered by qc"); // qa is now used up
+  const b = f.ticket("b", "top"), ctx = { journal: f.journal, widRev: b.widRev, key: "b", gen: 1 };
+  assert.deepEqual(await f.executor.forward({ kind: "send", rid: "pool", from: "main:test", to: "orch", sseq: 1, body: { to: "b", kind: "model", model: "top" } }, ctx), { action: "apply" });
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "send-note").map(e => [e.model, e.effect, e.pool]), [["qc/m", "next-execution", "top"]]);
+  // A pool whose only takeable entry has afterMs has nothing to offer now.
+  const c = f.ticket("c", "late");
+  assert.deepEqual(await f.executor.forward({ kind: "send", rid: "late", from: "main:test", to: "orch", sseq: 2, body: { to: "c", kind: "model", model: "late" } },
+    { journal: f.journal, widRev: c.widRev, key: "c", gen: 1 }), { action: "reject", reason: "pool-unavailable" });
+});
+
 test("failover: one execution moved on twice records each used-up provider", { timeout: 60000 }, async t => {
   const f = await setup(t, { pools: { top: ["qa/m", "qb/m", "qc/m"] } }, PI_RETRY);
   await f.exhaust(true); await f.exhaust(true, "qb");

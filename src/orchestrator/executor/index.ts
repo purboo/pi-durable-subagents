@@ -12,7 +12,7 @@
 // and mem{available,admitted,exec} (every admission; a repeated refusal at most every 30 s per call). All transitions are serialized before publication.
 import { mkdir, open, readdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CT, JT, attentionEntries, isEntry, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
 import { binDir, callDir, callInbox, callSession, journalPath, outboxRoot } from "../../paths.ts";
@@ -58,6 +58,16 @@ const entriesFor = (journal: JournalHandle, call: string) => journal.entries().f
 const current = (journal: JournalHandle, call: string) => entriesFor(journal, call).findLast(e => e.type === JT.exec)?.exec as string | undefined;
 const sealed = (journal: JournalHandle, call: string) => entriesFor(journal, call).find(e => e.type === JT.sealed)?.result as CallResult | undefined;
 const has = (journal: JournalHandle, type: string, exec: string) => entriesOf(journal, type, exec).length > 0;
+/** The run of executions of `call` whose launches failed for a reason of the environment, ending at `exec`: its first
+ *  execution and the one before it (absent for the call's first). Undefined when `exec` did not fail so. */
+function envFailedChain(journal: JournalHandle, call: string, exec: string): { first: string; before?: string } | undefined {
+  if (!has(journal, "spawn-env-failed", exec)) return undefined;
+  const execs = entriesFor(journal, call).filter(e => e.type === JT.exec).map(e => String(e.exec));
+  let i = execs.lastIndexOf(exec);
+  if (i < 0) return undefined;
+  while (i > 0 && has(journal, "spawn-env-failed", execs[i - 1]!)) i--;
+  return { first: execs[i]!, ...(i > 0 ? { before: execs[i - 1]! } : {}) };
+}
 /** The rid of the model request a follow-up naming a model makes (P12): derived, so withdrawing or replacing the
  *  follow-up withdraws its model request too. */
 export const modelRid = (rid: string) => contentHash([rid, "model"]);
@@ -111,6 +121,8 @@ export const HIBERNATED_NOTE = "While you waited for the answer below your execu
 export const environmentSpawnError = (error: unknown) => ["ENOENT", "EACCES"].includes(String((error as NodeJS.ErrnoException | undefined)?.code));
 /** The default wait before an environment launch failure is retried (an orchestrator restart retries at once). */
 export const SPAWN_RETRY_MS = 60_000;
+/** A call's environment launch failures print one console line at the first, then at most one per this interval. */
+export const SPAWN_CONSOLE_MS = 600_000;
 export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects; containment?: Containment;
   /** The pi subagents run (absolute; the orchestrator resolved it at start); a bare `pi` from PATH without one. */
   pi?: string; spawnRetryMs?: number;
@@ -554,7 +566,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
    *  config.json changes: a queued call follows a reloaded defaultModel, pool or limit, never a mix of two versions. */
   async function acquire(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>, writer?: string): Promise<{ model?: Model; continuation: boolean }> {
     const t = a.ticket, since = Date.now();
-    const resume = !!t.continueFrom || t.journal.entries().some(e => e.type === JT.exec && e.call === t.callId && e.exec !== exec);
+    // An execution that never started (its launch failed for a reason of the environment) does not make a resume.
+    const resume = !!t.continueFrom || t.journal.entries().some(e => e.type === JT.exec && e.call === t.callId && e.exec !== exec && !has(t.journal, "spawn-env-failed", String(e.exec)));
     const mine = { a, call: t.callId, origin: originOf(t.wid), since, resume, blockedOn: new Set<string>() as ReadonlySet<string>, at: since };
     acquiring.set(exec, mine);
     try { return await acquireLoop(a, exec, decide, mine, writer); }
@@ -763,12 +776,21 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   function pendingSwitch(exec: string) {
     return holdings().find(h => h.exec === exec && h.reserved && !folded().observed.has(`${exec}\n${h.rid}`));
   }
-  /** Serial sections only: record an environment launch failure and raise one `environment` alert for the call (a new
-   *  revision only after an earlier one was resolved by a launch that worked). */
+  /** When each call in environment retries last printed its console line. */
+  const spawnConsoleAt = new Map<string, number>();
+  /** Serial sections only: record an environment launch failure (before its execution is fenced: recovery after a crash
+   *  in between finds an execution that never started, not a loss). */
+  async function spawnEnvRecord(t: CallTicket, exec: string, error: unknown) {
+    if (!has(t.journal, "spawn-env-failed", exec)) await t.journal.append("spawn-env-failed", { exec, call: t.callId, command: piCommand, error: String(error).slice(0, 300) });
+  }
+  /** Serial sections only: raise one `environment` alert for the call (a new revision only after an earlier one was
+   *  resolved by a launch that worked); one console line at the first failure, then at most one per SPAWN_CONSOLE_MS. */
   async function spawnEnvFailed(t: CallTicket, exec: string, cwd: string, error: unknown) {
-    const message = String(error).slice(0, 300);
-    if (!has(t.journal, "spawn-env-failed", exec)) await t.journal.append("spawn-env-failed", { exec, call: t.callId, command: piCommand, error: message });
-    console.error(`durable-subagents: launching ${exec} failed: ${message}; retrying`);
+    const message = String(error).slice(0, 300), printed = spawnConsoleAt.get(t.callId);
+    if (printed === undefined || Date.now() - printed >= SPAWN_CONSOLE_MS) {
+      console.error(`durable-subagents: launching ${exec} failed: ${message}; retrying`);
+      spawnConsoleAt.set(t.callId, Date.now());
+    }
     const id = `environment:${t.callId}`, items = attentionEntries(t.journal.entries(), id), last = items.at(-1)?.item;
     if (last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev)) return;
     const pi = piCommand === "pi" ? "`pi` from the orchestrator's PATH (no absolute pi was resolved; set DSA_PI_BIN, or start the orchestrator from an environment whose PATH has pi)"
@@ -779,6 +801,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   /** Serial sections only: a launch worked, so the call's open environment alert is resolved. */
   async function spawnEnvResolved(t: CallTicket) {
+    spawnConsoleAt.delete(t.callId);
     const id = `environment:${t.callId}`, last = attentionEntries(t.journal.entries(), id).at(-1)?.item;
     if (last && !t.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === last.rev))
       await t.journal.append(JT.attentionResolved, { id, rev: last.rev, resolution: "launched" });
@@ -910,17 +933,28 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (openingRid && !openingReceived) await sender.send(t.callId, "task", { message: t.opening!.message }, undefined, { rid: openingRid });
       else if (!openingRid && !taskReceived) await sender.send(t.callId, "task", { message: t.spec.task }, undefined, { rid: taskRid });
       else if (unresolved && !receipt) await sender.send(t.callId, "continue", { message: String(unresolved.message) }, { qid: String(unresolved.qid), rev: Number(unresolved.rev) }, { rid: String(unresolved.rid2) });
-      else if (previous) await sender.send(t.callId, "continue", { message: continueMessage(dangling) }, undefined, { rid: contentHash([exec, "dispatch"]) });
+      else if (previous) {
+        // After launches that failed for a reason of the environment, no child received their dispatches: the first
+        // execution of that run of failures keeps its dispatch (rid and content), so one is pending, not one per retry.
+        const chain = envFailedChain(journal, t.callId, previous);
+        const prior = chain && sender.recorded(contentHash([chain.first, "dispatch"]));
+        if (prior) await sender.send(t.callId, prior.kind, prior.body, prior.cond, { rid: prior.rid });
+        else await sender.send(t.callId, "continue", { message: continueMessage(chain?.before ? evidence(entries, chain.before).dangling : dangling) }, undefined,
+          { rid: contentHash([chain?.first ?? exec, "dispatch"]) });
+      }
       else await sender.send(t.callId, "task", { message: t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
       await launchGate(a, exec, "child");
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       let child: Spawned;
       try {
         child = await containment.spawn({ exec, command: piCommand, args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
-          env: { DSA_HOME: home, PATH: [binDir(home), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
+          // The orchestrator's node follows binDir: a `#!/usr/bin/env node` pi runs under a PATH without node (a service's).
+          env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
       } catch (error) {
+        const environment = environmentSpawnError(error);
+        if (environment) await serial(() => spawnEnvRecord(t, exec!, error));
         await fence(journal, exec, { park: a }); a.live = undefined;
-        if (!environmentSpawnError(error)) return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
+        if (!environment) return finish(journal, t.callId, exec, makeResult("failed", "", `Spawn failed: ${String(error)}`));
         await release(exec);
         await serial(() => spawnEnvFailed(t, exec!, cwd, error));
         await retryWait(a);
@@ -972,7 +1006,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const item = attentionEntries(all).find(e => e.item.call === call && e.item.qid === sleeping.qid && e.item.rev === sleeping.rev)?.item;
       const message = String(((f.envelope as Envelope).body as { message?: unknown } | undefined)?.message ?? "");
       // A new identity: the stale answer may still sit in the child's inbox under the forward's rid2.
-      await journal.append("answer-bound", { call, qid: sleeping.qid, rev: sleeping.rev, rid: f.rid, rid2: contentHash([String(f.rid2), "hibernated"]), hash: f.hash,
+      await journal.append("answer-bound", { event: true, call, qid: sleeping.qid, rev: sleeping.rev, rid: f.rid, rid2: contentHash([String(f.rid2), "hibernated"]), hash: f.hash,
         message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${message}` });
       await resolveBoundAnswer(journal, call, sleeping.qid, sleeping.rev);
       await journal.append("forward-retired", { rid: f.rid, rid2: f.rid2, reason: "bound-to-hibernation" });
@@ -1047,7 +1081,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             if (sleeping.qid !== req.cond?.qid || sleeping.rev !== req.cond?.rev) return { action: "reject", reason: "stale-rev" } as const;
             const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
             const item = attentionEntries(ctx.journal.entries()).find(e => e.item.call === dest && e.item.qid === sleeping.qid && e.item.rev === sleeping.rev)?.item;
-            await ctx.journal.append("answer-bound", { call: dest, qid: sleeping.qid, rev: sleeping.rev, rid: req.rid, rid2, hash, message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
+            // `event`: the `answered` event derives from this entry (an unmarked older one: from its resolution).
+            await ctx.journal.append("answer-bound", { event: true, call: dest, qid: sleeping.qid, rev: sleeping.rev, rid: req.rid, rid2, hash, message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
             await resolveBoundAnswer(ctx.journal, dest, sleeping.qid, sleeping.rev);
             active.get(dest)?.wake(); wake();
             return { action: "apply" } as const;
@@ -1061,13 +1096,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           // recorded and the next execution launches on it (`requestedModel`); its slot is acquired then, as for any launch.
           const idle = !exec || has(ctx.journal, JT.fenced, exec) || !has(ctx.journal, "selected", exec);
           // A pool's name asks for its first model that can take the call now: provider not used up, and (for a running
-          // call) a free slot. The call's own pool stays, so a used-up window later moves it on as before.
+          // call) a free slot; an entry with afterMs is skipped (it is for calls that waited for a slot), as failover
+          // skips it. The call's own pool stays, so a used-up window later moves it on as before.
           const pools = settings().pools, pool = pools && Object.hasOwn(pools, model) ? model : undefined;
           if (pool) {
             let models: Model[]; try { models = resolveModel(pool, pools); } catch { return { action: "reject", reason: "unknown-model" } as const; }
             const free = (p: string) => idle || holdings().some(h => h.exec === exec && h.pool === p) ||
               capacity({ kind: "provider", holders: holdings().filter(h => h.pool === p).length, capacity: settings().providers?.[p]?.slots ?? Infinity });
-            const m = models.find(m => m.provider && !unavailable(m.provider) && free(m.provider));
+            const m = models.find(m => m.provider && m.afterMs === undefined && !unavailable(m.provider) && free(m.provider));
             if (!m) return { action: "reject", reason: "pool-unavailable" } as const;
             model = `${m.provider}/${m.id}${m.thinking ? `:${m.thinking}` : ""}`;
           }

@@ -537,7 +537,10 @@ A call whose current execution asked a question (also while it hibernates
 until the answer) is `asking`, not waiting. Once its answer is bound, it is
 `queued` with `answered: "<qid>"` and no open question, retaining
 `hibernated: true` while it holds no slot until its next execution starts.
-It waits like any queued call (for a slot, the writer lock, ...). A drained call
+It waits like any queued call (for a slot, the writer lock, ...), except while
+a drain holds its workflow: then it waits for `resume`, not for a slot, and
+`status` does not say it waits for one. Its `answered` event is logged when the
+answer is bound. A drained call
 (no execution running) is never `silent`; a sealed call never waits. `provider-exhausted`, `writer-lock`, `lease` and `slot` are queues
 that clear by themselves; `silent` and `unconfirmed-stop` may need a look.
 
@@ -597,11 +600,15 @@ It must not depend on that caller's environment or lifetime:
 - **Its own scope on Linux.** A oneshot systemd unit, a cron job or a CI step
   ends every process in its cgroup when it finishes, a detached orchestrator
   included. On Linux with a systemd user manager (`systemd-run` on `PATH`,
-  `XDG_RUNTIME_DIR` set), the starter therefore runs it as
+  `XDG_RUNTIME_DIR` set) and lingering enabled for the user
+  (`loginctl enable-linger`, i.e. `/var/lib/systemd/linger/$USER` exists),
+  the starter therefore runs it as
   `systemd-run --user --scope --collect -- node <entry>`, in a transient
-  scope of its own, after a quick probe that such a scope works. Without
-  one (macOS, no systemd, a failing probe) it starts as a plain detached
-  process, as before. `DSA_SCOPE=off` turns the scope off.
+  scope of its own, after a quick probe that such a scope works. Otherwise
+  (macOS, no systemd, no lingering, a failing probe) it starts as a plain
+  detached process, as before: without lingering the user manager stops its
+  scopes at logout, while a detached process survives it under the usual
+  `KillUserProcesses=no`. `DSA_SCOPE=off` turns the scope off.
 - **A launch the environment breaks does not use up the call.** When a
   subagent's `pi` cannot be launched because it is missing or not
   executable (`ENOENT`, `EACCES`), the call does not fail: its slots are
@@ -713,7 +720,8 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   A nested pool's `afterMs` applies to every model it lists (the larger value
   wins when nested twice). It does not apply to a call that continues its own
   session's model or was asked for a model, and a running call that moves off
-  a used-up provider skips such entries.
+  a used-up provider skips such entries, as does a model send that names the
+  pool.
 - **A used-up provider** is not sent new calls until its next try, 15 minutes
   after it last refused (`"k": { "probeMs": 900000 }`). Then one call at a
   time goes to it, so finding out costs no extra request. A call that moved to
@@ -743,7 +751,12 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   then to the workflow origin (pi session or CLI) that holds fewer of that
   provider's slots, then to the call that has waited longest. A call yields
   only to waiters that found the provider full on a recent attempt, so a slot
-  never stays free. `status` names the holders per origin when more than one
+  is not held back for a waiter that has gone, though it can stay free for up
+  to about three tracker periods (`k.trackerMs`) until that waiter no longer
+  counts as recent. The
+  `afterMs` wait and the precedence of a call that ran before are computed
+  anew for each execution: a call launched again (after a loss or a launch
+  that failed) starts its wait over. `status` names the holders per origin when more than one
   holds a provider: `anthropic 4/4 (3 cli:alice@host, 1 session 01a11a3b)`.
 - **Memory:** new subagents wait while memory is short. Running ones are
   never stopped for memory.

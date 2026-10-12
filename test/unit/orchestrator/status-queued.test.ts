@@ -73,13 +73,54 @@ test("answer-bound clears asking in the waiting fold before a new execution exis
   assert.equal(waitsOf(f, env).get(call), undefined, "a drained continuation has no live execution");
 });
 
-test("answer-bound emits answered once even when the child later resolves the question", () => {
-  const rows = [...bound, entry(9, "attention-resolved", { id: item.id, rev: 1, resolution: "answered" })];
-  const ledger = [entry(1, "request", { request: { rid: "answer", from: "main:test", body: { message: "yes" } } })];
-  const events = rows.flatMap((_, i) => deriveEntry(wid, rows, i, ledger, {}));
-  const answers = events.filter(e => e.type === "answered");
-  assert.equal(answers.length, 1); assert.equal(answers[0]!.ts, bound.at(-1)!.ts);
+test("a drained (paused) answered call is not shown or counted as waiting for a slot", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-answered-paused-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const journal = await openJournal(journalPath(home, wid)), orch = await openJournal(orchLedger(home));
+  t.after(async () => { await journal.close(); await orch.close(); });
+  await orch.append("created", { wid, rid: "run", origin: "main:test" });
+  for (const { seq: _s, ts: _t, type, ...fields } of bound) await journal.append(type, fields);
+  const status = async (...args: string[]) => {
+    const lines: string[] = [];
+    assert.equal(await main(["status", ...args], { env: { DSA_HOME: home }, write: line => lines.push(line) }), 0);
+    return lines.join("\n");
+  };
+  const ledger = foldLedger(emptyLedger(), [entry(1, "config", { hash: "h", config: { providers: { p: { slots: 1 } } } }), entry(2, "hold", { pool: "p", exec: "other#1.1", slot: 0 })]);
+  const waits = (held?: (w: string) => boolean) => waitsOf(foldWaits(wid, bound), { now: 9000, ledger, ...(held ? { held } : {}) }).get(call)?.reason;
+  // Not drained: the note and the slot wait.
+  for (const args of [[wid], [], [wid, "--tail", "1"]]) assert.match(await status(...args), /queued \(answered, waiting for a slot\)/, args.join(" "));
+  assert.equal(waits(), "slot");
+  await orch.append("drain", {});
+  for (const args of [[wid], [], [wid, "--tail", "1"]]) {
+    const text = await status(...args);
+    assert.match(text, /a@1 queued/, args.join(" ")); assert.doesNotMatch(text, /answered, waiting for a slot/, args.join(" "));
+  }
+  assert.equal(waits(() => true), undefined, "a drained answered call waits for resume, not for a slot");
+});
+
+/** Events as the pump derives them (entry i when the journal had i+1 entries) and as a rebuild does (the whole journal). */
+function answeredEvents(rows: Entry[], ledger: Entry[]) {
+  const live = rows.flatMap((_, i) => deriveEntry(wid, rows.slice(0, i + 1), i, ledger, {}));
+  const rebuilt = rows.flatMap((_, i) => deriveEntry(wid, rows, i, ledger, {}));
+  assert.deepEqual(rebuilt, live, "a rebuild of the event log derives the same events");
+  return live.filter(e => e.type === "answered");
+}
+const answerRequest = [entry(1, "request", { request: { rid: "answer", from: "main:test", body: { message: "yes" } } })];
+const resolution = entry(9, "attention-resolved", { id: item.id, rev: 1, resolution: "answered" });
+
+test("a marked answer-bound emits answered at the binding; the later resolution emits nothing", () => {
+  const marked = { ...bound.at(-1)!, event: true } as Entry;
+  const answers = answeredEvents([...asked, marked, resolution], answerRequest);
+  assert.equal(answers.length, 1); assert.equal(answers[0]!.ts, marked.ts); assert.equal(answers[0]!.id, `${wid}:8:answered`);
   assert.equal((answers[0] as { length: number }).length, 3);
+});
+
+test("an unmarked (older) answer-bound followed by the repair's resolution emits answered once, at the resolution", () => {
+  const answers = answeredEvents([...bound, resolution], answerRequest);
+  assert.equal(answers.length, 1); assert.equal(answers[0]!.id, `${wid}:9:answered`);
+  assert.equal((answers[0] as { by: string }).by, "session:test"); assert.equal((answers[0] as { length: number }).length, 3);
+  // Without its resolution yet, an unmarked binding emits nothing.
+  assert.equal(answeredEvents(bound, answerRequest).length, 0);
 });
 
 for (const status of ["done", "failed", "stopped"] as const) test(`finished run ${status}: live follow-up has active and leads the text`, async t => {

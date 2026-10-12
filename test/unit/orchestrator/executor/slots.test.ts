@@ -1,6 +1,7 @@
 // Who gets a freed provider slot (resume before fresh, the origin holding fewer slots first) and pool entries that
 // wait (afterMs) before a call spills over to them. Spawning fails at once, so each admitted call seals failed and
-// frees its slot; the order of the `selected` entries is the order of admission.
+// frees its slot; the order of the provider `hold` entries in the orchestrator ledger (one ordered journal) is the
+// order of admission.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
@@ -51,8 +52,11 @@ async function ranBefore(journal: JournalHandle, ticket: CallTicket) {
   await journal.append(JT.exec, { call: ticket.callId, exec: `${ticket.callId}#1.1` });
   await journal.append(JT.fenced, { exec: `${ticket.callId}#1.1` });
 }
-const selectedOrder = (...journals: JournalHandle[]) =>
-  journals.flatMap(j => j.entries().filter(e => e.type === "selected")).sort((a, b) => a.ts - b.ts || 0).map(e => String(e.exec));
+/** The executions of these workflows that were admitted, in the order of their provider holds in the orchestrator ledger. */
+function admitted(orch: JournalHandle, ...journals: JournalHandle[]): string[] {
+  const selected = new Set(journals.flatMap(j => j.entries().filter(e => e.type === "selected").map(e => String(e.exec))));
+  return [...new Set(orch.entries().filter(e => e.type === "hold" && e.pool !== "memory" && selected.has(String(e.exec))).map(e => String(e.exec)))];
+}
 
 // A long tracker period: waiters attempt again only when woken, in the order they last attempted, so the test decides
 // which waiter attempts first after the slot frees.
@@ -75,12 +79,30 @@ for (const first of ["fresh", "resume"] as const) {
       assert.ok(f.lastAttempt(resumeExec) < f.lastAttempt(freshExec), "the resumed waiter attempts first when woken");
     }
     assert.deepEqual(f.attempts.at(-1)![1], ["probe"]);
-    assert.equal(selectedOrder(w.journal).length, 0, "a full provider admits nobody");
+    assert.equal(admitted(f.orch, w.journal).length, 0, "a full provider admits nobody");
     await f.executor.reconfigure!(async () => { await f.orch.append("release", { pool: "probe", slot: 0, exec: "elsewhere" }); });
     await Promise.all(runs);
-    assert.deepEqual(selectedOrder(w.journal), [resumeExec, freshExec]);
+    assert.deepEqual(admitted(f.orch, w.journal), [resumeExec, freshExec]);
   });
 }
+
+test("a call whose earlier executions only failed to launch (environment) is no resume: the longer wait decides", { timeout: 15000 }, async t => {
+  const f = await fixture(t, { providers: { probe: { slots: 1 } }, k: { trackerMs: 60000 } });
+  const w = await f.workflow("main:session-a");
+  const fresh = w.ticket("fresh"), retried = w.ticket("retried"), freshExec = `${fresh.callId}#1.1`, retriedExec = `${retried.callId}#1.2`;
+  // Its first execution never started: pi could not be launched.
+  await w.journal.append(JT.exec, { call: retried.callId, exec: `${retried.callId}#1.1` });
+  await w.journal.append("spawn-env-failed", { call: retried.callId, exec: `${retried.callId}#1.1`, command: "pi", error: "spawn pi ENOENT" });
+  await w.journal.append(JT.fenced, { exec: `${retried.callId}#1.1` });
+  await f.orch.append("hold", { pool: "probe", slot: 0, exec: "elsewhere" });
+  const runs = [f.executor.run(fresh)];
+  await until(() => f.attempted(freshExec) > 0);
+  runs.push(f.executor.run(retried));
+  await until(() => f.attempted(retriedExec) > 0 && f.lastAttempt(freshExec) >= 0);
+  await f.executor.reconfigure!(async () => { await f.orch.append("release", { pool: "probe", slot: 0, exec: "elsewhere" }); });
+  await Promise.all(runs);
+  assert.deepEqual(admitted(f.orch, w.journal), [freshExec, retriedExec]);
+});
 
 test("a freed slot goes to the workflow origin that holds fewer of the provider's slots", { timeout: 15000 }, async t => {
   const f = await fixture(t, { providers: { probe: { slots: 3 } }, k: { trackerMs: 60000 } });
@@ -97,7 +119,7 @@ test("a freed slot goes to the workflow origin that holds fewer of the provider'
   assert.ok(f.lastAttempt(busyExec) < f.lastAttempt(idleExec));
   await f.executor.reconfigure!(async () => { await f.orch.append("release", { pool: "probe", slot: 2, exec: "elsewhere" }); });
   await Promise.all(runs);
-  assert.deepEqual(selectedOrder(x.journal, y.journal), [idleExec, busyExec]);
+  assert.deepEqual(admitted(f.orch, x.journal, y.journal), [idleExec, busyExec]);
 });
 
 test("a waiter with precedence holds back only the providers it found full", { timeout: 15000 }, async t => {
@@ -108,7 +130,7 @@ test("a waiter with precedence holds back only the providers it found full", { t
   const runs = [f.executor.run({ ...resume, spec: { ...resume.spec, model: "other/m" } })];
   await until(() => f.attempted(`${resume.callId}#1.2`) > 0);
   runs.push(f.executor.run(fresh));
-  await until(() => selectedOrder(w.journal).includes(`${fresh.callId}#1.1`));
+  await until(() => admitted(f.orch, w.journal).includes(`${fresh.callId}#1.1`));
   assert.deepEqual(f.attempts.filter(([e]) => e === `${fresh.callId}#1.1`), [], "admitted at its first attempt");
   await f.executor.stop({ wid: w.wid, callId: resume.callId });
   await Promise.all(runs);
