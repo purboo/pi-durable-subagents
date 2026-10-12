@@ -261,6 +261,58 @@ for (const once of [true, false]) test(`P28 an answer given while a${once ? " on
   assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
 });
 
+// A call asked q1, a steer ended that ask, and it asked a reminder q2 while q1 was still open; it hibernated on q2.
+// The answer to q1 is not stale: it binds the hibernation and the call resumes with it. A follow-up generation then
+// re-opens neither question (they were asked by the earlier generation, whose child alone could take their answers).
+test("P28 an answer to an earlier open question binds a call hibernated on its reminder; the next generation re-opens neither", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 2000, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "First?" } }, { tool: "ask", args: { question: "Reminder?" } }, { text: "not resumed with the answer" }]));
+  const pending = f.executor.run(ticket);
+  const asked = (text: string) => f.journal.entries().find(e => e.type === JT.attention && (e.item as { text?: string }).text === text)?.item as { id: string; qid: string; rev: number } | undefined;
+  await until(() => !!asked("First?"));
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  await f.executor.forward({ rid: "steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "still waiting" } }, ctx);
+  await until(() => !!asked("Reminder?"));
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  const q1 = asked("First?")!, q2 = asked("Reminder?")!;
+  assert.equal(f.journal.entries().find(e => e.type === "hibernated")!.qid, q2.qid, "hibernated on the reminder");
+  const req: Request = { rid: "answer-q1", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: q1.qid, rev: q1.rev }, body: { to: ticket.callId, kind: "answer", message: "first answered " + script([{ text: "resumed with q1" }]) } };
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  const result = await pending;
+  assert.equal(result.status, "ok"); assert.equal(result.output, "resumed with q1");
+  const bound = f.journal.entries().filter(e => e.type === "answer-bound");
+  assert.equal(bound.length, 1); assert.equal(bound[0]!.qid, q1.qid);
+  assert.match(String(bound[0]!.message), /\nQuestion: First\?\nAnswer: first answered /);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === q1.id && e.resolution === "answered").length, 1);
+  const next: CallTicket = { ...ticket, gen: 2, callId: `${f.wid}@1/a@2`, continueFrom: ticket.callId, opening: { rid: "next", kind: "follow-up", message: script([{ text: "second" }]) } };
+  assert.equal((await f.executor.run(next)).status, "ok");
+  assert.deepEqual(f.journal.entries().filter(e => e.type === JT.attention && (e.item as { call?: string }).call === next.callId).map(e => (e.item as { text: string }).text), []);
+});
+
+test("P28 an undelivered answer to an earlier open question is adopted when the call hibernates on a later one", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 600000, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "First?" } }, { tool: "ask", args: { question: "Reminder?" } }, { text: "not resumed with the answer" }]));
+  const pending = f.executor.run(ticket);
+  const asked = (text: string) => f.journal.entries().find(e => e.type === JT.attention && (e.item as { text?: string }).text === text)?.item as { id: string; qid: string; rev: number } | undefined;
+  await until(() => !!asked("First?"));
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  await f.executor.forward({ rid: "steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "still waiting" } }, ctx);
+  await until(() => !!asked("Reminder?"));
+  // A restart cuts the asker off; the answer to q1 is forwarded in the gap and no child takes it.
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  const q1 = asked("First?")!;
+  const req: Request = { rid: "answer-q1", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: q1.qid, rev: q1.rev }, body: { to: ticket.callId, kind: "answer", message: "first answered " + script([{ text: "resumed with q1" }]) } };
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "ok"); assert.equal(result.output, "resumed with q1");
+  assert.equal(f.journal.entries().find(e => e.type === "hibernated")!.qid, asked("Reminder?")!.qid);
+  const bound = f.journal.entries().filter(e => e.type === "answer-bound");
+  assert.equal(bound.length, 1); assert.equal(bound[0]!.qid, q1.qid); assert.equal(bound[0]!.rid, "answer-q1");
+  assert.ok(f.journal.entries().some(e => e.type === "forward-retired" && e.rid === "answer-q1" && e.reason === "bound-to-hibernation"));
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+});
+
 test("P28/P12 a model send to a hibernated asker is recorded and its resumed execution launches on that model", { timeout: 30000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
   const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
