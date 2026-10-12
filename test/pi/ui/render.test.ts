@@ -48,6 +48,24 @@ function setup(submit?: UiDeps["submit"]) {
   return { data, screen, requests, notes, actions, open, closed: () => closed };
 }
 
+test("answered calls render as queued in list and watch without an answer action", async () => {
+  const { snapshotFromEntries } = await import("../../../src/orchestrator/snapshot.ts");
+  const { screen, data } = setup(), call = "w@1/a@1", exec = `${call}#1.1`;
+  const rows = [
+    ["wf-created", { revision: 1, origin: "main:test" }], ["call", { key: "a", gen: 1 }], ["exec", { call, exec }],
+    ["selected", { exec, model: { provider: "p", id: "m" } }],
+    ["attention", { item: { id: `q:${call}:q1`, rev: 1, kind: "question", text: "Choose?", wid: "w", call, qid: "q1" } }],
+    ["hibernated", { call, exec, qid: "q1", rev: 1 }], ["fenced", { exec }], ["answer-bound", { call, qid: "q1", rev: 1 }],
+  ] as const;
+  data.workflows = [snapshotFromEntries("w", rows.map(([type, fields], i) => ({ seq: i + 1, ts: now + i, type, ...fields })) as never)];
+  data.sessions.clear(); data.facts.clear();
+  assert.match(plain(screen, 120), /queued \(answered, waiting for a slot\)/);
+  assert.doesNotMatch(plain(screen, 120), /asking|a answer|Choose\?/);
+  screen.handleInput("\r");
+  assert.match(plain(screen, 120), /queued \(answered, waiting for a slot\)/);
+  assert.doesNotMatch(plain(screen, 120), /a answer|Choose\?/);
+});
+
 test("isolated pi components produce stable full-width list and watch captures", () => {
   const original = Date.now; Date.now = () => now;
   try {

@@ -32,13 +32,13 @@ export function callLine(args: Args): string {
   }
 }
 
-type StatusRow = { wid: string; name?: string; status: string; calls: { phase: string; status?: string }[]; attention?: { kind: string }[] };
+type StatusRow = { wid: string; name?: string; status: string; followUps?: number; calls: { phase: string; status?: string }[]; attention?: { kind: string }[] };
 /** UI §5: The collapsed result: started / applied / rejected, or one line per workflow for status. */
 export function resultLines(details: unknown): string[] {
   const d = (details ?? {}) as Record<string, unknown>;
   if (typeof d.wid === "string" && typeof d.key === "string" && typeof d.phase === "string") {
     const r = d.result as { status?: string } | undefined;
-    return [`${d.key} · ${r?.status ?? d.phase}${typeof d.model === "string" ? ` · ${d.model}` : ""}`];
+    return [`${d.key} · ${r?.status ?? (d.phase === "queued" && d.answered ? "queued (answered, waiting for a slot)" : d.phase)}${typeof d.model === "string" ? ` · ${d.model}` : ""}`];
   }
   if (typeof d.wid === "string" && !Array.isArray(d.calls)) return [`started workflow ${d.wid}`, ...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : [])];
   if (d.applied === true) return ["✓ applied"];
@@ -47,13 +47,13 @@ export function resultLines(details: unknown): string[] {
   const row = (w: StatusRow) => {
     const done = w.calls.filter(c => c.phase === "sealed").length, failed = w.calls.filter(c => c.status && c.status !== "ok").length;
     const asks = (w.attention ?? []).filter(a => a.kind === "question").length;
-    return `${w.name ?? short(w.wid)} · ${w.status} · ${done}/${w.calls.length} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}`;
+    return `${w.name ?? short(w.wid)} · ${w.followUps ? `follow-up running (run ${w.status})` : w.status} · ${done}/${w.calls.length} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}`;
   };
   if (Array.isArray(d.active)) {
     type Brief = { wid: string; name?: string; status: string; paused?: boolean; followUps?: number; progress: string; calls: { status?: string }[]; asking?: unknown[]; alerts?: unknown[] };
     const rows = (d.active as Brief[]).map(w => {
       const failed = w.calls.filter(c => c.status && c.status !== "ok").length, asks = w.asking?.length ?? 0, alerts = w.alerts?.length ?? 0;
-      return `${w.name ?? short(w.wid)} · ${w.paused ? "paused" : w.followUps ? `${w.status}, follow-up running` : w.status} · ${w.progress} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}${alerts ? ` · ${alerts} alert${alerts > 1 ? "s" : ""}` : ""}`;
+      return `${w.name ?? short(w.wid)} · ${w.paused ? "paused" : w.followUps ? `follow-up running (run ${w.status})` : w.status} · ${w.progress} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}${alerts ? ` · ${alerts} alert${alerts > 1 ? "s" : ""}` : ""}`;
     });
     const finished = Array.isArray(d.finished) ? d.finished.length + Number(d.olderFinished ?? 0) : 0;
     return [...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : []), ...(rows.length ? rows.slice(0, 6) : ["nothing running"]),

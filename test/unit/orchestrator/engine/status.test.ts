@@ -255,7 +255,7 @@ test('tool status: brief lists only what runs, asks or failed; one line per fini
   await ledger.close();
   const now = Date.now() + 15 * 60_000; // journal.append stamps entries with the real clock
   const brief = statusBrief(home, { origin: 'main:me', now });
-  assert.deepEqual(brief.active, [{ wid: '01R', name: 'wave', status: 'running', progress: '2/4+', tokens: '10',
+  assert.deepEqual(brief.active, [{ wid: '01R', name: 'wave', status: 'running', active: true, progress: '2/4+', tokens: '10',
     calls: [
       { key: 'bad', agent: 'x', phase: 'sealed', status: 'failed', error: 'Provider error: quota' },
       { key: 'run', agent: 'w', phase: 'running', model: 'p/m', for: '15m', quiet: '15m', tokens: '0' },
@@ -399,7 +399,7 @@ test('a run rid stands for its wid once the workflow exists; other values pass t
   assert.equal(widOfRid(ledger, 'main:s:8'), 'main:s:8');
 });
 
-test('P28 a hibernated asker shows hibernated until its answer is bound, and never after it ends', () => {
+test('P28 a hibernated asker holds no slot until its answered call runs, and never after it ends', () => {
   const call = 'w@1/a@1', exec = `${call}#1.1`;
   const asked = [
     e(1, 'wf-created', { revision: 1 }), e(2, 'call', { key: 'a', gen: 1, spec: { agent: 'x' } }),
@@ -416,7 +416,8 @@ test('P28 a hibernated asker shows hibernated until its answer is bound, and nev
   // A hibernation recorded for an earlier execution says nothing about the current one.
   assert.equal(snapshotFromEntries('w', [...asked, e(8, 'exec', { call, exec: `${call}#1.2` })]).calls[0]!.hibernated, undefined);
   const bound = [...asked, e(8, 'answer-bound', { call, qid: 'q1', rev: 1, rid: 'r', rid2: 'r2', message: 'yes', hash: 'h' }), e(9, 'attention-resolved', { id: `q:${call}:q1`, rev: 1 })];
-  assert.equal(snapshotFromEntries('w', bound).calls[0]!.hibernated, undefined);
+  assert.equal(snapshotFromEntries('w', bound).calls[0]!.hibernated, true);
+  assert.equal(snapshotFromEntries('w', bound).calls[0]!.answered, 'q1');
   assert.equal(snapshotFromEntries('w', [...asked, e(8, 'sealed', { call, exec, result: res('a', 'stopped') })]).calls[0]!.hibernated, undefined);
 });
 

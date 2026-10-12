@@ -4,7 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { callName, workflowName, doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, listRows, modelLabel, pendingText, resultPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { callName, workflowName, doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, listRows, modelLabel, pendingText, resultPhrase, statusPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
 import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
@@ -393,7 +393,7 @@ export class SubagentScreen implements Component {
     const tools = toolCount(facts?.tools), pending = pendingText(c.pending), rule = this.theme.fg("borderMuted", "─".repeat(size.width));
     const switching = c.switching ? ` → ${this.name(c.switching)} (requested)` : "";
     const head = [tabs, `${callName(w, c)} · ${this.name(facts?.model ?? c.model)} ▾${switching} · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
-      this.theme.fg("dim", this.spend(c, facts)), rule];
+      this.theme.fg("dim", this.spend(c, facts)), ...(c.phase === "queued" && c.answered ? [statusPhrase(c, w, facts, Date.now())] : []), rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
     const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
     const empty = new Input({ prompt: "", placeholder, placeholderStyle: text => this.theme.fg("dim", text) });

@@ -632,6 +632,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     if (recorded && !freshFork && !skip) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined };
     return { candidates, continuation: false, pool };
   }
+  /** Resolve a bound answer before it waits for admission; also repairs an interrupted append pair. Called serially. */
+  async function resolveBoundAnswer(journal: JournalHandle, call: string, qid: unknown, rev: unknown) {
+    const id = `q:${call}:${qid}`;
+    if (!journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === rev))
+      await journal.append(JT.attentionResolved, { id, rev, resolution: "answered" });
+  }
   async function questions(t: CallTicket, entries: SessionEntry[]) {
     await collectReceipts(t.callId, entries).catch(error => console.error(`durable-subagents: inbox cleanup of ${t.callId} failed: ${String(error)}`));
     await serial(async () => {
@@ -641,8 +647,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const id = `q:${t.callId}:${qid}`;
         if (!entriesOf(t.journal, JT.attention).some(r => isEntry(r, JT.attention) && r.item.id === id && r.item.rev === rev))
           await t.journal.append(JT.attention, { item: { id, rev, kind: "question", text: String(question), wid: t.wid, call: t.callId, qid, session: callSession(home, t.wid, t.key, t.gen) } });
-        if (digest.answered.has(answerKey(qid, rev)) && !entriesOf(t.journal, JT.attentionResolved).some(r => r.id === id && r.rev === rev))
-          await t.journal.append(JT.attentionResolved, { id, rev, resolution: "answered" });
+        if (digest.answered.has(answerKey(qid, rev)) || t.journal.entries().some(e => e.type === "answer-bound" && e.call === t.callId && e.qid === qid && e.rev === rev))
+          await resolveBoundAnswer(t.journal, t.callId, qid, rev);
       }
     });
   }
@@ -926,6 +932,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       // A new identity: the stale answer may still sit in the child's inbox under the forward's rid2.
       await journal.append("answer-bound", { call, qid: sleeping.qid, rev: sleeping.rev, rid: f.rid, rid2: contentHash([String(f.rid2), "hibernated"]), hash: f.hash,
         message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${message}` });
+      await resolveBoundAnswer(journal, call, sleeping.qid, sleeping.rev);
       await journal.append("forward-retired", { rid: f.rid, rid2: f.rid2, reason: "bound-to-hibernation" });
       await (await outbox).markResolved(String(f.rid2));
     });
@@ -984,7 +991,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           return { action: "apply" } as const;
         }
         const boundRetry = ctx.journal.entries().find(e => e.type === "answer-bound" && e.call === dest && e.rid === req.rid);
-        if (boundRetry) return boundRetry.hash === hash ? { action: "apply" } as const : { action: "reject", reason: "identity-conflict" } as const;
+        if (boundRetry) {
+          if (boundRetry.hash !== hash) return { action: "reject", reason: "identity-conflict" } as const;
+          await resolveBoundAnswer(ctx.journal, dest, boundRetry.qid, boundRetry.rev);
+          return { action: "apply" } as const;
+        }
         if (sealed(ctx.journal, dest)) return { action: "reject", reason: req.kind === "send" && (req.body as SendBody).kind === "answer" ? "retired" : "call-sealed" } as const;
         if (req.kind === "send" && (req.body as SendBody).kind === "answer") {
           const sleeping = hibernation(ctx.journal, dest);
@@ -995,6 +1006,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
             const item = attentionEntries(ctx.journal.entries()).find(e => e.item.call === dest && e.item.qid === sleeping.qid && e.item.rev === sleeping.rev)?.item;
             await ctx.journal.append("answer-bound", { call: dest, qid: sleeping.qid, rev: sleeping.rev, rid: req.rid, rid2, hash, message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
+            await resolveBoundAnswer(ctx.journal, dest, sleeping.qid, sleeping.rev);
             active.get(dest)?.wake(); wake();
             return { action: "apply" } as const;
           }
