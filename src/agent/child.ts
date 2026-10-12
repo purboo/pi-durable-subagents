@@ -81,16 +81,17 @@ export function registerChild(pi: ExtensionAPI): void {
     // Scan is asynchronous: recheck before using the idle delivery API.
     if (!active || (mode === 'idle' && !ctx.isIdle())) return [];
     let delivered = false;
-    // Revisions answered by a decision of this intake count as answered for the rest of it (one delivery each, D3).
-    const taken = new Set<string>();
-    const closed = () => new Set([...state.answered, ...state.superseded, ...taken]);
+    // Revisions answered (taken) or superseded (planned) by a decision of this intake are closed for the rest of it:
+    // one delivery each (D3), and no answer to a question an earlier decision of the same intake superseded (D2).
+    const taken = new Set<string>(), planned = new Set<string>();
+    const closed = () => new Set([...state.answered, ...state.superseded, ...taken, ...planned]);
     const open = (q: Cond) => openness({ open: [...state.questions.values()], closed: closed() }, q);
     const pending = (req: { rid: string }, view: { resolved: ReadonlyMap<string, unknown>; tombstones: ReadonlySet<string>; admitted: ReadonlyMap<string, unknown> }) =>
       view.admitted.has(req.rid) && !view.resolved.has(req.rid) && !view.tombstones.has(req.rid);
     // An answer to an open question (or a bound continue, P28) that waits to be delivered.
     const waiting = (req: Request, view: Parameters<typeof pending>[1]) => {
       const q = answers(req);
-      return !!q && pending(req, view) && (open(q) || req.kind === 'continue' && !state.questions.has(q.qid));
+      return !!q && pending(req, view) && open(q);
     };
     const plans = planDecisions(state.records, candidates, (req, view) => {
       if (req.to !== call) return { action: 'reject', reason: 'wrong-recipient' };
@@ -101,19 +102,20 @@ export function registerChild(pi: ExtensionAPI): void {
       if (q) {
         const key = `${q.qid}@${q.rev}`;
         if (state.answered.has(key) || taken.has(key)) return { action: 'reject', reason: 'already-answered' };
-        if (state.superseded.has(key)) return { action: 'reject', reason: 'stale-rev' };
-        if (!open(q)) {
-          if (req.kind === 'answer') return { action: 'reject', reason: 'stale-rev' };
-        } else {
-          if (delivered && mode !== 'boundary' && mode !== 'settle') return { action: 'defer' };
-          // A blocked ask prefers its own answer when answers to several open questions wait.
-          if (mode === 'ask' && blocked && !(q.qid === blocked.qid && q.rev === blocked.rev) && candidates.some(other => pending(other, view) &&
-            answers(other)?.qid === blocked!.qid && answers(other)?.rev === blocked!.rev)) return { action: 'defer' };
-          // Follow-ups ordered before it enter first (fix C): at a boundary they ride ahead (below); here it waits.
-          if (mode !== 'ask' && candidates.some(other => other.kind === 'follow-up' && pending(other, view) && view.order.get(other.rid)! < view.order.get(req.rid)!))
-            return { action: 'defer' };
-          delivered = true; taken.add(key); return { action: 'apply' };
-        }
+        // Not open: superseded, an older revision, or a question this generation did not ask. A bound continue too: the
+        // orchestrator binds the latest revision it observed, and the child may have asked again meanwhile (V4).
+        if (!open(q)) return { action: 'reject', reason: 'stale-rev' };
+        if (delivered && mode !== 'boundary' && mode !== 'settle') return { action: 'defer' };
+        // A blocked ask prefers its own answer when answers to several open questions wait.
+        if (mode === 'ask' && blocked && !(q.qid === blocked.qid && q.rev === blocked.rev) && candidates.some(other => pending(other, view) &&
+          answers(other)?.qid === blocked!.qid && answers(other)?.rev === blocked!.rev)) return { action: 'defer' };
+        // Follow-ups ordered before it enter first (fix C): at a boundary they ride ahead (below); here it waits.
+        if (mode !== 'ask' && candidates.some(other => other.kind === 'follow-up' && pending(other, view) && view.order.get(other.rid)! < view.order.get(req.rid)!))
+          return { action: 'defer' };
+        delivered = true; taken.add(key);
+        for (const s of supersededOf(req)) planned.add(`${s.qid}@${s.rev}`);
+        if (mode === 'ask' && blocked && !(q.qid === blocked.qid && q.rev === blocked.rev)) planned.add(`${blocked.qid}@${blocked.rev}`);
+        return { action: 'apply' };
       }
       if (mode === 'ask' && (req.kind !== 'steer' || delivered)) return { action: 'defer' };
       if (req.kind === 'model') {

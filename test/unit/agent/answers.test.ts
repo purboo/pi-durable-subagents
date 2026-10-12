@@ -148,3 +148,23 @@ test('D2: a bound continue names the question its hibernated asker superseded', 
   await c.boundary();
   assert.equal(c.rejected('a2'), 'stale-rev');
 });
+
+test('fix2-4: one intake that delivers a bound continue superseding q2 refuses a queued answer to q2', async t => {
+  const c = await child(t, { q1: 'First?', q2: 'Reminder?' });
+  await c.start();
+  await c.send('bound', 'continue', { message: 'Question: First?\nAnswer: one', superseded: [{ qid: 'q2', rev: 1 }] }, { qid: 'q1', rev: 1 });
+  await c.send('a2', 'answer', { message: 'late' }, { qid: 'q2', rev: 1 });
+  const entries = await c.boundary();
+  assert.deepEqual(entries.filter(e => e.type === 'custom_message').map(e => e.details.rid), ['bound']);
+  assert.equal(c.rejected('a2'), 'stale-rev');
+});
+
+test('fix2-5: a bound continue for an older revision of a question asked again is refused like any stale answer', async t => {
+  const c = await child(t, { q1: 'First?' });
+  c.history.push({ type: 'custom', customType: CT.question, data: { qid: 'q1', rev: 2, question: 'First?' } });
+  await c.start();
+  await c.send('bound', 'continue', { message: 'Question: First?\nAnswer: one' }, { qid: 'q1', rev: 1 });
+  const entries = await c.boundary();
+  assert.deepEqual(entries.filter(e => e.type === 'custom_message').map(e => e.details.rid), []);
+  assert.equal(c.rejected('bound'), 'stale-rev');
+});

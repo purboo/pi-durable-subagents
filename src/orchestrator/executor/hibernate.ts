@@ -34,7 +34,14 @@ export function openAsked(entries: readonly Entry[], call: string, qid: unknown,
   if (typeof qid !== "string" || typeof rev !== "number") return false;
   const id = `q:${call}:${qid}`, items = attentionEntries(entries, id);
   return items.some(e => e.item.rev === rev) && !items.some(e => e.item.rev > rev) &&
-    !entries.some(e => e.type === JT.attentionResolved && e.id === id && e.rev === rev);
+    !entries.some(e => e.type === JT.attentionResolved && e.id === id && e.rev === rev) && !supersededByBinding(entries, call, qid, rev);
+}
+
+/** D2: qid@rev of `call` was superseded by a durable binding: an `answer-bound` names it in `superseded`. The binding is
+ *  the source of truth; the attention resolution `superseded` is derived from it (and may lag it across a crash). */
+export function supersededByBinding(entries: readonly Entry[], call: string, qid: unknown, rev: unknown): boolean {
+  return entries.some(e => e.type === "answer-bound" && e.call === call && Array.isArray(e.superseded) &&
+    (e.superseded as { qid?: unknown; rev?: unknown }[]).some(s => s?.qid === qid && s?.rev === rev));
 }
 
 /** P28: The answer bound to hibernation `sleeping`: to its question, or (bound after it) to another open question. */
