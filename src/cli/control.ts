@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { mkdir, readdir } from "node:fs/promises";
 import { hostname, userInfo } from "node:os";
 import { join } from "node:path";
@@ -8,6 +7,7 @@ import { Outbox, scanInbox } from "../kernel/mailbox.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
+import { launchOrchestrator } from "../platform/launch.ts";
 import { orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { unfinishedWorkflow } from "../agent/main/snapshots.ts";
 import { cliInitiator } from "./restart.ts";
@@ -16,17 +16,17 @@ import { JT, type Conditions, type DrainBody, type PruneBody, type Request, type
 import { RequestsBusy, sendIdentified, type Identified } from "../requests.ts";
 
 export type Control = "resume" | "drain" | "stop" | "stop-all" | "prune" | "restart";
-/** P1: Start the detached orchestrator only after probing its OS lock. */
+/** P1: Start the detached orchestrator only after probing its OS lock (platform/launch.ts: pi resolved here, its own
+ *  scope). Throws PiNotFound, starting nothing, when this environment has no pi: an orchestrator started here could
+ *  launch no subagent, and a request already published stays pending for the next starter that has pi. A replaced
+ *  entry (DSA_ORCHESTRATOR_ENTRY) may not launch pi at all and is started regardless. */
 export async function startOrchestrator(home: string, env: NodeJS.ProcessEnv): Promise<void> {
   const lock = await new OsLock().tryAcquire(orchLock(home));
   if (!lock) return;
   await lock.release();
   const entry = env.DSA_ORCHESTRATOR_ENTRY ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../orchestrator/main.ts" : "../orchestrator/main.js", import.meta.url));
   // The orchestrator serves every session: it never carries the starting pi session's $DSA_SESSION to its children.
-  const { DSA_SESSION: _session, ...rest } = env;
-  const child = spawn(process.execPath, [entry], { detached: true, stdio: "ignore", env: { ...rest, DSA_HOME: home } });
-  await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
-  child.unref();
+  await launchOrchestrator(entry, env, { home, requirePi: !env.DSA_ORCHESTRATOR_ENTRY });
 }
 /** P1, P38: Requests addressed to the orchestrator that some sender recorded as sent and that neither the sender nor the
  *  ledger has resolved. Read-only: other senders' outboxes are never modified here. */

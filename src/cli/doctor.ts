@@ -10,6 +10,7 @@ import { scanInbox } from "../kernel/mailbox.ts";
 import { OsLock } from "../platform/lock.ts";
 import { journalPath, orchInbox, orchLedger, orchLock } from "../paths.ts";
 import { runningStats, snapshotFromEntries } from "../orchestrator/snapshot.ts";
+import { emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
 import { statsLine, type OrchestratorStats } from "../orchestrator/stats.ts";
 import { diskUsage } from "../orchestrator/store.ts";
 import { JT, isEntry } from "../types.ts";
@@ -28,6 +29,11 @@ export interface DoctorReport {
   orphanStaging: string[];
   tmpFiles: string[];
   orchestrator: "running" | "not running" | "unknown";
+  /** The pi the last orchestrator launches subagents with (null: none was found; absent: not recorded). */
+  pi?: string | null;
+  /** How the last orchestrator ended: its recorded exit reason, or "unrecorded" when it is gone without one (killed
+   *  outright or crashed). Absent while it runs or when nothing is known. */
+  lastExit?: { reason: string; ageMs: number; signal?: string; error?: string };
   /** What the running orchestrator costs (see status --json), when it published it. */
   orchestratorStats?: OrchestratorStats;
   service: "installed" | "not installed" | "unavailable";
@@ -57,6 +63,13 @@ export async function doctor(home: string, env: NodeJS.ProcessEnv = process.env,
   const pruned = new Set(ledger.filter(e => e.type === "pruned").map(e => String(e.wid)));
   const report: DoctorReport = { home, bytes: await diskUsage(home), workflows: {}, ledger: { entries: ledger.length, bytes: await diskUsage(orchLedger(home)) },
     largestJournals: [], parked: [], attention: [], fenceFailed: [], orphanStaging: [], tmpFiles: [], orchestrator: await lockHeld(home), service: "unavailable", findings: [], ...runningStats(home) };
+  const last = foldLedger(emptyLedger(), ledger), o = last.orchestrator;
+  if (o && o.pi !== undefined) report.pi = o.pi;
+  if (o && report.orchestrator === "not running") {
+    const exit = last.lastExit?.pid === o.pid ? last.lastExit : undefined;
+    if (exit) report.lastExit = { reason: exit.reason, ageMs: now - exit.ts, ...(exit.signal ? { signal: exit.signal } : {}), ...(exit.error ? { error: exit.error } : {}) };
+    else if (!o.exited) report.lastExit = { reason: "unrecorded", ageMs: now - o.ts };
+  }
   const journals: { wid: string; bytes: number }[] = [];
   for (const wid of (await names(join(home, "w"))).filter(n => !n.startsWith(".") && !pruned.has(n)).sort()) {
     const entries = readJournalSnapshot(journalPath(home, wid)), snap = snapshotFromEntries(wid, entries);
@@ -116,6 +129,12 @@ export function age(ms: number): string {
   const m = Math.floor(ms / 60_000), h = Math.floor(m / 60), d = Math.floor(h / 24);
   return d ? `${d}d ${h % 24}h` : h ? `${h}h ${m % 60}m` : `${m}m`;
 }
+/** "last exit: idle 5m ago", "last exit: signal SIGTERM 2h ago", "last exit: error (message) 1m ago", "last exit
+ *  unrecorded (killed or crashed), started 3h ago". */
+export function exitLine(x: NonNullable<DoctorReport["lastExit"]>): string {
+  if (x.reason === "unrecorded") return `no exit recorded (killed or crashed), started ${age(x.ageMs)} ago`;
+  return `last exit: ${x.reason}${x.signal ? ` ${x.signal}` : ""}${x.error ? ` (${x.error})` : ""} ${age(x.ageMs)} ago`;
+}
 /** Housekeeping: Render the report; one suggested command per actionable finding. */
 export function renderDoctor(r: DoctorReport): string {
   const counts = Object.entries(r.workflows).sort(([a], [b]) => a < b ? -1 : 1);
@@ -131,7 +150,8 @@ export function renderDoctor(r: DoctorReport): string {
     ...list("unresolved fence failures", r.fenceFailed, f => `${f.wid} ${f.exec} ${age(f.ageMs)}`),
     ...list("orphan staging", r.orphanStaging, s => s),
     ...list("leftover tmp files", r.tmpFiles, s => s),
-    `orchestrator: ${r.orchestrator === "running" ? "running (holds the lock)" : r.orchestrator}${r.orchestratorStats ? `; ${statsLine(r.orchestratorStats)}` : ""}`,
+    `orchestrator: ${r.orchestrator === "running" ? "running (holds the lock)" : r.orchestrator}${r.lastExit ? `; ${exitLine(r.lastExit)}` : ""}${r.orchestratorStats ? `; ${statsLine(r.orchestratorStats)}` : ""}`,
+    ...(r.pi !== undefined ? [`pi: ${r.pi ?? "not found (subagents launch \`pi\` from PATH; set DSA_PI_BIN)"}`] : []),
     `service: ${r.service}`,
     ...(r.findings.length ? [`${r.findings.length} actionable finding(s):`, ...r.findings.flatMap(f => [`  ${f.kind}: ${f.detail}`, `    ${f.command}`])] : ["nothing actionable"]),
   ].join("\n");

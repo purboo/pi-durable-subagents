@@ -5,7 +5,8 @@
 //   provider-*: used-up usage windows (providers.ts).
 //   config{hash,config}: the orchestrator settings in effect from here; config-rejected{error,hash?}: a change of
 //     config.json refused, while the earlier settings stay (cleared by the next config record).
-//   orchestrator{version,pid} / orchestrator-exit{pid}: the orchestrator running (its package version) and its exit.
+//   orchestrator{version,pid,pi?} / orchestrator-exit{pid,reason?,signal?,error?}: the orchestrator running (its package
+//     version, the pi it launches) and its exit (why: idle, restart, signal, error).
 //   restart{rid,force,reason?,initiator?,from?,live}: accepted restart; the next start consumes its status provenance.
 //     Old records lack reason/initiator/from and remain readable (A1).
 //   writer-hold/writer-release{root,call}: the writer lock of a worktree root, held by one call until it ends.
@@ -28,7 +29,9 @@ export interface LedgerState {
   rejected?: { error: string; ts: number };
   /** `restart`: it decides restart requests (1.0.18+); an older one is checked and ended by the client instead. */
   pendingRestart?: RestartAudit;
-  orchestrator?: { version: string; pid: number; start?: string; ts: number; exited?: true; restart?: true; forceRestart?: RestartAudit };
+  orchestrator?: { version: string; pid: number; start?: string; ts: number; exited?: true; restart?: true; forceRestart?: RestartAudit; pi?: string | null };
+  /** The last recorded exit of an orchestrator, and why (absent in ledgers older than exit reasons). */
+  lastExit?: { pid: number; ts: number; reason: string; signal?: string; error?: string };
 }
 
 export function emptyLedger(): LedgerState {
@@ -45,12 +48,15 @@ export function applyLedger(state: LedgerState, e: Entry): void {
   else if (isEntry(e, "config-rejected")) state.rejected = { error: String(e.error), ts: e.ts };
   else if (e.type === "restart") state.pendingRestart = e.force === true ? { ts: e.ts, reason: e.reason as string | undefined, initiator: e.initiator as RestartInitiator | undefined, from: e.from as string | undefined } : undefined;
   else if (isEntry(e, "orchestrator")) {
-    state.orchestrator = { version: String(e.version), pid: Number(e.pid), ...(e.start ? { start: String(e.start) } : {}), ts: e.ts, ...(e.restart === true ? { restart: true as const } : {}), ...(state.pendingRestart ? { forceRestart: state.pendingRestart } : {}) };
+    state.orchestrator = { version: String(e.version), pid: Number(e.pid), ...(e.start ? { start: String(e.start) } : {}), ts: e.ts, ...(e.pi !== undefined ? { pi: e.pi } : {}), ...(e.restart === true ? { restart: true as const } : {}), ...(state.pendingRestart ? { forceRestart: state.pendingRestart } : {}) };
     delete state.pendingRestart;
   }
   else if (e.type === "writer-hold") { if (!state.writers.has(String(e.root))) state.writers.set(String(e.root), { call: String(e.call), ts: e.ts }); }
   else if (e.type === "writer-release") { if (state.writers.get(String(e.root))?.call === e.call) state.writers.delete(String(e.root)); }
-  else if (isEntry(e, "orchestrator-exit")) { if (state.orchestrator?.pid === e.pid) state.orchestrator.exited = true; }
+  else if (isEntry(e, "orchestrator-exit")) {
+    if (state.orchestrator?.pid === e.pid) state.orchestrator.exited = true;
+    if (e.reason) state.lastExit = { pid: e.pid, ts: e.ts, reason: e.reason, ...(e.signal ? { signal: e.signal } : {}), ...(e.error ? { error: e.error } : {}) };
+  }
   foldExhaustion(state.exhausted, e);
 }
 
@@ -58,7 +64,7 @@ export function applyLedger(state: LedgerState, e: Entry): void {
  *  folded so far (shorter, or another entry where the last folded one was) is folded from the start. */
 export function foldLedger(state: LedgerState, entries: readonly Entry[]): LedgerState {
   // Journal readers keep the entry objects of a ledger as it grows (kernel/journal.ts), so identity tells them apart.
-  if (state.seen && entries[state.seen - 1] !== state.last) Object.assign(state, emptyLedger(), { config: undefined, rejected: undefined, orchestrator: undefined, pendingRestart: undefined, last: undefined });
+  if (state.seen && entries[state.seen - 1] !== state.last) Object.assign(state, emptyLedger(), { config: undefined, rejected: undefined, orchestrator: undefined, pendingRestart: undefined, last: undefined, lastExit: undefined });
   for (; state.seen < entries.length; state.seen++) applyLedger(state, entries[state.seen]!);
   state.last = entries[state.seen - 1];
   return state;

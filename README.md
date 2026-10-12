@@ -572,6 +572,54 @@ read, in a burst each time a call ends), `pid` and `at` (when it was
 written). The orchestrator writes these to `orchestrator-stats.json` every
 10 s; they are shown only while that process runs.
 
+### Where the orchestrator starts
+
+Whatever needs it first starts the orchestrator: a pi session, a CLI
+command, the optional service, or the orchestrator itself after a restart.
+It must not depend on that caller's environment or lifetime:
+
+- **pi is resolved once, by the starter.** `DSA_PI_BIN` when set (it must
+  be the absolute path of an executable file), else the first `pi` on the
+  starter's `PATH` (a package-manager shim stays the shim). The orchestrator
+  receives it as `DSA_PI_BIN` and launches every subagent with that path, not
+  with whatever `pi` its inherited `PATH` finds. Its start records it in the
+  ledger (`orchestrator{pi}`, `null` when none was found) and `doctor` shows
+  it as `pi: <path>`.
+- **The CLI does not start an orchestrator without pi.** When neither
+  `DSA_PI_BIN` nor `PATH` has one, the command fails with an error naming
+  both; a request it already sent stays pending and runs once an orchestrator
+  starts from an environment that has pi (any pi session starts one). A pi
+  session starts it regardless; the orchestrator then looks pi up on its own
+  `PATH`. `install-service` writes the `pi` it finds into the service as
+  `DSA_PI_BIN`, since a service manager's `PATH` rarely has it.
+- **Its own scope on Linux.** A oneshot systemd unit, a cron job or a CI step
+  ends every process in its cgroup when it finishes, a detached orchestrator
+  included. On Linux with a systemd user manager (`systemd-run` on `PATH`,
+  `XDG_RUNTIME_DIR` set), the starter therefore runs it as
+  `systemd-run --user --scope --collect -- node <entry>`, in a transient
+  scope of its own, after a quick probe that such a scope works. Without
+  one (macOS, no systemd, a failing probe) it starts as a plain detached
+  process, as before. `DSA_SCOPE=off` turns the scope off.
+- **A launch the environment breaks does not use up the call.** When a
+  subagent's `pi` cannot be launched because it is missing or not
+  executable (`ENOENT`, `EACCES`), the call does not fail: its slots are
+  released, it stays queued, its workflow journal records
+  `spawn-env-failed{exec,command,error}`, and one `environment` alert says
+  what failed, which `pi` it ran and how to fix it. The launch is retried
+  every minute, and at once when the orchestrator restarts; the alert is
+  resolved when a launch works. Stop the call to give up. Other launch
+  errors still fail the call.
+- **Every exit says why.** The ledger's `orchestrator-exit` carries
+  `reason`: `idle` (no work for `k.idleExitMs`), `restart` (an applied
+  restart request), `signal` (with `signal`, e.g. `SIGTERM`) or `error`
+  (with the clipped `error`). A process killed outright (SIGKILL, a crash)
+  records nothing. While none runs, `doctor` shows
+  `orchestrator: not running; last exit: signal SIGTERM 5m ago`, or
+  `no exit recorded (killed or crashed)`.
+- Temporary files of interrupted writes (a full disk, say) are removed when
+  a write fails, and the orchestrator's start removes those older than
+  10 minutes from `$DSA_HOME/bin`.
+
 ### Resource leases
 
 Benchmarks, timing measurements and big builds need the machine to

@@ -57,9 +57,10 @@ export interface EntryFields {
   config: { hash: string; config: Record<string, unknown> };
   "config-rejected": { error: string; hash?: string };
   /** The orchestrator that holds the lock from here: its package version and process. */
-  orchestrator: { version: string; pid: number; start?: string };
-  /** That orchestrator exits (a crash records nothing; readers check the process too). */
-  "orchestrator-exit": { pid: number };
+  orchestrator: { version: string; pid: number; start?: string; pi?: string | null };
+  /** That orchestrator exits, and why (a crash records nothing; readers check the process too; older ones have no
+   *  reason). `signal` names the signal, `error` is the clipped message. */
+  "orchestrator-exit": { pid: number; reason?: "idle" | "restart" | "signal" | "error"; signal?: string; error?: string };
 }
 export type EntryOf<T extends keyof EntryFields> = Entry<T> & EntryFields[T];
 /** Narrow an entry to its type's fields (their shape is the writer's contract, not checked at runtime). */
@@ -264,7 +265,7 @@ export interface ReportArgs { outcome: "ok" | "failed"; summary?: string; data?:
 export interface AttentionItem {
   id: string;
   rev: number;
-  kind: "question" | "finished" | "stall" | "unknown" | "budget" | "conflict";
+  kind: "question" | "finished" | "stall" | "unknown" | "budget" | "conflict" | "environment";
   /** Human-readable one-liner shown to the main agent. */
   text: string;
   wid: Wid;
