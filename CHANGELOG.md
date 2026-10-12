@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.36
+
+- Slot precedence among waiting calls. When a provider slot frees, a call resuming earlier work (an answered
+  question, a follow-up, a recovery) is admitted before a fresh call; among equals the origin holding fewer slots of
+  that provider goes first, then the longest waiter. A waiter holds a slot back from others only while it is still
+  trying; one that is gone (stopped, interrupted, or silent for about 3 tracker periods) is ignored.
+- Pool entries can wait before a pool spills over to them: `{"model": "provider/id", "afterMs": 600000}` is used only
+  after the call has waited that long for the entries before it. Failover and a model request that names the pool
+  skip such entries. The wait and the resume precedence are recomputed for each execution.
+- `status` names the slot holders of a provider by origin when more than one origin holds it.
+- An answered question no longer shows its call as `asking` while the call waits for a slot: it is `queued` with
+  `answered: "<qid>"` (and still `hibernated`). The question's attention resolves when the answer is bound, and the
+  `answered` event is emitted then (journals written before 1.0.36 still emit it once, at resolution).
+- A follow-up running on a finished run shows `active: true`. `status` keeps meaning the run's result, so scripts that
+  read it are unaffected; the text renderings lead with `follow-up running (run done)`.
+- The orchestrator no longer depends on whoever started it. The starter resolves `pi` to an absolute path and passes
+  it as `DSA_PI_BIN`; `run` and `send` refuse with exit 75 when no `pi` can be found, and the submitted request stays
+  pending. On Linux with a lingering systemd user manager the orchestrator runs in its own transient scope, so the end
+  of a oneshot unit, cron job or CI step does not end it. Subagents get the orchestrator's node directory on their
+  PATH.
+- A launch that fails because `pi` is missing or not executable (ENOENT, EACCES) keeps the call queued, raises one
+  `environment` alert, releases its slots and retries every 60 s (at once after a restart). Only one dispatch message
+  is pending however many retries fail. Other launch failures stay terminal.
+- The orchestrator records why it exited (idle, restart, signal, error); `doctor` shows the last reason. Stale
+  temporary files in `$DSA_HOME/bin` are removed at start.
+
 ## 1.0.35
 
 - Generation openings of one workflow are serialized. The reopen of undelivered follow-ups at orchestrator start, the
