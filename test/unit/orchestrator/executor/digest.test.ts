@@ -38,8 +38,11 @@ function check(fold: SessionFold, entries: SessionEntry[], at: string) {
   const receipts = new Map<string, SessionEntry>();
   for (const e of entries) { const rid = receiptId(e); if (rid && !receipts.has(rid) && !(e.customType === CT.rejected && e.data?.reason === 'identity-conflict')) receipts.set(rid, e); }
   assert.deepEqual([...s.receipts], [...receipts], `receipts ${at}`);
-  const questions = entries.filter(e => e.type === 'custom' && e.customType === CT.question && e.data && typeof e.data.qid === 'string' && typeof e.data.rev === 'number')
-    .map(e => ({ qid: e.data!.qid, rev: e.data!.rev, question: e.data!.question }));
+  let own = false;
+  const questions = entries.filter(e => {
+    if (e.type === 'custom' && e.customType === CT.exec) own = String(e.data?.exec).startsWith(`${call}#`);
+    return own && e.type === 'custom' && e.customType === CT.question && e.data && typeof e.data.qid === 'string' && typeof e.data.rev === 'number';
+  }).map(e => ({ qid: e.data!.qid, rev: e.data!.rev, question: e.data!.question }));
   assert.deepEqual(s.questions, questions, `questions ${at}`);
   for (const q of questions) {
     const answered = entries.some(r => { const d = r.message?.details ?? r.details; return d?.qid === q.qid && d?.rev === q.rev && receiptId(r) !== undefined; });

@@ -12,7 +12,9 @@ export interface SessionDigest {
   usage: { id: string; usage: Usage }[];
   /** First receipt entry of each request id, without identity-conflict rejections (collectReceipts, forwardsDelivered). */
   receipts: Map<string, SessionEntry>;
-  /** Well-formed question entries (custom question with a string qid and numeric rev), in session order. */
+  /** Well-formed question entries (custom question with a string qid and numeric rev) in segments opened by this call's
+   *  executions, in session order. A question an earlier generation (or another call) asked is not this call's: its
+   *  child recovers only its own questions (child/history.ts) and rejects an answer to another as stale. */
   questions: Question[];
   /** JSON [qid, rev] of every entry whose details carry qid and rev and that is a receipt (an answer). */
   answered: Set<string>;
@@ -62,7 +64,7 @@ export class SessionFold {
         s.questionAt.set(e.data?.qid, i);
         if (e.type === "custom") {
           s.lastQuestion = i;
-          if (e.data && typeof e.data.qid === "string" && typeof e.data.rev === "number") s.questions.push({ qid: e.data.qid, rev: e.data.rev, question: e.data.question });
+          if (this.own && e.data && typeof e.data.qid === "string" && typeof e.data.rev === "number") s.questions.push({ qid: e.data.qid, rev: e.data.rev, question: e.data.question });
         }
       }
       const details = e.message?.details ?? e.details;

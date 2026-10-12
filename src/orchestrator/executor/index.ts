@@ -26,7 +26,7 @@ import { buildCallResult } from "../../compat/result.ts";
 import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts";
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
-import { hibernation, openQuestion } from "./hibernate.ts";
+import { boundAnswer, hibernation, openAsked, openQuestion } from "./hibernate.ts";
 import { SessionFold, answerKey, digestOpenQuestion } from "./digest.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
@@ -842,7 +842,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           if (interrupted(a) || has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs) break;
           if (reached(totalUsage(journal.entries(), t.callId), t.spec.budget) || reached(totalUsage(journal.entries()), t.workflowBudget))
             return finish(journal, t.callId, exec, makeResult("budget"));
-          bound = journal.entries().find(e => e.type === "answer-bound" && e.call === t.callId && e.qid === sleeping.qid && e.rev === sleeping.rev);
+          bound = boundAnswer(journal.entries(), sleeping);
           if (bound) break;
           await new Promise<void>(resolve => { const timer = setTimeout(resolve, config.k?.trackerMs ?? 1000); a.wake = () => { clearTimeout(timer); resolve(); }; });
         }
@@ -994,21 +994,24 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const entries = await readCall(journal, call);
     await serial(async () => {
       const all = journal.entries();
-      if (all.some(e => e.type === "answer-bound" && e.call === call && e.qid === sleeping.qid && e.rev === sleeping.rev)) return;
+      if (boundAnswer(all, sleeping)) return;
       const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
-      const f = all.find(e => {
+      // The answer to the question it hibernated on, else to another of its questions still open (an earlier one).
+      const pending = all.filter(e => {
         if (e.type !== "forward" || e.dest !== call) return false;
         const env = e.envelope as Envelope;
-        return env.kind === "answer" && env.cond?.qid === sleeping.qid && env.cond?.rev === sleeping.rev && !receipts.has(String(e.rid2)) &&
-          !all.some(r => r.rid2 === e.rid2 && (r.type === "forward-retired" || r.type === "forward-delivered"));
+        return env.kind === "answer" && !receipts.has(String(e.rid2)) && !all.some(r => r.rid2 === e.rid2 && (r.type === "forward-retired" || r.type === "forward-delivered")) &&
+          (env.cond?.qid === sleeping.qid && env.cond?.rev === sleeping.rev || openAsked(all, call, env.cond?.qid, env.cond?.rev));
       });
+      const f = pending.find(e => (e.envelope as Envelope).cond?.qid === sleeping.qid) ?? pending[0];
       if (!f) return;
-      const item = attentionEntries(all).find(e => e.item.call === call && e.item.qid === sleeping.qid && e.item.rev === sleeping.rev)?.item;
+      const { qid, rev } = (f.envelope as Envelope).cond!;
+      const item = attentionEntries(all).find(e => e.item.call === call && e.item.qid === qid && e.item.rev === rev)?.item;
       const message = String(((f.envelope as Envelope).body as { message?: unknown } | undefined)?.message ?? "");
       // A new identity: the stale answer may still sit in the child's inbox under the forward's rid2.
-      await journal.append("answer-bound", { event: true, call, qid: sleeping.qid, rev: sleeping.rev, rid: f.rid, rid2: contentHash([String(f.rid2), "hibernated"]), hash: f.hash,
-        message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${message}` });
-      await resolveBoundAnswer(journal, call, sleeping.qid, sleeping.rev);
+      await journal.append("answer-bound", { event: true, call, qid, rev, rid: f.rid, rid2: contentHash([String(f.rid2), "hibernated"]), hash: f.hash,
+        message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? qid}\nAnswer: ${message}` });
+      await resolveBoundAnswer(journal, call, qid, rev);
       await journal.append("forward-retired", { rid: f.rid, rid2: f.rid2, reason: "bound-to-hibernation" });
       await (await outbox).markResolved(String(f.rid2));
     });
@@ -1077,13 +1080,19 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           const sleeping = hibernation(ctx.journal, dest);
           const priorAnswer = ctx.journal.entries().find(e => e.type === "answer-bound" && e.call === dest && e.qid === req.cond?.qid && e.rev === req.cond?.rev);
           if (priorAnswer) return priorAnswer.rid === req.rid && priorAnswer.hash === hash ? { action: "apply" } as const : { action: "reject", reason: "already-answered" } as const;
-          if (sleeping && current(ctx.journal, dest) === sleeping.exec) {
-            if (sleeping.qid !== req.cond?.qid || sleeping.rev !== req.cond?.rev) return { action: "reject", reason: "stale-rev" } as const;
+          // A hibernated call takes one answer: to the question it hibernated on, or to another of its open questions (an
+          // earlier one, still open while the child asked a reminder). Once one is bound, a further answer to another
+          // open question is forwarded like any other: the resumed child takes it at its next ask.
+          if (sleeping && current(ctx.journal, dest) === sleeping.exec &&
+            !(sleeping.qid === req.cond?.qid && sleeping.rev === req.cond?.rev) && !openAsked(ctx.journal.entries(), dest, req.cond?.qid, req.cond?.rev))
+            return { action: "reject", reason: "stale-rev" } as const;
+          if (sleeping && current(ctx.journal, dest) === sleeping.exec && !boundAnswer(ctx.journal.entries(), sleeping)) {
+            const { qid, rev } = req.cond!;
             const rid2 = forwardRid(req.rid, ctx.widRev, ctx.key, hash);
-            const item = attentionEntries(ctx.journal.entries()).find(e => e.item.call === dest && e.item.qid === sleeping.qid && e.item.rev === sleeping.rev)?.item;
+            const item = attentionEntries(ctx.journal.entries()).find(e => e.item.call === dest && e.item.qid === qid && e.item.rev === rev)?.item;
             // `event`: the `answered` event derives from this entry (an unmarked older one: from its resolution).
-            await ctx.journal.append("answer-bound", { event: true, call: dest, qid: sleeping.qid, rev: sleeping.rev, rid: req.rid, rid2, hash, message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? sleeping.qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
-            await resolveBoundAnswer(ctx.journal, dest, sleeping.qid, sleeping.rev);
+            await ctx.journal.append("answer-bound", { event: true, call: dest, qid, rev, rid: req.rid, rid2, hash, message: `${HIBERNATED_NOTE}\n\nQuestion: ${item?.text ?? qid}\nAnswer: ${(req.body as SendBody).message ?? ""}` });
+            await resolveBoundAnswer(ctx.journal, dest, qid, rev);
             active.get(dest)?.wake(); wake();
             return { action: "apply" } as const;
           }
