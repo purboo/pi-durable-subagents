@@ -920,10 +920,18 @@ with no record) and idempotent repeats.
     `hibernated{call, qid, rev}`, fence (this is not a loss), and release
     the provider and memory holdings.
   - **Answer:** `forward` of an `answer` (cond qid/rev) to a hibernated
-    call. If it matches the open qid@rev, commit
-    `answer-bound{call, qid, rev, rid}` and resume. A duplicate or stale
-    answer is rejected (`already-answered`/`stale-rev`); an answer to a
-    retired question gets `retired`.
+    call. If it matches the open qid@rev, or another question of the call
+    that is still open (an earlier one, while the child asked a reminder),
+    commit `answer-bound{call, qid, rev, rid}` and resume; one answer binds
+    a hibernation, a later one to another open question is forwarded. An
+    answer forwarded before the hibernation and not received is bound when
+    the call hibernates. A duplicate or stale answer is rejected
+    (`already-answered`/`stale-rev`); an answer to a retired question gets
+    `retired`. A live child blocked in `ask` takes the answer to any of its
+    open questions (the ask result names an earlier one).
+  - **Generations:** a question is attention of the call whose execution
+    asked it; a follow-up generation does not re-open the questions of the
+    session it continues (its child would reject their answers).
   - **Resume:**
     1. Reacquire the holdings without hold-and-wait.
     2. Commit `resumed{call, rid}`.
