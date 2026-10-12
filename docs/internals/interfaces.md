@@ -923,13 +923,21 @@ with no record) and idempotent repeats.
   - **Answer:** `forward` of an `answer` (cond qid/rev) to a hibernated
     call. If it matches the open qid@rev, or another question of the call
     that is still open (an earlier one, while the child asked a reminder),
-    commit `answer-bound{call, qid, rev, rid}` and resume; one answer binds
-    a hibernation, a later one to another open question is forwarded. An
-    answer forwarded before the hibernation and not received is bound when
-    the call hibernates. A duplicate or stale answer is rejected
-    (`already-answered`/`stale-rev`); an answer to a retired question gets
-    `retired`. A live child blocked in `ask` takes the answer to any of its
-    open questions (the ask result names an earlier one).
+    commit `answer-bound{call, qid, rev, rid, superseded?}` and resume; one
+    answer binds a hibernation, a later one to another open question is
+    forwarded. An answer to another question than the hibernated one
+    supersedes it: `answer-bound.superseded` is the durable record, and the
+    attention resolution `superseded` is derived from it (at bind time, and
+    again at recovery and observation, idempotently). An answer forwarded
+    before the hibernation and not received is bound when the call
+    hibernates: its envelope is first withdrawn from the child inbox
+    (`withdraw-adopted`), and a forward whose withdrawal was published is
+    bound before any other answer. A duplicate or stale answer is rejected
+    (`already-answered`/`stale-rev`), as is one to a superseded or carried
+    question; an answer to a retired question gets `retired`. A live child
+    takes the answer to any open question once, at the first chance: as the
+    blocked ask's result (an answer to another question supersedes the
+    blocked one) or as a message at a boundary.
   - **Generations:** a question is attention of the call whose execution
     asked it; a follow-up generation does not re-open the questions of the
     session it continues (its child would reject their answers).
@@ -941,7 +949,9 @@ with no record) and idempotent repeats.
 
     The child's receipt for that message is the answer's receipt.
     Recovery: if the session already has that receipt, do not deliver it
-    again.
+    again. If the session closed qid@rev otherwise (answered or superseded
+    before the fence), commit `answer-settled{call, rid2}` instead and
+    continue; the resume never waits for that receipt.
   - **Other cases:** stop, timeout, budget and retire still settle or
     retire a hibernated call. Time spent hibernated is not active time.
   - **Child side:** for the question to close in the child history, the

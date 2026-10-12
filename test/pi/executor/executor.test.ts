@@ -419,6 +419,95 @@ test("D4 recovery resolves question items a generation did not ask (carried, as 
   assert.equal((await f.executor.run(next)).status, "ok");
 });
 
+/** Make the next `type` append of `journal` (matching `match`) fail once, like a crash between two journal writes. */
+function crashOnce(journal: { append: (type: string, data: any) => Promise<any> }, type: string, match: (data: any) => boolean = () => true) {
+  const append = journal.append.bind(journal);
+  let armed = true;
+  journal.append = async (kind: string, data: any) => {
+    if (armed && kind === type && match(data)) { armed = false; throw new Error(`injected crash before ${type}`); }
+    return append(kind, data);
+  };
+  return () => { journal.append = append; };
+}
+
+test("fix2-1 a bound answer whose question the session already closed is settled durably; the call goes on (no relaunch loop)", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20, lossBound: 3 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "went on" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated") && f.orch.entries().filter(e => e.type === "release").length >= 2);
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  // The child took the answer (another envelope) before it was fenced: the session already holds q@rev's receipt.
+  const path = callSession(f.home, f.wid, "a", 1);
+  const rows = (await readFile(path, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const last = rows.at(-1);
+  await appendFile(path, JSON.stringify({ type: "custom_message", id: "injected1", parentId: last.id ?? null, timestamp: new Date().toISOString(), customType: CT.msg,
+    content: "answered in the window", display: true, details: { rid: "taken-in-window", kind: "answer", from: "orch", qid: h.qid, rev: h.rev } }) + "\n");
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  const answer: Request = { rid: "answer", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: "yes" } };
+  assert.deepEqual(await f.executor.forward(answer, ctx), { action: "apply" });
+  const result = await Promise.race([pending, new Promise<undefined>(resolve => setTimeout(resolve, 25000))]);
+  assert.ok(result, "the call ends instead of relaunching until its budget or timeout");
+  assert.equal(result.status, "ok", JSON.stringify(result));
+  const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "answer-settled").map(e => e.rid2), [bound.rid2]);
+  assert.ok(!sent(f.home).some(r => r.rid === bound.rid2), "the dropped continue is not sent");
+});
+
+test("fix2-2 an adoption interrupted after its withdrawal is completed before a later answer binds", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 600000, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "First?" } }, { tool: "ask", args: { question: "Reminder?" } }, { text: "not resumed with the answer" }]));
+  const pending = f.executor.run(ticket);
+  const asked = (text: string) => f.journal.entries().find(e => e.type === JT.attention && (e.item as { text?: string }).text === text)?.item as { id: string; qid: string; rev: number } | undefined;
+  await until(() => !!asked("First?"));
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  await f.executor.forward({ rid: "steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "still waiting" } }, ctx);
+  await until(() => !!asked("Reminder?"));
+  const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  const q1 = asked("First?")!, q2 = asked("Reminder?")!;
+  const req: Request = { rid: "answer-q1", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: q1.qid, rev: q1.rev }, body: { to: ticket.callId, kind: "answer", message: "first answered " + script([{ text: "resumed with q1" }]) } };
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  // The adoption withdraws the q1 envelope, then crashes before answer-bound.
+  const restore = crashOnce(f.journal as any, "answer-bound");
+  await assert.rejects(f.executor.run(ticket), /injected crash/);
+  restore(); await f.executor.suspend();
+  const old = f.journal.entries().find(e => e.type === "forward" && e.rid === "answer-q1")!;
+  assert.ok(sent(f.home).some(r => r.kind === "withdraw" && (r.body as { rids: string[] }).rids.includes(String(old.rid2))), "the withdrawal was published");
+  await f.executor.recover(f.wid, f.journal);
+  // After the restart an answer to q2 arrives before the call runs: q1 (withdrawn, so reachable only by binding) binds first.
+  const late: Request = { rid: "answer-q2", from: "main:test", to: "orch", sseq: 3, kind: "send", cond: { qid: q2.qid, rev: q2.rev }, body: { to: ticket.callId, kind: "answer", message: "second" } };
+  assert.deepEqual(await f.executor.forward(late, ctx), { action: "reject", reason: "stale-rev" });
+  const bound = f.journal.entries().filter(e => e.type === "answer-bound");
+  assert.deepEqual(bound.map(e => e.rid), ["answer-q1"]);
+  assert.ok(f.journal.entries().some(e => e.type === "forward-retired" && e.rid === "answer-q1" && e.reason === "bound-to-hibernation"));
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "ok", JSON.stringify(result)); assert.equal(result.output, "resumed with q1");
+});
+
+test("fix2-3 a crash between a binding and its supersession: recovery derives it and a late answer to the superseded question is refused", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 2000, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "First?" } }, { tool: "ask", args: { question: "Reminder?" } }, { text: "not resumed with the answer" }]));
+  const pending = f.executor.run(ticket);
+  const asked = (text: string) => f.journal.entries().find(e => e.type === JT.attention && (e.item as { text?: string }).text === text)?.item as { id: string; qid: string; rev: number } | undefined;
+  await until(() => !!asked("First?"));
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  await f.executor.forward({ rid: "steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "still waiting" } }, ctx);
+  await until(() => !!asked("Reminder?"));
+  await until(() => f.journal.entries().some(e => e.type === "hibernated"));
+  const q1 = asked("First?")!, q2 = asked("Reminder?")!;
+  const restore = crashOnce(f.journal as any, JT.attentionResolved, d => d.resolution === "superseded");
+  const req: Request = { rid: "answer-q1", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: q1.qid, rev: q1.rev }, body: { to: ticket.callId, kind: "answer", message: "first answered " + script([{ delayMs: 3000, text: "resumed with q1" }]) } };
+  await assert.rejects(f.executor.forward(req, ctx), /injected crash/);
+  restore();
+  const stopped = pending.catch(() => undefined);
+  await f.executor.suspend(); await stopped;
+  assert.ok(f.journal.entries().some(e => e.type === "answer-bound" && e.qid === q1.qid));
+  await f.executor.recover(f.wid, f.journal);
+  assert.deepEqual(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === q2.id).map(e => e.resolution), ["superseded"]);
+  const late: Request = { rid: "answer-q2", from: "main:test", to: "orch", sseq: 3, kind: "send", cond: { qid: q2.qid, rev: q2.rev }, body: { to: ticket.callId, kind: "answer", message: "late" } };
+  assert.deepEqual(await f.executor.forward(late, ctx), { action: "reject", reason: "stale-rev" });
+});
+
 test("P28/P12 a model send to a hibernated asker is recorded and its resumed execution launches on that model", { timeout: 30000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
   const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));

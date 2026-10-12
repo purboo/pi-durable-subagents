@@ -26,7 +26,7 @@ import { buildCallResult } from "../../compat/result.ts";
 import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts";
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
-import { boundAnswer, hibernation, openAsked, openQuestion } from "./hibernate.ts";
+import { boundAnswer, hibernation, openAsked, openQuestion, supersededByBinding } from "./hibernate.ts";
 import { SessionFold, answerKey, digestOpenQuestion } from "./digest.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
@@ -682,8 +682,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           await t.journal.append(JT.attention, { item: { id, rev, kind: "question", text: String(question), wid: t.wid, call: t.callId, qid, session: callSession(home, t.wid, t.key, t.gen) } });
         if (digest.answered.has(answerKey(qid, rev)) || t.journal.entries().some(e => e.type === "answer-bound" && e.call === t.callId && e.qid === qid && e.rev === rev))
           await resolveBoundAnswer(t.journal, t.callId, qid, rev);
-        else if (digest.superseded.has(answerKey(qid, rev))) await resolveQuestion(t.journal, t.callId, qid, rev, "superseded");
+        else if (digest.superseded.has(answerKey(qid, rev)) || supersededByBinding(t.journal.entries(), t.callId, qid, rev))
+          await resolveQuestion(t.journal, t.callId, qid, rev, "superseded");
       }
+      await resolveSuperseded(t.journal, t.callId);
       if (entries.length) await resolveCarried(t.journal, t.callId, digest.questions);
     });
   }
@@ -692,6 +694,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const id = `q:${call}:${qid}`;
     if (attentionEntries(journal.entries(), id).some(e => e.item.rev === rev) && !journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === rev))
       await journal.append(JT.attentionResolved, { id, rev, resolution });
+  }
+  /** D2: the questions durable bindings superseded (answer-bound.superseded, the source of truth) resolve `superseded`:
+   *  after a crash between the binding and its resolution, recovery and observation derive it. Called serially. */
+  async function resolveSuperseded(journal: JournalHandle, call: string) {
+    for (const b of journal.entries().filter(e => e.type === "answer-bound" && e.call === call && Array.isArray(e.superseded)))
+      for (const s of b.superseded as { qid: unknown; rev: unknown }[]) await resolveQuestion(journal, call, s.qid, s.rev, "superseded");
   }
   /** D4: a question item of `call` that none of its executions asked (1.0.37 re-opened the questions of the session a
    *  generation continues) is resolved `carried`. `own`: the questions the call's executions asked. Called serially. */
@@ -860,6 +868,20 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       let entries = await readCall(journal, t.callId);
       let dangling: string[] = [];
       let bound: Entry | undefined;
+      // D3: a bound answer is settled by its receipt in the session, or by one durable `answer-settled{rid2}` when the
+      // session closed its question revision without it (the child took that answer, or superseded the question, before
+      // it was fenced): the resume never waits for a receipt the child would not give.
+      const answerSettled = (u: Entry, session: readonly SessionEntry[]) => session.some(e => receiptId(e) === u.rid2) ||
+        journal.entries().some(e => e.type === "answer-settled" && e.call === t.callId && e.rid2 === u.rid2);
+      const settleClosed = async (u: Entry | undefined, session: readonly SessionEntry[]) => {
+        if (!u || answerSettled(u, session)) return;
+        const d = digestOf(t.callId, session), key = answerKey(u.qid, u.rev);
+        if (!d.answered.has(key) && !d.superseded.has(key)) return;
+        await serial(async () => {
+          if (!journal.entries().some(e => e.type === "answer-settled" && e.call === t.callId && e.rid2 === u.rid2))
+            await journal.append("answer-settled", { call: t.callId, rid2: u.rid2, qid: u.qid, rev: u.rev, reason: d.answered.has(key) ? "answered-in-session" : "superseded-in-session" });
+        });
+      };
       const sleeping = hibernation(journal, t.callId);
       if (exec && sleeping?.exec === exec) {
         await fence(journal, exec, { park: a }); await release(exec);
@@ -874,7 +896,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         }
       }
       const pendingAnswer = journal.entries().findLast(e => e.type === "answer-bound" && e.call === t.callId);
-      if (!bound && pendingAnswer && !entries.some(e => receiptId(e) === pendingAnswer.rid2)) bound = pendingAnswer;
+      await settleClosed(pendingAnswer, entries);
+      if (!bound && pendingAnswer && !answerSettled(pendingAnswer, entries)) bound = pendingAnswer;
       if (exec) {
         await fence(journal, exec, { park: a });
         await questions(t, entries = await readCall(journal, t.callId));
@@ -949,9 +972,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       // The answer uses its stable forwarded identity across every recovery incarnation.
       const unresolved = journal.entries().findLast(e => e.type === "answer-bound" && e.call === t.callId);
       // D3: the child takes one answer per question revision; a bound answer to one the session already closed (answered
-      // or superseded) would be dropped, and a launch with nothing to deliver would wait forever: continue instead.
-      const closedInSession = (u: Entry) => { const d = digestOf(t.callId, entries); return d.answered.has(answerKey(u.qid, u.rev)) || d.superseded.has(answerKey(u.qid, u.rev)); };
-      const receipt = unresolved && (entries.some(e => receiptId(e) === unresolved.rid2) || closedInSession(unresolved));
+      // or superseded) is settled durably instead of sent (it would be dropped), and the execution continues.
+      await settleClosed(unresolved, entries);
+      const receipt = unresolved && answerSettled(unresolved, entries);
       const openingRid = t.opening && contentHash([t.opening.rid, "dispatch"]);
       const openingReceived = openingRid && entries.some(e => receiptId(e) === openingRid);
       // The task has one identity: the dispatch of the call's first execution. A later execution continues only once
@@ -1022,33 +1045,45 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
    */
   async function adoptAnswer(journal: JournalHandle, call: string, sleeping: Entry) {
     const entries = await readCall(journal, call);
-    await serial(async () => {
-      const all = journal.entries();
-      if (boundAnswer(all, sleeping)) return;
-      const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
-      // The answer to the question it hibernated on, else to another of its questions still open (an earlier one).
-      const pending = all.filter(e => {
-        if (e.type !== "forward" || e.dest !== call) return false;
-        const env = e.envelope as Envelope;
-        return env.kind === "answer" && !receipts.has(String(e.rid2)) && !all.some(r => r.rid2 === e.rid2 && (r.type === "forward-retired" || r.type === "forward-delivered")) &&
-          (env.cond?.qid === sleeping.qid && env.cond?.rev === sleeping.rev || openAsked(all, call, env.cond?.qid, env.cond?.rev));
-      });
-      const f = pending.find(e => (e.envelope as Envelope).cond?.qid === sleeping.qid) ?? pending[0];
-      if (!f) return;
-      const { qid, rev } = (f.envelope as Envelope).cond!;
-      const item = attentionEntries(all).find(e => e.item.call === call && e.item.qid === qid && e.item.rev === rev)?.item;
-      const message = String(((f.envelope as Envelope).body as { message?: unknown } | undefined)?.message ?? "");
-      // A new identity: the stale answer may still sit in the child's inbox under the forward's rid2. It is withdrawn
-      // there (D3; before the bound continue is sent, so the resumed child drops it first): the continue carries the
-      // answer and what it supersedes. Idempotent by rid, so a crash before the binding sends it once.
-      await (await outbox).send(call, "withdraw", { rids: [String(f.rid2)] }, undefined, { rid: contentHash([String(f.rid2), "withdraw-adopted"]) });
-      await journal.append("answer-bound", { event: true, call, qid, rev, rid: f.rid, rid2: contentHash([String(f.rid2), "hibernated"]), hash: f.hash,
-        message: `${HIBERNATED_NOTE}${withdrawn(all, call, sleeping, qid, rev)}\n\nQuestion: ${item?.text ?? qid}\nAnswer: ${message}`, ...supersedes(sleeping, qid, rev) });
-      await resolveBoundAnswer(journal, call, qid, rev);
-      if (qid !== sleeping.qid || rev !== sleeping.rev) await resolveQuestion(journal, call, sleeping.qid, sleeping.rev, "superseded");
-      await journal.append("forward-retired", { rid: f.rid, rid2: f.rid2, reason: "bound-to-hibernation" });
-      await (await outbox).markResolved(String(f.rid2));
+    await serial(() => adopt(journal, call, sleeping, entries));
+  }
+  /** The forward whose adoption was begun (its envelope withdrawn from the child's inbox) and not yet bound. */
+  async function adoptionBegun(journal: JournalHandle, call: string): Promise<Entry | undefined> {
+    const sender = await outbox, all = journal.entries();
+    return all.find(e => e.type === "forward" && e.dest === call && (e.envelope as Envelope).kind === "answer" &&
+      !all.some(r => r.rid2 === e.rid2 && r.type === "forward-retired") && !!sender.recorded(contentHash([String(e.rid2), "withdraw-adopted"])));
+  }
+  /** P28, D3: bind a pending answer forward to hibernation `sleeping` (see adoptAnswer). `onlyBegun`: only one whose
+   *  adoption was begun before a crash (its envelope is withdrawn, so it can reach the child only through this binding).
+   *  Called serially. */
+  async function adopt(journal: JournalHandle, call: string, sleeping: Entry, entries: readonly SessionEntry[], onlyBegun = false) {
+    const all = journal.entries();
+    if (boundAnswer(all, sleeping)) return;
+    const begun = await adoptionBegun(journal, call);
+    const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
+    // The answer to the question it hibernated on, else to another of its questions still open (an earlier one).
+    const pending = all.filter(e => {
+      if (e.type !== "forward" || e.dest !== call) return false;
+      const env = e.envelope as Envelope;
+      return env.kind === "answer" && !receipts.has(String(e.rid2)) && !all.some(r => r.rid2 === e.rid2 && (r.type === "forward-retired" || r.type === "forward-delivered")) &&
+        (env.cond?.qid === sleeping.qid && env.cond?.rev === sleeping.rev || openAsked(all, call, env.cond?.qid, env.cond?.rev));
     });
+    // An adoption begun before a crash is completed first: its envelope is already withdrawn.
+    const f = pending.find(e => e.rid2 === begun?.rid2) ?? (onlyBegun ? undefined : pending.find(e => (e.envelope as Envelope).cond?.qid === sleeping.qid) ?? pending[0]);
+    if (!f) return;
+    const { qid, rev } = (f.envelope as Envelope).cond!;
+    const item = attentionEntries(all).find(e => e.item.call === call && e.item.qid === qid && e.item.rev === rev)?.item;
+    const message = String(((f.envelope as Envelope).body as { message?: unknown } | undefined)?.message ?? "");
+    // A new identity: the stale answer may still sit in the child's inbox under the forward's rid2. It is withdrawn
+    // there (D3; before the bound continue is sent, so the resumed child drops it first): the continue carries the
+    // answer and what it supersedes. Idempotent by rid, so a crash before the binding sends it once.
+    await (await outbox).send(call, "withdraw", { rids: [String(f.rid2)] }, undefined, { rid: contentHash([String(f.rid2), "withdraw-adopted"]) });
+    await journal.append("answer-bound", { event: true, call, qid, rev, rid: f.rid, rid2: contentHash([String(f.rid2), "hibernated"]), hash: f.hash,
+      message: `${HIBERNATED_NOTE}${withdrawn(all, call, sleeping, qid, rev)}\n\nQuestion: ${item?.text ?? qid}\nAnswer: ${message}`, ...supersedes(sleeping, qid, rev) });
+    await resolveBoundAnswer(journal, call, qid, rev);
+    if (qid !== sleeping.qid || rev !== sleeping.rev) await resolveQuestion(journal, call, sleeping.qid, sleeping.rev, "superseded");
+    await journal.append("forward-retired", { rid: f.rid, rid2: f.rid2, reason: "bound-to-hibernation" });
+    await (await outbox).markResolved(String(f.rid2));
   }
   async function replayForward(e: Entry) {
     const envelope = e.envelope as Envelope;
@@ -1112,10 +1147,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (sealed(ctx.journal, dest)) return { action: "reject", reason: req.kind === "send" && (req.body as SendBody).kind === "answer" ? "retired" : "call-sealed" } as const;
         if (req.kind === "send" && (req.body as SendBody).kind === "answer") {
           const sleeping = hibernation(ctx.journal, dest);
+          // An adoption begun before a crash (the earlier answer withdrawn from the inbox, not yet bound) binds first.
+          if (sleeping && current(ctx.journal, dest) === sleeping.exec && !boundAnswer(ctx.journal.entries(), sleeping) && await adoptionBegun(ctx.journal, dest))
+            await adopt(ctx.journal, dest, sleeping, await readCall(ctx.journal, dest), true);
           const priorAnswer = ctx.journal.entries().find(e => e.type === "answer-bound" && e.call === dest && e.qid === req.cond?.qid && e.rev === req.cond?.rev);
           if (priorAnswer) return priorAnswer.rid === req.rid && priorAnswer.hash === hash ? { action: "apply" } as const : { action: "reject", reason: "already-answered" } as const;
           // D2, D4: a superseded or carried question takes no answer.
-          if (ctx.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `q:${dest}:${req.cond?.qid}` && e.rev === req.cond?.rev && (e.resolution === "superseded" || e.resolution === "carried")))
+          if (supersededByBinding(ctx.journal.entries(), dest, req.cond?.qid, req.cond?.rev) ||
+            ctx.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `q:${dest}:${req.cond?.qid}` && e.rev === req.cond?.rev && (e.resolution === "superseded" || e.resolution === "carried")))
             return { action: "reject", reason: "stale-rev" } as const;
           // A hibernated call takes one answer: to the question it hibernated on, or to another of its open questions (an
           // earlier one, still open while the child asked a reminder). Once one is bound, a further answer to another
@@ -1254,7 +1293,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           for (const u of values) if (!recorded.has(u.id)) await journal.append("usage", { call, ...u });
           if (sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) {
             await retireForwards(journal, call); await retireAttention(journal, call); await unknownAttention(journal, call);
-          } else if (session.length) await resolveCarried(journal, call, digestOf(call, session).questions);
+          } else {
+            await resolveSuperseded(journal, call);
+            if (session.length) await resolveCarried(journal, call, digestOf(call, session).questions);
+          }
         });
         if (!active.has(call)) forgetCall(call);
       }
