@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.37
+
+- The process table runs `ps` by its absolute path (`/bin/ps`), so an orchestrator started with a minimal PATH keeps
+  working on macOS.
+- Contains every change listed under 1.0.36, which was tagged but not published (its macOS CI failed on this).
+
 ## 1.0.36
 
 - Slot precedence among waiting calls. When a provider slot frees, a call resuming earlier work (an answered
