@@ -114,7 +114,7 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   // The alert's duration measures progress, whereas lastActivity also advances on provider retries.
   if (noProgress) return /no progress for [^(;]+/.exec(noProgress.text)?.[0].trim() ?? "no progress";
   if (workflow.attention.some(a => a.kind === "stall" && a.call === call.callId)) return `no activity for ${duration(now - Math.max(call.lastActivity ?? call.startedAt ?? now, facts?.lastActivity ?? 0))}`;
-  if (call.phase === "queued") return workflow.paused ? "paused · r resumes" : "queued: waiting for a free slot";
+  if (call.phase === "queued") return workflow.paused ? "paused · r resumes" : call.answered ? "queued (answered, waiting for a slot)" : "queued: waiting for a free slot";
   // Liveness (UI §2): the age of the newest evidence ticks, and resets whenever the agent does anything.
   const since = duration(Math.max(0, now - Math.max(call.lastActivity ?? 0, facts?.lastActivity ?? 0, call.startedAt ?? 0)));
   if (facts?.activity) return `${facts.activity} · ${since}`;
