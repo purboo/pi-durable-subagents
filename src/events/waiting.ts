@@ -137,6 +137,8 @@ function applyWait(f: WaitFold, e: Entry): void {
       break;
     }
     case JT.exec: { const c = f.calls.get(String(e.call)); if (c) { c.exec = String(e.exec); c.queued = e.ts; c.selected = false; c.fenced = false; delete c.answered; } break; }
+    // D6: hibernated again after a bound answer the session had already closed: it waits for a new answer.
+    case "hibernated": { const c = f.calls.get(String(e.call)); if (c && c.exec === e.exec) delete c.answered; break; }
     case "answer-bound": {
       const c = f.calls.get(String(e.call)), id = `q:${e.call}:${e.qid}`, item = f.items.get(id);
       if (item?.rev === e.rev) f.items.delete(id);

@@ -949,9 +949,16 @@ with no record) and idempotent repeats.
 
     The child's receipt for that message is the answer's receipt.
     Recovery: if the session already has that receipt, do not deliver it
-    again. If the session closed qid@rev otherwise (answered or superseded
-    before the fence), commit `answer-settled{call, rid2}` instead and
-    continue; the resume never waits for that receipt.
+    again. After the fence the session is final: if it closed qid@rev
+    otherwise (answered, superseded, or the child asked a newer revision
+    of the question before the fence), commit `answer-settled{call, rid2,
+    reason}` instead; the resume never waits for that receipt. Then, if
+    the session has an open question of the call, do not launch: commit a
+    new `hibernated` on it (its attention is open, so the parent is asked
+    that revision; an answer bound to a revision the child already
+    re-asked is not delivered). Otherwise launch with the plain continue.
+    A re-hibernated call resumes only on a new binding; both records are
+    idempotent across a crash between them.
   - **Other cases:** stop, timeout, budget and retire still settle or
     retire a hibernated call. Time spent hibernated is not active time.
   - **Child side:** for the question to close in the child history, the

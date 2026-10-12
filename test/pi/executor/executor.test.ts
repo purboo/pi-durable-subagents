@@ -11,7 +11,7 @@ import { FAUX, PI_BIN, REPO, script, settled, startPi, tempRoot, detachedSleep }
 import { parseAgent } from "../../../src/compat/agents.ts";
 import { binDir, callDir, callInbox, callSession, journalPath, orchLedger, outboxRoot } from "../../../src/paths.ts";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
-import { scanInbox } from "../../../src/kernel/mailbox.ts";
+import { publishRequest, scanInbox } from "../../../src/kernel/mailbox.ts";
 import { contentHash, forwardRid, ulid } from "../../../src/kernel/ids.ts";
 import { ASK_CUT, CT, JT, type Containment, type JournalHandle, type Request } from "../../../src/types.ts";
 import type { CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
@@ -483,6 +483,63 @@ test("fix2-2 an adoption interrupted after its withdrawal is completed before a 
   const result = await f.executor.run(ticket);
   assert.equal(result.status, "ok", JSON.stringify(result)); assert.equal(result.output, "resumed with q1");
 });
+
+/** D6: the native race. While the orchestrator commits `hibernated` on q@1, a steer reaches the child, whose model asks
+ *  the same question again (q@2, the same execution) before the fence. The answer to q@1 binds that hibernation. */
+async function reaskedBeforeFence(t: TestContext, crash: boolean) {
+  const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { tool: "ask", args: { question: "Choose?" } }, { text: "not resumed with the answer" }]));
+  const path = callSession(f.home, f.wid, "a", 1);
+  const revisions = async () => (await readFile(path, "utf8").catch(() => "")).split("\n").filter(Boolean).map(line => JSON.parse(line))
+    .filter(e => e.type === "custom" && e.customType === CT.question).map(e => e.data.rev as number);
+  const append = f.journal.append.bind(f.journal);
+  let raced = false;
+  (f.journal as any).append = async (kind: string, data: any) => {
+    if (kind === "hibernated" && !raced) {
+      raced = true;
+      await publishRequest(callInbox(f.home, f.wid, "a", 1), { rid: "steer-in-window", from: "test:steer", to: ticket.callId, sseq: 1, kind: "steer", body: { message: "still waiting" } } as Request);
+      await until(async () => (await revisions()).includes(2));
+    }
+    return append(kind, data);
+  };
+  const pending = f.executor.run(ticket);
+  const hibernations = () => f.journal.entries().filter(e => e.type === "hibernated");
+  await until(() => hibernations().length === 1 && f.journal.entries().some(e => e.type === JT.fenced && e.exec === `${ticket.callId}#1.1`));
+  assert.deepEqual(await revisions(), [1, 2], "the child itself asked the newer revision");
+  const h = hibernations()[0]!;
+  assert.equal(h.rev, 1);
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  const restore = crash ? crashOnce(f.journal as any, "hibernated", d => d.reason === "rebound-settled") : () => {};
+  const first: Request = { rid: "answer-1", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: 1 }, body: { to: ticket.callId, kind: "answer", message: "to the old revision" } };
+  assert.deepEqual(await f.executor.forward(first, ctx), { action: "apply" });
+  if (crash) {
+    await assert.rejects(pending, /injected crash/);
+    restore(); await f.executor.suspend();
+    assert.deepEqual(f.journal.entries().filter(e => e.type === "answer-settled").map(e => e.reason), ["newer-revision"]);
+    assert.equal(hibernations().length, 1, "crashed between answer-settled and the new hibernation");
+    await f.executor.recover(f.wid, f.journal);
+  }
+  const resumed = crash ? f.executor.run(ticket) : pending;
+  await until(() => hibernations().length === 2);
+  await delay(300);
+  const again = hibernations()[1]!;
+  assert.deepEqual([again.qid, again.rev, again.exec], [h.qid, 2, h.exec], "hibernated again on the newer revision");
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "answer-settled").map(e => e.reason), ["newer-revision"]);
+  assert.ok(!f.journal.entries().some(e => e.type === JT.exec && e.exec !== h.exec), "no idle launch");
+  assert.ok(!sent(f.home).some(r => r.kind === "continue"), "the stale continue is not sent");
+  const id = `q:${ticket.callId}:${h.qid}`;
+  assert.ok(f.journal.entries().some(e => e.type === JT.attention && (e.item as { id: string; rev: number }).id === id && (e.item as { rev: number }).rev === 2));
+  assert.ok(!f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === id && e.rev === 2), "q@2 is open: the parent is asked again");
+  const second: Request = { rid: "answer-2", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: String(h.qid), rev: 2 }, body: { to: ticket.callId, kind: "answer", message: "to the new revision " + script([{ text: "resumed with q2" }]) } };
+  assert.deepEqual(await f.executor.forward(second, ctx), { action: "apply" });
+  const result = await resumed;
+  assert.equal(result.status, "ok", JSON.stringify(result)); assert.equal(result.output, "resumed with q2");
+  const delivered = (await readFile(path, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line))
+    .filter(e => e.type === "custom_message" && e.customType === CT.msg && e.details?.qid === h.qid);
+  assert.deepEqual(delivered.map(e => e.details.rev), [2], "the model receives the answer to q@2 once, and nothing for q@1");
+}
+test("fix3-1 D6 an answer bound to a revision the child asked again is settled; the call hibernates on the newer one", { timeout: 60000 }, t => reaskedBeforeFence(t, false));
+test("fix3-2 D6 a crash between answer-settled and the new hibernation: recovery hibernates once on the newer revision", { timeout: 60000 }, t => reaskedBeforeFence(t, true));
 
 test("fix2-3 a crash between a binding and its supersession: recovery derives it and a late answer to the superseded question is refused", { timeout: 45000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 2000, trackerMs: 20 } });

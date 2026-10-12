@@ -19,7 +19,9 @@
   hibernation is withdrawn from the subagent's inbox; any further envelope for an answered, superseded or stale
   revision is dropped with a receipt, so nothing waits on it. These records survive a crash between their writes: a
   supersession is derived from the binding that made it, an adoption whose withdrawal went out is completed first, and
-  a bound answer the session had already closed is settled without waiting for a receipt.
+  a bound answer the session had already closed is settled without waiting for a receipt. An answer bound to a revision
+  the subagent has already asked again is not delivered: the call hibernates again and the parent is asked the newer
+  revision.
 - A follow-up generation no longer re-opens the questions of the session it continues (its subagent would refuse
   their answers). Items that 1.0.37 re-opened in a running generation are resolved `carried` at orchestrator start.
 - Follow-ups queued while a call waited on its question reach the resumed model before the answer, in send order.
