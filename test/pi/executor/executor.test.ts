@@ -131,6 +131,31 @@ test("shared worktree reminder (writerLock off) observes real pi writes without 
   assert.equal(conflicts().length, 1);
 });
 
+test("an answered hibernated call queues behind a full provider and resolves attention before resume", { timeout: 30000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 1 } }, k: { hibernateMs: 40, trackerMs: 20 } }, { memory: async () => 1e6 });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
+  const pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated") && f.orch.entries().filter(e => e.type === "release").length >= 2);
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  await f.orch.append("hold", { pool: "probe", slot: 0, exec: "fixture#1.1" });
+  const req: Request = { rid: "answer", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) },
+    body: { to: ticket.callId, kind: "answer", message: "yes " + script([{ text: "resumed" }]) } };
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  await until(() => f.journal.entries().some(e => e.type === JT.exec && e.exec !== h.exec));
+  const queued = statusOf(f.journal, f.wid);
+  assert.equal(queued.phase, "queued"); assert.equal(queued.answered, h.qid); assert.equal(queued.hibernated, true);
+  const id = `q:${ticket.callId}:${h.qid}`;
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === id && e.resolution === "answered").length, 1);
+  assert.ok(!f.journal.entries().some(e => e.type === "resumed"));
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  assert.deepEqual(await f.executor.forward({ ...req, rid: "duplicate" }, ctx), { action: "reject", reason: "already-answered" });
+  await f.orch.append("release", { pool: "probe", slot: 0, exec: "fixture#1.1" });
+  assert.equal((await pending).status, "ok");
+  assert.equal(statusOf(f.journal, f.wid).answered, undefined);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === id).length, 1, "the child receipt does not resolve twice");
+});
+
 test("P28 hibernates without loss, binds once, resumes with one receipt", { timeout: 30000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
   const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));

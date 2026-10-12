@@ -52,8 +52,10 @@ export interface CallSnapshot {
   switchFailed?: string;
   /** A follow-up still open on a finished workflow: live work although the workflow's status is final. */
   afterEnd?: true;
-  /** P28: asking and hibernated: its execution is fenced and holds no provider slot until the answer arrives. */
+  /** Hibernated: its execution is fenced and holds no provider slot, including while its answered call queues. */
   hibernated?: true;
+  /** Bound question id, until the next execution starts running. */
+  answered?: string;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
   /** Notes (send kind "notify") recorded for this call while it was not running; its next follow-up carries them. */
@@ -61,7 +63,10 @@ export interface CallSnapshot {
 }
 export interface WorkflowSnapshot {
   wid: string; rev: number; name?: string; origin?: string; cwd?: string;
+  /** The run's result; follow-ups leave a final status unchanged. */
   status: "running" | "done" | "failed" | "parked" | "stopped";
+  /** Work is still going in a latest-generation call (a follow-up when the run has finished). */
+  active?: true;
   error?: string; result?: unknown;
   calls: CallSnapshot[];
   counts: Record<CallPhase, number>;
@@ -148,6 +153,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
   const calls = new Map<string, CallSnapshot>();
   const byExec = new Map<string, CallSnapshot>();
   const hibernating = new Map<string, string>(); // callId → exec that decided to hibernate and is not fenced yet
+  const fenced = new Set<string>();
   const resolved = new Set<string>();
   const generations = new Set<string>(), retired = new Set<string>();
   const attention: AttentionItem[] = [];
@@ -185,24 +191,38 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         // An execution waits for a provider slot and memory before it launches; it is running once `selected` says so
         // (otherwise a call still waiting for a slot reads "thinking · 2m").
         call.exec = String(e.exec); call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
-        delete call.hibernated; hibernating.delete(call.callId);
+        if (!call.answered) { delete call.hibernated; hibernating.delete(call.callId); }
       } else if (e.type === "writer-wait" || e.type === "writer-acquired") {
         const call = calls.get(String(e.call)), holder = String(e.holder ?? "");
         if (call && e.type === "writer-wait") call.writerWait = { root: String(e.root), holder: holder.includes("/") ? `${holder.split("@")[0]}/${holder.split("/")[1]!.split("@")[0]}` : holder };
         else if (call) delete call.writerWait;
       } else if (e.type === "hibernated") {
         // The decision to hibernate precedes the fence; the slot is released only once the execution is fenced.
-        const call = calls.get(String(e.call)); if (call?.exec && call.exec === e.exec) hibernating.set(call.callId, call.exec);
-      } else if (e.type === "answer-bound" || (e.type === "resumed" && e.call)) {
-        const call = calls.get(String(e.call)); if (call) { delete call.hibernated; hibernating.delete(call.callId); }
+        // Recovery may record the hibernation after fencing the interrupted asker.
+        const call = calls.get(String(e.call));
+        if (call?.exec && call.exec === e.exec) {
+          hibernating.set(call.callId, call.exec); if (fenced.has(call.exec)) call.hibernated = true;
+        }
+      } else if (e.type === "answer-bound") {
+        resolved.add(`q:${e.call}:${e.qid}@${e.rev}`);
+        const call = calls.get(String(e.call));
+        if (call && call.phase !== "sealed") { call.answered = String(e.qid); call.phase = "queued"; }
+      } else if (e.type === "resumed" && e.call) {
+        const call = calls.get(String(e.call));
+        if (call && call.phase !== "sealed" && (!e.exec || call.exec === e.exec)) {
+          call.phase = "running"; delete call.answered; delete call.hibernated; hibernating.delete(call.callId);
+        }
       } else if (e.type === JT.fenced) {
+        fenced.add(String(e.exec));
         // A fenced execution without a seal (stop-all, a quit pi, a loss before its continuation) waits to run again.
         const call = byExec.get(String(e.exec)); if (call && call.phase === "running") call.phase = "queued";
         if (call && hibernating.get(call.callId) === e.exec) call.hibernated = true;
       } else if (e.type === "selected") {
         const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
         if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
-        if (call && call.phase === "queued") call.phase = "running";
+        if (call && call.exec === e.exec && call.phase === "queued") {
+          call.phase = "running"; delete call.answered; delete call.hibernated; hibernating.delete(call.callId);
+        }
       } else if (e.type === "model-used") {
         // Evidence of a switch: the execution answered with another model than it launched with.
         const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
@@ -221,7 +241,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         const usage = (e.result as CallResult | undefined)?.usage;
         if (usage) sealedUsage.set(String(e.call), usage);
         const call = calls.get(String(e.call)); if (!call) continue;
-        call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.hibernated; delete call.writerWait; hibernating.delete(call.callId);
+        call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.answered; delete call.hibernated; delete call.writerWait; hibernating.delete(call.callId);
       } else if (isEntry(e, JT.attention)) {
         const item = e.item;
         attention.push(item);
@@ -258,7 +278,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
       const call = item.kind === "question" ? list.find(c => item.id.startsWith(`q:${c.callId}:`)) : undefined;
       if (call && (call.phase === "running" || call.phase === "queued")) call.phase = "asking"; // a hibernated asker is fenced
     }
-    for (const c of list) if (c.hibernated && c.phase !== "asking") delete c.hibernated;
+    for (const c of list) if (c.hibernated && c.phase !== "asking" && !c.answered) delete c.hibernated;
     const usageOf = (callId: string) => sealedUsage.get(callId) ?? live.get(callId);
     const counts: Record<CallPhase, number> = { queued: 0, running: 0, asking: 0, sealed: 0 };
     for (const c of list) {
@@ -288,6 +308,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
       wid, rev, ...(typeof created?.name === "string" ? { name: created.name } : {}),
       ...(created ? { origin: String(created.origin), cwd: String(created.cwd), startedAt: created.ts } : {}),
       status: done ? done.status as WorkflowSnapshot["status"] : "running",
+      ...(latestCalls({ calls: list }).some(c => c.phase !== "sealed") ? { active: true as const } : {}),
       ...(done?.error ? { error: String(done.error) } : {}), ...(done && "result" in done ? { result: structuredClone(done.result) } : {}),
       ...(done ? { endedAt: done.ts } : {}),
       ...(followUps ? { followUps } : {}),
@@ -464,8 +485,10 @@ export interface StatusCall {
   switchFailed?: string;
   /** Last non-empty output line (clipped); the full output is in `status wid=<wid>`. */
   lastLine?: string; error?: string;
-  /** Asking and hibernated: no provider slot is held while it waits (P28). */
+  /** Hibernated: no provider slot is held while it waits (P28). */
   hibernated?: true;
+  /** Bound question id, until the next execution starts running. */
+  answered?: string;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
   /** Resource leases (`pi-durable-subagents hold`): "holds lease machine" / "waiting for lease machine 3m". */
@@ -474,7 +497,12 @@ export interface StatusCall {
   notesPending?: number;
 }
 export interface StatusWorkflow {
-  wid: string; name?: string; origin?: string; status: WorkflowSnapshot["status"]; rev: number;
+  wid: string; name?: string; origin?: string;
+  /** The run's result; follow-ups leave a final status unchanged. */
+  status: WorkflowSnapshot["status"];
+  /** Work is still going in a latest-generation call (a follow-up when the run has finished). */
+  active?: true;
+  rev: number;
   startedAt?: number; endedAt?: number; error?: string; usage: Usage; counts: Record<CallPhase, number>;
   /** v12 §4: planned total (tasks/chain length) when known; absent for scripts. */
   planned?: number;
@@ -510,7 +538,8 @@ export type StatusDetail = WorkflowSnapshot & { scriptLog?: string };
 export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, string>): StatusWorkflow {
   const progress = progressOf(wf); // v12 §4
   return {
-    wid: wf.wid, ...(wf.name ? { name: wf.name } : {}), ...(wf.origin ? { origin: wf.origin } : {}), status: wf.status, rev: wf.rev,
+    wid: wf.wid, ...(wf.name ? { name: wf.name } : {}), ...(wf.origin ? { origin: wf.origin } : {}), status: wf.status,
+    ...(wf.active ? { active: true as const } : {}), rev: wf.rev,
     ...(wf.startedAt !== undefined ? { startedAt: wf.startedAt } : {}), ...(wf.endedAt !== undefined ? { endedAt: wf.endedAt } : {}),
     ...(wf.error ? { error: clip(wf.error, 500) } : {}), usage: wf.usage ?? zero(), counts: wf.counts,
     ...(wf.planned !== undefined ? { planned: wf.planned } : {}), done: progress.done,
@@ -520,7 +549,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
-        ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
+        ...(c.answered ? { answered: c.answered } : {}), ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
         ...(c.notesPending ? { notesPending: c.notesPending } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
@@ -573,7 +602,7 @@ const settled = (w: WorkflowSnapshot) => FINAL.includes(w.status) && !w.followUp
 const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`;
 const tokens = (u?: Usage) => { const n = u ? u.input + u.output : 0; return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(n); };
 /** The latest generation of every key, in first-call order. */
-const latestCalls = (wf: WorkflowSnapshot) => [...new Map(wf.calls.map(c => [c.key, c] as const)).values()];
+const latestCalls = (wf: Pick<WorkflowSnapshot, "calls">) => [...new Map(wf.calls.map(c => [c.key, c] as const)).values()];
 
 export interface BriefCall {
   key: string; agent: string; phase: CallPhase; model?: string;
@@ -582,8 +611,10 @@ export interface BriefCall {
   for?: string; quiet?: string;
   /** Input + output tokens so far: a running call at 0 has done nothing yet. */
   tokens?: string; status?: CallResult["status"]; error?: string;
-  /** Asking and hibernated: it holds no provider slot while it waits (P28). */
+  /** Hibernated: it holds no provider slot while it waits (P28). */
   hibernated?: true;
+  /** Bound question id, until the next execution starts running. */
+  answered?: string;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
   /** Resource leases (`pi-durable-subagents hold`): "holds lease machine" / "waiting for lease machine 3m". */
@@ -594,7 +625,12 @@ export interface BriefCall {
   notesPending?: number;
 }
 export interface BriefWorkflow {
-  wid: string; name?: string; status: WorkflowSnapshot["status"]; paused?: true;
+  wid: string; name?: string;
+  /** The run's result; follow-ups leave a final status unchanged. */
+  status: WorkflowSnapshot["status"];
+  /** Work is still going in a latest-generation call (a follow-up when the run has finished). */
+  active?: true;
+  paused?: true;
   /** The run's labels on one clipped line, e.g. "[node=A3 attempt=2]" (the full labels: status wid=<wid>, describe). */
   labels?: string;
   /** Follow-ups still open on this finished workflow (its status stays final). */
@@ -738,7 +774,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
   const line = (w: WorkflowSnapshot) => {
     const p = progressOf(w), notOk = latestCalls(w).filter(c => c.result && !c.result.ok).length;
     const notes = latestCalls(w).reduce((n, c) => n + (c.notesPending ?? 0), 0);
-    return [w.wid, labelsText(w.labels), w.name, `${w.paused ? "paused" : w.followUps ? `${w.status}, follow-up running` : w.status}`, `${p.done}/${p.total}${p.plus ? "+" : ""} done`, notOk ? `${notOk} not ok` : "",
+    return [w.wid, labelsText(w.labels), w.name, `${w.paused ? "paused" : w.followUps ? `follow-up running (run ${w.status})` : w.status}`, `${p.done}/${p.total}${p.plus ? "+" : ""} done`, notOk ? `${notOk} not ok` : "",
       notes ? `${notes} note${notes > 1 ? "s" : ""} pending` : "",
       w.endedAt !== undefined ? `ended ${age(now - w.endedAt)} ago` : w.startedAt !== undefined ? `started ${age(now - w.startedAt)} ago` : ""].filter(Boolean).join(" · ");
   };
@@ -752,7 +788,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
         ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
         ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
-        ...(c.hibernated ? { hibernated: true as const } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
+        ...(c.hibernated ? { hibernated: true as const } : {}), ...(c.answered ? { answered: c.answered } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
         ...(live && byCall.get(c.callId) ? { lease: byCall.get(c.callId) } : {}),
         ...(live && c.switching ? { switching: c.switching } : {}), ...(live && c.switchFailed ? { switchFailed: c.switchFailed } : {}),
         ...(c.notesPending ? { notesPending: c.notesPending } : {}) };
@@ -760,7 +796,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
       ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300) }));
     const alerts = open.filter(a => a.kind !== "question").map(a => `${a.kind}${a.call ? ` ${w.wid}/${callKey(a.call)}` : ""}: ${clip(a.text, 200)}`);
-    return { wid: w.wid, ...(w.labels ? { labels: labelsText(w.labels) } : {}), ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.paused ? { paused: true as const } : {}), ...(w.followUps ? { followUps: w.followUps } : {}),
+    return { wid: w.wid, ...(w.labels ? { labels: labelsText(w.labels) } : {}), ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.active ? { active: true as const } : {}), ...(w.paused ? { paused: true as const } : {}), ...(w.followUps ? { followUps: w.followUps } : {}),
       progress: `${p.done}/${p.total}${p.plus ? "+" : ""}`, tokens: tokens(w.usage), calls,
       ...(asking.length ? { asking } : {}), ...(alerts.length ? { alerts } : {}) };
   };
