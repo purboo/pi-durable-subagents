@@ -86,7 +86,12 @@ export function registerChild(pi: ExtensionAPI): void {
         return body && ctx.modelRegistry.find(body.provider, body.model) ? { action: 'apply' } : { action: 'reject', reason: 'unknown-model' };
       }
       if (MESSAGES.includes(req.kind)) {
-        if ((mode === 'idle' && delivered) || (req.kind === 'follow-up' && mode === 'boundary')) return { action: 'defer' };
+        // A resumed turn can reach this boundary before an idle intake. Older follow-ups must ride ahead of its
+        // bound answer; otherwise continue bypasses them and the model sees stale instructions after the answer.
+        const beforeResume = mode === 'boundary' && req.kind === 'follow-up' && candidates.some(other =>
+          other.kind === 'continue' && other.cond?.qid !== undefined && !view.resolved.has(other.rid) && !view.tombstones.has(other.rid) &&
+          view.order.get(req.rid)! < (view.order.get(other.rid) ?? -1));
+        if ((mode === 'idle' && delivered) || (req.kind === 'follow-up' && mode === 'boundary' && !beforeResume)) return { action: 'defer' };
         // A notify never interrupts a question: while an answer waits to be delivered (a hibernated asker resumes with
         // its answer as a continue) it goes after it, at the next safe point. In ask mode it was deferred above.
         if (req.kind === 'notify' && candidates.some(other => !view.resolved.has(other.rid) && !view.tombstones.has(other.rid) &&

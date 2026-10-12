@@ -1,0 +1,51 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { registerChild } from '../../../src/agent/child.ts';
+import { openJournal } from '../../../src/kernel/journal.ts';
+import { publishRequest } from '../../../src/kernel/mailbox.ts';
+import { CT, JT, type Request } from '../../../src/types.ts';
+
+for (const withdrawn of [false, true]) test(`resume boundary delivers earlier queued follow-ups before the answer (withdrawn=${withdrawn})`, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsa-resume-order-'));
+  const inbox = join(root, 'inbox'), journal = join(root, 'journal.jsonl');
+  await mkdir(inbox);
+  const log = await openJournal(journal);
+  await log.append(JT.exec, { exec: 'call#1.2', call: 'call' });
+  await log.close();
+  const old = Object.fromEntries(['DSA_EXEC', 'DSA_CALL', 'DSA_INBOX', 'DSA_JOURNAL', 'DSA_MODEL', 'DSA_BUDGET', 'DSA_SCHEMA'].map(key => [key, process.env[key]]));
+  Object.assign(process.env, { DSA_EXEC: 'call#1.2', DSA_CALL: 'call', DSA_INBOX: inbox, DSA_JOURNAL: journal });
+  for (const key of ['DSA_MODEL', 'DSA_BUDGET', 'DSA_SCHEMA']) delete process.env[key];
+  const hooks = new Map<string, (event: unknown, ctx: any) => Promise<any>>();
+  const history: any[] = [{ type: 'custom', customType: CT.question, data: { qid: 'q', rev: 1, question: 'Choose?' } }];
+  const ctx = { isIdle: () => false, sessionManager: { getEntries: () => history }, shutdown() {} };
+  t.after(async () => {
+    await hooks.get('session_shutdown')?.({}, ctx);
+    for (const [key, value] of Object.entries(old)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    await rm(root, { recursive: true, force: true });
+  });
+  registerChild({ on: (name: string, fn: any) => hooks.set(name, fn), registerTool() {}, appendEntry: (customType: string, data: unknown) => history.push({ type: 'custom', customType, data }) } as unknown as Parameters<typeof registerChild>[0]);
+  let sseq = 0;
+  const send = async (rid: string, kind: Request['kind'], body: unknown, cond?: Request['cond']) => publishRequest(inbox, { rid, from: 'orch', to: 'call', sseq: ++sseq, kind, body, ...(cond ? { cond } : {}) });
+  await send('early-1', 'follow-up', { message: 'first instructions' });
+  await send('early-2', 'follow-up', { message: 'second instructions' });
+  if (withdrawn) await send('withdraw', 'withdraw', { rids: ['early-1'] });
+  await send('answer', 'continue', { message: 'Answer: approved' }, { qid: 'q', rev: 1 });
+  await send('late', 'follow-up', { message: 'later instructions' });
+  // A resumed pi may already be in a turn: startup cannot use the idle API.
+  await hooks.get('session_start')!({}, ctx);
+  const boundary = await hooks.get('turn_end')!({}, ctx);
+  const messages = boundary.entries.filter((e: any) => e.type === 'custom_message');
+  assert.deepEqual(messages.map((e: any) => e.details.rid), withdrawn ? ['early-2', 'answer'] : ['early-1', 'early-2', 'answer']);
+  assert.deepEqual(messages.at(-1).details, { rid: 'answer', kind: 'continue', from: 'orch', qid: 'q', rev: 1 });
+  history.push(...boundary.entries);
+  const settle = await hooks.get('agent_before_settle')!({}, ctx);
+  assert.deepEqual(settle.entries.filter((e: any) => e.type === 'custom_message').map((e: any) => e.details.rid), ['late']);
+  history.push(...settle.entries);
+  await hooks.get('session_shutdown')!({}, ctx);
+  await hooks.get('session_start')!({}, ctx);
+  const retry = await hooks.get('agent_before_settle')!({}, ctx);
+  assert.deepEqual(retry.entries, [], 'restart does not deliver any receipt twice');
+});
