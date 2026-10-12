@@ -9,8 +9,8 @@
 // can be missed: a grant needs no lock once the ticket exists. A ticket is live while its wrapper or its
 // command (pid + start token) lives, or processes the command left in its group remain; a waiter next in line ends such
 // leftovers of a killed wrapper. Anyone may delete a dead ticket. No orchestrator is involved.
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { OsLock } from "./lock.ts";
 
@@ -125,13 +125,36 @@ export function blockers(t: Pick<LeaseTicket, "seq" | "mode" | "slots" | "grante
   return granted.length >= (t.slots ?? 1) ? granted : [];
 }
 
+/** Write `file` through a temporary file renamed over it; a failed write or rename removes the temporary file (a full
+ *  disk left empty ones behind). */
+export function replaceFileSync(file: string, content: string, mode?: number) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try { writeFileSync(tmp, content); if (mode !== undefined) chmodSync(tmp, mode); renameSync(tmp, file); }
+  catch (error) { try { unlinkSync(tmp); } catch { /* never written */ } throw error; }
+}
+async function replaceFile(file: string, content: string) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try { await writeFile(tmp, content); renameSync(tmp, file); }
+  catch (error) { await unlink(tmp).catch(() => {}); throw error; }
+}
+/** Remove `*.tmp` files in `dir` older than `maxAgeMs` (partial writes of processes that died or ran out of disk). Best
+ *  effort: returns how many were removed, never throws. */
+export function removeStaleTemps(dir: string, maxAgeMs: number, now = Date.now()): number {
+  let removed = 0, names: string[];
+  try { names = readdirSync(dir); } catch { return 0; }
+  for (const name of names.filter(n => n.endsWith(".tmp"))) {
+    try {
+      const file = path.join(dir, name), info = statSync(file);
+      if (info.isFile() && now - info.mtimeMs > maxAgeMs) { unlinkSync(file); removed++; }
+    } catch { /* gone meanwhile, or not ours to remove */ }
+  }
+  return removed;
+}
 function writeTicketSync(home: string, t: LeaseTicket) {
-  const file = path.join(leaseDir(home, t.resource), ticketName(t.seq)), tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(t)); renameSync(tmp, file);
+  replaceFileSync(path.join(leaseDir(home, t.resource), ticketName(t.seq)), JSON.stringify(t));
 }
 export async function writeTicket(home: string, t: LeaseTicket) {
-  const file = path.join(leaseDir(home, t.resource), ticketName(t.seq)), tmp = `${file}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(t)); renameSync(tmp, file);
+  await replaceFile(path.join(leaseDir(home, t.resource), ticketName(t.seq)), JSON.stringify(t));
 }
 export function removeTicket(home: string, t: LeaseTicket) {
   try { unlinkSync(path.join(leaseDir(home, t.resource), ticketName(t.seq))); } catch { /* already gone */ }
@@ -167,7 +190,7 @@ async function numbered(home: string, ticket: Omit<LeaseTicket, "seq">, now: boo
       if (busy.length) return { busy };
       t.grantedAt = Date.now();
     }
-    await writeFile(`${counter}.tmp`, String(t.seq)); renameSync(`${counter}.tmp`, counter);
+    await replaceFile(counter, String(t.seq));
     writeTicketSync(home, t);
     return t;
   } finally { await handle.release(); }
@@ -238,8 +261,7 @@ const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
  *  the running orchestrator, so children can `hold` without the package on their PATH. Rewritten at every start. */
 export function writeShim(dir: string, node: string, entry: string): string {
   mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, "pi-durable-subagents"), tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, `#!/bin/sh\nexec ${quote(node)} ${quote(entry)} "$@"\n`);
-  chmodSync(tmp, 0o755); renameSync(tmp, file);
+  const file = path.join(dir, "pi-durable-subagents");
+  replaceFileSync(file, `#!/bin/sh\nexec ${quote(node)} ${quote(entry)} "$@"\n`, 0o755);
   return file;
 }
