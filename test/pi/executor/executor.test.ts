@@ -156,6 +156,27 @@ test("an answered hibernated call queues behind a full provider and resolves att
   assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === id).length, 1, "the child receipt does not resolve twice");
 });
 
+for (const when of ["asking", "hibernated"] as const) test(`a follow-up queued while ${when} reaches the resumed model before the later answer`, { timeout: 30000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: when === "asking" ? 500 : 40, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
+  const pending = f.executor.run(ticket);
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  await until(() => f.journal.entries().some(e => e.type === (when === "asking" ? JT.attention : "hibernated")));
+  const follow: Request = { rid: "follow", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "follow-up", message: "earlier instructions" } };
+  assert.deepEqual(await f.executor.forward(follow, ctx), { action: "apply" });
+  await until(() => f.journal.entries().some(e => e.type === "hibernated") && f.orch.entries().filter(e => e.type === "release").length >= 2);
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  const answer: Request = { rid: "answer", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: "yes " + script([{ text: "resumed" }]) } };
+  assert.deepEqual(await f.executor.forward(answer, ctx), { action: "apply" });
+  const result = await pending;
+  assert.equal(result.status, "ok");
+  const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
+  const forwarded = f.journal.entries().find(e => e.type === "forward" && e.rid === follow.rid)!;
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const messages = rows.filter(e => e.type === "custom_message" && e.customType === CT.msg);
+  assert.deepEqual(messages.filter(e => [forwarded.rid2, bound.rid2].includes(e.details?.rid)).map(e => e.details.rid), [forwarded.rid2, bound.rid2], "send order is preserved in the native model context");
+});
+
 test("P28 hibernates without loss, binds once, resumes with one receipt", { timeout: 30000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
   const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
