@@ -74,40 +74,49 @@ test("the starter passes the resolved pi as DSA_PI_BIN and never the starting se
   assert.deepEqual(calls[0]!.env, { PATH: bin, OTHER: "x", DSA_HOME: "/h", DSA_PI_BIN: pi });
 });
 
-test("scope launch selection: systemd-run on Linux with a user manager when its probe works, else a detached process", async t => {
+test("scope launch selection: systemd-run on Linux with a lingering user manager when its probe works, else a detached process", async t => {
   const dir = await root(t), bin = join(dir, "bin"), runner = await executable(bin, "systemd-run");
   await executable(bin, "pi");
-  const env = { PATH: bin, XDG_RUNTIME_DIR: "/run/user/1" };
+  const env = { PATH: bin, XDG_RUNTIME_DIR: "/run/user/1", USER: "u1" };
+  const linger = () => true;
   const probes: string[][] = [];
   const probe = (ok: boolean) => async (command: string, args: string[], options: { timeoutMs: number }) => { probes.push([command, ...args]); assert.ok(options.timeoutMs <= 5000); return ok; };
   // Works: the scope runs node with the entry.
   let r = recorder();
-  assert.deepEqual(await launchOrchestrator("/entry.js", env, { home: "/h", node: "/node", platform: "linux", probe: probe(true), spawn: r.spawn }), { pid: 4243, scope: true, pi: join(bin, "pi") });
+  assert.deepEqual(await launchOrchestrator("/entry.js", env, { home: "/h", node: "/node", platform: "linux", linger, probe: probe(true), spawn: r.spawn }), { pid: 4243, scope: true, pi: join(bin, "pi") });
   assert.deepEqual(probes, [[runner, ...SCOPE_ARGS, "true"]]);
   assert.deepEqual(r.calls.map(c => [c.command, c.args]), [[runner, ["--user", "--scope", "--quiet", "--collect", "--description", "pi-durable-subagents orchestrator", "--", "/node", "/entry.js"]]]);
   assert.equal(r.calls[0]!.env.DSA_HOME, "/h");
   // A failing probe: the plain detached process.
   r = recorder();
-  assert.equal((await launchOrchestrator("/entry.js", env, { home: "/h", node: "/node", platform: "linux", probe: probe(false), spawn: r.spawn })).scope, false);
+  assert.equal((await launchOrchestrator("/entry.js", env, { home: "/h", node: "/node", platform: "linux", linger, probe: probe(false), spawn: r.spawn })).scope, false);
   assert.deepEqual(r.calls.map(c => c.command), ["/node"]);
   // The probe worked but the scope launch failed: the plain detached process.
   r = recorder(command => command === runner);
-  assert.equal((await launchOrchestrator("/entry.js", env, { home: "/h", node: "/node", platform: "linux", probe: probe(true), spawn: r.spawn })).scope, false);
+  assert.equal((await launchOrchestrator("/entry.js", env, { home: "/h", node: "/node", platform: "linux", linger, probe: probe(true), spawn: r.spawn })).scope, false);
   assert.deepEqual(r.calls.map(c => c.command), [runner, "/node"]);
   // Never probed: DSA_SCOPE=off, another platform, no XDG_RUNTIME_DIR, no systemd-run on PATH.
   probes.length = 0;
-  assert.equal(await scopeRunner({ ...env, DSA_SCOPE: "off" }, { platform: "linux", probe: probe(true) }), undefined);
+  assert.equal(await scopeRunner({ ...env, DSA_SCOPE: "off" }, { platform: "linux", linger, probe: probe(true) }), undefined);
   assert.equal(await scopeRunner(env, { platform: "darwin", probe: probe(true) }), undefined);
-  assert.equal(await scopeRunner({ PATH: bin }, { platform: "linux", probe: probe(true) }), undefined);
-  assert.equal(await scopeRunner({ ...env, PATH: join(dir, "none") }, { platform: "linux", probe: probe(true) }), undefined);
+  assert.equal(await scopeRunner({ PATH: bin }, { platform: "linux", linger, probe: probe(true) }), undefined);
+  assert.equal(await scopeRunner({ ...env, PATH: join(dir, "none") }, { platform: "linux", linger, probe: probe(true) }), undefined);
+  // Without lingering the user manager stops its scopes at logout: never probed, a plain detached process.
+  const asked: string[] = [];
+  assert.equal(await scopeRunner(env, { platform: "linux", linger: user => { asked.push(user); return false; }, probe: probe(true) }), undefined);
+  assert.deepEqual(asked, ["u1"]);
+  r = recorder();
+  assert.equal((await launchOrchestrator("/entry.js", env, { home: "/h", node: "/node", platform: "linux", linger: () => false, probe: probe(true), spawn: r.spawn })).scope, false);
+  assert.deepEqual(r.calls.map(c => c.command), ["/node"]);
   assert.deepEqual(probes, []);
   // A probe that throws counts as failing.
-  assert.equal(await scopeRunner(env, { platform: "linux", probe: async () => { throw new Error("boom"); } }), undefined);
+  assert.equal(await scopeRunner(env, { platform: "linux", linger, probe: async () => { throw new Error("boom"); } }), undefined);
 });
 
 const cgroupOf = (pid: number | "self") => readFileSync(`/proc/${pid}/cgroup`, "utf8").split("\n").find(l => l.startsWith("0::"));
 test("on this host: the orchestrator runs in its own scope, outside the starter's cgroup", {
   skip: process.platform !== "linux" || !process.env.XDG_RUNTIME_DIR || !findOnPath("systemd-run", process.env.PATH) || !cgroupOf("self") ? "needs Linux with a systemd user manager (cgroup v2)" : false,
+  // Lingering is the host's choice; the scope path itself is exercised as if it were enabled.
   timeout: 20000 }, async t => {
   const dir = await root(t), out = join(dir, "out.txt");
   // A stand-in orchestrator: records its pid and cgroup, then waits to be stopped.
@@ -117,7 +126,7 @@ test("on this host: the orchestrator runs in its own scope, outside the starter'
     `renameSync(${JSON.stringify(out + ".tmp")}, ${JSON.stringify(out)});\nsetInterval(() => {}, 1000);\nprocess.on("SIGTERM", () => process.exit(0));\n`);
   const env: NodeJS.ProcessEnv = { ...process.env, DSA_PI_BIN: process.execPath };
   delete env.DSA_SCOPE;
-  const launched = await launchOrchestrator(entry, env, { home: dir });
+  const launched = await launchOrchestrator(entry, env, { home: dir, linger: () => true });
   t.after(() => { try { process.kill(launched.pid, "SIGKILL"); } catch { /* exited */ } });
   if (!launched.scope) return t.skip("systemd-run --user --scope is not usable here");
   const deadline = Date.now() + 10_000;

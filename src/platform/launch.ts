@@ -2,10 +2,13 @@
 // successor) goes through launchOrchestrator, so the orchestrator never depends on whoever happened to start it:
 // - `pi` is resolved once, by the starter, to an absolute path passed on as DSA_PI_BIN (the starter's PATH may be the
 //   only one that has it: a systemd unit or cron job usually has a minimal PATH);
-// - on Linux with a systemd user manager it runs in its own transient scope, outside the starter's cgroup, so the end
-//   of a oneshot unit, a cron job or a CI step (which kill their whole cgroup) does not end it.
+// - on Linux with a systemd user manager and lingering enabled for the user it runs in its own transient scope, outside
+//   the starter's cgroup, so the end of a oneshot unit, a cron job or a CI step (which kill their whole cgroup) does not
+//   end it. Without lingering the user manager stops its scopes at logout, while a plain detached process survives it
+//   (KillUserProcesses=no, the usual default): it starts as a plain detached process then.
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { accessSync, constants, statSync } from "node:fs";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { userInfo } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
 
 /** Whether `path` is a regular file this process may execute. */
@@ -61,6 +64,8 @@ export interface LaunchOptions {
   node?: string;
   platform?: NodeJS.Platform;
   probe?: ProbeRunner;
+  /** Whether `user` has lingering enabled (default: /var/lib/systemd/linger/<user> exists). */
+  linger?: (user: string) => boolean;
   spawn?: Spawner;
 }
 export interface Launched { pid: number; scope: boolean; pi?: string }
@@ -76,11 +81,22 @@ export const runProbe: ProbeRunner = (command, args, { env, timeoutMs }) => new 
   child.once("exit", code => resolve(code === 0));
 });
 
-/** systemd-run when the orchestrator should run in its own scope: Linux, a user manager (XDG_RUNTIME_DIR), systemd-run
- *  on PATH, DSA_SCOPE not "off", and a probe scope that works. Probed once per start attempt (the starter only runs
- *  when no orchestrator holds the lock). */
-export async function scopeRunner(env: NodeJS.ProcessEnv, options: Pick<LaunchOptions, "platform" | "probe"> = {}): Promise<string | undefined> {
+/** Whether systemd keeps `user`'s manager (and its scopes) running after the last logout. */
+export function lingering(user: string): boolean {
+  return !!user && !user.includes("/") && existsSync(join("/var/lib/systemd/linger", user));
+}
+function currentUser(env: NodeJS.ProcessEnv): string {
+  if (env.USER) return env.USER;
+  try { return userInfo().username; } catch { return ""; }
+}
+
+/** systemd-run when the orchestrator should run in its own scope: Linux, a user manager (XDG_RUNTIME_DIR) that lingers
+ *  (it outlives logouts; a scope under a manager that does not would be stopped at logout), systemd-run on PATH,
+ *  DSA_SCOPE not "off", and a probe scope that works. Probed once per start attempt (the starter only runs when no
+ *  orchestrator holds the lock). */
+export async function scopeRunner(env: NodeJS.ProcessEnv, options: Pick<LaunchOptions, "platform" | "probe" | "linger"> = {}): Promise<string | undefined> {
   if ((options.platform ?? process.platform) !== "linux" || env.DSA_SCOPE === "off" || !env.XDG_RUNTIME_DIR) return undefined;
+  if (!(options.linger ?? lingering)(currentUser(env))) return undefined;
   const runner = findOnPath("systemd-run", env.PATH);
   if (!runner) return undefined;
   const ok = await (options.probe ?? runProbe)(runner, [...SCOPE_ARGS, "true"], { env, timeoutMs: PROBE_TIMEOUT_MS }).catch(() => false);

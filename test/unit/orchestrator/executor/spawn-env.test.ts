@@ -4,12 +4,13 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { PassThrough } from "node:stream";
 import { openJournal } from "../../../../src/kernel/journal.ts";
-import { ulid } from "../../../../src/kernel/ids.ts";
-import { callDir, callSession, journalPath, orchLedger } from "../../../../src/paths.ts";
+import { contentHash, ulid } from "../../../../src/kernel/ids.ts";
+import { scanInbox } from "../../../../src/kernel/mailbox.ts";
+import { binDir, callDir, callInbox, callSession, journalPath, orchLedger } from "../../../../src/paths.ts";
 import { CT, JT, type Containment, type Entry, type ProcInfo, type SpawnSpec } from "../../../../src/types.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 import createExecutor from "../../../../src/orchestrator/executor/index.ts";
@@ -38,7 +39,7 @@ const effects = { prepare: async (t: CallTicket) => ({ cwd: t.cwd }), beforeSeal
 async function fixture(t: TestContext, options: { spawnRetryMs?: number; pi?: string } = {}) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "dsa-spawn-env-"))), wid = ulid(), containment = new FakeContainment();
   const orch = await openJournal(orchLedger(home)), journal = await openJournal(journalPath(home, wid));
-  t.mock.method(console, "error", () => {});
+  const consoleError = t.mock.method(console, "error", () => {});
   const ledgers = { home, orch, config: { k: { trackerMs: 20 }, writerLock: "off" as const } };
   const make = () => createExecutor(ledgers, { effects, containment, memory: async () => 1e6, sweepMs: 40, ...options });
   let executor = make();
@@ -50,7 +51,7 @@ async function fixture(t: TestContext, options: { spawnRetryMs?: number; pi?: st
     await writeFile(callSession(home, wid, "a", 1), [{ type: "custom", customType: CT.exec, data: { exec } }, { type: "custom", customType: CT.report, data: { exec, outcome: "ok", data: { exec } } }]
       .map(l => JSON.stringify(l)).join("\n") + "\n");
   };
-  return { home, wid, orch, journal, containment, ticket, get executor() { return executor; },
+  return { home, wid, orch, journal, containment, ticket, consoleError, get executor() { return executor; },
     async restart() { await executor.shutdown(); executor = make(); return executor; } };
 }
 const alerts = (entries: readonly Entry[]) => entries.filter(e => e.type === JT.attention && (e.item as { kind: string }).kind === "environment");
@@ -115,4 +116,49 @@ test("other launch errors stay terminal", { timeout: 10000 }, async t => {
   assert.equal(result.status, "failed"); assert.match(String(result.error), /Spawn failed: .*E2BIG/);
   assert.equal(f.containment.launches.length, 1);
   assert.equal(alerts(f.journal.entries()).length, 0);
+});
+
+const launchLines = (f: { consoleError: { mock: { calls: { arguments: unknown[] }[] } } }) =>
+  f.consoleError.mock.calls.filter(c => /launching .* failed/.test(String(c.arguments[0]))).length;
+
+test("environment retries of a call that ran before leave exactly one pending dispatch, the first retry's", { timeout: 15000 }, async t => {
+  const f = await fixture(t, { spawnRetryMs: 30, pi: "/missing/pi" });
+  // The call ran before: its session holds the task (received), and its execution #1.1 ended without a report.
+  const taskRid = contentHash([`${f.ticket.callId}#1.1`, "dispatch"]);
+  await mkdir(callDir(f.home, f.wid, "a", 1), { recursive: true });
+  await writeFile(callSession(f.home, f.wid, "a", 1), [{ type: "custom", customType: CT.exec, data: { exec: `${f.ticket.callId}#1.1` } },
+    { type: "message", message: { role: "user", content: "task", details: { rid: taskRid } } }].map(l => JSON.stringify(l)).join("\n") + "\n");
+  await f.journal.append(JT.exec, { call: f.ticket.callId, exec: `${f.ticket.callId}#1.1` });
+  const inbox = callInbox(f.home, f.wid, "a", 1);
+  let pending: { kind: string; rid: string }[] | undefined;
+  const write = f.containment.session!;
+  f.containment.session = async exec => { pending = (await scanInbox(inbox)).filter(r => r.kind === "task" || r.kind === "continue"); await write(exec); };
+  f.containment.fail = n => n <= 4 ? enoent() : undefined;
+  const result = await f.executor.run(f.ticket);
+  assert.equal(result.status, "ok");
+  assert.equal(f.containment.launches.length, 5);
+  assert.deepEqual(pending?.map(r => [r.kind, r.rid]), [["continue", contentHash([`${f.ticket.callId}#1.2`, "dispatch"])]],
+    "one continue (the first retry's), not one per failed launch");
+  // Logged once for the run of failures, not once per attempt.
+  assert.equal(launchLines(f), 1);
+});
+
+test("a launch failure is recorded before its execution is fenced", { timeout: 15000 }, async t => {
+  const f = await fixture(t, { spawnRetryMs: 30 });
+  f.containment.fail = n => n <= 2 ? enoent() : undefined;
+  const result = await f.executor.run(f.ticket);
+  assert.equal(result.status, "ok");
+  const entries = f.journal.entries(), first = `${f.ticket.callId}#1.1`;
+  const failed = entries.findIndex(e => e.type === "spawn-env-failed" && e.exec === first);
+  const fenced = entries.findIndex(e => e.type === JT.fenced && e.exec === first);
+  assert.ok(failed >= 0 && fenced >= 0 && failed < fenced, "spawn-env-failed precedes the fence: a crash in between loses nothing");
+});
+
+test("the child's PATH: binDir, then the orchestrator's node, then the inherited PATH", { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const result = await f.executor.run(f.ticket);
+  assert.equal(result.status, "ok");
+  const PATH = String(f.containment.launches[0]!.env.PATH).split(delimiter);
+  assert.deepEqual(PATH.slice(0, 2), [binDir(f.home), dirname(process.execPath)]);
+  if (process.env.PATH) assert.deepEqual(PATH.slice(2), process.env.PATH.split(delimiter));
 });

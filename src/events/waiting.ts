@@ -26,7 +26,7 @@ import { EVENT_SEQ_SKIP, WAIT_REASONS, type EventDraft, type EventSink, type Wai
 import { emptyLedger, foldLedger, settingsOf, type LedgerState } from "../orchestrator/ledger.ts";
 import type { Exhaustion } from "../orchestrator/providers.ts";
 import type { OrchestratorConfig } from "../orchestrator/contract.ts";
-import { exhaustedLine, slotLine } from "../orchestrator/snapshot.ts";
+import { exhaustedLine, heldIn, slotLine } from "../orchestrator/snapshot.ts";
 import { parseModel, resolveModel } from "../compat/model.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { requestId } from "../requests.ts";
@@ -191,6 +191,8 @@ export interface WaitEnv {
   ledger: LedgerState;
   /** Settings when the ledger records none (an embedded orchestrator). */
   config?: OrchestratorConfig;
+  /** Whether a drain holds the workflow (stop-all, drain, a quit pi): an answered call there waits for resume, not a slot. */
+  held?: (wid: string) => boolean;
   /** Per call id: its waiting lease tickets (`leaseWaits`). Read only for running calls (a getter can defer it). */
   readonly leases?: ReadonlyMap<string, { detail: string; since: number }>;
 }
@@ -203,7 +205,9 @@ export function leaseWaits(state: ReturnType<typeof leaseState>, now: number): M
 const providerOf = (model?: string) => { if (!model) return undefined; try { return parseModel(model).provider; } catch { return undefined; } };
 /** The call's state as `whyWaiting` reads it. `agentModel` names the model of a pinned agent (for a call naming none). */
 export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: (agent: string) => string | undefined): WaitInput {
-  const settings = settingsOf(env.ledger, env.config ?? {}), live = c.exec && (!c.fenced || c.answered !== undefined), selected = c.selected && c.answered === undefined;
+  // An answered asker is queued (live) although its hibernated execution is fenced, unless a drain holds its workflow.
+  const answered = c.answered !== undefined && !env.held?.(f.wid);
+  const settings = settingsOf(env.ledger, env.config ?? {}), live = c.exec && (!c.fenced || answered), selected = c.selected && c.answered === undefined;
   const attention: { id: string; kind: string; text: string; since: number; exec?: string }[] = [];
   let asking = false;
   for (const [id, item] of f.items) if (item.call === c.call) {
@@ -376,7 +380,7 @@ export function waitCollector(src: WaitSources): (now?: number) => WaitsCollecte
     const orch = src.orch.entries();
     foldLedger(ledger, orch); foldRuns(orch);
     let leases: ReadonlyMap<string, { detail: string; since: number }> | undefined;
-    const env: WaitEnv = { now, ledger, ...(src.config ? { config: src.config } : {}), get leases() { return leases ??= leaseWaits((src.leases ?? (() => leaseState(src.home)))(), now); } };
+    const env: WaitEnv = { now, ledger, held: heldIn(orch), ...(src.config ? { config: src.config } : {}), get leases() { return leases ??= leaseWaits((src.leases ?? (() => leaseState(src.home)))(), now); } };
     const current = new Map<string, Wait>(), meta = new Map<string, WaitMeta>(), present = new Set<string>();
     for (const wf of src.workflows()) {
       present.add(wf.wid);

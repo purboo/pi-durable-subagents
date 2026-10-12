@@ -433,6 +433,10 @@ export function holdOf(ledger: readonly Entry[], wid: string, origin?: string): 
   const created = ix.created.get(wid);
   return !created || created.seq < last.seq ? last : undefined;
 }
+/** Drain: whether a drain holds workflow `wid`, from the orchestrator ledger's entries. */
+export function heldIn(ledger: readonly Entry[]): (wid: string) => boolean {
+  return wid => holdOf(ledger, wid, ledgerIndex(ledger).created.get(wid)?.origin as string | undefined) !== undefined;
+}
 /** Drain: the workflows a drain (stop-all, a quit pi) holds until resume, and since when. */
 export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean; labels: (wid: string) => Record<string, string> | undefined; session: (wid: string) => string | undefined } {
   const ledger = readJournalSnapshot(orchLedger(home)), ix = ledgerIndex(ledger);
@@ -904,7 +908,8 @@ export function statusDetail(home: string, wid: string): StatusDetail {
   const origin = origins(home);
   if (!origin.has(wid)) throw new Error(prunedIds(home).has(wid) ? `Workflow ${wid} was pruned` : `Unknown workflow: ${wid}`);
   const held = heldWorkflows(home), wf = labelled(workflowSnapshot(home, wid), held.labels(wid), held.session(wid)), log = scriptLogPath(home, wid);
-  return { ...wf, ...(wf.origin === undefined && origin.get(wid) !== undefined ? { origin: origin.get(wid) } : {}), ...(existsSync(log) ? { scriptLog: log } : {}) };
+  return { ...wf, ...(wf.origin === undefined && origin.get(wid) !== undefined ? { origin: origin.get(wid) } : {}), ...(existsSync(log) ? { scriptLog: log } : {}),
+    ...(isLive(wf) && held.held(wid) ? { paused: true } : {}) };
 }
 
 export interface TimelineEvent { seq: number; ts: number; event: string; [field: string]: unknown }

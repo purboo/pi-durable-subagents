@@ -107,6 +107,8 @@ export class Outbox {
       await this.publish(req); return structuredClone(req);
     });
   }
+  /** The envelope recorded as sent under `rid`, if any. */
+  recorded(rid: string): Request | undefined { const req = this.sent.get(rid); return req && structuredClone(req); }
   /** P38: Re-publish every unresolved envelope under its original identity. */
   republishPending(): Promise<void> { return this.serial(async () => { for (const req of this.pending.values()) await this.publish(req); }); }
   /** P38: Record observed terminal resolution without deleting the sequence high-water. */
