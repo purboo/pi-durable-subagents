@@ -16,9 +16,9 @@ witness('V2 seal', () => guards.seal({ sealed: false, exec: 'e' }, { exec: 'e' }
 witness('V2 current execution', () => guards.seal({ sealed: false, exec: 'e' }, { exec: 'e' }), () => guards.seal({ sealed: false, exec: 'e' }, { exec: 'old' }));
 witness('V3 currency', () => guards.currency({ epoch: 'w@2', ev: 2 }, { epoch: 'w@2', ev: 2 }), () => guards.currency({ epoch: 'w@2', ev: 2 }, { epoch: 'w@2', ev: 1 }));
 const q = { qid: 'q', rev: 2 };
-witness('V4 openness', () => guards.openness({ open: [q], blocked: q }, q), () => guards.openness({ open: [], blocked: q }, q));
-witness('V4 hibernated revision', () => guards.openness({ open: [q], hibernated: q }, q), () => guards.openness({ open: [q], hibernated: { ...q, rev: 1 } }, q));
-witness('V4 interrupted question', () => guards.openness({ open: [q], blocked: q }, q), () => guards.openness({ open: [q] }, q));
+witness('V4 openness', () => guards.openness({ open: [q], closed: new Set() }, q), () => guards.openness({ open: [], closed: new Set() }, q));
+witness('V4 current revision', () => guards.openness({ open: [q], closed: new Set() }, q), () => guards.openness({ open: [q], closed: new Set() }, { ...q, rev: 1 }));
+witness('V4 answered or superseded', () => guards.openness({ open: [q], closed: new Set(['q@1']) }, q), () => guards.openness({ open: [q], closed: new Set(['q@2']) }, q));
 const dep = { order: new Map([['a', 0], ['b', 1]]), resolved: new Set(['a']) };
 witness('V5 earlier dependency', () => guards.dependency(dep, { rid: 'b', after: 'a', phase: 'application' }), () => guards.dependency(dep, { rid: 'a', after: 'b', phase: 'admission' }));
 witness('V5 resolved dependency', () => guards.dependency(dep, { rid: 'b', after: 'a', phase: 'application' }), () => guards.dependency({ ...dep, resolved: new Set() }, { rid: 'b', after: 'a', phase: 'application' }));

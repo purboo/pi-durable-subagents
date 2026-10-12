@@ -299,11 +299,18 @@ test("P28 an answer to an earlier open question binds a call hibernated on its r
   assert.equal(f.journal.entries().find(e => e.type === "hibernated")!.qid, q2.qid, "hibernated on the reminder");
   const req: Request = { rid: "answer-q1", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: q1.qid, rev: q1.rev }, body: { to: ticket.callId, kind: "answer", message: "first answered " + script([{ text: "resumed with q1" }]) } };
   assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  // D2: binding q1 supersedes q2 at once: its item is resolved and the call is not shown asking; q2 takes no answer.
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === q2.id && e.resolution === "superseded").length, 1);
+  assert.notEqual(statusOf(f.journal, f.wid).phase, "asking");
+  assert.deepEqual(await f.executor.forward({ ...req, rid: "answer-q2", cond: { qid: q2.qid, rev: q2.rev } }, ctx), { action: "reject", reason: "stale-rev" });
   const result = await pending;
-  assert.equal(result.status, "ok"); assert.equal(result.output, "resumed with q1");
+  assert.equal(result.status, "ok", JSON.stringify(result)); assert.equal(result.output, "resumed with q1");
   const bound = f.journal.entries().filter(e => e.type === "answer-bound");
   assert.equal(bound.length, 1); assert.equal(bound[0]!.qid, q1.qid);
-  assert.match(String(bound[0]!.message), /\nQuestion: First\?\nAnswer: first answered /);
+  assert.deepEqual(bound[0]!.superseded, [{ qid: q2.qid, rev: q2.rev }]);
+  assert.match(String(bound[0]!.message), /"Reminder\?" is withdrawn[^]*\nQuestion: First\?\nAnswer: first answered /);
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  assert.deepEqual(rows.find(e => e.type === "custom_message" && e.details?.rid === bound[0]!.rid2)?.details.superseded, [{ qid: q2.qid, rev: q2.rev }], "the child records the superseded question");
   assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === q1.id && e.resolution === "answered").length, 1);
   const next: CallTicket = { ...ticket, gen: 2, callId: `${f.wid}@1/a@2`, continueFrom: ticket.callId, opening: { rid: "next", kind: "follow-up", message: script([{ text: "second" }]) } };
   assert.equal((await f.executor.run(next)).status, "ok");
@@ -326,12 +333,90 @@ test("P28 an undelivered answer to an earlier open question is adopted when the 
   const req: Request = { rid: "answer-q1", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: q1.qid, rev: q1.rev }, body: { to: ticket.callId, kind: "answer", message: "first answered " + script([{ text: "resumed with q1" }]) } };
   assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
   const result = await f.executor.run(ticket);
-  assert.equal(result.status, "ok"); assert.equal(result.output, "resumed with q1");
+  assert.equal(result.status, "ok", JSON.stringify(result)); assert.equal(result.output, "resumed with q1");
   assert.equal(f.journal.entries().find(e => e.type === "hibernated")!.qid, asked("Reminder?")!.qid);
   const bound = f.journal.entries().filter(e => e.type === "answer-bound");
   assert.equal(bound.length, 1); assert.equal(bound[0]!.qid, q1.qid); assert.equal(bound[0]!.rid, "answer-q1");
   assert.ok(f.journal.entries().some(e => e.type === "forward-retired" && e.rid === "answer-q1" && e.reason === "bound-to-hibernation"));
   assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+  // D2, D3: q2 is superseded; the old envelope is withdrawn in the inbox, so q1@1 has exactly one receipt (the continue).
+  const q2 = asked("Reminder?")!;
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === q2.id && e.resolution === "superseded").length, 1);
+  const old = f.journal.entries().find(e => e.type === "forward" && e.rid === "answer-q1")!;
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const receipts = rows.filter(e => (e.message?.details ?? e.details)?.qid === q1.qid && (e.message?.details ?? e.details)?.rid);
+  assert.deepEqual(receipts.map(e => (e.message?.details ?? e.details).rid), [bound[0]!.rid2]);
+  assert.ok(rows.some(e => e.customType === CT.rejected && e.data?.rid === old.rid2 && e.data?.reason === "withdrawn"));
+});
+
+test("D2 a live asker blocked on a reminder: the answer to the earlier question supersedes the reminder (resolved, not asking, no later answer)", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 600000, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "First?" } }, { tool: "ask", args: { question: "Reminder?" } }, { delayMs: 1500, text: "went on" }]));
+  const pending = f.executor.run(ticket);
+  const asked = (text: string) => f.journal.entries().find(e => e.type === JT.attention && (e.item as { text?: string }).text === text)?.item as { id: string; qid: string; rev: number } | undefined;
+  await until(() => !!asked("First?"));
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  await f.executor.forward({ rid: "steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "still waiting" } }, ctx);
+  await until(() => !!asked("Reminder?"));
+  const q1 = asked("First?")!, q2 = asked("Reminder?")!;
+  assert.equal(statusOf(f.journal, f.wid).phase, "asking");
+  const req: Request = { rid: "answer-q1", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: q1.qid, rev: q1.rev }, body: { to: ticket.callId, kind: "answer", message: "first answered" } };
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  await until(() => f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === q2.id), 15000);
+  assert.equal(f.journal.entries().find(e => e.type === JT.attentionResolved && e.id === q2.id)!.resolution, "superseded");
+  assert.equal(f.journal.entries().find(e => e.type === JT.attentionResolved && e.id === q1.id)!.resolution, "answered");
+  assert.notEqual(statusOf(f.journal, f.wid).phase, "asking");
+  assert.deepEqual(await f.executor.forward({ ...req, rid: "answer-q2", cond: { qid: q2.qid, rev: q2.rev } }, ctx), { action: "reject", reason: "stale-rev" });
+  const result = await pending;
+  assert.equal(result.status, "ok"); assert.equal(result.output, "went on");
+});
+
+test("P2a a follow-up queued before a bound answer asks again: the answer resolves that ask, the call does not stay hibernated", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "not resumed" }]));
+  const pending = f.executor.run(ticket);
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: ticket.gen };
+  await until(() => f.journal.entries().some(e => e.type === "hibernated") && f.orch.entries().filter(e => e.type === "release").length >= 2);
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  const follow: Request = { rid: "follow", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "follow-up", message: "more work " + script([{ tool: "ask", args: { question: "Third?" } }, { text: "after the answer" }]) } };
+  assert.deepEqual(await f.executor.forward(follow, ctx), { action: "apply" });
+  const answer: Request = { rid: "answer", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: "yes" } };
+  assert.deepEqual(await f.executor.forward(answer, ctx), { action: "apply" });
+  const result = await pending;
+  assert.equal(result.status, "ok"); assert.equal(result.output, "after the answer");
+  const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
+  const rows = (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const third = rows.find(e => e.customType === CT.question && e.data?.question === "Third?")!.data;
+  const taken = rows.find(e => e.message?.role === "toolResult" && e.message.details?.rid === bound.rid2)?.message;
+  assert.ok(taken, "the bound answer reached the model as the result of the new ask");
+  assert.deepEqual(taken.details.superseded, [{ qid: third.qid, rev: third.rev }]);
+  assert.equal(f.journal.entries().filter(e => e.type === "hibernated").length, 1, "no second hibernation");
+  const id = `q:${ticket.callId}:${third.qid}`;
+  assert.equal(f.journal.entries().find(e => e.type === JT.attentionResolved && e.id === id)?.resolution, "superseded");
+});
+
+test("D4 recovery resolves question items a generation did not ask (carried, as 1.0.37 re-opened them)", { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 20 } });
+  const first = f.ticket("a", script([{ tool: "ask", args: { question: "Carried?" } }, { text: "first done" }]));
+  const pending = f.executor.run(first);
+  await until(() => f.journal.entries().some(e => e.type === JT.attention && (e.item as { kind?: string }).kind === "question"));
+  await f.executor.forward({ rid: "steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: first.callId, kind: "steer", message: "go on" } }, { journal: f.journal, widRev: first.widRev, key: "a", gen: 1 });
+  assert.equal((await pending).status, "ok");
+  const carried = (f.journal.entries().find(e => e.type === JT.attention && (e.item as { kind?: string }).kind === "question")!.item as { qid: string; text: string });
+  const next: CallTicket = { ...first, gen: 2, callId: `${f.wid}@1/a@2`, continueFrom: first.callId, opening: { rid: "next", kind: "follow-up", message: script([{ delayMs: 4000, text: "second" }]) } };
+  const running = f.executor.run(next);
+  await until(() => f.journal.entries().some(e => e.type === "tracked" && String(e.exec).startsWith(`${next.callId}#`)));
+  const rejected = assert.rejects(running, { name: "ExecutorShutdown" });
+  await f.executor.suspend(); await rejected;
+  // What 1.0.37 wrote for the running generation: the carried question as its own open item.
+  const id = `q:${next.callId}:${carried.qid}`;
+  await f.journal.append(JT.attention, { item: { id, rev: 1, kind: "question", text: carried.text, wid: f.wid, call: next.callId, qid: carried.qid, session: callSession(f.home, f.wid, "a", 2) } });
+  await f.executor.recover(f.wid, f.journal);
+  assert.deepEqual(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === id).map(e => e.resolution), ["carried"]);
+  await f.executor.recover(f.wid, f.journal);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === id).length, 1, "idempotent");
+  assert.deepEqual(await f.executor.forward({ rid: "late", from: "main:test", to: "orch", sseq: 2, kind: "send", cond: { qid: carried.qid, rev: 1 }, body: { to: next.callId, kind: "answer", message: "late" } }, { journal: f.journal, widRev: next.widRev, key: "a", gen: 2 }), { action: "reject", reason: "stale-rev" });
+  assert.equal((await f.executor.run(next)).status, "ok");
 });
 
 test("P28/P12 a model send to a hibernated asker is recorded and its resumed execution launches on that model", { timeout: 30000 }, async t => {

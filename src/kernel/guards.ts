@@ -12,10 +12,10 @@ export function currency(state: Readonly<Record<string, string | number | undefi
   return Object.entries(transition).every(([key, value]) => value === undefined || state[key] === value);
 }
 type Question = { qid: string; rev: number };
-/** A4, V4, P28: Answers require an open question and matching blocked or hibernated state. */
-export function openness(state: { open: readonly Question[]; blocked?: Question; hibernated?: Question }, transition: Question): boolean {
-  const matches = (q: Question | undefined) => q?.qid === transition.qid && q.rev === transition.rev;
-  return state.open.some(matches) && (matches(state.blocked) || matches(state.hibernated));
+/** A4, V4, P28: An answer requires an open question: the current revision of a question the call asked (`open`), not yet
+ *  answered or superseded (`closed`, keys `qid@rev`). Any open question takes its answer, blocked in an ask or not. */
+export function openness(state: { open: readonly Question[]; closed: ReadonlySet<string> }, transition: Question): boolean {
+  return state.open.some(q => q.qid === transition.qid && q.rev === transition.rev) && !state.closed.has(`${transition.qid}@${transition.rev}`);
 }
 /** A4, V5, P5: Dependencies must be earlier admissions, and resolved before application. */
 export function dependency(state: { order: ReadonlyMap<string, number>; resolved: ReadonlySet<string> }, transition: { rid: string; after?: string; phase: 'admission' | 'application' }): boolean {

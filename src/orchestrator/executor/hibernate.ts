@@ -2,6 +2,7 @@
 // answer-bound{call,qid,rev,rid,rid2,message,hash}; resumed{call,rid,exec}.
 import { CT, JT, attentionEntries, type Entry, type JournalHandle } from "../../types.ts";
 import { askOf, cutAskResult, receiptId, type SessionEntry } from "./session.ts";
+import { supersededBy } from "./digest.ts";
 
 /** P28, V4: Find an unanswered question whose native ask tool remains blocked. */
 export function openQuestion(entries: SessionEntry[]): { qid: string; rev: number; question: string } | undefined {
@@ -9,7 +10,8 @@ export function openQuestion(entries: SessionEntry[]): { qid: string; rev: numbe
   if (!q || typeof q.qid !== "string" || typeof q.rev !== "number") return;
   if (entries.some(e => {
     const details = e.message?.details ?? e.details;
-    return !!details && details.qid === q.qid && details.rev === q.rev && receiptId(e) !== undefined;
+    return !!details && receiptId(e) !== undefined && (details.qid === q.qid && details.rev === q.rev ||
+      supersededBy(details).some(s => s.qid === q.qid && s.rev === q.rev));
   })) return;
   // Only the ask that wrote this question counts: it is still blocked when it has no result, or only the error it ended
   // with when its session shut down or its run was aborted. An earlier ask cut off that way does not keep a later
