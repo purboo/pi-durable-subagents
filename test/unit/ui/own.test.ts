@@ -2,7 +2,8 @@
 // orchestrator ledger before any workflow journal is opened, and list exactly what allWorkflows + ownedBy would.
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
+import fs, { chmodSync, copyFileSync, mkdirSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { root, clean } from "./fixture.ts";
 import { openJournal } from "../../../src/kernel/journal.ts";
@@ -126,4 +127,44 @@ test("a workflow the ledger does not know is attributed by its journal's first e
   assert.deepEqual(data.workflows.map(w => w.wid), ["W30"]);
   data.refresh(B);
   assert.deepEqual(data.workflows, []);
+});
+
+test("a workflow another session creates while the list is being read is attributed without opening its journal", async t => {
+  // The new workflow (intent, directory, journal) is prepared in a scratch home, then copied in at the moment `w/` is
+  // listed: after a ledger read that came first, before a ledger read that comes after the listing.
+  const home = join(root, "race"), scratch = join(root, "race-next");
+  await create(home, "W40", A);
+  await create(scratch, "W40", A); await create(scratch, "W41", B);
+  const foreign = journalPath(home, "W41"), opened: string[] = [];
+  const readdirSync = fs.readdirSync, openSync = fs.openSync;
+  let injected = false;
+  t.mock.method(fs, "readdirSync", (path: fs.PathLike, ...rest: unknown[]) => {
+    if (!injected && String(path) === join(home, "w")) {
+      injected = true;
+      mkdirSync(join(home, "w", "W41"), { recursive: true });
+      copyFileSync(journalPath(scratch, "W41"), foreign);
+      copyFileSync(orchLedger(scratch), orchLedger(home)); // the ledger with W41's create-intent and created
+    }
+    return (readdirSync as (...a: unknown[]) => unknown)(path, ...rest);
+  });
+  t.mock.method(fs, "openSync", (path: fs.PathLike, ...rest: unknown[]) => { opened.push(String(path)); return (openSync as (...a: unknown[]) => number)(path, ...rest); });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const data = new UiData(home);
+  data.refresh(A);
+  assert.ok(injected);
+  assert.deepEqual(data.workflows.map(w => w.wid), ["W40"]);
+  assert.ok(!opened.includes(foreign), "the foreign journal was opened");
+});
+
+test("an unreadable journal the ledger does not know is read again once it changes", { skip: process.getuid?.() === 0 ? "root reads mode 000 files" : false }, async () => {
+  const home = join(root, "unreadable"), j = await openJournal(journalPath(home, "W50"));
+  await j.append("wf-created", { origin: A, cwd: root, revision: 1 }); await j.close();
+  chmodSync(journalPath(home, "W50"), 0o000);
+  const data = new UiData(home);
+  data.refresh(A); data.refresh(A);
+  assert.deepEqual(data.workflows.map(w => w.wid), []);
+  chmodSync(journalPath(home, "W50"), 0o600);
+  data.refresh(A);
+  assert.deepEqual(data.workflows.map(w => w.wid), ["W50"]);
 });

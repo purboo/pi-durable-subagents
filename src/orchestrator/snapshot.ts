@@ -1,7 +1,7 @@
 // Read-only status snapshots (P25: `status` is always a fresh snapshot). Pure readers of committed journals:
 // never depend on orchestrator memory, so the UI, the CLI and the main agent see the same durable state.
 import { initiatorSummary, restartLine } from "./restart.ts";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { compileFanout } from "../compat/fanout.ts";
 import { readJournalSnapshot, readJournalUncached } from "../kernel/journal.ts";
@@ -453,19 +453,28 @@ export function heldWorkflows(home: string): { since?: number; held: (wid: strin
   const since = ix.lastDrain !== undefined ? ledger[ix.lastDrain]!.ts : undefined;
   return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined, labels: wid => ix.labels.get(wid), session: wid => ix.sessions.get(wid) };
 }
-/** The origin of a workflow's `wf-created`, the first entry of its journal, which never changes once written: read once
- *  per journal (only for a workflow the ledger does not attribute) and not kept in the journal snapshot cache. A journal
- *  that cannot be read counts as no origin (no session's own), like one without its first entry yet (asked again). */
-const firstOrigins = new Map<string, unknown>();
+/** The origin of a workflow's `wf-created`, the first entry of its journal, for a workflow the ledger does not attribute
+ *  (only a damaged or hand-made home has one), read without keeping the journal in the snapshot cache. The first entry
+ *  never changes once written, so a successful read is kept for the life of the process. A journal that cannot be read
+ *  counts as no origin (no session's own) only while it stays as it was: the failure is kept with the file's identity
+ *  (inode, size, ctime and mode: ctime ticks coarsely, so a chmod right after the failure may leave it unchanged) and
+ *  the read is retried once that changes. A journal without its first
+ *  entry yet is asked again. */
+const firstOrigins = new Map<string, { origin: unknown } | { failed: { ino: number; size: number; ctimeMs: number; mode: number } | undefined }>();
 function firstOrigin(home: string, wid: string): unknown {
-  const path = journalPath(home, wid);
-  if (firstOrigins.has(path)) return firstOrigins.get(path);
+  const path = journalPath(home, wid), known = firstOrigins.get(path);
+  if (known && "origin" in known) return known.origin;
+  const identity = () => { try { const st = statSync(path); return { ino: st.ino, size: st.size, ctimeMs: st.ctimeMs, mode: st.mode }; } catch { return undefined; } };
+  if (known) {
+    const now = identity(), was = known.failed;
+    if (now && was && now.ino === was.ino && now.size === was.size && now.ctimeMs === was.ctimeMs && now.mode === was.mode) return undefined;
+  }
   let first: Entry | undefined;
   try { first = readJournalUncached(path)?.entries[0]; }
-  catch { firstOrigins.set(path, undefined); return undefined; }
-  if (!first) return undefined;
+  catch { firstOrigins.set(path, { failed: identity() }); return undefined; }
+  if (!first) { firstOrigins.delete(path); return undefined; }
   const origin = first.type === "wf-created" ? first.origin : undefined;
-  firstOrigins.set(path, origin);
+  firstOrigins.set(path, { origin });
   return origin;
 }
 /** The workflow with its run's labels and session, when it has them. */
@@ -499,12 +508,16 @@ function snapshotsOf(home: string, wids: string[]): WorkflowSnapshot[] {
  *  caching every workflow of the machine cost it seconds at startup and hundreds of MB.
  *  The engine records a workflow's create-intent (with its origin) before it creates the workflow's directory, so a
  *  workflow just being created is already attributed; its `session` (like `allWorkflows`) shows once `created` lands.
- *  A directory under `w/` the ledger knows nothing of (the engine never leaves one; a hand-made or damaged home may)
- *  is attributed by its journal's first entry, read once. `started`: only those `own` started itself (origin `own`),
+ *  A directory under `w/` the ledger knows nothing of (given the order below, only a hand-made or damaged home has one)
+ *  is attributed by its journal's first entry (see firstOrigin). `started`: only those `own` started itself (origin `own`),
  *  not runs of other senders that named its session. */
 export function ownWorkflows(home: string, own: string, options: { started?: boolean } = {}): WorkflowSnapshot[] {
-  const ix = ledgerIndex(readJournalSnapshot(orchLedger(home)));
-  const mine = workflowIds(home).filter(wid => {
+  // Order matters: list `w/` first, then read the ledger used for attribution. The engine appends a workflow's
+  // create-intent before it creates the directory, so every directory listed here already has its intent in a ledger
+  // read afterwards; a workflow another session creates in between is attributed without opening its journal. (Read
+  // the other way round, such a workflow would look unknown to the ledger and its journal would be read.)
+  const wids = workflowIds(home), ix = ledgerIndex(readJournalSnapshot(orchLedger(home)));
+  const mine = wids.filter(wid => {
     const known = ix.intents.has(wid) || ix.created.has(wid), session = ix.sessions.get(wid);
     const origin = known ? ix.intents.get(wid) ?? ix.created.get(wid)?.origin : firstOrigin(home, wid);
     return origin === own || (!options.started && session !== undefined && `main:${session}` === own);
