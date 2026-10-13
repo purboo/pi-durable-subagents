@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.39
+
+- A pi session reads only its own workflows. Since 1.0.30 the UI shows only the workflows of its session, yet the pi
+  process read, folded and cached every workflow journal of the machine every 500 ms. Ownership is now decided from
+  the orchestrator ledger (the origin of a workflow's create-intent or `created`, or the session its run named)
+  before any journal is opened, so other sessions' journals are never opened, stat'ed or cached by a pi process.
+  Measured on a home with 1,132 workflows (load 16-27): the first refresh of a busy session fell from 9.4 s to 1.6 s,
+  a steady refresh from 86 ms to 7 ms and the process RSS from 696 MiB to 325 MiB; a session without workflows went
+  from 17.7 s to 0.4 s and 683 MiB to 166 MiB. A session that many runs name (here 759 workflows) still reads all of
+  them, so its gain is smaller. `scripts/bench-ui.ts` measures this (read-only).
+- Session start no longer scans every journal: the starter checks whether an orchestrator holds its lock first and
+  scans only when none does; the scan stops at the first unfinished workflow and does not keep the journals it read.
+  The paused notice at session start and the pause on quit read only the workflows the session started.
+- A workflow directory the ledger does not know (only a hand-made or damaged home has one) is attributed by its
+  journal's first entry, read once; a failed read is retried once the file changes.
+- The CLI (`status`, `restart`) and the orchestrator are unchanged.
+
 ## 1.0.38
 
 - An answer to any open question of a call reaches it. A call whose question was interrupted (by a steer) and that
