@@ -168,3 +168,25 @@ test("an unreadable journal the ledger does not know is read again once it chang
   data.refresh(A);
   assert.deepEqual(data.workflows.map(w => w.wid), ["W50"]);
 });
+
+test("a journal made readable right after a failed read is read again on the next refresh", { skip: process.getuid?.() === 0 ? "root reads mode 000 files" : false }, async t => {
+  // The permission comes back between the failed open and anything sampled after it: the failure must not be kept
+  // under the restored file's identity.
+  const home = join(root, "unreadable-race"), path = journalPath(home, "W60"), j = await openJournal(path);
+  await j.append("wf-created", { origin: A, cwd: root, revision: 1 }); await j.close();
+  chmodSync(path, 0o000);
+  const openSync = fs.openSync;
+  let restored = false;
+  t.mock.method(fs, "openSync", (p: fs.PathLike, ...rest: unknown[]) => {
+    try { return (openSync as (...a: unknown[]) => number)(p, ...rest); }
+    catch (error) { if (!restored && String(p) === path) { restored = true; chmodSync(path, 0o600); } throw error; }
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const data = new UiData(home);
+  data.refresh(A);
+  assert.ok(restored);
+  assert.deepEqual(data.workflows.map(w => w.wid), []);
+  data.refresh(A);
+  assert.deepEqual(data.workflows.map(w => w.wid), ["W60"]);
+});

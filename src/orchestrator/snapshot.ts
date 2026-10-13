@@ -465,13 +465,17 @@ function firstOrigin(home: string, wid: string): unknown {
   const path = journalPath(home, wid), known = firstOrigins.get(path);
   if (known && "origin" in known) return known.origin;
   const identity = () => { try { const st = statSync(path); return { ino: st.ino, size: st.size, ctimeMs: st.ctimeMs, mode: st.mode }; } catch { return undefined; } };
-  if (known) {
-    const now = identity(), was = known.failed;
-    if (now && was && now.ino === was.ino && now.size === was.size && now.ctimeMs === was.ctimeMs && now.mode === was.mode) return undefined;
-  }
+  const same = (a: ReturnType<typeof identity>, b: ReturnType<typeof identity>) => !!a && !!b && a.ino === b.ino && a.size === b.size && a.ctimeMs === b.ctimeMs && a.mode === b.mode;
+  // The identity is taken before the read, and a failure is kept only when the file did not change during the read:
+  // a chmod between the failed read and a later sample would otherwise be recorded as the failure's identity.
+  const before = identity();
+  if (known && same(before, known.failed)) return undefined;
   let first: Entry | undefined;
   try { first = readJournalUncached(path)?.entries[0]; }
-  catch { firstOrigins.set(path, { failed: identity() }); return undefined; }
+  catch {
+    if (same(before, identity())) firstOrigins.set(path, { failed: before }); else firstOrigins.delete(path);
+    return undefined;
+  }
   if (!first) { firstOrigins.delete(path); return undefined; }
   const origin = first.type === "wf-created" ? first.origin : undefined;
   firstOrigins.set(path, { origin });
