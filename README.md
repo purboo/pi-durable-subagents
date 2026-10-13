@@ -577,6 +577,15 @@ read, in a burst each time a call ends), `pid` and `at` (when it was
 written). The orchestrator writes these to `orchestrator-stats.json` every
 10 s; they are shown only while that process runs.
 
+A pi session reads only its own workflows. Which workflows are its own comes
+from the orchestrator ledger, so its dock and list never open the journals or
+transcripts of other sessions' workflows, however many the machine has. While
+an orchestrator runs, a pi session does not look for pending work at all;
+without one, it looks until it finds the first unfinished workflow and keeps
+none of the journals it read. `node scripts/bench-ui.ts --owner=main:<pi
+session id>` measures what a session pays on its main thread for a given
+`DSA_HOME` (read-only).
+
 ### Where the orchestrator starts
 
 Whatever needs it first starts the orchestrator: a pi session, a CLI

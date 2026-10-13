@@ -4,7 +4,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { UiDeps } from "../agent/main.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 type Entry = ReturnType<typeof readJournalSnapshot>[number];
-import { allWorkflows, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { allWorkflows, ownWorkflows, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { callDir, callSession, journalPath, orchLedger } from "../paths.ts";
 import { LIVE_FILE, type Live } from "../agent/child/live.ts";
 import { JT } from "../types.ts";
@@ -77,8 +77,11 @@ export class UiData {
   private derived = new Map<string, { source: readonly SessionEntry[]; length: number; entries: SessionEntry[]; facts: Facts }>();
   home: string;
   constructor(home: string) { this.home = home; }
-  refresh() {
-    const workflows = allWorkflows(this.home), known = new Set<string>(), deferred = new Map<string, () => void>();
+  /** Read the workflows `own` ("main:<pi session id>") shows as its own (see ownWorkflows): the pi process reads only
+   *  its own workflows, so other sessions' journals and call sessions are never opened, stat'ed or cached here. Without
+   *  an owner every workflow is read (fixtures and tools that show them all). */
+  refresh(own?: string) {
+    const workflows = own === undefined ? allWorkflows(this.home) : ownWorkflows(this.home, own), known = new Set<string>(), deferred = new Map<string, () => void>();
     const facts = new LazyMap<Facts>(key => deferred.get(key)?.());
     const sessions = new LazyMap<readonly SessionEntry[]>(key => deferred.has(key) ? deferred.get(key)!() : this.transcript(key, sessions));
     for (const w of workflows) {
