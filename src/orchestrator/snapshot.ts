@@ -4,7 +4,7 @@ import { initiatorSummary, restartLine } from "./restart.ts";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { compileFanout } from "../compat/fanout.ts";
-import { readJournalSnapshot } from "../kernel/journal.ts";
+import { readJournalSnapshot, readJournalUncached } from "../kernel/journal.ts";
 import { journalPath, orchLedger, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
 import { emptyLedger, foldLedger, type LedgerState } from "./ledger.ts";
@@ -371,6 +371,10 @@ function prunedIds(home: string): Set<string> {
 export interface LedgerIndex {
   /** First `created` entry per wid (the raw `wid` value is the key, compared like `===`). */
   created: Map<unknown, Entry>;
+  /** The origin of each workflow's `create-intent`, by wid: the engine records it before it creates the workflow's
+   *  directory and journal, and appends `created` only after the journal's `wf-created`, so between the two the
+   *  intent is the ledger's only word on who started it. */
+  intents: Map<string, unknown>;
   /** wids archived by `prune`. */
   pruned: Set<string>;
   /** The labels of each workflow's run request (only workflows that have any). */
@@ -388,7 +392,7 @@ const ledgerIndexes = new WeakMap<readonly Entry[], Folded>();
 export function ledgerIndex(ledger: readonly Entry[]): LedgerIndex {
   let ix = ledgerIndexes.get(ledger);
   if (!ix || ix.length > ledger.length || (ix.length && ledger[ix.length - 1] !== ix.last)) {
-    ix = { length: 0, created: new Map(), pruned: new Set(), labels: new Map(), runLabels: new Map(), sessions: new Map(), runSessions: new Map(), byWid: new Map(), byOrigin: new Map() };
+    ix = { length: 0, created: new Map(), intents: new Map(), pruned: new Set(), labels: new Map(), runLabels: new Map(), sessions: new Map(), runSessions: new Map(), byWid: new Map(), byOrigin: new Map() };
     ledgerIndexes.set(ledger, ix);
   }
   for (let i = ix.length; i < ledger.length; i++) {
@@ -399,6 +403,8 @@ export function ledgerIndex(ledger: readonly Entry[]): LedgerIndex {
       if (labels) { if (!ix.labels.has(String(e.wid))) ix.labels.set(String(e.wid), labels); ix.runLabels.delete(String(e.rid)); }
       const session = ix.runSessions.get(String(e.rid));
       if (session) { if (!ix.sessions.has(String(e.wid))) ix.sessions.set(String(e.wid), session); ix.runSessions.delete(String(e.rid)); }
+    } else if (e.type === "create-intent") {
+      if (!ix.intents.has(String(e.wid))) ix.intents.set(String(e.wid), e.origin);
     } else if (e.type === "request") {
       const r = e.request as { rid?: unknown; kind?: unknown; body?: unknown } | undefined, labels = r?.kind === "run" ? labelsOf(r.body) : undefined;
       if (labels && typeof r?.rid === "string") ix.runLabels.set(r.rid, labels);
@@ -447,6 +453,21 @@ export function heldWorkflows(home: string): { since?: number; held: (wid: strin
   const since = ix.lastDrain !== undefined ? ledger[ix.lastDrain]!.ts : undefined;
   return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined, labels: wid => ix.labels.get(wid), session: wid => ix.sessions.get(wid) };
 }
+/** The origin of a workflow's `wf-created`, the first entry of its journal, which never changes once written: read once
+ *  per journal (only for a workflow the ledger does not attribute) and not kept in the journal snapshot cache. A journal
+ *  that cannot be read counts as no origin (no session's own), like one without its first entry yet (asked again). */
+const firstOrigins = new Map<string, unknown>();
+function firstOrigin(home: string, wid: string): unknown {
+  const path = journalPath(home, wid);
+  if (firstOrigins.has(path)) return firstOrigins.get(path);
+  let first: Entry | undefined;
+  try { first = readJournalUncached(path)?.entries[0]; }
+  catch { firstOrigins.set(path, undefined); return undefined; }
+  if (!first) return undefined;
+  const origin = first.type === "wf-created" ? first.origin : undefined;
+  firstOrigins.set(path, origin);
+  return origin;
+}
 /** The workflow with its run's labels and session, when it has them. */
 function labelled<T extends WorkflowSnapshot>(wf: T, labels: Record<string, string> | undefined, session?: string): T {
   return labels || session ? { ...wf, ...(labels ? { labels } : {}), ...(session ? { session } : {}) } : wf;
@@ -465,8 +486,31 @@ export function labelsText(labels: Record<string, string> | undefined, width = 6
 
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
 export function allWorkflows(home: string): WorkflowSnapshot[] {
+  return snapshotsOf(home, workflowIds(home));
+}
+function snapshotsOf(home: string, wids: string[]): WorkflowSnapshot[] {
   const { held, labels, session } = heldWorkflows(home);
-  return workflowIds(home).sort().reverse().map(wid => { const wf = labelled(workflowSnapshot(home, wid), labels(wid), session(wid)); return isLive(wf) && held(wid) ? { ...wf, paused: true } : wf; });
+  return wids.sort().reverse().map(wid => { const wf = labelled(workflowSnapshot(home, wid), labels(wid), session(wid)); return isLive(wf) && held(wid) ? { ...wf, paused: true } : wf; });
+}
+/** The workflows `own` ("main:<pi session id>") shows as its own (`ownedBy`), snapshotted exactly as `allWorkflows`
+ *  does: the same list as `allWorkflows(home).filter(w => ownedBy(w, own))`, but who owns a workflow is decided from
+ *  the orchestrator ledger alone (the origin of its create-intent or `created`, the session its run named), so the
+ *  journals of other sessions' workflows are never opened. A pi process polls only its own workflows: reading and
+ *  caching every workflow of the machine cost it seconds at startup and hundreds of MB.
+ *  The engine records a workflow's create-intent (with its origin) before it creates the workflow's directory, so a
+ *  workflow just being created is already attributed; its `session` (like `allWorkflows`) shows once `created` lands.
+ *  A directory under `w/` the ledger knows nothing of (the engine never leaves one; a hand-made or damaged home may)
+ *  is attributed by its journal's first entry, read once. `started`: only those `own` started itself (origin `own`),
+ *  not runs of other senders that named its session. */
+export function ownWorkflows(home: string, own: string, options: { started?: boolean } = {}): WorkflowSnapshot[] {
+  const ix = ledgerIndex(readJournalSnapshot(orchLedger(home)));
+  const mine = workflowIds(home).filter(wid => {
+    const known = ix.intents.has(wid) || ix.created.has(wid), session = ix.sessions.get(wid);
+    const origin = known ? ix.intents.get(wid) ?? ix.created.get(wid)?.origin : firstOrigin(home, wid);
+    return origin === own || (!options.started && session !== undefined && `main:${session}` === own);
+  });
+  // The journal decides as well: a workflow whose wf-created is not written yet has no origin, as in allWorkflows.
+  return snapshotsOf(home, mine).filter(w => options.started ? w.origin === own : ownedBy(w, own));
 }
 
 /** P10/P11: Per-workflow script console log written by the orchestrator (bounded, human-readable). */

@@ -68,6 +68,21 @@ export function readJournalSnapshot(path: string): Entry[] {
     return entries as Entry[];
   } finally { closeSync(fd); }
 }
+/** A committed snapshot with the file identity it was read at, without keeping it in the shared snapshot cache (a
+ *  cached snapshot of the same file is reused): for one-off scans over many journals whose entries are not needed
+ *  again. `undefined` when the file does not exist. */
+export function readJournalUncached(path: string): { ino: number; size: number; entries: readonly Entry[] } | undefined {
+  let fd: number;
+  try { fd = openSync(path, 'r'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  try {
+    const { ino, size } = fstatSync(fd), cached = snapshots.get(path);
+    if (cached && cached.ino === ino && cached.size === size) return { ino, size, entries: cached.entries };
+    const bytes = Buffer.alloc(size);
+    for (let read = 0; read < bytes.length;) { const n = readSync(fd, bytes, read, bytes.length - read, read); if (!n) break; read += n; }
+    return { ino, size, entries: decode(bytes).entries };
+  } finally { closeSync(fd); }
+}
 /** How long a resting journal keeps its descriptor after its last append (a burst of appends opens it once). */
 export const JOURNAL_REST_MS = 1000;
 let descriptors = 0, appends = 0;

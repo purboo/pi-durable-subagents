@@ -12,7 +12,7 @@ import { launchOrchestrator } from "../platform/launch.ts";
 import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
-import { NOTIFY_SINCE, isLive, orchestratorTooOld, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "./main/tool.ts";
 import { parameters } from "./main/schema.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, requestRid, sendIdentified, type Identified } from "../requests.ts";
@@ -80,12 +80,15 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   async function starter(submitting = false) {
     if (stopped) return;
     await reconcile();
-    const pending = submitting || pendingOutbox() || (await scanInbox(orchInbox(home))).length > 0 || unfinishedWorkflow(home);
-    if (!pending) return;
+    // A running orchestrator (it holds its lock) serves every pending request and workflow: then nothing is scanned.
+    // Only without one is pending work looked for, stopping at the first; the scan reads workflow journals without
+    // keeping them (see unfinishedWorkflow).
     await mkdir(home, { recursive: true });
     const lock = await new OsLock().tryAcquire(orchLock(home));
     if (!lock) return;
     await lock.release();
+    const pending = submitting || pendingOutbox() || (await scanInbox(orchInbox(home))).length > 0 || unfinishedWorkflow(home);
+    if (!pending) return;
     const entry = process.env.DSA_ORCHESTRATOR_ENTRY ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../orchestrator/main.ts" : "../orchestrator/main.js", import.meta.url));
     // Inside pi: started even when pi cannot be resolved here (the orchestrator falls back to its own lookup).
     await launchOrchestrator(entry, process.env, { home });
@@ -148,7 +151,8 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   pi.on("session_start", async (_event, context) => {
     await start(context);
     // Quit pause: say once, at the session's start, which of its workflows wait for a resume.
-    const paused = statusView(home, { origin: sender }).workflows.filter(w => w.origin === sender && isLive(w) && w.paused);
+    // Only the workflows this session started are read (ownership comes from the orchestrator ledger), not every one.
+    const paused = ownWorkflows(home, sender, { started: true }).filter(w => w.origin === sender && isLive(w) && w.paused);
     if (paused.length) pi.sendMessage({ customType: CT.note, display: true, content: `${paused.length} subagent workflow${paused.length > 1 ? "s were" : " was"} paused when pi quit (${paused.map(w => w.name ?? w.wid).join(", ")}). Ask to resume, or open /subagents (or ↓) and press r.` });
   });
   // Quitting pi is a stop-burning-tokens moment: on a quit (Ctrl+D, /quit, a closed terminal, SIGTERM) this session's
@@ -158,7 +162,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   pi.on("session_shutdown", async event => {
     if (event.reason === "quit" && quitPolicy(home) === "pause" && outbox && !stopped) {
       try {
-        const running = statusView(home, { origin: sender }).workflows.some(w => w.origin === sender && isLive(w) && !w.paused);
+        const running = ownWorkflows(home, sender, { started: true }).some(w => w.origin === sender && isLive(w) && !w.paused);
         if (running) await serial(async () => { await outbox?.send("orch", "drain", { fence: true, origin: sender }); });
       } catch (error) { console.error("durable-subagents: could not pause on quit:", error); }
     }

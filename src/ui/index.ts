@@ -54,9 +54,11 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     const refresh = () => {
       if (stopped) return;
       try {
-        data.refresh(); actions.reconcile();
-        for (const result of actions.resolutions.splice(0)) screen?.controlResult(result);
+        // This session's workflows only: ownership comes from the orchestrator ledger, and other sessions' journals are
+        // never read by this pi process. orderWorkflows filters by the same rule and orders the list.
         const own = `main:${ctx.sessionManager.getSessionId()}`;
+        data.refresh(own); actions.reconcile();
+        for (const result of actions.resolutions.splice(0)) screen?.controlResult(result);
         data.workflows = orderWorkflows(data.workflows, own);
         // UI §1: the dock — live rows per active agent plus a summary line ("auto"), only the summary ("line"), or nothing.
         const name = (model: string | undefined) => modelLabel(model, (p, id) => ctx.modelRegistry.find(p, id), data.aliases);

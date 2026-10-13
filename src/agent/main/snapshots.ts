@@ -2,7 +2,7 @@ import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readJournalSnapshot } from "../../kernel/journal.ts";
+import { readJournalSnapshot, readJournalUncached } from "../../kernel/journal.ts";
 import { journalPath, orchLedger } from "../../paths.ts";
 import { CT, JT, attentionEntries, type AttentionItem, type Entry } from "../../types.ts";
 import { holdOf, ledgerIndex } from "../../orchestrator/snapshot.ts";
@@ -40,11 +40,46 @@ export function openGeneration(entries: readonly { type: string; [k: string]: un
   opened.set(entries, { length: entries.length, open });
   return open;
 }
+/** Whether one journal is unfinished, by file identity: a journal that has not changed is not read again. */
+const decided = new Map<string, { ino: number; size: number; unfinished: boolean }>();
+function unfinishedJournal(path: string, known?: { ino: number; size: number; entries: readonly Entry[] }): boolean {
+  let stat;
+  try { stat = statSync(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; decided.delete(path); return true; } // no done yet
+  const hit = decided.get(path);
+  if (hit && hit.ino === stat.ino && hit.size === stat.size) return hit.unfinished;
+  // Read without keeping the entries in the shared journal cache: a pi process scans every workflow only when no
+  // orchestrator runs, and keeping every journal of the machine cost it hundreds of MB.
+  const read = known ?? readJournalUncached(path);
+  if (!read) { decided.delete(path); return true; }
+  const unfinished = !read.entries.some(e => e.type === JT.done) || openGeneration(read.entries);
+  decided.set(path, { ino: read.ino, size: read.size, unfinished });
+  return unfinished;
+}
 /** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation,
- *  unless a drain (stop-all) holds it: held work waits for an explicit resume, which starts the orchestrator itself. */
+ *  unless a drain (stop-all) holds it: held work waits for an explicit resume, which starts the orchestrator itself.
+ *  Stops at the first unfinished workflow (newest first); a held workflow the ledger attributes is skipped without
+ *  reading its journal, and an unchanged journal is not read again. */
 export function unfinishedWorkflow(home: string): boolean {
-  const ledger = readJournalSnapshot(orchLedger(home));
-  return workflows(home).some(w => (!w.entries.some(e => e.type === JT.done) || openGeneration(w.entries)) && !holdOf(ledger, w.wid, w.origin));
+  const ledger = readJournalSnapshot(orchLedger(home)), { created, pruned } = ledgerIndex(ledger);
+  let names: string[];
+  try { names = readdirSync(join(home, "w")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
+  const ids = [...new Set([...[...created.keys()].map(String), ...names].filter(wid => !pruned.has(wid)))].sort().reverse();
+  for (const wid of ids) {
+    const path = journalPath(home, wid);
+    // The hold rule is the one workflows() applies: the ledger's `created` names the origin a drain may hold; only for
+    // a wid the ledger has no `created` for is the journal read first, for a `created` entry of its own.
+    const known = created.get(wid);
+    if (known && holdOf(ledger, wid, known.origin as string | undefined)) continue;
+    let read: ReturnType<typeof readJournalUncached>;
+    if (!known) {
+      read = readJournalUncached(path);
+      if (holdOf(ledger, wid, read?.entries.find(e => e.type === JT.created)?.origin as string | undefined)) continue;
+    }
+    if (unfinishedJournal(path, read)) return true;
+  }
+  return false;
 }
 
 /** P15, V7: Rebuild session-wide receipts, including entries hidden by compaction. */
