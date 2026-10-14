@@ -50,22 +50,39 @@ export async function syncDirectory(path: string): Promise<void> {
 }
 // Readers poll journals (UI, main agent, CLI). Committed bytes never change, so a snapshot is extended by decoding
 // only the bytes appended since the last read; a different inode or a shorter file is read from scratch.
-const snapshots = new Map<string, { ino: number; size: number; length: number; entries: readonly Entry[] }>();
+/** One read of a journal: its entries and the file they were read from. `length` is the committed bytes decoded; it
+ *  is less than `size` while a torn or unfinished last line follows them. */
+export type JournalRecord = { dev: number; ino: number; size: number; length: number; entries: readonly Entry[] };
+const snapshots = new Map<string, JournalRecord>();
 /** A1, C11: Read a committed snapshot without repairing or writing its tail. The result is shared and frozen. */
 export function readJournalSnapshot(path: string): Entry[] {
+  return (readJournalRecord(path)?.entries ?? []) as Entry[];
+}
+/** Drop a journal's cached entries (a reader that keeps what it derived from them no longer needs them in memory);
+ *  the next read decodes the file again. */
+export function forgetJournalSnapshot(path: string): void { snapshots.delete(path); }
+/** Drop loaded snapshots selected by a compact reader; work is proportional to loaded journals, not settled history. */
+export function forgetJournalSnapshotsIf(match: (path: string) => boolean): void {
+  for (const path of snapshots.keys()) if (match(path)) snapshots.delete(path);
+}
+/** Whether a reader still retains this journal's decoded snapshot (for diagnostics). */
+export function hasJournalSnapshot(path: string): boolean { return snapshots.has(path); }
+/** readJournalSnapshot with the identity of what was read; undefined when the file does not exist. */
+export function readJournalRecord(path: string): JournalRecord | undefined {
   let fd: number;
   try { fd = openSync(path, 'r'); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') { snapshots.delete(path); return []; } throw error; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') { snapshots.delete(path); return undefined; } throw error; }
   try {
-    const { ino, size } = fstatSync(fd), cached = snapshots.get(path);
-    if (cached && cached.ino === ino && cached.size === size) return cached.entries as Entry[];
-    const from = cached && cached.ino === ino && size > cached.size ? cached.length : 0;
+    const { dev, ino, size } = fstatSync(fd), cached = snapshots.get(path);
+    if (cached && cached.dev === dev && cached.ino === ino && cached.size === size) return cached;
+    const from = cached && cached.dev === dev && cached.ino === ino && size > cached.size ? cached.length : 0;
     const bytes = Buffer.alloc(size - from);
     for (let read = 0; read < bytes.length;) { const n = readSync(fd, bytes, read, bytes.length - read, from + read); if (!n) break; read += n; }
     const decoded = decode(bytes, from ? cached!.entries : []);
     const entries = Object.freeze(decoded.entries) as readonly Entry[];
-    snapshots.set(path, { ino, size, length: from + decoded.length, entries });
-    return entries as Entry[];
+    const record = { dev, ino, size, length: from + decoded.length, entries };
+    snapshots.set(path, record);
+    return record;
   } finally { closeSync(fd); }
 }
 /** A committed snapshot with the file identity it was read at, without keeping it in the shared snapshot cache (a
@@ -76,13 +93,58 @@ export function readJournalUncached(path: string): { ino: number; size: number; 
   try { fd = openSync(path, 'r'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
   try {
-    const { ino, size } = fstatSync(fd), cached = snapshots.get(path);
-    if (cached && cached.ino === ino && cached.size === size) return { ino, size, entries: cached.entries };
+    const { dev, ino, size } = fstatSync(fd), cached = snapshots.get(path);
+    if (cached && cached.dev === dev && cached.ino === ino && cached.size === size) return { ino, size, entries: cached.entries };
     const bytes = Buffer.alloc(size);
     for (let read = 0; read < bytes.length;) { const n = readSync(fd, bytes, read, bytes.length - read, read); if (!n) break; read += n; }
     return { ino, size, entries: decode(bytes).entries };
   } finally { closeSync(fd); }
 }
+/** A compact reader's position, with no decoded history. `length` stops before an uncommitted tail. */
+export type JournalFold<T> = { dev: number; ino: number; size: number; length: number; seen: number; state: T };
+/** Fold a committed prefix a bounded chunk at a time. Only one record (possibly larger than a chunk) is buffered;
+ *  newly appended bytes extend the state, and replacement or shrink rebuilds it. Never repairs the journal. */
+export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefined, empty: () => T, apply: (state: T, entry: Entry) => void): JournalFold<T> | undefined {
+  let fd: number;
+  try { fd = openSync(path, 'r'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  try {
+    const { dev, ino, size } = fstatSync(fd);
+    if (prior && prior.dev === dev && prior.ino === ino && prior.size === size) return prior;
+    const kept = prior && prior.dev === dev && prior.ino === ino && size >= prior.size;
+    const record: JournalFold<T> = kept ? { ...prior, size } : { dev, ino, size, length: 0, seen: 0, state: empty() };
+    let offset = record.length, pending = Buffer.alloc(0);
+    const buffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, size - offset)));
+    while (offset < size) {
+      const n = readSync(fd, buffer, 0, Math.min(buffer.length, size - offset), offset);
+      if (!n) throw new Error(`Journal changed during read: ${path}`);
+      offset += n;
+      const bytes = pending.length ? Buffer.concat([pending, buffer.subarray(0, n)]) : buffer.subarray(0, n);
+      let start = 0, end: number;
+      while ((end = bytes.indexOf(10, start)) >= 0) {
+        let entry: Entry;
+        try {
+          const json = unframeLine(bytes.subarray(start, end));
+          if (json === undefined) throw new Error('CRC');
+          entry = JSON.parse(json) as Entry;
+          if (entry.seq !== record.seen + 1 || !Number.isFinite(entry.ts) || typeof entry.type !== 'string') throw new Error('Envelope');
+        } catch (cause) {
+          if (offset - bytes.length + end !== size - 1) throw new Error(`Journal corruption at byte ${record.length}`, { cause });
+          return record;
+        }
+        apply(record.state, entry);
+        record.seen++; record.length += end + 1 - start; start = end + 1;
+      }
+      pending = Buffer.from(bytes.subarray(start));
+    }
+    return record;
+  } finally { closeSync(fd); }
+}
+/** Find one record without retaining history (request-time lookups that do not belong in a compact polling state). */
+export function findJournalEntry(path: string, match: (entry: Entry) => boolean): Entry | undefined {
+  return readJournalFold<{ found?: Entry }>(path, undefined, () => ({}), (state, entry) => { if (!state.found && match(entry)) state.found = entry; })?.state.found;
+}
+
 /** How long a resting journal keeps its descriptor after its last append (a burst of appends opens it once). */
 export const JOURNAL_REST_MS = 1000;
 let descriptors = 0, appends = 0;

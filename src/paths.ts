@@ -15,6 +15,12 @@ export const binDir = (home: string) => path.join(home, "bin");
 export const orchInbox = (home: string) => path.join(home, "inbox");
 /** Sender outboxes live under this root (kernel Outbox.open(root, ...)). */
 export const outboxRoot = (home: string) => home;
+/** Derived, rebuildable reader caches (never authoritative): deleting it only costs a slower next read. */
+export const cacheDir = (home: string) => path.join(process.env.DSA_CACHE_HOME ?? home, "cache");
+/** Digests of settled workflow journals (orchestrator/snapshot.ts). */
+export const digestDir = (home: string) => path.join(cacheDir(home), "digests");
+/** Facts of final calls shown by the UI (ui/data.ts), per workflow. */
+export const factsDir = (home: string) => path.join(cacheDir(home), "facts");
 export const workflowDir = (home: string, wid: Wid) => path.join(home, "w", wid);
 export const journalPath = (home: string, wid: Wid) => path.join(workflowDir(home, wid), "journal.jsonl");
 /** Per-call directory; `key` is the script key, `gen` the generation. */

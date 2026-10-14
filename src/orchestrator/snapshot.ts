@@ -4,16 +4,18 @@ import { initiatorSummary, restartLine } from "./restart.ts";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { compileFanout } from "../compat/fanout.ts";
-import { readJournalSnapshot, readJournalUncached } from "../kernel/journal.ts";
-import { journalPath, orchLedger, pinnedDir, workflowDir } from "../paths.ts";
-import { JT, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
-import { emptyLedger, foldLedger, type LedgerState } from "./ledger.ts";
+import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends, readJournalRecord, readJournalSnapshot, readJournalUncached, type JournalRecord } from "../kernel/journal.ts";
+import { readCache, writeCache } from "../kernel/cache.ts";
+import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
+import { JT, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
+import { type LedgerState } from "./ledger.ts";
+import { readerHold, readerLedger, readerLedgerIdentity, type ReaderLedger } from "./reader-ledger.ts";
 import type { Exhaustion } from "./providers.ts";
 import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
 import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
 import { labelsOf } from "../events/derive.ts";
-import { PENDING_NOTE } from "./notes.ts";
+import { PENDING_NOTE, generationRids, UNDELIVERED_FOLLOW_UP } from "./notes.ts";
 import { readStats, type OrchestratorStats } from "./stats.ts";
 
 export type CallPhase = "queued" | "running" | "asking" | "sealed";
@@ -120,7 +122,8 @@ export function plannedFromScript(source: string): number | undefined {
 const plannedByPath = new Map<string, number | undefined>();
 /** v12 §4: The current revision's planned total, read lazily from the pinned run body and cached (pins are immutable). */
 function plannedTotal(home: string, wid: string, rev: number): number | undefined {
-  const path = join(pinnedDir(home, wid), rev === 1 ? "script.js" : join(`r${rev}`, "script.js"));
+  const scripts = pathsOf(home, wid).scripts;
+  const path = scripts[rev] ??= join(pinnedDir(home, wid), rev === 1 ? "script.js" : join(`r${rev}`, "script.js"));
   if (!plannedByPath.has(path)) {
     try { plannedByPath.set(path, plannedFromScript(readFileSync(path, "utf8"))); } catch { plannedByPath.set(path, undefined); }
   }
@@ -331,8 +334,168 @@ export function snapshotFromEntries(wid: string, entries: readonly Entry[]): Wor
 const FOLDS = 256; // workflows whose fold state is kept; pruned and long-idle ones fall out
 const folds = new Map<string, { wid: string; length: number; last?: Entry; reducer: ReturnType<typeof snapshotReducer> }>();
 const derived = new WeakMap<readonly Entry[], { wid: string; snapshot: WorkflowSnapshot }>();
-export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
-  const path = journalPath(home, wid), entries = readJournalSnapshot(path), hit = derived.get(entries);
+export function workflowSnapshot(home: string, wid: string, ledger?: string): WorkflowSnapshot {
+  const wf = workflowDigest(home, wid, ledger).snapshot;
+  const planned = plannedTotal(home, wid, wf.rev);
+  return planned === undefined ? wf : { ...wf, planned };
+}
+
+/** P37: a generation opened by a send (possibly after the workflow finished) that has no seal yet is pending work. */
+const opened = new WeakMap<object, { length: number; open: boolean }>();
+export function openGeneration(entries: readonly { type: string; [k: string]: unknown }[]): boolean {
+  const hit = opened.get(entries);
+  if (hit?.length === entries.length) return hit.open;
+  // Sealed call ids end in `/<key>@<gen>`; collect every such suffix once instead of rescanning per generation.
+  const sealed = new Set<string>();
+  for (const s of entries) if (s.type === JT.sealed) { const call = String(s.call); for (let i = call.indexOf("/"); i >= 0; i = call.indexOf("/", i + 1)) sealed.add(call.slice(i)); }
+  const open = entries.some(g => g.type === "generation" && !sealed.has(`/${String(g.key)}@${String(g.gen)}`));
+  opened.set(entries, { length: entries.length, open });
+  return open;
+}
+const unresolvedByEntries = new WeakMap<readonly Entry[], AttentionItem[]>();
+/** P15: The attention items of one immutable journal snapshot without an `attention-resolved`, computed once per snapshot. */
+export function unresolvedAttention(entries: readonly Entry[]): AttentionItem[] {
+  let items = unresolvedByEntries.get(entries);
+  if (items) return items;
+  const done = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}\0${e.rev}`));
+  items = attentionEntries(entries).map(e => e.item).filter(item => !done.has(`${item.id}\0${item.rev}`));
+  unresolvedByEntries.set(entries, items);
+  return items;
+}
+
+/** What pi's pollers need from one workflow journal. A finished workflow with no live call or open generation
+ *  carries `settled` attention and task fallbacks, so pollers can release the journal. Late writes are rechecked. */
+export interface WorkflowDigest { snapshot: WorkflowSnapshot; settled?: { attention: AttentionItem[]; tasks: Record<string, string> } }
+// A settled workflow's digest is kept in memory and on disk (DSA_HOME/cache), keyed by the journal's inode and committed
+// size: committed bytes never change (A1), so the same device, inode and size reduce to the same digest. Readers used to
+// decode every historical journal at each pi start (hundreds of MB: seconds of pi's main thread and hundreds of MB
+// per pi window) only to find them finished. The key also names this reduction's code, so a changed reducer reads its
+// journals again instead of trusting digests an older one wrote.
+const DIGEST_FORMAT = 2;
+let digestCode: string | undefined;
+function digestVersion(): string {
+  if (digestCode === undefined) {
+    try {
+      const ext = import.meta.url.endsWith(".ts") ? "ts" : "js";
+      digestCode = `${DIGEST_FORMAT}.${crc32(Buffer.concat([new URL(import.meta.url), ...[`../types.${ext}`, `./executor/worktree.${ext}`, `./notes.${ext}`].map(p => new URL(p, import.meta.url))].map(u => readFileSync(u))))}`;
+    } catch { digestCode = ""; }
+  }
+  return digestCode;
+}
+const digests = new Map<string, { dev: number; ino: number; size: number; digest: WorkflowDigest; checked: number; ledger?: string; appends: number }>();
+const FINAL_STATUS = new Set(["done", "failed", "stopped"]);
+/** Post-seal/recovery work that can append without a new request must not enter a polling trust window. */
+export function pendingRecovery(wid: string, entries: readonly Entry[]): boolean {
+  const start = entries.findLastIndex(e => e.type === "revised"), current = start < 0 ? entries : entries.slice(start);
+  const consumed = new Set(current.filter(e => e.type === "generation").flatMap(generationRids));
+  const retiredForwards = new Map(entries.filter(e => e.type === "forward-retired").map(e => [String(e.rid2), e]));
+  const delivered = new Set(entries.filter(e => e.type === "forward-delivered").map(e => String(e.rid2)));
+  // collectSealed repairs forwarding receipts of older revisions as well.
+  for (const e of entries) if (e.type === "forward" && !retiredForwards.has(String(e.rid2)) && !delivered.has(String(e.rid2))) return true;
+  for (const e of current) if (e.type === "forward" && retiredForwards.get(String(e.rid2))?.reason === UNDELIVERED_FOLLOW_UP && !consumed.has(String(e.rid))) return true;
+  const fenced = new Set(entries.filter(e => e.type === JT.fenced).map(e => e.exec));
+  const gates = new Set(entries.filter(e => e.type === "gate").map(e => e.id));
+  const cleaned = new Set(entries.filter(e => e.type === "wt-removed" || e.type === "wt-kept").map(e => e.call));
+  const seals = new Map(entries.filter(e => e.type === JT.sealed).map(e => [e.call, e]));
+  const attention = attentionEntries(entries), resolved = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => JSON.stringify([e.id, e.rev])));
+  const hasAttention = (id: string, rev?: number) => attention.some(e => e.item.id === id && (rev === undefined || e.item.rev === rev));
+  // Engine.attention repairs completion notices, including on already-ended workflows after a crash.
+  if (current.some(e => e.type === JT.done) && !hasAttention(`finished:${wid}`, entries.filter(e => e.type === JT.done).length)) return true;
+  for (const e of entries) {
+    if (e.type === JT.exec && !fenced.has(e.exec)) return true;
+    if (e.type === "gate-intent" && !gates.has(e.id)) return true;
+    if (e.type === "wt-intent" && (seals.get(e.call)?.result as CallResult | undefined)?.status === "ok" && !cleaned.has(e.call)) return true;
+    if (e.type === JT.sealed && (e.result as CallResult | undefined)?.status === "unknown" && !hasAttention(`unknown:${String(e.call)}`)) return true;
+    if (e.type === "generation" && e.revision !== undefined) {
+      const call = `${wid}@${e.revision}/${String(e.key)}@${String(e.gen)}`;
+      if (seals.has(call) && !hasAttention(`finished:${call}`)) return true;
+    }
+  }
+  // Retirement, fence repair, and cross-workflow conflict resolution can still close these items.
+  for (const { item } of attention) if (!resolved.has(JSON.stringify([item.id, item.rev]))) {
+    if (item.id.startsWith("fence:") || item.kind === "conflict") return true;
+    if (item.call && seals.has(item.call) && item.kind !== "finished" && item.id !== `unknown:${item.call}`) return true;
+  }
+  return false;
+}
+function digestOf(wf: WorkflowSnapshot, entries: readonly Entry[], complete: boolean): WorkflowDigest {
+  const settled = complete && FINAL_STATUS.has(wf.status) && !wf.active && !wf.followUps &&
+    entries.some(e => e.type === JT.done) && !openGeneration(entries) && !pendingRecovery(wf.wid, entries);
+  const tasks: Record<string, string> = Object.create(null);
+  if (settled) for (const e of entries) if (e.type === "call") tasks[`${e.key}\0${e.gen}`] = String((e.spec as { task?: string } | undefined)?.task ?? "");
+  return settled ? { snapshot: wf, settled: { attention: structuredClone(unresolvedAttention(entries)), tasks } } : { snapshot: wf };
+}
+type StoredDigest = { v: string; home: string; dev: number; ino: number; size: number; digest: WorkflowDigest };
+function storedDigest(home: string, wid: string, dev: number, ino: number, size: number): WorkflowDigest | undefined {
+  const stored = readCache(join(digestDir(home), `${wid}.json`)) as StoredDigest | undefined;
+  const d = stored?.digest, wf = d?.snapshot;
+  if (!(digestVersion() && stored?.v === digestVersion() && stored.home === home && stored.dev === dev && stored.ino === ino && stored.size === size &&
+    d?.settled && Array.isArray(d.settled.attention) && d.settled.tasks && wf?.wid === wid && Array.isArray(wf.calls) &&
+    Array.isArray(wf.attention) && wf.counts && FINAL_STATUS.has(wf.status) && !wf.active && !wf.followUps)) return undefined;
+  // The reducer always sets pos with Number(e.pos); a missing position is NaN, which JSON represents as null.
+  for (const call of wf.calls) if ((call.pos as unknown) === null) call.pos = NaN;
+  return d;
+}
+/** Concurrent windows publish independently; an old writer's identity cannot pass a new journal's key. */
+function storeDigest(home: string, wid: string, record: JournalRecord, digest: WorkflowDigest): void {
+  const v = digestVersion();
+  if (v) writeCache(join(digestDir(home), `${wid}.json`), { v, home, dev: record.dev, ino: record.ino, size: record.size, digest } satisfies StoredDigest, journalPath(home, wid));
+}
+// Path strings per workflow: joining them for every workflow on every UI refresh cost pi's main thread milliseconds.
+const pathsByHome = new Map<string, Map<string, { journal: string; scripts: string[] }>>();
+function pathsOf(home: string, wid: string): { journal: string; scripts: string[] } {
+  let byWid = pathsByHome.get(home);
+  if (!byWid) pathsByHome.set(home, byWid = new Map());
+  let paths = byWid.get(wid);
+  if (!paths) byWid.set(wid, paths = { journal: journalPath(home, wid), scripts: [] });
+  return paths;
+}
+/** Intake commits requests before applying their generation or revision, then decisions afterward. Recovery and
+ *  late attention can also append without a fresh request: an unchanged ledger skips settled journal IO only for
+ *  this bounded window. Local appends end it too; turn boundaries check immediately. */
+export const SETTLED_RECHECK_MS = 5000;
+/** P25: The current digest of one workflow, from its committed journal. With `ledger` (the orchestrator ledger's
+ *  identity, see allWorkflows) a settled digest checked under the same ledger less than SETTLED_RECHECK_MS ago is
+ *  reused without a stat. */
+export function workflowDigest(home: string, wid: string, ledger?: string): WorkflowDigest {
+  const path = pathsOf(home, wid).journal, memo = digests.get(path), now = Date.now();
+  if (memo?.digest.settled) releasable.add(path);
+  if (ledger !== undefined && memo?.digest.settled && memo.ledger === ledger && memo.appends === journalAppends() && now >= memo.checked && now - memo.checked < SETTLED_RECHECK_MS) return memo.digest;
+  let dev: number | undefined, ino: number | undefined, size: number | undefined;
+  try { ({ dev, ino, size } = statSync(path)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (memo && memo.dev === dev && memo.ino === ino && memo.size === size) {
+    memo.ledger = ledger; memo.checked = now; memo.appends = journalAppends();
+    return memo.digest;
+  }
+  if (dev !== undefined && ino !== undefined && size !== undefined && !memo) {
+    const stored = storedDigest(home, wid, dev, ino, size);
+    if (stored) { digests.set(path, { dev, ino, size, digest: stored, checked: now, ledger, appends: journalAppends() }); releasable.add(path); return stored; }
+  }
+  const record = readJournalRecord(path), entries = record?.entries ?? [];
+  const digest = digestOf(foldSnapshot(path, wid, entries), entries, !!record && record.length === record.size);
+  if (!record) { digests.delete(path); return digest; }
+  digests.set(path, { dev: record.dev, ino: record.ino, size: record.size, digest, checked: now, ledger, appends: journalAppends() });
+  if (digest.settled) { storeDigest(home, wid, record, digest); releasable.add(path); }
+  return digest;
+}
+/** Last journal identity check of the current digest. Reuse never renews this timestamp. */
+export function workflowDigestChecked(home: string, wid: string): number {
+  return digests.get(pathsOf(home, wid).journal)?.checked ?? -Infinity;
+}
+/** The digest is all a poller reads of a settled workflow: its entries and fold state need not stay in memory. Pollers
+ *  (allWorkflows, the main agent's workflows) release them after a pass; a one-off reader that compares journal
+ *  snapshots by identity around a digest (describe) keeps them. */
+const releasable = new Set<string>();
+/** Explicit one-off readers may load settled history between polling passes. */
+export function releaseLoadedSettledJournals(): void {
+  forgetJournalSnapshotsIf(path => !!digests.get(path)?.digest.settled);
+}
+export function releaseSettledJournals(): void {
+  for (const path of releasable) { forgetJournalSnapshot(path); folds.delete(path); }
+  releasable.clear();
+}
+function foldSnapshot(path: string, wid: string, entries: readonly Entry[]): WorkflowSnapshot {
+  const hit = derived.get(entries);
   let wf: WorkflowSnapshot;
   if (hit?.wid === wid) wf = hit.snapshot;
   else {
@@ -356,13 +519,12 @@ export function workflowSnapshot(home: string, wid: string): WorkflowSnapshot {
       derived.set(entries, { wid, snapshot: wf });
     } else folds.delete(path);
   }
-  const planned = plannedTotal(home, wid, wf.rev);
-  return planned === undefined ? wf : { ...wf, planned };
+  return wf;
 }
 
 /** Ops: wids archived by `prune` (orchestrator ledger `pruned{wid}`); they no longer exist for any reader. */
 function prunedIds(home: string): Set<string> {
-  return ledgerIndex(readJournalSnapshot(orchLedger(home))).pruned;
+  return readerLedger(home).state.pruned;
 }
 
 /** What the readers polled by pi's main thread need from the orchestrator ledger, folded once per ledger snapshot
@@ -427,7 +589,16 @@ function workflowIds(home: string): string[] {
   let wids: string[] = [];
   try { wids = readdirSync(join(home, "w")).filter(n => !n.startsWith(".")); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   const pruned = prunedIds(home);
+  forgetRemovedWorkflows(home, wids, pruned);
   return wids.filter(wid => !pruned.has(wid));
+}
+function forgetRemovedWorkflows(home: string, names: string[], pruned: Set<string>): void {
+  const paths = pathsByHome.get(home), present = new Set(names);
+  if (paths) for (const [wid, p] of paths) if (pruned.has(wid) || !present.has(wid)) {
+    digests.delete(p.journal); folds.delete(p.journal); forgetJournalSnapshot(p.journal); firstOrigins.delete(p.journal);
+    for (const script of p.scripts) if (script) plannedByPath.delete(script);
+    paths.delete(wid);
+  }
 }
 
 /** Drain: the one hold rule. drain/undrain entries apply to every workflow (no scope), one session's (`origin`) or one
@@ -447,10 +618,10 @@ export function heldIn(ledger: readonly Entry[]): (wid: string) => boolean {
 }
 /** Drain: the workflows a drain (stop-all, a quit pi) holds until resume, and since when. */
 export function heldWorkflows(home: string): { since?: number; held: (wid: string) => boolean; labels: (wid: string) => Record<string, string> | undefined; session: (wid: string) => string | undefined } {
-  const ledger = readJournalSnapshot(orchLedger(home)), ix = ledgerIndex(ledger);
+  const ix = readerLedger(home).state;
   const origin = (wid: string) => ix.created.get(wid)?.origin as string | undefined;
-  const hold = (wid: string) => holdOf(ledger, wid, origin(wid));
-  const since = ix.lastDrain !== undefined ? ledger[ix.lastDrain]!.ts : undefined;
+  const hold = (wid: string) => readerHold(ix, wid, origin(wid));
+  const since = ix.lastDrain?.ts;
   return { ...(since !== undefined ? { since } : {}), held: wid => hold(wid) !== undefined, labels: wid => ix.labels.get(wid), session: wid => ix.sessions.get(wid) };
 }
 /** The origin of a workflow's `wf-created`, the first entry of its journal, for a workflow the ledger does not attribute
@@ -497,14 +668,50 @@ export function labelsText(labels: Record<string, string> | undefined, width = 6
   return text ? `[${clip(text, Math.max(1, width - 3))}]` : "";
 }
 
+const decorated = new WeakMap<WorkflowSnapshot, { planned?: number; labels?: Record<string, string>; session?: string; paused: boolean; wf: WorkflowSnapshot }>();
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
 export function allWorkflows(home: string): WorkflowSnapshot[] {
   return snapshotsOf(home, workflowIds(home));
 }
-function snapshotsOf(home: string, wids: string[]): WorkflowSnapshot[] {
-  const { held, labels, session } = heldWorkflows(home);
-  return wids.sort().reverse().map(wid => { const wf = labelled(workflowSnapshot(home, wid), labels(wid), session(wid)); return isLive(wf) && held(wid) ? { ...wf, paused: true } : wf; });
+export function ledgerIdentity(record: JournalRecord | undefined): string {
+  return record ? `${record.dev}:${record.ino}:${record.size}` : "";
 }
+function snapshotWithLedger(home: string, wid: string, ix: ReaderLedger, mark: string): WorkflowSnapshot {
+  const pendingRevision = (ix.revisions.get(wid) ?? 0) > (digests.get(pathsOf(home, wid).journal)?.digest.snapshot.rev ?? 0);
+  const base = workflowDigest(home, wid, pendingRevision ? undefined : mark).snapshot, planned = plannedTotal(home, wid, base.rev), l = ix.labels.get(wid), s = ix.sessions.get(wid);
+  const paused = isLive(base) && !!readerHold(ix, wid, ix.created.get(wid)?.origin as string | undefined), hit = decorated.get(base);
+  if (hit && hit.planned === planned && hit.labels === l && hit.session === s && hit.paused === paused) return hit.wf;
+  const planned1 = planned === undefined ? base : { ...base, planned }, labelled1 = labelled(planned1, l, s);
+  const wf = paused ? { ...labelled1, paused: true } : labelled1;
+  decorated.set(base, { planned, labels: l, session: s, paused, wf });
+  return wf;
+}
+function snapshotsOf(home: string, wids: string[]): WorkflowSnapshot[] {
+  const record = readerLedger(home), mark = readerLedgerIdentity(record);
+  try { return wids.sort().reverse().map(wid => snapshotWithLedger(home, wid, record.state, mark)); }
+  finally { releaseSettledJournals(); }
+}
+/** Directory effects follow committed create-intent/pruned entries (Store.create/materialize, Engine.prune).
+ *  Check identity first for the fast path; if a scan is needed, read the attributing ledger AFTER listing w/. */
+const listings = new Map<string, { mark: string; checked: number; names: string[] }>();
+export function readerWorkflowListing(home: string, fresh = false): { record: ReturnType<typeof readerLedger>; names: string[]; checked: number } {
+  let record = readerLedger(home);
+  const memo = listings.get(home), now = Date.now();
+  if (!fresh && memo && memo.mark === readerLedgerIdentity(record) && now >= memo.checked && now - memo.checked < SETTLED_RECHECK_MS) return { record, names: memo.names, checked: memo.checked };
+  let names: string[];
+  try { names = readdirSync(join(home, "w")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
+  record = readerLedger(home);
+  forgetRemovedWorkflows(home, names, record.state.pruned);
+  // An intent can be committed before its directory is materialized. Until all unpruned intents are present,
+  // a second pass must list again even if no more ledger bytes arrive (including a create during this scan).
+  const present = new Set(names), incomplete = [...record.state.intents.keys()].some(wid => !record.state.pruned.has(wid) && !present.has(wid));
+  if (incomplete) listings.delete(home);
+  else listings.set(home, { mark: readerLedgerIdentity(record), checked: now, names });
+  return { record, names, checked: now };
+}
+type OwnPass = { mark: string; checked: number; appends: number; names: string[]; retryUnknown: boolean; candidates: string[]; pending: string[]; result: WorkflowSnapshot[] };
+const ownPasses = new Map<string, Map<string, OwnPass>>();
 /** The workflows `own` ("main:<pi session id>") shows as its own (`ownedBy`), snapshotted exactly as `allWorkflows`
  *  does: the same list as `allWorkflows(home).filter(w => ownedBy(w, own))`, but who owns a workflow is decided from
  *  the orchestrator ledger alone (the origin of its create-intent or `created`, the session its run named), so the
@@ -520,14 +727,38 @@ export function ownWorkflows(home: string, own: string, options: { started?: boo
   // create-intent before it creates the directory, so every directory listed here already has its intent in a ledger
   // read afterwards; a workflow another session creates in between is attributed without opening its journal. (Read
   // the other way round, such a workflow would look unknown to the ledger and its journal would be read.)
-  const wids = workflowIds(home), ix = ledgerIndex(readJournalSnapshot(orchLedger(home)));
-  const mine = wids.filter(wid => {
+  const { record, names, checked: listed } = readerWorkflowListing(home), ix = record.state, mark = readerLedgerIdentity(record), now = Date.now();
+  let passes = ownPasses.get(home);
+  if (!passes) ownPasses.set(home, passes = new Map());
+  const key = JSON.stringify([own, !!options.started]), prior = passes.get(key);
+  const current = prior && prior.names === names && !prior.retryUnknown && prior.mark === mark && prior.appends === journalAppends() && now >= prior.checked && now - prior.checked < SETTLED_RECHECK_MS;
+  const includes = (w: WorkflowSnapshot) => options.started ? w.origin === own : ownedBy(w, own);
+  if (current && !prior.pending.length) {
+    // Another explicit reader may have loaded these journals since the preceding pass.
+    releaseLoadedSettledJournals();
+    return prior.result;
+  }
+  const candidates = current ? prior.candidates : names.filter(wid => !wid.startsWith(".") && !ix.pruned.has(wid)).filter(wid => {
     const known = ix.intents.has(wid) || ix.created.has(wid), session = ix.sessions.get(wid);
     const origin = known ? ix.intents.get(wid) ?? ix.created.get(wid)?.origin : firstOrigin(home, wid);
     return origin === own || (!options.started && session !== undefined && `main:${session}` === own);
-  });
-  // The journal decides as well: a workflow whose wf-created is not written yet has no origin, as in allWorkflows.
-  return snapshotsOf(home, mine).filter(w => options.started ? w.origin === own : ownedBy(w, own));
+  }).sort().reverse();
+  try {
+    const changed = new Map((current ? prior.pending : candidates).map(wid => [wid, snapshotWithLedger(home, wid, ix, mark)]));
+    const old = new Map(prior?.result.map(w => [w.wid, w]));
+    const result = candidates.map(wid => changed.get(wid) ?? old.get(wid)!).filter(w => w && includes(w));
+    const same = prior && prior.result.length === result.length && result.every((w, i) => w === prior.result[i]);
+    // A rescan can reuse digests checked earlier: the outer pass inherits the oldest dependency check.
+    let checked = current ? prior.checked : Math.min(now, listed);
+    const pending = candidates.filter(wid => {
+      const memo = digests.get(pathsOf(home, wid).journal), digest = memo?.digest;
+      if (digest?.settled) checked = Math.min(checked, memo!.checked);
+      return !digest?.settled || (ix.revisions.get(wid) ?? 0) > digest.snapshot.rev;
+    });
+    passes.set(key, { mark, checked, appends: journalAppends(), names, retryUnknown: names.some(wid => !ix.intents.has(wid) && !ix.created.has(wid) && !ix.pruned.has(wid)), candidates, pending, result: same ? prior.result : result });
+    return same ? prior.result : result;
+  } finally { releaseSettledJournals(); }
+
 }
 
 /** P10/P11: Per-workflow script console log written by the orchestrator (bounded, human-readable). */
@@ -627,7 +858,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
 function origins(home: string): Map<string, string | undefined> {
   const ids = new Map<string, string | undefined>();
   const pruned = prunedIds(home);
-  for (const e of readJournalSnapshot(orchLedger(home))) if (e.type === JT.created && !pruned.has(String(e.wid))) ids.set(String(e.wid), e.origin as string | undefined);
+  for (const [wid, origin] of readerLedger(home).state.origins) if (!pruned.has(wid)) ids.set(wid, origin as string | undefined);
   for (const wid of workflowIds(home)) if (!ids.has(wid)) ids.set(wid, undefined);
   return ids;
 }
@@ -657,8 +888,7 @@ export function statusView(home: string, options: { origin?: string; keep?: numb
 }
 /** The stats the running orchestrator published (none when no orchestrator runs). */
 export function runningStats(home: string): { orchestratorStats?: OrchestratorStats } {
-  const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
-  ledgerStates.set(path, state);
+  const state = readerLedger(home).state.state;
   const o = state.orchestrator, stats = o && !o.exited && processAlive(o.pid, o.start) ? readStats(home, o.pid) : undefined;
   return stats ? { orchestratorStats: stats } : {};
 }
@@ -736,7 +966,7 @@ export interface StatusBrief {
 /** Provider slots from the orchestrator ledger: holders per provider (hold/release{pool,slot,exec}) and the limits of
  *  the settings in effect (the latest config{hash,config}); config-rejected after it is reported too. */
 // One fold per orchestrator ledger, extended as it grows (ledger.ts; the executor folds the same entries the same way).
-const ledgerStates = new Map<string, LedgerState>();
+// Pi readers share the compact incremental fold in reader-ledger.ts.
 /** The orchestrator running now (its last `orchestrator` record, without an exit, whose process lives), and a note when
  *  its version is not the one this process loaded: running work stays on the version it started with. */
 export function orchestratorView(state: LedgerState, loaded = packageVersion(), now = Date.now()): { orchestrator?: string; versionNote?: string } {
@@ -776,8 +1006,7 @@ export const NOTIFY_SINCE = "1.0.28";
  *  older orchestrator would accept the request and its child would drop it); none when none runs (the next one starts
  *  on the installed version) or it is current. */
 export function orchestratorTooOld(home: string, feature: string, since: string, loaded = packageVersion()): string | undefined {
-  const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
-  ledgerStates.set(path, state);
+  const state = readerLedger(home).state.state;
   const o = state.orchestrator;
   if (!o || o.exited || !processAlive(o.pid, o.start) || !newer(since, o.version) || !newer(loaded, o.version)) return undefined;
   return `the running orchestrator ${o.version} predates ${feature} (new in ${since}); restart it to the installed version ${loaded} first ` +
@@ -785,8 +1014,7 @@ export function orchestratorTooOld(home: string, feature: string, since: string,
 }
 /** orchestratorView of the home's orchestrator ledger. */
 export function runningOrchestrator(home: string): { orchestrator?: string; versionNote?: string } {
-  const path = orchLedger(home), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), readJournalSnapshot(path));
-  ledgerStates.set(path, state);
+  const state = readerLedger(home).state.state;
   return orchestratorView(state);
 }
 
@@ -805,13 +1033,12 @@ export function originLabel(origin: string | undefined): string {
   return origin.startsWith("main:") ? `session ${origin.slice(5, 13)}` : clip(restartLine(origin), 40);
 }
 export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected" | "exhausted" | "orchestrator" | "versionNote"> {
-  const path = orchLedger(home), entries = readJournalSnapshot(path), state = foldLedger(ledgerStates.get(path) ?? emptyLedger(), entries);
-  ledgerStates.set(path, state);
+  const ix = readerLedger(home).state, state = ix.state;
   const { held, config, rejected } = state, used = state.exhausted;
   const exhausted = [...used].sort(([a], [b]) => a.localeCompare(b)).map(([p, x]) => exhaustedLine(p, x, now));
   const limits: Record<string, { slots?: number }> = config?.settings.providers ?? {};
   const holders = new Map<string, number>(), byOrigin = new Map<string, Map<string, number>>();
-  const created = ledgerIndex(entries).created;
+  const created = ix.created;
   for (const e of held.values()) if (e.pool !== "memory") {
     holders.set(e.pool, (holders.get(e.pool) ?? 0) + 1);
     // exec "<wid>@<rev>/<key>@<gen>#<n>" -> the origin of its workflow

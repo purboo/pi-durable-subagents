@@ -584,7 +584,21 @@ an orchestrator runs, a pi session does not look for pending work at all;
 without one, it looks until it finds the first unfinished workflow and keeps
 none of the journals it read. `node scripts/bench-ui.ts --owner=main:<pi
 session id>` measures what a session pays on its main thread for a given
-`DSA_HOME` (read-only).
+`DSA_HOME` (read-only). The measurement uses a temporary cache; pass
+`--cache-home=<temporary directory>` to reuse it across runs, and run with
+`node --expose-gc` to measure RSS after released history is collected.
+
+Readers keep digests of settled workflows and facts of final calls in
+`DSA_HOME/cache`. These are rebuildable: deleting the cache costs one slower
+read. Digests are keyed by journal identity and reducer code; final facts by
+call seal, session identity and deriving code. A settled journal is released
+after each pass. Polling skips its journal IO while the ledger stays unchanged,
+for at most five seconds. Turn boundaries check immediately for late attention.
+Ledger changes force a journal check;
+final sessions are also rechecked within five seconds. Only an explicitly
+opened final call keeps its transcript. Prune removes the workflow's caches.
+`DSA_CACHE_HOME=<directory>` places the derived cache under that directory
+instead of `DSA_HOME`, without changing where authoritative data is read.
 
 ### Where the orchestrator starts
 

@@ -6,13 +6,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { defineTool, type ExtensionAPI, type ExtensionContext, type CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { Outbox, scanInbox } from "../kernel/mailbox.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
-import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
+import { readerLedger } from "../orchestrator/reader-ledger.ts";
 import { OsLock } from "../platform/lock.ts";
 import { launchOrchestrator } from "../platform/launch.ts";
-import { dsaHome, orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
+import { dsaHome, orchInbox, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
-import { NOTIFY_SINCE, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, widOfRid, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "./main/tool.ts";
 import { parameters } from "./main/schema.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, requestRid, sendIdentified, type Identified } from "../requests.ts";
@@ -60,13 +60,11 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   function serial<T>(fn: () => Promise<T>): Promise<T> {
     const result = queue.then(fn); queue = result.catch(() => {}); return result;
   }
-  function ledger() { return readJournalSnapshot(orchLedger(home)); }
-  function decisions() {
-    return reduceLifecycle(ledger().filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[]).resolved;
-  }
+  function ledger() { return readerLedger(home).state; }
+  function decisions() { return ledger().decisions; }
   async function reconcile() {
     for (const rid of decisions().keys()) await outbox?.markResolved(rid);
-    for (const entry of ledger()) if (entry.type === JT.created) await outbox?.markResolved(String(entry.rid));
+    for (const rid of ledger().createdRids.keys()) await outbox?.markResolved(String(rid));
   }
   function pendingOutbox() { return pendingRids().size > 0; }
   function pendingRids() {
@@ -102,7 +100,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     versionTold = orchestrator;
     ctx.ui.notify(`Durable Subagents: ${versionNote}.`, "warning");
   }
-  function collect() { return ctx ? attention(home, sender, [...presented(ctx), ...reserved]) : []; }
+  function collect(fresh = false) { return ctx ? attention(home, sender, [...presented(ctx), ...reserved], fresh) : []; }
   function message(items: AttentionItem[]): CustomMessageEntryDraft {
     return { type: "custom_message", customType: CT.attention, content: items.map(presentText).join("\n"), display: true, details: { items } };
   }
@@ -118,7 +116,8 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   const boundary = async (_event: unknown, context: ExtensionContext) => serial(async () => {
     if (stopped) return;
     ctx = context;
-    const items = collect(), entries: CustomMessageEntryDraft[] = [];
+    // Polling can reuse a settled digest; a turn boundary must see attention appended just before it.
+    const items = collect(true), entries: CustomMessageEntryDraft[] = [];
     if (items.length) { entries.push(message(items)); reserved.push(...items); }
     if (notes.length) entries.push({ type: "custom_message", customType: CT.note, content: notes.splice(0).join("\n"), display: true });
     return entries.length ? { entries, ...(items.length ? { continue: true } : {}) } : undefined;
@@ -198,7 +197,10 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     return args;
   }
   /** "<rid>" or "<rid>/<key>" of a created run → the same address with its wid; anything else is unchanged. */
-  function ridToWid(value: string): string { return widOfRid(ledger(), value); }
+  function ridToWid(value: string): string {
+    const cut = value.indexOf("/"), head = cut < 0 ? value : value.slice(0, cut), created = head ? ledger().createdRids.get(head) : undefined;
+    return created ? `${String(created.wid)}${value.slice(head.length)}` : value;
+  }
   /** A run request without a workflow yet (still pending, or rejected), asked about by its rid. */
   function pendingRun(rid: string): unknown {
     const decision = decisions().get(rid);
@@ -309,7 +311,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
       return outbox.send("orch", normalized.kind, normalized.body, normalized.cond);
     });
     if ("conflict" in outcome) {
-      const created = ledger().find(e => e.type === JT.created && e.rid === rid);
+      const created = ledger().createdRids.get(rid);
       return { applied: false, reason: "request-conflict", request: args.request, spec_digest: outcome.digest, ...(created ? { wid: created.wid } : {}),
         note: "this request id was used for different content; use a new id" };
     }
@@ -317,7 +319,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     // P25: run waits for `created`; control requests wait for their terminal lifecycle record (applied or rejected+reason).
     const deadline = performance.now() + 10_000;
     while (wait || sent.kind === "run") {
-      const receipt = sent.kind === "run" ? ledger().find(e => e.type === JT.created && e.rid === sent.rid) : undefined;
+      const receipt = sent.kind === "run" ? ledger().createdRids.get(sent.rid) : undefined;
       const decision = receipt ? undefined : decisions().get(sent.rid);
       if (receipt || decision) {
         await serial(async () => { await outbox?.markResolved(sent.rid); });
@@ -329,7 +331,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
         // The rid is returned so a later send can supersede this one (replaces: [rid]).
         if (decision!.type === "rejected") return { applied: false, reason: sent.kind === "resume" && args.wid === undefined ? resumeElsewhere(String(decision!.reason)) : decision!.reason, rid: sent.rid };
         if (sent.kind !== "run") {
-          return { applied: true, rid: sent.rid, ...followUpReceipt(home, sent.rid, sent.body), ...sendReceipt(ledger(), sent.rid) };
+          return { applied: true, rid: sent.rid, ...followUpReceipt(home, sent.rid, sent.body), ...sendReceipt([ledger().sendNotes.get(sent.rid)].filter((e): e is NonNullable<typeof e> => !!e), sent.rid) };
         }
       }
       if (performance.now() >= deadline || signal?.aborted) break;

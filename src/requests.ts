@@ -7,7 +7,7 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { contentHash } from './kernel/ids.ts';
-import { readJournalSnapshot } from './kernel/journal.ts';
+import { findJournalEntry, readJournalSnapshot } from './kernel/journal.ts';
 import { publishRequest, type Outbox } from './kernel/mailbox.ts';
 import { OsLock } from './platform/lock.ts';
 import { orchInbox, orchLedger, outboxRoot } from './paths.ts';
@@ -60,7 +60,7 @@ export function specDigest(req: Pick<Request, 'kind' | 'body' | 'cond'>): string
 /** The envelope recorded for `rid`: the orchestrator's admitted copy (ledger `request`, kept after prune), else any
  *  sender's outbox `sent` entry (published or about to be). Read-only. */
 export async function findRequest(home: string, rid: string): Promise<{ request: Request; admitted: boolean } | undefined> {
-  const admitted = readJournalSnapshot(orchLedger(home)).find(e => e.type === 'request' && (e.request as Request).rid === rid);
+  const admitted = findJournalEntry(orchLedger(home), e => e.type === 'request' && (e.request as Request).rid === rid);
   if (admitted) return { request: admitted.request as Request, admitted: true };
   const dir = join(outboxRoot(home), 'outbox');
   const names = await readdir(dir).catch(error => { if (error.code === 'ENOENT') return [] as string[]; throw error; });

@@ -58,6 +58,18 @@ below refer to those documents.
   processes is the caller's job (the orchestrator lock).
 - Also provide `readJournalSnapshot(path): Entry[]`. It is used by other
   domains, which only read; it tolerates a torn tail and never writes.
+- Readers may keep what they derive from a journal in `DSA_HOME/cache`
+  (`orchestrator/snapshot.ts` digests of settled workflows, `ui/data.ts`
+  facts of final calls). An entry names the journal's (or session's) device,
+  inode and committed size and the deriving code; anything else is a miss.
+  The cache has a checked payload, is never authoritative, is written whole
+  and renamed into place, and may be deleted at any time. Prune removes it;
+  an in-flight reader cannot recreate it after the journal disappears.
+  Polling can skip settled journal IO under an unchanged ledger for at most
+  five seconds; a ledger change forces a check. Turn boundaries check late
+  attention immediately. Final session identities are rechecked within five
+  seconds; final facts retain no transcript unless that call is opened.
+  `DSA_CACHE_HOME` redirects only this derived data (used by measurements).
 
 **`ids.ts`**
 

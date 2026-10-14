@@ -4,7 +4,7 @@ import type { UiDeps } from "../agent/main.ts";
 import { UiActions, UiData } from "./data.ts";
 import { SubagentScreen } from "./screen.ts";
 import { oneLine } from "./frame.ts";
-import { dockLines, mainLine, modelLabel, orderWorkflows, type ViewState } from "./view.ts";
+import { dockLines, mainLine, modelLabel, type ViewState } from "./view.ts";
 import { registerCards } from "./cards.ts";
 import { toolRenderers } from "./tool.ts";
 
@@ -35,6 +35,7 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
     let screen: SubagentScreen | undefined, opening = false, stopped = false, closeScreen: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined, timer: ReturnType<typeof setInterval> | undefined;
     let dockRows: (width: number) => string[] = () => [], dockAt: "above" | "below" | undefined | null = null, lastDock = "";
+    let lastData: object | undefined, completionExpires = Infinity;
     // ↓ opens the list only from pi's own input editor. Another surface — /model's selector, a dialog, another
     // extension's overlay — has the focus instead, and its ↓ belongs to it. pi's editor (and any editor built on
     // CustomEditor) carries the app action map; the TUI comes from the dock widget, so without a dock the check
@@ -57,9 +58,17 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
         // This session's workflows only: ownership comes from the orchestrator ledger, and other sessions' journals are
         // never read by this pi process. orderWorkflows filters by the same rule and orders the list.
         const own = `main:${ctx.sessionManager.getSessionId()}`;
-        data.refresh(own); actions.reconcile();
-        for (const result of actions.resolutions.splice(0)) screen?.controlResult(result);
-        data.workflows = orderWorkflows(data.workflows, own);
+        const revision = data.refresh(own); actions.reconcile();
+        const resolved = actions.resolutions.splice(0);
+        for (const result of resolved) screen?.controlResult(result);
+        const cardsChanged = refreshCards();
+        if (revision === lastData && !resolved.length && Date.now() < completionExpires) {
+          if (cardsChanged) keysTui?.requestRender?.();
+          return;
+        }
+        lastData = revision;
+        const expires = Math.max(0, ...data.workflows.map(w => w.endedAt ?? 0)) + 10 * 60_000;
+        completionExpires = expires > Date.now() ? expires : Infinity;
         // UI §1: the dock — live rows per active agent plus a summary line ("auto"), only the summary ("line"), or nothing.
         const name = (model: string | undefined) => modelLabel(model, (p, id) => ctx.modelRegistry.find(p, id), data.aliases);
         const now = Date.now(), dock = data.dock;
@@ -90,7 +99,6 @@ export function registerUi(pi: ExtensionAPI, deps: UiDeps): void {
           }, { placement: at === "above" ? "aboveEditor" : "belowEditor" });
         }
         const shown = dockRows(200).join("\n");
-        const cardsChanged = refreshCards();
         if (shown !== lastDock || cardsChanged) { lastDock = shown; keysTui?.requestRender?.(); }
         screen?.refresh();
       } catch { /* P21: journal or UI unavailability must not interrupt the main agent. */ }

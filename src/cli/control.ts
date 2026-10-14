@@ -49,7 +49,7 @@ async function pendingOutboxes(home: string): Promise<boolean> {
 /** P1: The pending-work rule shared with the main agent's starter: a non-empty orchestrator inbox, a pending
  *  request to the orchestrator in any sender outbox, a workflow without JT.done, or an unsealed generation. */
 export async function pendingWork(home: string): Promise<boolean> {
-  return (await scanInbox(orchInbox(home))).length > 0 || await pendingOutboxes(home) || unfinishedWorkflow(home);
+  return (await scanInbox(orchInbox(home))).length > 0 || await pendingOutboxes(home) || unfinishedWorkflow(home, true);
 }
 /** P1: The optional service's starter: start the orchestrator only when work is pending; publish no request
  *  (unlike `resume`, it never undoes a drain or stop-all). Returns whether the starter was invoked. */

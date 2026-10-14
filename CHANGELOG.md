@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.0.40
+
+- Readers keep rebuildable digests of settled workflows and facts of final calls in `DSA_HOME/cache`, keyed by
+  journal or session identity and the deriving code. Prune removes these cache entries with their workflow.
+
+- A pi session uses these digests for its own workflows, keeps unchanged workflow objects, and releases settled
+  journals and fold state after each pass. An unchanged ledger permits at most five seconds without journal IO;
+  a ledger change forces a check, and turn boundaries check immediately for late attention. Final call facts release
+  their transcripts and recheck session identity within
+  five seconds. Concurrent cache writes are atomic, checked, and cannot recreate a pruned workflow's cache.
+- Pi readers fold the ledger's committed prefix in bounded chunks into compact per-home state, without retaining
+  decoded history. Replacement and truncation rebuild it. Unchanged passes skip the workflow directory scan and
+  reuse settled results and the ordered UI view by identity; the dock and open list do not request redundant renders.
+  Incomplete creation or revision intents and unsettled workflows are still checked on the next pass.
+- Workflows with pending undelivered follow-ups or unfinished recovery bookkeeping are not settled. Recovery-only
+  follow-ups therefore appear on the next poll, even without a new ledger entry. Missing completion notices, pending
+  forwards, fences, gates, successful worktree cleanup and retired questions also prevent the trust window.
+- `scripts/bench-ui.ts` uses a temporary cache and reports steady RSS and live heap after history release. `--cache-home`
+  reuses caches for a second run; `node --expose-gc` collects released history before and after steady-state polling.
+- Measured against 1.0.39 on a home with 1,530 workflows, for a session owning 197 of them (load 1.3, warm cache): a
+  steady refresh fell from 9.0 ms to 2.7 ms (p50), the steady RSS from 345 MiB to 145 MiB with a 26 MiB live heap, the
+  first refresh from 1.2 s to 0.4 s and the session-start notice from 0.71 s to 0.12 s. With an empty cache the first
+  refresh is unchanged (1.2 s) and the RSS stays near 300 MiB until the allocator returns memory.
+
 ## 1.0.39
 
 - A pi session reads only its own workflows. Since 1.0.30 the UI shows only the workflows of its session, yet the pi
