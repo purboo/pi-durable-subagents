@@ -1,6 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { stripVTControlCharacters } from "node:util";
 import { join } from "node:path";
 import { root, clean, now, call, workflow, state, session, ctx, tui, theme, writeSession } from "../../unit/ui/fixture.ts";
@@ -14,7 +14,7 @@ const { SubagentScreen } = await import("../../../src/ui/screen.ts");
 const { UiData, UiActions } = await import("../../../src/ui/data.ts");
 const { sessionFacts, sessionBranch } = await import("../../../src/ui/session.ts");
 const { JT } = await import("../../../src/types.ts");
-const { openJournal } = await import("../../../src/kernel/journal.ts");
+const { crc32, openJournal } = await import("../../../src/kernel/journal.ts");
 const { journalPath, callSession, orchLedger } = await import("../../../src/paths.ts");
 after(clean);
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -277,6 +277,26 @@ test("history: a finished call's session is read when first shown, with the same
     const transcript = data.sessions.get("old@1/E02@1");
     assert.equal(transcript!.length, session().length, "and its transcript is read again when shown");
     data.refresh(); assert.equal(data.sessions.get("old@1/E02@1"), transcript, "the shown transcript is not re-read every frame");
+    // Another pi finds the final facts stored and does not read the session for them.
+    const file = join(home, "cache", "facts", "old", "E02@1.json"), stored = JSON.parse(readFileSync(file, "utf8"));
+    assert.deepEqual(stored.facts, JSON.parse(JSON.stringify({ ...expected, live: undefined })));
+    const { checksum: _checksum, ...record } = stored;
+    const marked = { ...record, facts: { ...stored.facts, latest: "from the cache" } };
+    writeFileSync(file, JSON.stringify({ ...marked, checksum: crc32(Buffer.from(JSON.stringify(marked))) }));
+    const next = new UiData(home); next.refresh();
+    assert.equal(next.facts.get("old@1/E02@1")!.latest, "from the cache");
+    assert.equal(next.sessions.get("old@1/E02@1")!.length, session().length, "its transcript is still read when shown");
+    // A session changed afterwards (by hand) is read again.
+    appendFileSync(callSession(home, "old", "E02", 1), "\n");
+    const changed = new UiData(home); changed.refresh();
+    assert.deepEqual(changed.facts.get("old@1/E02@1"), { ...expected, live: undefined });
+    Date.now = () => original() + 65_000;
+    next.refresh();
+    assert.deepEqual(next.facts.get("old@1/E02@1"), { ...expected, live: undefined }, "a running reader rechecks final session identity within five seconds");
+    assert.equal(next.sessions.size, 0, "final facts do not retain the transcript");
+    writeFileSync(file, "{truncated");
+    const corrupt = new UiData(home); corrupt.refresh();
+    assert.deepEqual(corrupt.facts.get("old@1/E02@1"), { ...expected, live: undefined }, "a corrupt facts cache is a miss");
   } finally { Date.now = original; }
 });
 

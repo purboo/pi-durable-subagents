@@ -1,5 +1,5 @@
 // Read-only session tailing (C5, P21): incomplete trailing records are never displayed.
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { CT } from "../types.ts";
@@ -13,6 +13,10 @@ export class SessionTail {
   private decoder = new StringDecoder("utf8");
   private entries: SessionEntry[] = [];
   private failure?: Error;
+  private readIdentity = "none";
+  private readSize = 0;
+  /** The complete file actually read, for derived caches; a torn tail cannot become final facts. */
+  get snapshotIdentity(): string | undefined { return this.pending || this.offset !== this.readSize ? undefined : this.readIdentity; }
   read(path: string): readonly SessionEntry[] {
     let stat;
     try { stat = statSync(path); } catch (error) {
@@ -22,9 +26,17 @@ export class SessionTail {
     const identity = `${path}:${stat.dev}:${stat.ino}`;
     if (identity !== this.identity || stat.size < this.offset) { this.reset(); this.identity = identity; }
     if (this.failure) throw this.failure;
-    if (stat.size === this.offset) return this.entries;
+    if (stat.size === this.offset) {
+      if (!stat.size) this.readIdentity = `${stat.dev}:${stat.ino}:0`;
+      return this.entries;
+    }
     const fd = openSync(path, "r");
     try {
+      stat = fstatSync(fd);
+      const openedIdentity = `${path}:${stat.dev}:${stat.ino}`;
+      if (openedIdentity !== this.identity || stat.size < this.offset) { this.reset(); this.identity = openedIdentity; }
+      this.readIdentity = `${stat.dev}:${stat.ino}:${stat.size}`;
+      this.readSize = stat.size;
       const buffer = Buffer.alloc(Math.min(64 * 1024, stat.size - this.offset));
       while (this.offset < stat.size) {
         const n = readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - this.offset), this.offset);
@@ -42,7 +54,7 @@ export class SessionTail {
     finally { closeSync(fd); }
     return this.entries;
   }
-  private reset() { this.identity = ""; this.offset = 0; this.pending = ""; this.entries = []; this.failure = undefined; this.decoder = new StringDecoder("utf8"); }
+  private reset() { this.identity = ""; this.readIdentity = "none"; this.readSize = 0; this.offset = 0; this.pending = ""; this.entries = []; this.failure = undefined; this.decoder = new StringDecoder("utf8"); }
 }
 
 /** C5: Select the native session's current branch without showing abandoned conversation turns. */

@@ -1,45 +1,60 @@
-import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readJournalSnapshot, readJournalUncached } from "../../kernel/journal.ts";
-import { journalPath, orchLedger } from "../../paths.ts";
-import { CT, JT, attentionEntries, type AttentionItem, type Entry } from "../../types.ts";
-import { holdOf, ledgerIndex } from "../../orchestrator/snapshot.ts";
+import { forgetJournalSnapshot, journalAppends, readJournalSnapshot, readJournalUncached } from "../../kernel/journal.ts";
+import { journalPath } from "../../paths.ts";
+import { CT, JT, type AttentionItem, type Entry } from "../../types.ts";
+import { openGeneration, readerWorkflowListing, releaseLoadedSettledJournals, releaseSettledJournals, SETTLED_RECHECK_MS, unresolvedAttention, workflowDigest, workflowDigestChecked, type WorkflowDigest } from "../../orchestrator/snapshot.ts";
+import { readerHold, readerLedgerIdentity } from "../../orchestrator/reader-ledger.ts";
 
 /** P15, P25: Read workflow snapshots without modifying another domain's history; a wid with an orchestrator.jsonl
- *  `pruned{wid}` entry is gone (housekeeping), even while its directory is still being removed. */
-export function workflows(home: string, origin?: string): { wid: string; origin?: string; entries: Entry[] }[] {
-  const ledger = readJournalSnapshot(orchLedger(home)), { created: createdBy, pruned } = ledgerIndex(ledger);
-  let names: string[];
-  try { names = readdirSync(join(home, "w")); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
-  const ids = new Set([...[...createdBy.keys()].map(String), ...names].filter(wid => !pruned.has(wid)));
-  const result: { wid: string; origin?: string; entries: Entry[] }[] = [];
-  for (const wid of [...ids].sort()) {
-    // With an origin wanted, a workflow the ledger attributes to another session is skipped without reading its journal.
-    const known = createdBy.get(wid);
-    if (origin !== undefined && known && known.origin !== origin) continue;
-    const entries = readJournalSnapshot(journalPath(home, wid));
-    const created = known ?? entries.find(e => e.type === JT.created);
-    if (origin !== undefined && created?.origin !== origin) continue;
-    result.push({ wid, origin: created?.origin as string | undefined, entries });
+ *  `pruned{wid}` entry is gone (housekeeping), even while its directory is still being removed. A settled workflow
+ *  comes with its digest (`settled`) and its journal is read only if `entries` is asked for. */
+export type MainWorkflow = { wid: string; origin?: string; settled?: { attention: AttentionItem[] }; readonly entries: Entry[] };
+type MainPass = { mark: string; checked: number; appends: number; names: string[]; retryUnknown: boolean; ids: string[]; pending: string[]; digests: Map<string, WorkflowDigest>; result: MainWorkflow[] };
+const passes = new Map<string, Map<string | undefined, MainPass>>();
+export function workflows(home: string, origin?: string, fresh = false): MainWorkflow[] {
+  const { record, names, checked: listed } = readerWorkflowListing(home, fresh), ix = record.state, mark = readerLedgerIdentity(record), now = Date.now();
+  let byOrigin = passes.get(home);
+  if (!byOrigin) passes.set(home, byOrigin = new Map());
+  const prior = byOrigin.get(origin), current = !fresh && prior && prior.names === names && !prior.retryUnknown && prior.mark === mark && prior.appends === journalAppends() && now >= prior.checked && now - prior.checked < SETTLED_RECHECK_MS;
+  if (current && !prior.pending.length) {
+    releaseLoadedSettledJournals();
+    return prior.result;
   }
-  return result;
+  const ids = current ? prior.ids : [...new Set([...[...ix.created.keys()].map(String), ...names].filter(wid => !ix.pruned.has(wid)))].sort()
+    .filter(wid => origin === undefined || !ix.created.has(wid) || ix.created.get(wid)?.origin === origin);
+  const digests = new Map(current ? prior.digests : []), old = new Map(prior?.result.map(w => [w.wid, w])), changes = new Map<string, MainWorkflow>();
+  try {
+    for (const wid of current ? prior.pending : ids) {
+      const pendingRevision = (ix.revisions.get(wid) ?? 0) > (prior?.digests.get(wid)?.snapshot.rev ?? 0);
+      const known = ix.created.get(wid), digest = workflowDigest(home, wid, fresh || pendingRevision ? undefined : mark), path = journalPath(home, wid);
+      const from = known ? known.origin : readJournalUncached(path)?.entries.find(e => e.type === JT.created)?.origin;
+      if (origin !== undefined && from !== origin) { old.delete(wid); digests.set(wid, digest); continue; }
+      if (prior?.digests.get(wid) === digest && old.get(wid)?.origin === from) { digests.set(wid, digest); continue; }
+      digests.set(wid, digest);
+      changes.set(wid, { wid, origin: from as string | undefined, ...(digest.settled ? { settled: digest.settled } : {}), get entries() {
+        const entries = readJournalSnapshot(path);
+        if (digest.settled) forgetJournalSnapshot(path);
+        return entries;
+      } });
+    }
+    const result = ids.map(wid => changes.get(wid) ?? old.get(wid)).filter((w): w is MainWorkflow => !!w);
+    const same = prior && prior.result.length === result.length && result.every((w, i) => w === prior.result[i]);
+    // Digest reuse and another reader's listing refresh cannot extend this pass's trust window.
+    let checked = current ? prior.checked : Math.min(now, listed);
+    const pending = ids.filter(wid => {
+      const d = digests.get(wid);
+      if (d?.settled) checked = Math.min(checked, workflowDigestChecked(home, wid));
+      return !d?.settled || (ix.revisions.get(wid) ?? 0) > d.snapshot.rev;
+    });
+    byOrigin.set(origin, { mark, checked, appends: journalAppends(), names, retryUnknown: ids.some(wid => !ix.created.has(wid)), ids, pending, digests, result: same ? prior.result : result });
+    return same ? prior.result : result;
+  } finally { releaseSettledJournals(); }
 }
 
-/** P37: a generation opened by a send (possibly after the workflow finished) that has no seal yet is pending work. */
-const opened = new WeakMap<object, { length: number; open: boolean }>();
-export function openGeneration(entries: readonly { type: string; [k: string]: unknown }[]): boolean {
-  const hit = opened.get(entries);
-  if (hit?.length === entries.length) return hit.open;
-  // Sealed call ids end in `/<key>@<gen>`; collect every such suffix once instead of rescanning per generation.
-  const sealed = new Set<string>();
-  for (const s of entries) if (s.type === JT.sealed) { const call = String(s.call); for (let i = call.indexOf("/"); i >= 0; i = call.indexOf("/", i + 1)) sealed.add(call.slice(i)); }
-  const open = entries.some(g => g.type === "generation" && !sealed.has(`/${String(g.key)}@${String(g.gen)}`));
-  opened.set(entries, { length: entries.length, open });
-  return open;
-}
+export { openGeneration };
 /** Whether one journal is unfinished, by file identity: a journal that has not changed is not read again. */
 const decided = new Map<string, { ino: number; size: number; unfinished: boolean }>();
 function unfinishedJournal(path: string, known?: { ino: number; size: number; entries: readonly Entry[] }): boolean {
@@ -60,22 +75,19 @@ function unfinishedJournal(path: string, known?: { ino: number; size: number; en
  *  unless a drain (stop-all) holds it: held work waits for an explicit resume, which starts the orchestrator itself.
  *  Stops at the first unfinished workflow (newest first); a held workflow the ledger attributes is skipped without
  *  reading its journal, and an unchanged journal is not read again. */
-export function unfinishedWorkflow(home: string): boolean {
-  const ledger = readJournalSnapshot(orchLedger(home)), { created, pruned } = ledgerIndex(ledger);
-  let names: string[];
-  try { names = readdirSync(join(home, "w")); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
+export function unfinishedWorkflow(home: string, fresh = false): boolean {
+  const { record, names } = readerWorkflowListing(home, fresh), ix = record.state, { created, pruned } = ix;
   const ids = [...new Set([...[...created.keys()].map(String), ...names].filter(wid => !pruned.has(wid)))].sort().reverse();
   for (const wid of ids) {
     const path = journalPath(home, wid);
     // The hold rule is the one workflows() applies: the ledger's `created` names the origin a drain may hold; only for
     // a wid the ledger has no `created` for is the journal read first, for a `created` entry of its own.
     const known = created.get(wid);
-    if (known && holdOf(ledger, wid, known.origin as string | undefined)) continue;
+    if (known && readerHold(ix, wid, known.origin as string | undefined)) continue;
     let read: ReturnType<typeof readJournalUncached>;
     if (!known) {
       read = readJournalUncached(path);
-      if (holdOf(ledger, wid, read?.entries.find(e => e.type === JT.created)?.origin as string | undefined)) continue;
+      if (readerHold(ix, wid, read?.entries.find(e => e.type === JT.created)?.origin as string | undefined)) continue;
     }
     if (unfinishedJournal(path, read)) return true;
   }
@@ -97,21 +109,11 @@ export function presented(ctx: ExtensionContext): { id: string; rev: number }[] 
   return items;
 }
 
-const open = new WeakMap<readonly Entry[], AttentionItem[]>();
-/** The unresolved attention items of one immutable journal snapshot, computed once per snapshot. */
-function unresolved(entries: readonly Entry[]): AttentionItem[] {
-  let items = open.get(entries);
-  if (items) return items;
-  const done = new Set(entries.filter(e => e.type === JT.attentionResolved).map(e => `${e.id}\0${e.rev}`));
-  items = attentionEntries(entries).map(e => e.item).filter(item => !done.has(`${item.id}\0${item.rev}`));
-  open.set(entries, items);
-  return items;
-}
 /** P15, V7: Select only unresolved, unpresented items owned by this session. */
-export function attention(home: string, sender: string, seen: { id: string; rev: number }[]): AttentionItem[] {
+export function attention(home: string, sender: string, seen: { id: string; rev: number }[], fresh = false): AttentionItem[] {
   const items: AttentionItem[] = [], shown = new Set(seen.map(s => `${s.id}\0${s.rev}`));
-  for (const workflow of workflows(home, sender)) {
-    for (const item of unresolved(workflow.entries)) {
+  for (const workflow of workflows(home, sender, fresh)) {
+    for (const item of workflow.settled?.attention ?? unresolvedAttention(workflow.entries)) {
       const key = `${item.id}\0${item.rev}`;
       if (shown.has(key)) continue; // singlePresentation: one presentation per id/rev
       shown.add(key); items.push(item);

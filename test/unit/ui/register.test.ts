@@ -63,6 +63,35 @@ for (const dock of ["line", "off"]) test(`resolved cards request a repaint with 
   refresh(); assert.equal(paints, before + 1, "no redundant repaint after recovery");
 });
 
+test("an unchanged settled UI poll does not request a render, including an open list", async t => {
+  const { join } = await import("node:path");
+  const { openJournal } = await import("../../../src/kernel/journal.ts");
+  const { journalPath, orchLedger } = await import("../../../src/paths.ts");
+  const home = join(root, "quiet-ui"), journal = await openJournal(journalPath(home, "wf"));
+  await journal.append("wf-created", { origin: "main:test", revision: 1 });
+  await journal.append("workflow-done", { status: "done" });
+  await journal.append("attention", { item: { id: "finished:wf", rev: 1, kind: "finished", wid: "wf", text: "done" } });
+  await journal.close();
+  const ledger = await openJournal(orchLedger(home)); await ledger.append("created", { wid: "wf", origin: "main:test" }); await ledger.close();
+  const clock = Date.now() + 60_000; t.mock.method(Date, "now", () => clock);
+  let refresh = () => {}, paints = 0, resolve: (() => void) | undefined;
+  const interval = globalThis.setInterval;
+  t.mock.method(globalThis, "setInterval", (fn: () => void) => { refresh = fn; return interval(fn, 1_000_000); });
+  const hooks = new Map<string, Function>(), commands = new Map<string, { handler: Function }>();
+  const pi = { on: (name: string, fn: Function) => hooks.set(name, fn), registerCommand: (name: string, spec: { handler: Function }) => commands.set(name, spec) } as unknown as ExtensionAPI;
+  registerUi(pi, { home, submit: async () => {}, presentNote() {} });
+  const tui = { requestRender() { paints++; } }, theme = { fg: (_c: string, s: string) => s };
+  const ctx = { mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "test" }, modelRegistry: { find: () => undefined }, ui: {
+    custom: (factory: Function) => new Promise<void>(done => { resolve = done; factory(tui, theme, {}, done); }),
+    setWidget: (_key: string, factory: unknown) => { if (typeof factory === "function") factory(tui, theme); },
+    getEditorText: () => "", onTerminalInput: () => () => {},
+  } } as unknown as ExtensionContext;
+  hooks.get("session_start")!({}, ctx); t.after(() => { hooks.get("session_shutdown")!(); resolve?.(); });
+  commands.get("subagents")!.handler("", ctx);
+  const before = paints; refresh(); refresh();
+  assert.equal(paints, before, "neither dock nor open list repaints an unchanged view");
+});
+
 test("\u2193 opens the list only from pi's input editor, not from /model's selector or another overlay", async () => {
   const { join } = await import("node:path");
   const { openJournal } = await import("../../../src/kernel/journal.ts");

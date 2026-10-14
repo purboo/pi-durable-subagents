@@ -15,7 +15,7 @@ import { compileFanout } from '../compat/fanout.ts';
 import { contentHash, ulid } from '../kernel/ids.ts';
 import { openJournal, syncDirectory } from '../kernel/journal.ts';
 import { publishFile } from '../kernel/mailbox.ts';
-import { journalPath, pinnedDir, workflowDir } from '../paths.ts';
+import { digestDir, factsDir, journalPath, pinnedDir, workflowDir } from '../paths.ts';
 import { JT, type Entry, type JournalHandle, type Request, type RunBody, type ReviseBody } from '../types.ts';
 import type { Ledgers } from './contract.ts';
 
@@ -351,6 +351,11 @@ export class Store {
     await syncDirectory(join(this.ledgers.home, 'w')).catch(error => { if (error.code !== 'ENOENT') throw error; });
     for (const rid of this.stagedRids(wid)) await rm(this.stagePath(rid), { recursive: true, force: true });
     await syncDirectory(join(this.ledgers.home, 'staging')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    // Readers' caches of it (derived, never authoritative: no sync needed).
+    await rm(join(digestDir(this.ledgers.home), `${wid}.json`), { force: true });
+    const cached = await readdir(digestDir(this.ledgers.home)).catch(error => { if (error.code !== 'ENOENT') throw error; return []; });
+    for (const name of cached) if (name.startsWith(`${wid}.json.`) && name.endsWith('.tmp')) await rm(join(digestDir(this.ledgers.home), name), { force: true });
+    await rm(join(factsDir(this.ledgers.home), wid), { recursive: true, force: true });
   }
   /** A1, A5: Restore committed revisions; the engine reconciles pending retirement intents. A pruned wid is never
    *  materialized again; its interrupted removal is finished here (a failure is reported and retried next start). */

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openJournal } from '../../../../src/kernel/journal.ts';
 import { publishRequest } from '../../../../src/kernel/mailbox.ts';
-import { orchInbox, orchLedger, workflowDir } from '../../../../src/paths.ts';
+import { digestDir, factsDir, orchInbox, orchLedger, workflowDir } from '../../../../src/paths.ts';
 import { Engine } from '../../../../src/orchestrator/engine.ts';
 import { unfinishedWorkflow } from '../../../../src/agent/main/snapshots.ts';
 import { JT, type Request, type RunBody, type EvalToOrch, type OrchToEval } from '../../../../src/types.ts';
@@ -66,6 +66,15 @@ async function run(b: Booted, end?: 'done' | 'failed' | 'parked' | 'stopped'): P
   await b.engine.intake();
   return wf;
 }
+test('a workflow created through the engine appears on the next owner pass without a clock advance', async t => {
+  const { ownWorkflows } = await import('../../../../src/orchestrator/snapshot.ts');
+  const { workflows } = await import('../../../../src/agent/main/snapshots.ts');
+  const f = await home(t), b = await f.boot(), owner = 'cli:prune-test';
+  assert.deepEqual(ownWorkflows(f.dir, owner), []); assert.deepEqual(workflows(f.dir, owner), []);
+  const wf = await run(b);
+  assert.deepEqual(ownWorkflows(f.dir, owner).map(w => w.wid), [wf.wid]);
+  assert.deepEqual(workflows(f.dir, owner).map(w => w.wid), [wf.wid]);
+});
 const decision = (b: Booted, rid: string) => b.ledgers.orch.entries().find(e => (e.type === JT.applied || e.type === JT.rejected) && e.rid === rid);
 const pruned = (b: Booted, rid?: string) => b.ledgers.orch.entries().filter(e => e.type === 'pruned' && (!rid || e.rid === rid)).map(e => String(e.wid));
 
@@ -114,7 +123,13 @@ test('prune: the pruned entry commits first, then the handle closes and files go
     if (type === 'pruned') seen.push({ journal: existsSync(join(workflowDir(dir, wf.wid), 'journal.jsonl')), staging: existsSync(join(dir, 'staging', createRid)), held: b.engine.store.workflows.has(wf.wid) });
     return append(type, fields);
   };
+  // Readers' caches of the workflow go with it.
+  await mkdir(join(factsDir(dir), wf.wid), { recursive: true }); await writeFile(join(factsDir(dir), wf.wid, 'a@1.json'), '{}');
+  await mkdir(digestDir(dir), { recursive: true }); await writeFile(join(digestDir(dir), `${wf.wid}.json`), '{}');
+  await writeFile(join(digestDir(dir), `${wf.wid}.json.123.interrupted.tmp`), '{}');
   const rid = await request(b, 'prune', { wid: wf.wid });
+  assert.ok(!existsSync(join(factsDir(dir), wf.wid)) && !existsSync(join(digestDir(dir), `${wf.wid}.json`)));
+  assert.ok(!existsSync(join(digestDir(dir), `${wf.wid}.json.123.interrupted.tmp`)));
   assert.deepEqual(seen, [{ journal: true, staging: true, held: true }]);
   assert.deepEqual(b.ledgers.orch.entries().filter(e => e.rid === rid).map(e => e.type), [JT.admitted, 'pruned', JT.applied]);
   const entry = b.ledgers.orch.entries().find(e => e.type === 'pruned')!;

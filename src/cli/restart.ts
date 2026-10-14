@@ -13,14 +13,14 @@ import { journalPath, orchLedger } from "../paths.ts";
 import { PS } from "../platform/proctable.ts";
 import { JT, type RestartBody, type RestartInitiator } from "../types.ts";
 import { restartInputError, restartRefusal, type RestartExecution } from "../orchestrator/restart.ts";
-import { emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
+import { readerLedger } from "../orchestrator/reader-ledger.ts";
 import { allWorkflows, liveCalls, processAlive } from "../orchestrator/snapshot.ts";
 
 export interface OrchestratorProcess { version: string; pid: number; start?: string; ts: number; restart?: true }
 
 /** The orchestrator that runs now: the last `orchestrator` record without an exit, whose process lives. */
 export function currentOrchestrator(home: string): OrchestratorProcess | undefined {
-  const o = foldLedger(emptyLedger(), readJournalSnapshot(orchLedger(home))).orchestrator;
+  const o = readerLedger(home).state.state.orchestrator;
   return o && !o.exited && processAlive(o.pid, o.start) ? { version: o.version, pid: o.pid, ...(o.start ? { start: o.start } : {}), ts: o.ts, ...(o.restart ? { restart: true as const } : {}) } : undefined;
 }
 
