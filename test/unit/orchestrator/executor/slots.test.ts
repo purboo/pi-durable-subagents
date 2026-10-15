@@ -4,15 +4,19 @@
 // order of admission.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { openJournal } from "../../../../src/kernel/journal.ts";
 import { ulid } from "../../../../src/kernel/ids.ts";
-import { journalPath, orchLedger } from "../../../../src/paths.ts";
-import { JT, type Containment, type JournalHandle, type ProcInfo } from "../../../../src/types.ts";
+import { callDir, callSession, journalPath, orchLedger } from "../../../../src/paths.ts";
+import { CT, JT, type Containment, type JournalHandle, type ProcInfo } from "../../../../src/types.ts";
 import type { CallTicket, OrchestratorConfig } from "../../../../src/orchestrator/contract.ts";
+import { compactWorkflow, snapshotFromEntries, workflowSnapshot, statusView, ownWorkflows } from "../../../../src/orchestrator/snapshot.ts";
+import { renderStatus, renderView } from "../../../../src/cli/main.ts";
+import { parseModel, resolveModel } from "../../../../src/compat/model.ts";
+import { spillCandidates } from "../../../../src/orchestrator/executor/pool.ts";
 import createExecutor from "../../../../src/orchestrator/executor/index.ts";
 
 const containment: Containment = {
@@ -31,6 +35,7 @@ async function until(predicate: () => boolean, ms = 5000) {
 async function fixture(t: TestContext, config: OrchestratorConfig) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "dsa-slots-")));
   const orch = await openJournal(orchLedger(home)), journals: JournalHandle[] = [];
+  await orch.append("config", { hash: "fixture", config: { writerLock: "off", ...config } });
   t.mock.method(console, "error", () => {});
   /** Every slot attempt that admitted nothing, in order: [exec, providers found full]. */
   const attempts: [string, string[]][] = [];
@@ -40,6 +45,7 @@ async function fixture(t: TestContext, config: OrchestratorConfig) {
   const workflow = async (origin: string) => {
     const wid = ulid(), journal = await openJournal(journalPath(home, wid)); journals.push(journal);
     await orch.append(JT.created, { rid: ulid(), wid, origin });
+    await journal.append("wf-created", { revision: 1, origin });
     const ticket = (key: string): CallTicket => ({ wid, widRev: `${wid}@1`, key, gen: 1, callId: `${wid}@1/${key}@1`, cwd: home, journal, spec: { agent: "test", task: "task" }, agent });
     return { wid, journal, ticket };
   };
@@ -154,4 +160,110 @@ test("a free first entry is taken at once; afterMs does not delay it", { timeout
   const w = await f.workflow("main:session-a"), call = w.ticket("a");
   await f.executor.run({ ...call, spec: { ...call.spec, model: "pool" } });
   assert.deepEqual(w.journal.entries().find(e => e.type === "selected")!.model, { provider: "p", id: "strong" });
+});
+
+async function resumed(home: string, journal: JournalHandle, ticket: CallTicket, model = { provider: "p", id: "strong" }) {
+  await journal.append("call", { key: ticket.key, gen: 1, spec: ticket.spec });
+  await ranBefore(journal, ticket);
+  await mkdir(callDir(home, ticket.wid, ticket.key, 1), { recursive: true });
+  await writeFile(callSession(home, ticket.wid, ticket.key, 1), [
+    { type: "custom", customType: CT.exec, data: { exec: `${ticket.callId}#1.1` } },
+    { type: "model_change", provider: model.provider, modelId: model.id },
+  ].map(e => JSON.stringify(e)).join("\n") + "\n");
+}
+
+for (const mode of ["delay", "immediate", "same-id", "path-prefix", "afterMs"] as const) test(`resumed pool spills: ${mode}`, { timeout: 10000 }, async t => {
+  const spillMs = mode === "immediate" ? 0 : 160;
+  const f = await fixture(t, { pools: { pool: mode === "path-prefix" ? ["r/claude-opus-5-5", "p/ide/strong", "q/strong:high"] : mode === "same-id" ? ["p/strong", "r/other", "q/strong:high"] : ["p/strong", { model: "q/strong:high", ...(mode === "afterMs" ? { afterMs: 300 } : {}) }] },
+    providers: { p: { slots: 0 }, q: { slots: 1 }, r: { slots: 1 } }, k: { trackerMs: 10, resumeSpillMs: spillMs } });
+  const w = await f.workflow("main:resume"), ticket = w.ticket("a"); ticket.spec.model = "pool";
+  await resumed(f.home, w.journal, ticket, { provider: "p", id: mode === "path-prefix" ? "ide/strong" : "strong" });
+  const run = f.executor.run(ticket);
+  if (mode !== "immediate") {
+    await until(() => w.journal.entries().some(e => e.type === "slot-wait"));
+    const snap = workflowSnapshot(f.home, w.wid), c = snap.calls[0]!;
+    assert.deepEqual(c.poolWait?.free, mode === "same-id" || mode === "path-prefix" ? ["r", "q"] : ["q"]);
+    assert.match(renderStatus(snap), /queued .* on p \(full\); pool has free slots:/);
+    assert.match(renderView({ workflows: [compactWorkflow(snap)] }), /pool has free slots:/);
+    assert.equal(w.journal.entries().some(e => e.type === "selected"), false);
+  }
+  await run;
+  const spill = w.journal.entries().find(e => e.type === "spilled")!;
+  assert.ok(spill, "the resumed call moved without waiting for p");
+  assert.ok(Number(spill.waitedMs) >= spillMs);
+  const selected = w.journal.entries().find(e => e.type === "selected")!;
+  assert.deepEqual(selected.model, { provider: "q", id: "strong", thinking: "high" });
+  assert.equal(selected.pool, "pool");
+  if (mode === "afterMs") assert.ok(Number(spill.waitedMs) >= 290);
+  const snap = snapshotFromEntries(w.wid, w.journal.entries());
+  assert.match(renderStatus(snap), /spilled after .*p full -> q\/strong/);
+  assert.deepEqual(compactWorkflow(snap).calls[0]!.spill, snap.calls[0]!.spill);
+});
+
+for (const mode of ["explicit", "parent-pinned", "follow-up-pin", "null", "negative"] as const) test(`resumed calls never spill: ${mode}`, { timeout: 10000 }, async t => {
+  const f = await fixture(t, { pools: { pool: ["p/strong", "q/strong"] }, providers: { p: { slots: 0 }, q: { slots: 1 } },
+    k: { trackerMs: 10, resumeSpillMs: mode === "null" ? null : mode === "negative" ? -1 : 0 } });
+  const w = await f.workflow("main:resume"), ticket = w.ticket("a"); ticket.spec.model = mode === "explicit" ? "p/strong" : "pool";
+  if (mode === "follow-up-pin") ticket.model = "p/strong";
+  await resumed(f.home, w.journal, ticket);
+  if (mode === "parent-pinned") {
+    await w.journal.append("forward", { rid: "pin", rid2: "pin", dest: ticket.callId, envelope: { kind: "model", body: { provider: "p", model: "strong" } } });
+    await w.journal.append("forward-delivered", { call: ticket.callId, rid2: "pin" });
+  }
+  const run = f.executor.run(ticket);
+  await until(() => f.attempted(`${ticket.callId}#1.2`) >= 3);
+  assert.equal(w.journal.entries().some(e => e.type === "selected"), false);
+  assert.equal(w.journal.entries().some(e => e.type === "spilled"), false);
+  await f.executor.stop({ wid: w.wid, callId: ticket.callId }); await run;
+});
+
+test("same-id spill preference uses the last path segment of real pool identifiers", () => {
+  const pinned = parseModel("mccodex/ide/gpt-6.1-sol:high");
+  const pool = resolveModel("writer", { writer: ["s2a-claude/claude-opus-5-5:medium", "mccodex/ide/gpt-6.1-sol:high", "sota/GPT-6.1-SOL:high"] });
+  assert.deepEqual(spillCandidates(pinned, pool).map(m => m.provider), ["sota", "s2a-claude"]);
+  assert.equal(spillCandidates({ provider: "mccodex", id: "ide/gpt-6.1-sol:high" }, pool)[0]!.thinking, "high");
+});
+
+test("slot wait journals stay bounded while live status follows free-provider changes", { timeout: 10000 }, async t => {
+  const config: OrchestratorConfig = { pools: { pool: ["p/strong", "q/strong", "r/other"] }, providers: { p: { slots: 0 }, q: { slots: 1 }, r: { slots: 1 } }, k: { trackerMs: 10, resumeSpillMs: null } };
+  const f = await fixture(t, config), w = await f.workflow("main:resume"), ticket = w.ticket("a"); ticket.spec.model = "pool";
+  await resumed(f.home, w.journal, ticket);
+  const run = f.executor.run(ticket);
+  await until(() => w.journal.entries().some(e => e.type === "slot-wait"));
+  const start = w.journal.entries().find(e => e.type === "slot-wait")!;
+  assert.equal(start.free, undefined, "free slots are not persisted in workflow journals");
+  assert.deepEqual(workflowSnapshot(f.home, w.wid).calls[0]!.poolWait?.free, ["q", "r"]);
+  for (let i = 0; i < 8; i++) {
+    const provider = i % 2 ? "r" : "q";
+    await f.executor.reconfigure!(async () => { await f.orch.append("hold", { pool: provider, slot: 0, exec: "fixture-busy" }); });
+    await until(() => f.attempted(`${ticket.callId}#1.2`) >= i * 2 + 2);
+    const free = ["q", "r"].filter(p => p !== provider);
+    assert.deepEqual(statusView(f.home).workflows[0]!.calls[0]!.poolWait?.free, free);
+    assert.deepEqual(ownWorkflows(f.home, "main:resume")[0]!.calls[0]!.poolWait?.free, free);
+    assert.equal(workflowSnapshot(f.home, w.wid).calls[0]!.poolWait?.since, start.since);
+    await f.executor.reconfigure!(async () => { await f.orch.append("release", { pool: provider, slot: 0, exec: "fixture-busy" }); });
+    assert.deepEqual(workflowSnapshot(f.home, w.wid).calls[0]!.poolWait?.free, ["q", "r"]);
+  }
+  assert.equal(w.journal.entries().filter(e => e.type === "slot-wait").length, 1);
+  await f.executor.reconfigure!(async () => { await f.orch.append("config", { hash: "free", config: { ...config, writerLock: "off", providers: { ...config.providers, p: { slots: 1 } } } }); });
+  await run;
+  assert.equal(w.journal.entries().filter(e => e.type === "slot-wait").length, 2, "only start and end are recorded");
+  assert.equal(workflowSnapshot(f.home, w.wid).calls[0]!.poolWait, undefined);
+});
+
+test("resumed pool keeps its wait timer only for this execution; recovery restarts the wait", { timeout: 10000 }, async t => {
+  const config: OrchestratorConfig = { pools: { pool: ["p/strong", "q/strong"] }, providers: { p: { slots: 0 }, q: { slots: 1 } }, k: { trackerMs: 10, resumeSpillMs: 300 } };
+  const f = await fixture(t, config), w = await f.workflow("main:resume"), ticket = w.ticket("a"); ticket.spec.model = "pool";
+  await resumed(f.home, w.journal, ticket);
+  const first = f.executor.run(ticket); void first.catch(() => {});
+  await until(() => w.journal.entries().some(e => e.type === "slot-wait"));
+  await delay(160); await f.executor.shutdown(); await assert.rejects(first, { name: "ExecutorShutdown" });
+  const recovered = createExecutor({ home: f.home, orch: f.orch, config: { ...config, writerLock: "off" } }, { effects, containment, memory: async () => 1e6 });
+  t.after(() => recovered.shutdown());
+  await recovered.recover(w.wid, w.journal);
+  await recovered.run(ticket);
+  const waits = w.journal.entries().filter(e => e.type === "slot-wait" && e.model);
+  assert.equal(waits.length, 2);
+  const spill = w.journal.entries().find(e => e.type === "spilled")!;
+  assert.ok(spill.ts - waits[1]!.ts >= 300, "the new execution waits a full interval");
 });

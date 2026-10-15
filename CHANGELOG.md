@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.41
+
+- An answer that races the planned hibernation no longer strands its call. In 1.0.40 the parent forwarded an answer,
+  the call hibernated two seconds later, the child had already read the answer and was fenced, and the call showed
+  `asking` for 49 minutes until a second answer arrived. Hibernation is now decided on the current journal inside the
+  serial section and is refused while an answer forward to the call is pending or in flight. A call fenced while
+  stopped on that `ask` (hibernated on the question, or the answer receipt is the last thing it did) is treated as
+  answered and continues its session at once, live and after recovery; a call that kept working after the answer is
+  judged by its own evidence as before (report, `once` with a dangling tool, losses). `status` flags an answer that
+  was forwarded but not delivered within 30 seconds.
+- A bound answer excuses losses only for the execution it was bound to and for the first launch that never started a
+  child. A child that keeps dying before its first marker now stops at `lossBound` instead of relaunching without
+  limit (a defect since before 1.0.40).
+- A resumed pool call no longer waits a whole turn on its session's full provider. After `k.resumeSpillMs` (default
+  120000; `0` at once; `null` or negative never) it continues the same session on another entry of its pool that has a
+  free slot, preferring the same model id (compared by its last path segment, case-insensitively, without thinking
+  suffix). Explicit models and models requested by the parent never spill. `status` shows the wait, the free pool
+  providers and the spill. The wait timer restarts after recovery.
+- A child never answers with a model dsa did not select. The child extension checks the active model at session
+  start and before every turn; a mismatch (for example pi falling back to its default model because the selected
+  provider has no credentials) stops the execution before its first request and records `model-unavailable` with
+  the reason. A pool call fails over to the next entry and skips the failed one for ten minutes; a call with an
+  explicit model fails naming both models. Virtual (routed) models must activate at launch; their answers name the
+  routed physical model, shown as `routed Y`. Any other answer from an unselected model shows `used Y, selected X`.
+- Slot waits are journaled once per wait episode; free providers are computed live for `status`.
+
 ## 1.0.40
 
 - Readers keep rebuildable digests of settled workflows and facts of final calls in `DSA_HOME/cache`, keyed by

@@ -57,7 +57,7 @@ the npx cache, so `install-service` refuses to run from there.
 | A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
 | A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded, a daily quota at 0) | Found at the second refusal in a row, while pi is still retrying. A call in a pool continues **in the same session** on the pool's next model (within pi's next retry or two); new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
 | Two subagents would write in the same worktree | Only one runs there at a time. A call that can write (its tools include `edit` or `write`, which pi's default tools do) holds its git worktree's writer lock from its launch until it ends, also while it waits for an answer. Another writer for that worktree waits in order, and status shows `waiting for writer lock: <root> held by <wid>/<key>`. `writer: false` (a call that does not write there), `isolation: "worktree"` and `"writerLock": "off"` opt out. |
-| A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. The question survives orchestrator restarts (also forced ones) and crashes, including one that hits before the subagent released its slot. |
+| A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. A forwarded answer prevents planned hibernation. If an execution was stopped after consuming the answer, recovery continues the same session without another answer. The question survives orchestrator restarts (also forced ones) and crashes, including one that hits before the subagent released its slot. |
 | A subagent's work ends (finished, stopped, or cut off) | Every process its tools started ends with that execution, also ones started with `nohup`, `setsid` or `&`: they carry the execution's tag (see the limit below). Anything that must outlive the subagent has to be started by you or the parent session. A command run under `hold` is no exception: a forced restart stops it and its lease is released. |
 | A subagent runs in a worktree you made (`isolation: "none"`, the default, with `cwd`) | Durable Subagents never creates, cleans, moves or deletes that directory or its branch, also not on `prune`; `prune` deletes only its own state and the worktrees it created for `isolation: "worktree"`. |
 
@@ -544,6 +544,10 @@ answer is bound. A drained call
 (no execution running) is never `silent`; a sealed call never waits. `provider-exhausted`, `writer-lock`, `lease` and `slot` are queues
 that clear by themselves; `silent` and `unconfirmed-stop` may need a look.
 
+An open question with an unconfirmed answer forward carries
+`answerForwarded: {rid, qid, rev, at}` in JSON status. After 30 seconds, text status
+says `asking: answer forwarded <age> ago, not delivered` instead of plain `asking`.
+
 ### Housekeeping
 
 Journals are never compacted, so state only grows. `prune` removes finished
@@ -745,6 +749,24 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   session's model or was asked for a model, and a running call that moves off
   a used-up provider skips such entries, as does a model send that names the
   pool.
+- **Resumed pool calls:** keep their session's model for its prompt cache, but
+  after 2 minutes queued on its full provider try another free provider in the
+  same pool. Set `"k": { "resumeSpillMs": 120000 }` to change the wait;
+  `0` spills immediately, `null` or a negative number keeps waiting indefinitely.
+  The same model id on another provider is preferred, then pool order; the new
+  entry's thinking level and `afterMs` apply. This continues the same session
+  but gives up the old provider's prompt cache. Explicit models and models
+  requested by the parent do not spill. The timer restarts for each execution,
+  including recovery after an orchestrator restart, like `afterMs`.
+  `status` shows the queued provider, elapsed wait and free pool providers,
+  then the recorded spill and how long it waited (`poolWait` / `spill` in JSON).
+- **Selected model unavailable:** before delivering work, the child verifies
+  that pi activated the selected model (including catalog aliases and display
+  names). Missing auth or a different model stops that execution; a pool call
+  tries another entry and skips the unavailable entry for that call for 10
+  minutes. A single-model call fails with the selected model, pi's fallback
+  and the reason. `status` retains `modelUnavailable`; an unexpected answering
+  model also shows `used Y, selected X` (`modelMismatch` in JSON).
 - **A used-up provider** is not sent new calls until its next try, 15 minutes
   after it last refused (`"k": { "probeMs": 900000 }`). Then one call at a
   time goes to it, so finding out costs no extra request. A call that moved to

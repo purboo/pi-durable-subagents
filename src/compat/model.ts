@@ -8,6 +8,20 @@ export type ModelPools = Readonly<Record<string, readonly PoolEntry[]>>;
 /** The model without scheduling fields, as recorded and launched. */
 export const plainModel = (m: Model): Model => ({ ...(m.provider !== undefined ? { provider: m.provider } : {}), id: m.id, ...(m.thinking ? { thinking: m.thinking } : {}) });
 
+export const sameModel = (a: Pick<Model, "provider" | "id"> | undefined, b: Pick<Model, "provider" | "id"> | undefined): boolean =>
+  !!a && !!b && a.provider?.toLowerCase() === b.provider?.toLowerCase() && a.id.toLowerCase() === b.id.toLowerCase();
+
+/** Resolve CLI spelling within the selected provider, using pi's alias-before-dated ordering. */
+export function catalogModel<T extends { provider: string; id: string; name?: string }>(selected: Model, catalog: readonly T[]): T | undefined {
+  const models = catalog.filter(m => m.provider.toLowerCase() === selected.provider?.toLowerCase());
+  const exact = models.find(m => sameModel(m, selected));
+  if (exact) return exact;
+  const name = selected.id.toLowerCase();
+  const matches = models.filter(m => m.id.toLowerCase().includes(name) || m.name?.toLowerCase().includes(name));
+  const aliases = matches.filter(m => !/-\d{8}$/.test(m.id));
+  return (aliases.length ? aliases : matches).sort((a, b) => b.id.localeCompare(a.id))[0];
+}
+
 /** P35: Parse Pi model identifiers, preserving colons that are not thinking suffixes. */
 export function parseModel(value: string): Model {
   let id = value.trim();

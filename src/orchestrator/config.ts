@@ -13,7 +13,7 @@ import type { OrchestratorConfig } from "./contract.ts";
 
 /** The keys the orchestrator reads; config.json also holds pi-side settings (ui, onQuit) that it ignores. */
 const KEYS = ["defaultModel", "pools", "providers", "memory", "writerLock", "k"] as const;
-const K = ["lossBound", "checkpointMs", "stallMs", "progressMs", "switchTimeoutMs", "idleExitMs", "trackerMs", "hibernateMs", "spawnBudget", "probeMs", "eventRetentionMs", "waitCheckMs"];
+const K = ["lossBound", "checkpointMs", "stallMs", "progressMs", "switchTimeoutMs", "idleExitMs", "trackerMs", "hibernateMs", "spawnBudget", "probeMs", "eventRetentionMs", "waitCheckMs", "resumeSpillMs"];
 
 export const configPath = (home: string) => join(home, "config.json");
 
@@ -60,6 +60,10 @@ export function configProblem(raw: unknown): string | undefined {
     if (!record(k)) return "k must map K-parameters to numbers";
     for (const [key, v] of Object.entries(k)) {
       if (!K.includes(key)) return `k.${key} is not a K-parameter (${K.join(", ")})`;
+      if (key === "resumeSpillMs") {
+        if (v !== null && !(typeof v === "number" && Number.isFinite(v))) return "k.resumeSpillMs must be a finite number of milliseconds or null";
+        continue;
+      }
       if (!count(v) || (key !== "lossBound" && key !== "spawnBudget" && v === 0)) return `k.${key} must be a positive number`;
     }
   }

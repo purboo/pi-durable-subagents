@@ -131,6 +131,29 @@ test("shared worktree reminder (writerLock off) observes real pi writes without 
   assert.equal(conflicts().length, 1);
 });
 
+test("a resumed pool spills off its full provider and answers in the same native session", { timeout: 30000 }, async t => {
+  const f = await setup(t, { pools: { pool: ["probe/scripted", "switch-probe/target"] }, providers: { probe: { slots: 1 }, "switch-probe": { slots: 1 } },
+    k: { hibernateMs: 40, trackerMs: 20, resumeSpillMs: 120 } }, { memory: async () => 1e6 });
+  await writeFile(join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({ extensions: [FAUX, fileURLToPath(new URL("switch-provider.ts", import.meta.url))] }));
+  const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }])); ticket.spec.model = "pool";
+  const run = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "hibernated") && f.orch.entries().filter(e => e.type === "release").length >= 2);
+  const session = callSession(f.home, f.wid, "a", 1), before = (await readFile(session, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const h = f.journal.entries().find(e => e.type === "hibernated")!;
+  await f.orch.append("hold", { pool: "probe", slot: 0, exec: "fixture#1.1" });
+  assert.deepEqual(await f.executor.forward({ rid: "answer-spill", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) },
+    body: { to: ticket.callId, kind: "answer", message: "continue" } }, { journal: f.journal, widRev: ticket.widRev, key: "a", gen: 1 }), { action: "apply" });
+  const result = await run; assert.equal(result.status, "ok"); assert.equal(result.output, "switched to Y");
+  const spill = f.journal.entries().find(e => e.type === "spilled")!; assert.ok(Number(spill.waitedMs) >= 120);
+  const after = (await readFile(session, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  assert.equal(after[0].id, before[0].id, "the same native session header survives");
+  assert.ok(after.some(e => e.customType === CT.question && e.data.qid === h.qid), "the original context is retained");
+  const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
+  assert.equal(after.filter(e => e.type === "custom_message" && e.details?.rid === bound.rid2).length, 1);
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "selected").map(e => (e.model as { provider: string }).provider), ["probe", "switch-probe"]);
+  assert.equal(statusOf(f.journal, f.wid).modelMismatch, undefined);
+});
+
 test("an answered hibernated call queues behind a full provider and resolves attention before resume", { timeout: 30000 }, async t => {
   const f = await setup(t, { providers: { probe: { slots: 1 } }, k: { hibernateMs: 40, trackerMs: 20 } }, { memory: async () => 1e6 });
   const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { text: "answered" }]));
@@ -429,6 +452,40 @@ function crashOnce(journal: { append: (type: string, data: any) => Promise<any> 
   };
   return () => { journal.append = append; };
 }
+
+for (const recovered of [false, true]) test(`a consumed forward in a stranded hibernation continues in native pi (${recovered ? "recovery" : "live"})`, { timeout: 45000 }, async t => {
+  const f = await setup(t, { k: { trackerMs: 20 } }, { memory: async () => 1e6 });
+  const { pi, exec, ticket } = await nativeSession(t, f, { question: true });
+  await pi.stop();
+  const id = `q:${ticket.callId}:q1`, path = callSession(f.home, f.wid, "a", 1);
+  const req: Request = { rid: "original-answer", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: "q1", rev: 1 },
+    body: { to: ticket.callId, kind: "answer", message: "yes" } };
+  const rid2 = forwardRid(req.rid, ticket.widRev, ticket.key, contentHash(req));
+  await f.journal.append(JT.attention, { item: { id, rev: 1, kind: "question", text: "Need input", wid: f.wid, call: ticket.callId, qid: "q1" } });
+  assert.deepEqual(await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: "a", gen: 1 }), { action: "apply" });
+  await f.journal.append("hibernated", { call: ticket.callId, exec, qid: "q1", rev: 1 });
+  await f.journal.append(JT.fenced, { exec });
+  const rows = (await readFile(path, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  let parent = rows.at(-1).id;
+  const forwarded = sent(f.home).find(r => r.rid === rid2)!;
+  await appendFile(path, JSON.stringify({ type: "custom", id: "admitted-answer", parentId: parent, timestamp: new Date().toISOString(),
+    customType: CT.admitted, data: { rid: rid2, from: "orch", sseq: forwarded.sseq, kind: "answer", hash: contentHash(forwarded) } }) + "\n");
+  parent = "admitted-answer";
+  for (const [receipt, details] of [["task", { rid: contentHash([exec, "dispatch"]), kind: "task" }],
+    ["answer", { rid: rid2, kind: "answer", qid: "q1", rev: 1 }]] as const) {
+    await appendFile(path, JSON.stringify({ type: "custom_message", id: receipt, parentId: parent, timestamp: new Date().toISOString(),
+      customType: CT.msg, content: "received", display: true, details }) + "\n"); parent = receipt;
+  }
+  if (recovered) { await f.executor.recover(f.wid, f.journal); await f.executor.recover(f.wid, f.journal); }
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "ok", JSON.stringify(result));
+  assert.deepEqual(f.journal.entries().filter(e => e.type === JT.exec).map(e => e.exec), [exec, `${ticket.callId}#1.2`]);
+  assert.equal(f.journal.entries().filter(e => e.type === "forward-delivered" && e.rid2 === rid2).length, 1);
+  assert.equal(f.journal.entries().filter(e => e.type === JT.attentionResolved && e.id === id && e.resolution === "answered").length, 1);
+  const continues = sent(f.home).filter(r => r.kind === "continue");
+  assert.equal(continues.length, 1); assert.equal(continues[0]!.cond, undefined, "plain continuation, not another answer");
+  assert.equal(f.journal.entries().filter(e => e.type === "loss").length, 0);
+});
 
 test("fix2-1 a bound answer whose question the session already closed is settled durably; the call goes on (no relaunch loop)", { timeout: 45000 }, async t => {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20, lossBound: 3 } });

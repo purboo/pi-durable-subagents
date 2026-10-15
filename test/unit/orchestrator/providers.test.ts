@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { foldExhaustion, type Exhaustion } from "../../../src/orchestrator/providers.ts";
 import { fatalProviderError, quotaExhausted, sessionModel, type SessionEntry } from "../../../src/orchestrator/executor/session.ts";
-import type { Entry } from "../../../src/types.ts";
+import { CT, type Entry } from "../../../src/types.ts";
 
 const fold = (entries: Record<string, unknown>[]) => { const m = new Map<string, Exhaustion>(); for (const e of entries) foldExhaustion(m, e as unknown as Entry); return m; };
 
@@ -50,6 +50,13 @@ test("real provider errors: daily windows fail over, rate and concurrency limits
     'sota API error (503): {"message":"Service temporarily unavailable","type":"api_error"}',
     "server_error: Scheduler unavailable",
   ]) assert.ok(!quotaExhausted(text) && !fatalProviderError(text), text);
+});
+
+test("virtual model restoration retains the selection rather than the routed answer", () => {
+  const ready = { type: "custom", customType: CT.modelReady, data: { virtual: true, model: { provider: "router", id: "auto" } } };
+  const answer = { type: "message", message: { role: "assistant", provider: "physical", model: "m" } };
+  assert.deepEqual(sessionModel([ready, answer] as SessionEntry[]), { provider: "router", id: "auto" });
+  assert.deepEqual(sessionModel([ready, answer, { type: "model_change", provider: "other", modelId: "new" }] as SessionEntry[]), { provider: "other", id: "new" });
 });
 
 test("the session's model is pi's: the last model change or assistant message", () => {

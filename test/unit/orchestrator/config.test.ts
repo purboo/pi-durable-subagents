@@ -30,6 +30,12 @@ test("configProblem accepts pi-side keys and names the first invalid orchestrato
   assert.equal(configHash({ providers: { a: { slots: 1 } } }), configHash({ providers: { a: { slots: 1 } }, ui: { dock: "off" } } as OrchestratorConfig));
 });
 
+test("configProblem accepts immediate/disabled resume spill and rejects non-numeric values", () => {
+  for (const resumeSpillMs of [0, 120000, -1, null]) assert.equal(configProblem({ k: { resumeSpillMs } }), undefined);
+  for (const resumeSpillMs of ["120000", true, {}, Infinity, NaN])
+    assert.equal(configProblem({ k: { resumeSpillMs } }), "k.resumeSpillMs must be a finite number of milliseconds or null");
+});
+
 test("configProblem accepts a pool entry that waits ({ model, afterMs }) and names what is wrong with one", () => {
   assert.equal(configProblem({ pools: { p: ["a/x", { model: "b/y:high", afterMs: 600000 }, { model: "q" }], q: ["c/z"] } }), undefined);
   assert.equal(configProblem({ pools: { p: ["a/x", { model: "b/y", afterMs: 0 }] } }), "pools.p[1].afterMs must be a positive number of milliseconds");

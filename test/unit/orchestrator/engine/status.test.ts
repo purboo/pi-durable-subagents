@@ -51,6 +51,24 @@ test('P31: snapshots carry per-call and workflow usage from seals and deduplicat
   assert.equal(finishedText('w', entries), 'nightly (w) stopped: 1 ok; 1 stopped; 1 unknown\nold: ok\n  a\nfinal old\nb: stopped (edits it made so far are left in place)\nc: unknown\nUsage: 1.3K in / 73 out, $0.13\nFull output: subagents status wid:w');
 });
 
+test('new executions and selections clear the previous answering model', () => {
+  const call = 'w@1/a@1', first = `${call}#1.1`, next = `${call}#1.2`;
+  const log = [e(1, 'call', { key: 'a', gen: 1, spec: { agent: 'x' } }), e(2, 'exec', { call, exec: first }),
+    e(3, 'selected', { exec: first, model: { provider: 'p', id: 'old' } }),
+    e(4, 'model-used', { exec: first, model: { provider: 'p', id: 'old' } })];
+  assert.equal(snapshotFromEntries('w', log).calls[0]!.usedModel, 'p/old');
+  log.push(e(5, 'exec', { call, exec: next }));
+  const queued = snapshotFromEntries('w', log).calls[0]!;
+  assert.equal(queued.usedModel, undefined); assert.equal(queued.modelMismatch, undefined);
+  // Even a delayed observation of an earlier execution cannot restore stale identity.
+  log.push(e(6, 'model-used', { exec: first, model: { provider: 'p', id: 'old' } }),
+    e(7, 'selected', { exec: next, model: { provider: 'q', id: 'new' } }));
+  const selected = snapshotFromEntries('w', log).calls[0]!;
+  assert.equal(selected.usedModel, undefined); assert.equal(selected.modelMismatch, undefined);
+  log.push(e(8, 'model-used', { exec: next, model: { provider: 'q', id: 'new' } }));
+  assert.equal(snapshotFromEntries('w', log).calls[0]!.modelMismatch, undefined);
+});
+
 test('T10: events keep the meaningful timeline only', () => {
   const events = eventsFromEntries(entries);
   assert.deepEqual(events.map(x => x.event), ['created', 'call', 'sealed', 'revised', 'reused', 'call', 'exec', 'model', 'loss', 'stop', 'sealed', 'call', 'exec', 'done']);
