@@ -8,7 +8,7 @@ import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends,
 import { readCache, writeCache } from "../kernel/cache.ts";
 import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
-import { resolveModel } from "../compat/model.ts";
+import { parseModel, resolveModel } from "../compat/model.ts";
 import { type LedgerState } from "./ledger.ts";
 import { readerHold, readerLedger, readerLedgerIdentity, type ReaderLedger } from "./reader-ledger.ts";
 import type { Exhaustion } from "./providers.ts";
@@ -94,7 +94,12 @@ export interface CallSnapshot extends ModelStatus {
   writerWait?: { root: string; holder: string };
   /** Notes (send kind "notify") recorded for this call while it was not running; its next follow-up carries them. */
   notesPending?: number;
+  /** Why a queued call does not start, when the orchestrator ledger says so (see queueWait); readers add it. */
+  queuedFor?: QueueWait;
 }
+/** Why a queued call waits, most specific first: the orchestrator is still recovering (`since` its start), the call's
+ *  every provider is used up, it waits for its worktree's writer lock, or every provider it can start on is full. */
+export interface QueueWait { reason: "starting" | "provider-exhausted" | "writer-lock" | "slot"; detail: string; since?: number }
 export interface WorkflowSnapshot {
   wid: string; rev: number; name?: string; origin?: string; cwd?: string;
   /** The run's result; follow-ups leave a final status unchanged. */
@@ -397,7 +402,7 @@ const folds = new Map<string, { wid: string; length: number; last?: Entry; reduc
 const derived = new WeakMap<readonly Entry[], { wid: string; snapshot: WorkflowSnapshot }>();
 export function workflowSnapshot(home: string, wid: string, ledger?: string): WorkflowSnapshot {
   const base = workflowDigest(home, wid, ledger).snapshot;
-  const wf = base.calls.some(c => c.poolWait) ? withPoolSlots(base, readerLedger(home).state.state) : base;
+  const wf = base.calls.some(c => c.poolWait || c.phase === "queued") ? withLedgerFacts(base, readerLedger(home).state.state) : base;
   const planned = plannedTotal(home, wid, wf.rev);
   return planned === undefined ? wf : { ...wf, planned };
 }
@@ -731,13 +736,63 @@ export function labelsText(labels: Record<string, string> | undefined, width = 6
 }
 
 const decorated = new WeakMap<WorkflowSnapshot, { planned?: number; labels?: Record<string, string>; session?: string; paused: boolean; slotMark?: string; wf: WorkflowSnapshot }>();
-/** Free slots are live ledger state, not repeated workflow journal records. */
-function withPoolSlots(wf: WorkflowSnapshot, state: LedgerState): WorkflowSnapshot {
-  if (!wf.calls.some(c => c.poolWait)) return wf;
-  const held = new Map<string, number>();
+/** The orchestrator that is still recovering the home's workflows: its start entry says it recovers first, it has not
+ *  recorded `recovered` and its process lives. Undefined for an orchestrator that does not say so (older versions). */
+export function orchestratorStarting(state: LedgerState): { pid: number; since: number } | undefined {
+  const o = state.orchestrator;
+  if (!o?.recovery || o.recovered || o.exited) return undefined;
+  // Readers ask on every refresh; the process check is kept for a second per start entry.
+  const now = Date.now(), hit = startingChecks.get(o);
+  const alive = hit && now >= hit.at && now - hit.at < 1000 ? hit.alive : processAlive(o.pid, o.start);
+  if (!hit || hit.alive !== alive || now < hit.at || now - hit.at >= 1000) startingChecks.set(o, { at: now, alive });
+  return alive ? { pid: o.pid, since: o.ts } : undefined;
+}
+const startingChecks = new WeakMap<object, { at: number; alive: boolean }>();
+/** A queued call's wait as one phrase: "orchestrator starting (12s)", "waiting for a free slot (p 2/2)", ... */
+export function queuedText(w: QueueWait, now = Date.now(), span: (ms: number) => string = age): string {
+  return w.reason === "starting" ? `orchestrator starting (${span(now - (w.since ?? now))})` : w.detail;
+}
+const providerOf = (model: string) => { try { return parseModel(model).provider; } catch { return undefined; } };
+/** Why a queued call waits, from what the orchestrator ledger records (precedence as events/waiting.ts): the
+ *  orchestrator still recovering; every candidate provider used up and not admitted now; the writer lock of its worktree;
+ *  every candidate provider full. Undefined when none is known: a call is never said to wait for a slot without a full
+ *  provider (memory headroom and an admission in progress look the same from here). Candidates: the provider it waits
+ *  for to resume on, else those of the model or pool it asked for (else the configured default). */
+export function queueWait(c: CallSnapshot, state: LedgerState, now = Date.now(), starting = orchestratorStarting(state)): QueueWait | undefined {
+  if (c.phase !== "queued") return undefined;
+  if (starting) return { reason: "starting", detail: "orchestrator starting", since: starting.since };
+  const settings = state.config?.settings ?? {}, pools = settings.pools ?? {}, wanted = c.poolWait?.model ?? c.model ?? settings.defaultModel;
+  let providers: string[] = [];
+  if (wanted && Object.hasOwn(pools, wanted)) { try { providers = [...new Set(resolveModel(wanted, pools).map(m => m.provider).filter((p): p is string => !!p))]; } catch { /* an invalid pool: unknown */ } }
+  else if (wanted) { const p = providerOf(wanted); if (p) providers = [p]; }
+  const used = providers.map(p => [p, state.exhausted.get(p)] as const);
+  if (used.length && used.every(([, x]) => x && (now < x.nextTry || x.probe !== undefined)))
+    return { reason: "provider-exhausted", detail: `${providers.join(", ")} usage window${providers.length > 1 ? "s" : ""} used up` };
+  if (c.writerWait) return { reason: "writer-lock", detail: `waiting for the writer lock of ${c.writerWait.root}` };
+  if (!providers.length) return undefined;
+  let full = true;
+  const lines = providers.map(p => {
+    let held = 0; for (const h of state.held.values()) if (h.pool === p) held++;
+    const limit = settings.providers?.[p]?.slots;
+    if (limit === undefined || held < limit) full = false;
+    return slotLine(p, held, limit);
+  });
+  return full ? { reason: "slot", detail: `waiting for a free slot (${lines.join(", ")})` } : undefined;
+}
+/** A mark of the ledger facts a workflow's queued calls show: they are derived again when it changes. */
+function queueMark(wf: WorkflowSnapshot, state: LedgerState, mark: string): string | undefined {
+  if (!wf.calls.some(c => c.poolWait || c.phase === "queued")) return undefined;
+  return `${mark}:${[...state.exhausted.values()].map(x => x.nextTry > Date.now()).join(",")}:${orchestratorStarting(state)?.since ?? ""}`;
+}
+/** Free slots and why queued calls wait are live ledger state, not repeated workflow journal records. */
+function withLedgerFacts(wf: WorkflowSnapshot, state: LedgerState): WorkflowSnapshot {
+  if (!wf.calls.some(c => c.poolWait || c.phase === "queued")) return wf;
+  const held = new Map<string, number>(), now = Date.now(), starting = orchestratorStarting(state);
   for (const h of state.held.values()) held.set(h.pool, (held.get(h.pool) ?? 0) + 1);
   const pools = state.config?.settings.pools, limits = state.config?.settings.providers;
   return { ...wf, calls: wf.calls.map(c => {
+    const why = queueWait(c, state, now, starting);
+    if (why) c = { ...c, queuedFor: why };
     const wait = c.poolWait;
     if (!wait) return c;
     let providers: string[] = [];
@@ -762,9 +817,9 @@ function snapshotWithLedger(home: string, wid: string, ix: ReaderLedger, mark: s
   const pendingRevision = (ix.revisions.get(wid) ?? 0) > (digests.get(pathsOf(home, wid).journal)?.digest.snapshot.rev ?? 0);
   const base = workflowDigest(home, wid, pendingRevision ? undefined : mark).snapshot, planned = plannedTotal(home, wid, base.rev), l = ix.labels.get(wid), s = ix.sessions.get(wid);
   const paused = isLive(base) && !!readerHold(ix, wid, ix.created.get(wid)?.origin as string | undefined), hit = decorated.get(base);
-  const slotMark = base.calls.some(c => c.poolWait) ? `${mark}:${[...ix.state.exhausted.values()].map(x => x.nextTry > Date.now()).join(",")}` : undefined;
+  const slotMark = queueMark(base, ix.state, mark);
   if (hit && hit.planned === planned && hit.labels === l && hit.session === s && hit.paused === paused && hit.slotMark === slotMark) return hit.wf;
-  const live = withPoolSlots(base, ix.state);
+  const live = withLedgerFacts(base, ix.state);
   const planned1 = planned === undefined ? live : { ...live, planned }, labelled1 = labelled(planned1, l, s);
   const wf = paused ? { ...labelled1, paused: true } : labelled1;
   decorated.set(base, { planned, labels: l, session: s, paused, slotMark, wf });
@@ -878,6 +933,9 @@ export interface StatusCall extends ModelStatus {
   lease?: string;
   /** Notes (send kind "notify") recorded while the call was not running; its next follow-up carries them. */
   notesPending?: number;
+  /** Why this queued call does not start, when known: "orchestrator starting (12s)", "waiting for the writer lock of
+   *  <root>", "<provider> usage window used up", "waiting for a free slot (<provider> n/n)". */
+  queued?: string;
 }
 export interface StatusWorkflow {
   wid: string; name?: string; origin?: string;
@@ -933,7 +991,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
         ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
-        ...(c.notesPending ? { notesPending: c.notesPending } : {}) };
+        ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(c.queuedFor && !r && !wf.paused ? { queued: queuedText(c.queuedFor) } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
     ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}), ...(wf.labels ? { labels: wf.labels } : {}),
@@ -1006,6 +1064,9 @@ export interface BriefCall extends ModelStatus {
   switching?: string; switchFailed?: string;
   /** Notes (send kind "notify") recorded while the call was not running; its next follow-up carries them. */
   notesPending?: number;
+  /** Why this queued call does not start, when known: "orchestrator starting (12s)", "waiting for the writer lock of
+   *  <root>", "<provider> usage window used up", "waiting for a free slot (<provider> n/n)". */
+  queued?: string;
 }
 export interface BriefWorkflow {
   wid: string; name?: string;
@@ -1060,7 +1121,9 @@ export function orchestratorView(state: LedgerState, loaded = packageVersion(), 
   if (!o || o.exited || !processAlive(o.pid, o.start)) return {};
   const r = o.forceRestart, note = r && now - r.ts < 24 * 60 * 60_000
     ? `; restarted by force ${age(now - r.ts)} ago by ${initiatorSummary(r.initiator, r.from)}: ${restartLine(r.reason ?? "no reason recorded")}` : "";
-  return { orchestrator: `${o.version} (pid ${o.pid})${note}`, ...(o.version === loaded ? {} : { versionNote: versionNote(o.version, loaded) }) };
+  // Still recovering the home's workflows: nothing is dispatched yet, whatever the slots say.
+  const starting = orchestratorStarting(state), phase = starting ? `, starting ${age(now - starting.since)}` : "";
+  return { orchestrator: `${o.version} (pid ${o.pid}${phase})${note}`, ...(o.version === loaded ? {} : { versionNote: versionNote(o.version, loaded) }) };
 }
 /** Whether the recorded orchestrator still runs. On Linux its start time also tells it from a later process given the
  *  same pid after a crash (elsewhere the pid alone is checked). */
@@ -1171,7 +1234,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(c.hibernated ? { hibernated: true as const } : {}), ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
         ...(live && byCall.get(c.callId) ? { lease: byCall.get(c.callId) } : {}),
         ...(live && c.switching ? { switching: c.switching } : {}), ...(live && c.switchFailed ? { switchFailed: c.switchFailed } : {}),
-        ...(c.notesPending ? { notesPending: c.notesPending } : {}) };
+        ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(live && c.queuedFor && !w.paused ? { queued: queuedText(c.queuedFor, now) } : {}) };
     });
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
       ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300) }));

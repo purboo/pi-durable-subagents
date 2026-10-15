@@ -1,5 +1,5 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { answerForwardedNote, isLive, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { answerForwardedNote, isLive, queuedText, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import type { CallStatus } from "../types.ts";
 import type { sessionFacts } from "./session.ts";
 import { oneLine } from "./frame.ts";
@@ -114,7 +114,7 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   // The alert's duration measures progress, whereas lastActivity also advances on provider retries.
   if (noProgress) return /no progress for [^(;]+/.exec(noProgress.text)?.[0].trim() ?? "no progress";
   if (workflow.attention.some(a => a.kind === "stall" && a.call === call.callId)) return `no activity for ${duration(now - Math.max(call.lastActivity ?? call.startedAt ?? now, facts?.lastActivity ?? 0))}`;
-  if (call.phase === "queued") return workflow.paused ? "paused · r resumes" : call.answered ? "queued (answered, waiting for a slot)" : "queued: waiting for a free slot";
+  if (call.phase === "queued") return workflow.paused ? "paused · r resumes" : queuedPhrase(call, now);
   // Liveness (UI §2): the age of the newest evidence ticks, and resets whenever the agent does anything.
   const since = duration(Math.max(0, now - Math.max(call.lastActivity ?? 0, facts?.lastActivity ?? 0, call.startedAt ?? 0)));
   if (facts?.activity) return `${facts.activity} · ${since}`;
@@ -123,6 +123,14 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   if (live?.phase === "waiting") return `waiting for the model · ${age}`;
   if (live?.phase === "streaming") return live.tool ? `writing a ${live.tool} call · ${age}` : live.text ? `writing · ${age}` : `thinking · ${age}`;
   return `thinking · ${since}`;
+}
+/** Why a queued call does not start, only as far as the orchestrator ledger says (CallSnapshot.queuedFor): a call is
+ *  never said to wait for a slot without a full provider. An answered asker keeps its own phrase. */
+export function queuedPhrase(call: Pick<CallSnapshot, "answered" | "queuedFor">, now: number): string {
+  const why = call.queuedFor;
+  if (why?.reason === "starting") return `queued: ${queuedText(why, now, duration)}`;
+  if (call.answered) return why && why.reason !== "slot" ? `queued (answered): ${why.detail}` : "queued (answered, waiting for a slot)";
+  return why ? `queued: ${queuedText(why, now, duration)}` : "queued";
 }
 function failed(c: CallSnapshot) { return c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped"; }
 
@@ -165,16 +173,18 @@ export function summary(workflows: readonly WorkflowSnapshot[]): { working: numb
     done: progress.reduce((n, p) => n + p.done, 0), total: progress.reduce((n, p) => n + p.total, 0), plus: progress.some(p => p.plus) };
 }
 /** UI §1, v12 §4: What needs you first, then what is running, then progress — e.g. "1 asking · 3 working · 12/40 done". */
-export function summaryText(workflows: readonly WorkflowSnapshot[]): string {
+export function summaryText(workflows: readonly WorkflowSnapshot[], now = Date.now()): string {
   const s = summary(workflows), finished = workflows.filter(w => !isLive(w)).length;
   if (!s.total) return finished ? `${finished} finished` : "nothing running";
-  return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", s.queued ? `${s.queued} queued` : "", s.paused ? `${s.paused} paused` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
+  // While the orchestrator recovers, nothing queued starts: say so once, rather than suggest a slot shortage.
+  const starting = s.queued ? workflows.filter(w => isLive(w) && !w.paused).flatMap(liveCalls).find(c => c.phase === "queued" && c.queuedFor?.reason === "starting")?.queuedFor : undefined;
+  return [s.asking ? `${s.asking} asking` : "", s.working ? `${s.working} working` : "", s.queued ? `${s.queued} queued${starting ? `: ${queuedText(starting, now, duration)}` : ""}` : "", s.paused ? `${s.paused} paused` : "", `${s.done}/${s.total}${s.plus ? "+" : ""} done`].filter(Boolean).join(" · ");
 }
-export function mainLine(workflows: readonly WorkflowSnapshot[]): string | undefined {
+export function mainLine(workflows: readonly WorkflowSnapshot[], now = Date.now()): string | undefined {
   if (!workflows.length) return undefined;
   const s = summary(workflows);
   // The key that opens the list is spelled out: a bare arrow is easy to miss.
-  if (s.working || s.asking || s.queued || s.paused) return `${summaryText(workflows)} · ↓ subagents`;
+  if (s.working || s.asking || s.queued || s.paused) return `${summaryText(workflows, now)} · ↓ subagents`;
   const w = workflows.filter(w => !isLive(w)).sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
   if (!w) return undefined;
   const latest = [...new Map(w.calls.map(c => [c.key, c])).values()]; // the newest generation of each key (P37)
@@ -198,7 +208,7 @@ export function dockLines(workflows: readonly WorkflowSnapshot[], facts: Readonl
   }).sort((a, b) => Number(b.asking) - Number(a.asking));
   if (!active.length) {
     const ended = workflows.filter(w => !isLive(w)).sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
-    const line = ended && now - (ended.endedAt ?? 0) < 10 * 60_000 ? mainLine(workflows) : undefined;
+    const line = ended && now - (ended.endedAt ?? 0) < 10 * 60_000 ? mainLine(workflows, now) : undefined;
     return line ? [truncateToWidth(line, Math.max(1, width))] : [];
   }
   const cols = { key: Math.min(20, Math.max(...active.map(a => visibleWidth(callName(a.w, a.c))))), model: Math.min(20, Math.max(...active.map(a => visibleWidth(name(facts.get(a.c.callId)?.model ?? a.c.model))))) };
@@ -211,7 +221,7 @@ export function dockLines(workflows: readonly WorkflowSnapshot[], facts: Readonl
     return rowText(`${mark} `, callName(w, c), name(f?.model ?? c.model), phrase, [], width, cols);
   });
   const more = active.length - shown.length;
-  lines.push(truncateToWidth(`${more ? `+${more} more · ` : ""}${summaryText(workflows)} · ↓ subagents`, Math.max(1, width)));
+  lines.push(truncateToWidth(`${more ? `+${more} more · ` : ""}${summaryText(workflows, now)} · ↓ subagents`, Math.max(1, width)));
   return lines;
 }
 

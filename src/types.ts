@@ -57,7 +57,10 @@ export interface EntryFields {
   config: { hash: string; config: Record<string, unknown> };
   "config-rejected": { error: string; hash?: string };
   /** The orchestrator that holds the lock from here: its package version and process. */
-  orchestrator: { version: string; pid: number; start?: string; pi?: string | null };
+  /** `recovery`: it recovers the workflows of the home before it dispatches anything, until its `recovered`. */
+  orchestrator: { version: string; pid: number; start?: string; pi?: string | null; recovery?: true };
+  /** That orchestrator finished recovery after `ms` (workflows and calls recovered, workflows skipped). */
+  recovered: { pid: number; ms: number; workflows: number; calls: number; skipped: number };
   /** That orchestrator exits, and why (a crash records nothing; readers check the process too; older ones have no
    *  reason). `signal` names the signal, `error` is the clipped message. */
   "orchestrator-exit": { pid: number; reason?: "idle" | "restart" | "signal" | "error"; signal?: string; error?: string };
