@@ -98,7 +98,7 @@ test("ordinary status phrases, main line, questions and stalls", () => {
   w.attention = []; c.lastActivity = now - 8_000; assert.equal(statusPhrase(c, w, undefined, now), "thinking · 8s", "the age of the newest evidence ticks");
   c.lastActivity = now - 1_000; assert.equal(statusPhrase(c, w, undefined, now), "thinking · 1s", "and resets on new activity");
   assert.equal(statusPhrase(c, w, { ...sessionFacts([], c.callId), activity: "reading src/a.ts" }, now), "reading src/a.ts · 1s");
-  c.phase = "queued"; assert.match(statusPhrase(c, w, undefined, now), /^queued:/);
+  c.phase = "queued"; assert.equal(statusPhrase(c, w, undefined, now), "queued", "no recorded reason: no claimed one");
   c.phase = "sealed"; c.result = { key: c.key, gen: 1, status: "failed", ok: false, output: "", error: "blocked" };
   w.status = "failed"; w.endedAt = now;
   assert.match(mainLine([w])!, /exec-0927 finished: 1 failed · ↓ subagents/);
@@ -256,7 +256,7 @@ test("P7 list rows carry a small pending marker until the message is delivered, 
 test("drain: a queued call in a drained orchestrator says it waits for resume, not for capacity", () => {
   const c = call("q", { phase: "queued" });
   assert.equal(statusPhrase(c, workflow([c], { paused: true }), undefined, now), "paused · r resumes");
-  assert.equal(statusPhrase(c, workflow([c]), undefined, now), "queued: waiting for a free slot");
+  assert.equal(statusPhrase(c, workflow([c]), undefined, now), "queued", "without slot evidence it claims no slot wait");
 });
 
 test("v12 §4: totals use planned counts; scripts show n+ while running", () => {
