@@ -78,7 +78,15 @@ export function registerChild(pi: ExtensionAPI): void {
     if (!model) reason = `model is not registered for provider ${selected.provider}`;
     else if (!sameModel(ctx.model, model)) {
       if (!correct) reason = 'active model changed after turn selection';
-      else try { if (!await pi.setModel(model)) reason = `no auth for provider ${model.provider} (setModel refused)`; }
+      else try {
+        // pi 1.0.2 answers setModel from an availability snapshot that a startup refresh can briefly replace with
+        // one taken before an extension provider registered (seen on CI after a resume: provider found, setModel
+        // refused). Recheck that provider's credentials once, authoritatively, before calling the model unavailable.
+        if (!await pi.setModel(model)) {
+          try { await ctx.modelRegistry.refresh({ providers: [model.provider], allowNetwork: false }); } catch { /* recheck below */ }
+          if (!await pi.setModel(model)) reason = `no auth for provider ${model.provider} (setModel refused)`;
+        }
+      }
       catch (error) { reason = String(error); }
     }
     if (!reason && model && !sameModel(ctx.model, model)) reason = 'pi did not activate the selected model';

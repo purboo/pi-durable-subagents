@@ -9,7 +9,7 @@ import { openJournal } from "../../../src/kernel/journal.ts";
 import { publishRequest } from "../../../src/kernel/mailbox.ts";
 import { CT } from "../../../src/types.ts";
 
-async function fixture(t: TestContext, selected: string, activation: "ok" | "refused" | "throws", catalog?: { provider: string; id: string; name: string; api?: string }[]) {
+async function fixture(t: TestContext, selected: string, activation: "ok" | "refused" | "throws" | "stale", catalog?: { provider: string; id: string; name: string; api?: string }[]) {
   const home = await mkdtemp(join(tmpdir(), "dsa-launch-model-")), inbox = join(home, "inbox"), path = join(home, "journal");
   await mkdir(inbox);
   const log = await openJournal(path); await log.append("exec", { call: "call", exec: "call#1.1" }); await log.close();
@@ -18,9 +18,9 @@ async function fixture(t: TestContext, selected: string, activation: "ok" | "ref
   Object.assign(process.env, env); delete process.env.DSA_BUDGET; delete process.env.DSA_SCHEMA;
   const hooks = new Map<string, (event: unknown, ctx: any) => Promise<unknown>>(), history: any[] = [], sent: unknown[] = [], rpc: any[] = [];
   const canonical = { provider: "p", id: "canonical", name: "Alias" }, models = catalog ?? [canonical];
-  let model = { provider: "default", id: "other", name: "Other" }, shutdown = false, activations = 0;
+  let model = { provider: "default", id: "other", name: "Other" }, shutdown = false, activations = 0, refreshes = 0, fresh = false;
   const ctx = { get model() { return model; }, isIdle: () => true, shutdown() { shutdown = true; },
-    modelRegistry: { find: (p: string, id: string) => models.find(m => m.provider === p && m.id === id), getAll: () => models },
+    modelRegistry: { refresh: async (options: { providers?: string[] }) => { refreshes++; assert.deepEqual(options.providers, ["p"]); fresh = true; return { aborted: false, errors: new Map() }; }, find: (p: string, id: string) => models.find(m => m.provider === p && m.id === id), getAll: () => models },
     sessionManager: { getEntries: () => history } };
   t.mock.method(fs, "writeSync", (_fd: number, chunk: string) => { rpc.push(JSON.parse(chunk)); return chunk.length; });
   t.mock.method(process.stdout, "write", (chunk: string) => { rpc.push(JSON.parse(chunk)); return true; });
@@ -29,12 +29,12 @@ async function fixture(t: TestContext, selected: string, activation: "ok" | "ref
     on: (name: string, fn: any) => hooks.set(name, fn), registerTool() {},
     appendEntry: (customType: string, data: unknown) => history.push({ type: "custom", customType, data }),
     sendMessage: (message: unknown) => sent.push(message),
-    setModel: async (next: typeof model) => { activations++; if (activation === "throws") throw new Error("No API key for p/canonical"); if (activation === "refused") return false; model = next; return true; },
+    setModel: async (next: typeof model) => { activations++; if (activation === "throws") throw new Error("No API key for p/canonical"); if (activation === "refused" || (activation === "stale" && !fresh)) return false; model = next; return true; },
   } as unknown as Parameters<typeof registerChild>[0]);
   t.after(async () => { await hooks.get("session_shutdown")?.({}, ctx); for (const key of Object.keys(env).concat(["DSA_BUDGET", "DSA_SCHEMA"])) { if (before[key] === undefined) delete process.env[key]; else process.env[key] = before[key]; } await rm(home, { recursive: true, force: true }); });
   await publishRequest(inbox, { rid: "task", from: "orch", to: "call", kind: "task", sseq: 1, body: { message: "work" } });
   const start = () => hooks.get("session_start")!({}, ctx);
-  return { start, hooks, ctx, history, sent, rpc, get shutdown() { return shutdown; }, get activations() { return activations; }, change: () => { model = { provider: "default", id: "other", name: "Other" }; } };
+  return { start, hooks, ctx, history, sent, rpc, get shutdown() { return shutdown; }, get activations() { return activations; }, get refreshes() { return refreshes; }, change: () => { model = { provider: "default", id: "other", name: "Other" }; } };
 }
 
 for (const activation of ["refused", "throws"] as const) test(`launch guard refuses default fallback before delivering any work (${activation})`, async t => {
@@ -44,10 +44,21 @@ for (const activation of ["refused", "throws"] as const) test(`launch guard refu
   assert.deepEqual(failure.selected, { provider: "p", id: "canonical" });
   assert.deepEqual(failure.actual, { provider: "default", id: "other" });
   assert.match(failure.reason, /auth|API key/);
+  assert.equal(f.refreshes, activation === "refused" ? 1 : 0, "a refusal is rechecked once against fresh provider availability");
   assert.equal(f.rpc.at(-1).type, CT.modelUnavailable);
   // A later request hook must stop synchronously, since pi swallows extension errors.
   t.mock.method(process, "exit", () => { throw new Error("owned child exited"); });
   await assert.rejects(f.hooks.get("turn_start")!({}, f.ctx), /owned child exited/);
+});
+
+test("launch guard rechecks a refusal from a stale availability snapshot and goes on", async t => {
+  // pi 1.0.2 on CI after a resume: the provider is registered, but a startup refresh briefly dropped it from the
+  // snapshot setModel reads. 1.0.41 before this fix failed such calls as model-unavailable.
+  const f = await fixture(t, "p/canonical", "stale"); await f.start();
+  assert.equal(f.shutdown, false); assert.equal(f.sent.length, 1);
+  assert.equal(f.refreshes, 1); assert.equal(f.activations, 2);
+  assert.equal(f.history.some(e => e.customType === CT.modelUnavailable), false);
+  assert.deepEqual(f.history.find(e => e.customType === CT.modelReady)?.data.model, { provider: "p", id: "canonical" });
 });
 
 test("context guard stops a late model replacement before the captured request can run", async t => {

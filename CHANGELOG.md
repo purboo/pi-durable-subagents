@@ -24,6 +24,9 @@
   the reason. A pool call fails over to the next entry and skips the failed one for ten minutes; a call with an
   explicit model fails naming both models. Virtual (routed) models must activate at launch; their answers name the
   routed physical model, shown as `routed Y`. Any other answer from an unselected model shows `used Y, selected X`.
+  A refusal is rechecked once against fresh credentials of that provider first: pi can answer `setModel` from an
+  availability snapshot that a startup refresh briefly replaced (seen after resumes on CI), which is not a missing
+  credential.
 - Slot waits are journaled once per wait episode; free providers are computed live for `status`.
 
 ## 1.0.40
