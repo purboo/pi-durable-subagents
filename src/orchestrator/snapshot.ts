@@ -8,6 +8,7 @@ import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends,
 import { readCache, writeCache } from "../kernel/cache.ts";
 import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
+import { resolveModel } from "../compat/model.ts";
 import { type LedgerState } from "./ledger.ts";
 import { readerHold, readerLedger, readerLedgerIdentity, type ReaderLedger } from "./reader-ledger.ts";
 import type { Exhaustion } from "./providers.ts";
@@ -29,8 +30,37 @@ export interface CallSend {
   reason?: string;
   /** A model switch's target ("provider/id"). */
   model?: string;
+  /** Question revision addressed by an answer forward. */
+  question?: { qid: string; rev: number };
 }
-export interface CallSnapshot {
+/** Durable pending-answer evidence; timestamps stay fresh even when an unchanged snapshot is cached. */
+export type AnswerForwarded = { rid: string; qid: string; rev: number; at: number };
+export function answerForwardedNote(c: { answerForwarded?: AnswerForwarded }, now = Date.now()): string {
+  const answer = c.answerForwarded;
+  return answer && now - answer.at >= 30_000 ? `answer forwarded ${age(now - answer.at)} ago, not delivered` : "";
+}
+export interface ModelStatus {
+  selectedModel?: string;
+  usedModel?: string;
+  virtualModel?: boolean;
+  routedModel?: string;
+  modelMismatch?: { used: string; selected: string };
+  modelUnavailable?: string;
+  poolWait?: { since: number; model: string; pool?: string; free: string[] };
+  spill?: { from: string; to: string; waitedMs: number };
+}
+const modelName = (m: unknown): string => { const v = m as { provider?: string; id: string }; return v.provider ? `${v.provider}/${v.id}` : v.id; };
+const modelStatus = (c: ModelStatus): ModelStatus => Object.fromEntries(Object.entries(c).filter(([key]) =>
+  ["routedModel", "modelMismatch", "modelUnavailable", "poolWait", "spill"].includes(key)));
+/** Scheduling and model identity facts shared by detailed and compact text status. */
+export function modelStatusText(c: ModelStatus, now = Date.now()): string {
+  const w = c.poolWait, s = c.spill, m = c.modelMismatch;
+  return (w ? ` (queued ${age(now - w.since)} on ${w.model.split("/")[0]} (full)${w.free.length ? `; pool has free slots: ${w.free.join(", ")}` : ""})` : "") +
+    (s ? ` (spilled after ${age(s.waitedMs)}: ${s.from.split("/")[0]} full -> ${s.to})` : "") +
+    (c.routedModel ? ` (routed ${c.routedModel})` : "") +
+    (m ? ` (used ${m.used}, selected ${m.selected})` : "") + (c.modelUnavailable ? ` (model-unavailable: ${c.modelUnavailable})` : "");
+}
+export interface CallSnapshot extends ModelStatus {
   key: string; gen: number; callId: string; agent: string; phase: CallPhase;
   /** Other calls named by an open shared-worktree reminder. */
   sharedWorktree?: string[];
@@ -58,6 +88,8 @@ export interface CallSnapshot {
   hibernated?: true;
   /** Bound question id, until the next execution starts running. */
   answered?: string;
+  /** An answer to an open question was forwarded but its child receipt is not confirmed yet. */
+  answerForwarded?: AnswerForwarded;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
   /** Notes (send kind "notify") recorded for this call while it was not running; its next follow-up carries them. */
@@ -193,8 +225,22 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         const call = calls.get(String(e.call)); if (!call) continue;
         // An execution waits for a provider slot and memory before it launches; it is running once `selected` says so
         // (otherwise a call still waiting for a slot reads "thinking · 2m").
-        call.exec = String(e.exec); call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
+        call.exec = String(e.exec); delete call.poolWait; delete call.usedModel; delete call.virtualModel; call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
         if (!call.answered) { delete call.hibernated; hibernating.delete(call.callId); }
+      } else if (e.type === "slot-wait") {
+        const call = byExec.get(String(e.exec));
+        if (call && call.exec === e.exec) {
+          if (e.model) call.poolWait = { since: Number(e.since), model: modelName(e.model), ...(typeof e.pool === "string" ? { pool: e.pool } : {}), free: [] };
+          else delete call.poolWait;
+        }
+      } else if (e.type === "spilled") {
+        const call = byExec.get(String(e.exec));
+        if (call) call.spill = { from: modelName(e.from), to: modelName(e.to), waitedMs: Number(e.waitedMs) };
+      } else if (e.type === "model-unavailable") {
+        const call = byExec.get(String(e.exec)); if (call) call.modelUnavailable = String(e.reason);
+      } else if (e.type === "model-ready") {
+        const call = byExec.get(String(e.exec));
+        if (call && call.exec === e.exec) { call.selectedModel = modelName(e.model); call.virtualModel = e.virtual === true; }
       } else if (e.type === "writer-wait" || e.type === "writer-acquired") {
         const call = calls.get(String(e.call)), holder = String(e.holder ?? "");
         if (call && e.type === "writer-wait") call.writerWait = { root: String(e.root), holder: holder.includes("/") ? `${holder.split("@")[0]}/${holder.split("/")[1]!.split("@")[0]}` : holder };
@@ -224,17 +270,22 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         if (call && hibernating.get(call.callId) === e.exec) call.hibernated = true;
       } else if (e.type === "selected") {
         const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
-        if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
+        if (call && call.exec === e.exec && m) { call.model = m.provider ? `${m.provider}/${m.id}` : m.id; call.selectedModel = call.model; delete call.poolWait; delete call.usedModel; delete call.virtualModel; }
         if (call && call.exec === e.exec && call.phase === "queued") {
           call.phase = "running"; delete call.answered; delete call.hibernated; hibernating.delete(call.callId);
         }
       } else if (e.type === "model-used") {
         // Evidence of a switch: the execution answered with another model than it launched with.
         const call = byExec.get(String(e.exec)), m = e.model as { provider?: string; id?: string } | undefined;
-        if (call && m) call.model = m.provider ? `${m.provider}/${m.id}` : m.id;
+        if (call && call.exec === e.exec && m) {
+          call.model = m.provider ? `${m.provider}/${m.id}` : m.id; call.usedModel = call.model;
+          if (sends.get(call.callId)?.some(s => s.kind === "model" && !s.reason && s.model?.toLowerCase() === call.model?.toLowerCase())) call.selectedModel = call.model;
+        }
       } else if (e.type === "observation") {
         // Only what the agent did counts as activity; tracker scans and time checkpoints are bookkeeping.
         const call = byExec.get(String(e.exec)); if (call) call.lastActivity = e.ts;
+        const event = e.event as { type?: string; provider?: string; model?: string } | undefined;
+        if (call && call.exec === e.exec && event?.type === "message_start" && event.provider && event.model) call.usedModel = `${event.provider}/${event.model}`;
         if (call && e.type === "observation" && (e.event as { type?: string } | undefined)?.type === "tool_execution_start") tools.set(call.callId, (tools.get(call.callId) ?? 0) + 1);
       } else if (e.type === "usage") {
         const id = `${e.call}:${e.id}`, u = e.usage as Usage | undefined;
@@ -246,14 +297,16 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         const usage = (e.result as CallResult | undefined)?.usage;
         if (usage) sealedUsage.set(String(e.call), usage);
         const call = calls.get(String(e.call)); if (!call) continue;
-        call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.answered; delete call.hibernated; delete call.writerWait; hibernating.delete(call.callId);
+        call.phase = "sealed"; call.result = e.result as CallResult; call.endedAt = e.ts; delete call.answered; delete call.hibernated; delete call.writerWait; delete call.poolWait; hibernating.delete(call.callId);
       } else if (isEntry(e, JT.attention)) {
         const item = e.item;
         attention.push(item);
       } else if (e.type === "forward") {
-        const envelope = e.envelope as { kind?: string; body?: { provider?: string; model?: string } } | undefined;
+        const envelope = e.envelope as { kind?: string; body?: { provider?: string; model?: string }; cond?: { qid?: string; rev?: number } } | undefined;
         const send: CallSend = { rid: String(e.rid), kind: String(envelope?.kind ?? ""), state: "pending", at: e.ts,
-          ...(envelope?.kind === "model" && envelope.body?.provider ? { model: `${envelope.body.provider}/${envelope.body.model}` } : {}) };
+          ...(envelope?.kind === "model" && envelope.body?.provider ? { model: `${envelope.body.provider}/${envelope.body.model}` } : {}),
+          ...(envelope?.kind === "answer" && typeof envelope.cond?.qid === "string" && typeof envelope.cond.rev === "number"
+            ? { question: { qid: envelope.cond.qid, rev: envelope.cond.rev } } : {}) };
         const list = sends.get(String(e.dest)) ?? []; list.push(send); sends.set(String(e.dest), list);
         // A withdrawn model request no longer stands (the executor ignores it for the next launch as well).
         if (envelope?.kind === "withdraw") for (const rid2 of (envelope.body as { rids?: string[] } | undefined)?.rids ?? []) {
@@ -287,16 +340,24 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
     const usageOf = (callId: string) => sealedUsage.get(callId) ?? live.get(callId);
     const counts: Record<CallPhase, number> = { queued: 0, running: 0, asking: 0, sealed: 0 };
     for (const c of list) {
+      if (c.phase !== "sealed" && c.phase !== "queued") delete c.poolWait;
       counts[c.phase]++;
       const usage = usageOf(c.callId); if (usage) c.usage = { ...usage };
       const n = tools.get(c.callId); if (n) c.tools = n;
       const forwarded = sends.get(c.callId);
       if (forwarded) {
         c.sends = structuredClone(forwarded); const pending = forwarded.filter(pendingMessage).length; if (pending) c.pending = pending;
+        const answer = c.phase === "asking" && forwarded.find(s => s.kind === "answer" && s.state === "pending" && s.question &&
+          openAttention.some(a => a.call === c.callId && a.qid === s.question!.qid && a.rev === s.question!.rev));
+        if (answer) c.answerForwarded = { rid: answer.rid, ...answer.question!, at: answer.at };
         const last = c.phase !== "sealed" && !retired.has(c.callId) ? forwarded.findLast(s => s.kind === "model" && s.reason !== "withdrawn" && s.reason !== "stale-execution") : undefined;
         if (last?.reason !== undefined) c.switchFailed = `${last.model} (${last.reason})`;
-        else if (last && last.state !== "retired" && last.model !== c.model?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = last.model;
+        else if (last && last.state !== "retired" && last.model !== (c.virtualModel ? c.selectedModel : c.model)?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = last.model;
       }
+      const selected = c.switching ?? c.selectedModel;
+      if (c.usedModel && c.virtualModel) c.routedModel = c.usedModel;
+      else if (c.usedModel && selected && c.usedModel.toLowerCase() !== selected.toLowerCase())
+        c.modelMismatch = { used: c.usedModel, selected };
     }
     for (const [key, rids] of notes) {
       const n = [...rids].filter(rid => !carried.has(rid)).length, call = list.findLast(c => c.key === key);
@@ -335,7 +396,8 @@ const FOLDS = 256; // workflows whose fold state is kept; pruned and long-idle o
 const folds = new Map<string, { wid: string; length: number; last?: Entry; reducer: ReturnType<typeof snapshotReducer> }>();
 const derived = new WeakMap<readonly Entry[], { wid: string; snapshot: WorkflowSnapshot }>();
 export function workflowSnapshot(home: string, wid: string, ledger?: string): WorkflowSnapshot {
-  const wf = workflowDigest(home, wid, ledger).snapshot;
+  const base = workflowDigest(home, wid, ledger).snapshot;
+  const wf = base.calls.some(c => c.poolWait) ? withPoolSlots(base, readerLedger(home).state.state) : base;
   const planned = plannedTotal(home, wid, wf.rev);
   return planned === undefined ? wf : { ...wf, planned };
 }
@@ -668,7 +730,27 @@ export function labelsText(labels: Record<string, string> | undefined, width = 6
   return text ? `[${clip(text, Math.max(1, width - 3))}]` : "";
 }
 
-const decorated = new WeakMap<WorkflowSnapshot, { planned?: number; labels?: Record<string, string>; session?: string; paused: boolean; wf: WorkflowSnapshot }>();
+const decorated = new WeakMap<WorkflowSnapshot, { planned?: number; labels?: Record<string, string>; session?: string; paused: boolean; slotMark?: string; wf: WorkflowSnapshot }>();
+/** Free slots are live ledger state, not repeated workflow journal records. */
+function withPoolSlots(wf: WorkflowSnapshot, state: LedgerState): WorkflowSnapshot {
+  if (!wf.calls.some(c => c.poolWait)) return wf;
+  const held = new Map<string, number>();
+  for (const h of state.held.values()) held.set(h.pool, (held.get(h.pool) ?? 0) + 1);
+  const pools = state.config?.settings.pools, limits = state.config?.settings.providers;
+  return { ...wf, calls: wf.calls.map(c => {
+    const wait = c.poolWait;
+    if (!wait) return c;
+    let providers: string[] = [];
+    if (wait.pool && pools?.[wait.pool]) {
+      try { providers = resolveModel(wait.pool, pools).map(m => m.provider).filter((p): p is string => !!p); }
+      catch { /* A removed or invalid pool has no available entries to show. */ }
+    }
+    const pinned = wait.model.split("/")[0];
+    const free = [...new Set(providers)].filter(p => p !== pinned && (held.get(p) ?? 0) < (limits?.[p]?.slots ?? Infinity) &&
+      !(state.exhausted.get(p)?.nextTry && state.exhausted.get(p)!.nextTry > Date.now()));
+    return { ...c, poolWait: { ...wait, free } };
+  }) };
+}
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
 export function allWorkflows(home: string): WorkflowSnapshot[] {
   return snapshotsOf(home, workflowIds(home));
@@ -680,10 +762,12 @@ function snapshotWithLedger(home: string, wid: string, ix: ReaderLedger, mark: s
   const pendingRevision = (ix.revisions.get(wid) ?? 0) > (digests.get(pathsOf(home, wid).journal)?.digest.snapshot.rev ?? 0);
   const base = workflowDigest(home, wid, pendingRevision ? undefined : mark).snapshot, planned = plannedTotal(home, wid, base.rev), l = ix.labels.get(wid), s = ix.sessions.get(wid);
   const paused = isLive(base) && !!readerHold(ix, wid, ix.created.get(wid)?.origin as string | undefined), hit = decorated.get(base);
-  if (hit && hit.planned === planned && hit.labels === l && hit.session === s && hit.paused === paused) return hit.wf;
-  const planned1 = planned === undefined ? base : { ...base, planned }, labelled1 = labelled(planned1, l, s);
+  const slotMark = base.calls.some(c => c.poolWait) ? `${mark}:${[...ix.state.exhausted.values()].map(x => x.nextTry > Date.now()).join(",")}` : undefined;
+  if (hit && hit.planned === planned && hit.labels === l && hit.session === s && hit.paused === paused && hit.slotMark === slotMark) return hit.wf;
+  const live = withPoolSlots(base, ix.state);
+  const planned1 = planned === undefined ? live : { ...live, planned }, labelled1 = labelled(planned1, l, s);
   const wf = paused ? { ...labelled1, paused: true } : labelled1;
-  decorated.set(base, { planned, labels: l, session: s, paused, wf });
+  decorated.set(base, { planned, labels: l, session: s, paused, slotMark, wf });
   return wf;
 }
 function snapshotsOf(home: string, wids: string[]): WorkflowSnapshot[] {
@@ -770,7 +854,7 @@ export function formatUsage(u: Usage): string {
   return `${n(u.input)} in / ${n(u.output)} out${u.costUsd > 0 ? `, $${u.costUsd.toFixed(u.costUsd < 0.01 ? 4 : 2)}` : ""}`;
 }
 
-export interface StatusCall {
+export interface StatusCall extends ModelStatus {
   key: string; gen: number; callId: string; phase: CallPhase;
   sharedWorktree?: string[];
   status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage;
@@ -787,6 +871,7 @@ export interface StatusCall {
   hibernated?: true;
   /** Bound question id, until the next execution starts running. */
   answered?: string;
+  answerForwarded?: AnswerForwarded;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
   /** Resource leases (`pi-durable-subagents hold`): "holds lease machine" / "waiting for lease machine 3m". */
@@ -843,11 +928,11 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
     ...(wf.planned !== undefined ? { planned: wf.planned } : {}), done: progress.done,
     calls: wf.calls.map(c => {
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
-      return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...(r ? { status: r.status, ok: r.ok } : {}),
+      return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...modelStatus(c), ...(r ? { status: r.status, ok: r.ok } : {}),
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
-        ...(c.answered ? { answered: c.answered } : {}), ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
+        ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
         ...(c.notesPending ? { notesPending: c.notesPending } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
@@ -901,7 +986,7 @@ const tokens = (u?: Usage) => { const n = u ? u.input + u.output : 0; return n >
 /** The latest generation of every key, in first-call order. */
 const latestCalls = (wf: Pick<WorkflowSnapshot, "calls">) => [...new Map(wf.calls.map(c => [c.key, c] as const)).values()];
 
-export interface BriefCall {
+export interface BriefCall extends ModelStatus {
   key: string; agent: string; phase: CallPhase; model?: string;
   sharedWorktree?: string[];
   /** Since the call started, and since its last activity (shown when quiet for a minute or more). */
@@ -912,6 +997,7 @@ export interface BriefCall {
   hibernated?: true;
   /** Bound question id, until the next execution starts running. */
   answered?: string;
+  answerForwarded?: AnswerForwarded;
   /** Writer lock: the worktree root this queued call waits for and the call that holds it ("<wid>/<key>"). */
   writerWait?: { root: string; holder: string };
   /** Resource leases (`pi-durable-subagents hold`): "holds lease machine" / "waiting for lease machine 3m". */
@@ -1076,13 +1162,13 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
     const p = progressOf(w), open = w.attention.filter(a => a.kind !== "finished");
     const calls = latestCalls(w).filter(c => c.phase !== "sealed" || (c.result && !c.result.ok) || c.notesPending).map((c): BriefCall => {
       const live = c.phase !== "sealed", quiet = c.lastActivity !== undefined ? now - c.lastActivity : undefined;
-      return { key: c.key, agent: c.agent, phase: c.phase, ...(c.model ? { model: c.model } : {}),
+      return { key: c.key, agent: c.agent, phase: c.phase, ...modelStatus(c), ...(c.model ? { model: c.model } : {}),
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(live && c.startedAt !== undefined ? { for: age(now - c.startedAt) } : {}),
         ...(live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
         ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
         ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
-        ...(c.hibernated ? { hibernated: true as const } : {}), ...(c.answered ? { answered: c.answered } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
+        ...(c.hibernated ? { hibernated: true as const } : {}), ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
         ...(live && byCall.get(c.callId) ? { lease: byCall.get(c.callId) } : {}),
         ...(live && c.switching ? { switching: c.switching } : {}), ...(live && c.switchFailed ? { switchFailed: c.switchFailed } : {}),
         ...(c.notesPending ? { notesPending: c.notesPending } : {}) };

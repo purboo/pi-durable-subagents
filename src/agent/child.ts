@@ -1,4 +1,4 @@
-import { watch, type FSWatcher } from 'node:fs';
+import fs, { watch, type FSWatcher } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { Type } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from '@earendil-works/pi-coding-agent';
@@ -11,6 +11,7 @@ import { planDecisions, type DecisionRecord } from '../kernel/lifecycle.ts';
 import { openness } from '../kernel/guards.ts';
 import { recover, type Question } from './child/history.ts';
 import { validate } from './child/schema.ts';
+import { catalogModel, parseModel, sameModel } from '../compat/model.ts';
 import { registerLive } from './child/live.ts';
 
 // boundary = turn_end (steer lands between turns); settle = agent_before_settle (follow-ups land only here or idle).
@@ -63,20 +64,45 @@ export function registerChild(pi: ExtensionAPI): void {
    *  pi captures a turn's model when the turn begins, so a correction in the `context` hook comes too late for that
    *  turn: seen on CI as one "Unknown provider: unknown" reply (pi's placeholder model) after a resume. The registry
    *  can briefly lack an extension provider at startup, so wait for it up to 5 s. */
-  async function ensureModel(ctx: ExtensionContext): Promise<void> {
-    const slash = target?.indexOf('/') ?? -1;
-    if (!target || slash <= 0 || `${ctx.model?.provider}/${ctx.model?.id}` === target) return;
-    let model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
+  let verified: string | undefined, modelFailed = false;
+  async function ensureModel(ctx: ExtensionContext, correct = true): Promise<boolean> {
+    if (modelFailed) return false;
+    if (!target) return true;
+    const selected = parseModel(target), actual = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : { id: 'none' };
+    let model = ctx.modelRegistry.find(selected.provider!, selected.id) ?? catalogModel(selected, ctx.modelRegistry.getAll());
     for (let waited = 0; !model && waited < 5000; waited += 50) {
       await new Promise(resolve => setTimeout(resolve, 50));
-      model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
+      model = ctx.modelRegistry.find(selected.provider!, selected.id) ?? catalogModel(selected, ctx.modelRegistry.getAll());
     }
-    if (model) await pi.setModel(model);
-    else console.error(`durable-subagents: model ${target} is not registered in this pi (have: ${[...new Set(ctx.modelRegistry.getAll().map(m => m.provider))].join(', ')})`);
+    let reason: string | undefined;
+    if (!model) reason = `model is not registered for provider ${selected.provider}`;
+    else if (!sameModel(ctx.model, model)) {
+      if (!correct) reason = 'active model changed after turn selection';
+      else try { if (!await pi.setModel(model)) reason = `no auth for provider ${model.provider} (setModel refused)`; }
+      catch (error) { reason = String(error); }
+    }
+    if (!reason && model && !sameModel(ctx.model, model)) reason = 'pi did not activate the selected model';
+    if (reason) {
+      modelFailed = true; active = false; watcher?.close();
+      const data = { exec, selected, actual, reason };
+      pi.appendEntry(CT.modelUnavailable, data);
+      // Native state survives a crash; RPC wakes the observer even before a first answer exists.
+      fs.writeSync(process.stdout.fd, JSON.stringify({ type: CT.modelUnavailable, ...data }) + '\n');
+      console.error(`durable-subagents: model-unavailable: selected ${target}, pi would use ${actual.provider ? `${actual.provider}/` : ''}${actual.id}: ${reason}`);
+      ctx.shutdown();
+      return false;
+    }
+    if (verified !== target) {
+      const data = { exec, selected, model: { provider: model!.provider, id: model!.id }, virtual: model!.api === 'pi-virtual' };
+      pi.appendEntry(CT.modelReady, data);
+      fs.writeSync(process.stdout.fd, JSON.stringify({ type: CT.modelReady, ...data }) + '\n');
+      verified = target;
+    }
+    return true;
   }
   async function consume(ctx: ExtensionContext, mode: Mode): Promise<SessionBoundaryDraft[]> {
     if (!active || (mode === 'idle' && !ctx.isIdle())) return [];
-    if (mode === 'idle') await ensureModel(ctx); // an idle delivery starts a turn
+    if (mode === 'idle' && !await ensureModel(ctx)) return []; // an idle delivery starts a turn
     const candidates = await scanInbox(inbox), byRid = new Map(candidates.map(req => [req.rid, req]));
     // Scan is asynchronous: recheck before using the idle delivery API.
     if (!active || (mode === 'idle' && !ctx.isIdle())) return [];
@@ -214,7 +240,7 @@ export function registerChild(pi: ExtensionAPI): void {
       // The executor names the model it holds a slot for; apply it before any provider request if pi did not.
       // Observed with pi 1.0.2 on resumed sessions: the registry briefly lacks an extension provider at startup.
       // Nothing is delivered (so no provider request starts) until the held model is resolvable, for up to 5 s.
-      await ensureModel(ctx);
+      if (!await ensureModel(ctx)) return;
       watcher = watch(inbox, () => { void serial(async () => { await consume(ctx, blocked ? 'ask' : 'idle'); }).catch(error => fail(ctx, error)); });
       watcher.on('error', error => fail(ctx, error));
       await consume(ctx, 'idle');
@@ -235,11 +261,11 @@ export function registerChild(pi: ExtensionAPI): void {
   // turn_start runs before the request is prepared (pi reads the model then); `context` runs after it, too late for
   // that request (seen on CI: model_change after the delivered message, then "Unknown provider: unknown"). Keep both.
   const guard = async (_event: unknown, ctx: ExtensionContext) => {
-    const slash = target?.indexOf('/') ?? -1;
-    if (!target || slash <= 0 || `${ctx.model?.provider}/${ctx.model?.id}` === target) return;
-    const model = ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1));
-    if (model) await pi.setModel(model);
-    else console.error(`durable-subagents: model ${target} is not registered before a provider request`);
+    if (!await ensureModel(ctx, (_event as { type?: string })?.type !== 'context')) {
+      // Hook errors are swallowed by pi. Exit this owned child synchronously so a captured fallback model
+      // cannot make a request, even when a provider ignores abort. The receipt was appended synchronously.
+      process.exit(1);
+    }
   };
   pi.on('turn_start', guard);
   pi.on('context', guard);

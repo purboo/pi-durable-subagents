@@ -21,13 +21,13 @@ import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, forwardRid } from "../../kernel/ids.ts";
 import { capacity, seal } from "../../kernel/guards.ts";
 import { buildPiArgs } from "../../compat/pi-args.ts";
-import { parseModel, plainModel, resolveModel, type Model } from "../../compat/model.ts";
+import { parseModel, plainModel, resolveModel, sameModel, type Model } from "../../compat/model.ts";
 import { buildCallResult } from "../../compat/result.ts";
 import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts";
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
-import { boundAnswer, hibernation, openAsked, openQuestion, supersededByBinding } from "./hibernate.ts";
-import { SessionFold, answerKey, digestOpenQuestion } from "./digest.ts";
+import { answerInFlight, boundAnswer, hibernation, openAsked, openQuestion, supersededByBinding } from "./hibernate.ts";
+import { SessionFold, answerKey, digestOpenQuestion, supersededBy } from "./digest.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
@@ -38,6 +38,7 @@ import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 import { indexSweep, recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
 import { gateRetired } from "./effects/gate.ts";
 import { WorktreeIndex, worktreeCalls, worktreeLabel, worktreePair, worktreeRoots, type WorktreeWrite } from "./worktree.ts";
+import { failedModel, modelFailures, MODEL_RETRY_MS, parentPinned, spillCandidates } from "./pool.ts";
 import { PENDING_NOTE, UNDELIVERED_FOLLOW_UP } from "../notes.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
@@ -586,6 +587,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   async function acquireLoop(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>,
     mine: { since: number; blockedOn: ReadonlySet<string>; at: number }, writer?: string): Promise<{ model?: Model; continuation: boolean }> {
     let continuation = false;
+    let pinnedWait: { model: Model; since: number } | undefined;
+    let waitMark = "";
     for (;;) {
       let signal!: () => void;
       const changed = new Promise<void>(resolve => { signal = resolve; waiters.add(resolve); });
@@ -593,10 +596,26 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const chosen = await serial(async () => { try {
         if (interrupted(a) || await workflowReached(a.ticket)) return;
         if (writer && !await writerAdmit(a, writer)) return;
-        const decision = await decide(), models = decision.candidates, pool = decision.pool;
+        const decision = await decide(), pool = decision.pool;
+        let models = decision.candidates;
+        const pinned = decision.spill?.[0];
+        const full = (m: Model) => holdings().filter(h => h.pool === m.provider).length >= (settings().providers?.[m.provider ?? ""]?.slots ?? Infinity);
+        if (pinned && full(pinned)) {
+          if (!sameModel(pinnedWait?.model, pinned)) pinnedWait = { model: pinned, since: Date.now() };
+          const ms = settings().k?.resumeSpillMs;
+          if (ms !== null && (ms ?? 120_000) >= 0 && Date.now() - pinnedWait!.since >= (ms ?? 120_000))
+            models = [...models, ...spillCandidates(pinned, decision.spill!)];
+        } else pinnedWait = undefined;
+        const mark = pinnedWait ? JSON.stringify(pinnedWait.model) : "";
+        if (mark !== waitMark) {
+          await a.ticket.journal.append("slot-wait", { call: a.ticket.callId, exec, ...(pinnedWait ? { model: plainModel(pinnedWait.model), since: pinnedWait.since, pool } : {}) });
+          waitMark = mark;
+        }
         continuation = decision.continuation;
         for (const model of models) {
-          if (!continuation && pool && models.length > 1 && skipped(pool, model)) continue;
+          const spilling = !!pinned && !sameModel(model, pinned);
+          if (pool && (spilling || !continuation && models.length > 1) && skipped(pool, model)) continue;
+          if (failedModel(modelFailures(a.ticket.journal, a.ticket.callId), model)) continue;
           // A pool entry with afterMs waits its turn: it is taken only once this acquisition has waited that long.
           if (model.afterMs !== undefined && Date.now() - mine.since < model.afterMs) continue;
           const provider = model.provider;
@@ -628,6 +647,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             if (probe) await orch.append("provider-probe", { provider, exec });
           }
           const plain = plainModel(model);
+          if (spilling && pinnedWait) {
+            continuation = false;
+            await a.ticket.journal.append("spilled", { call: a.ticket.callId, exec, pool, from: plainModel(pinned!), to: plain, waitedMs: Date.now() - pinnedWait.since });
+          }
           await a.ticket.journal.append("selected", { exec, model: plain, ...(pool ? { pool } : {}) });
           return plain;
         }
@@ -639,30 +662,34 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     }
   }
   /** P13, C5, C8: Decide holdings and CLI model restoration from the same fenced session. */
-  async function launchModel(t: CallTicket, entries: SessionEntry[], previous?: string) {
+  async function launchModel(t: CallTicket, entries: SessionEntry[], previous?: string): Promise<{ candidates: Model[]; continuation: boolean; pool?: string; spill?: Model[] }> {
     const recorded = sessionModel(entries);
     const ownSegment = entries.some(e => e.type === "custom" && e.customType === CT.exec && typeof e.data?.exec === "string" && e.data.exec.startsWith(`${t.callId}#`));
     const freshFork = t.spec.context === "fork" && !t.continueFrom && !ownSegment;
     const { defaultModel: configured, pools } = settings();
     const raw = t.spec.model ?? t.agent.model ?? configured ?? await defaultModel();
     const pool = raw && pools?.[raw] ? raw : undefined;
-    const candidates = raw ? resolveModel(raw, pools) : [{ id: "" }];
-    const candidate = recorded && candidates.some(m => m.provider === recorded.provider && m.id === recorded.id);
+    const failures = modelFailures(t.journal, t.callId);
+    const candidates = (raw ? resolveModel(raw, pools) : [{ id: "" }]).filter(m => !failedModel(failures, m));
+    if (!candidates.length) throw new Error(`model-unavailable: no usable model remains; ${String(failures.at(-1)?.reason ?? raw)}`);
+    const matches = (m: Model, other: Model | undefined) => sameModel(m, other) || !!other && t.journal.entries().some(e => e.type === "model-ready" && sameModel(e.selected as Model, m) && sameModel(e.model as Model, other));
+    const candidate = recorded && candidates.some(m => matches(m, recorded));
     // Leave the session's model for the pool's others when its pool skips it after losses, or its provider's usage
     // window is used up; and at a new generation, go back to the pool's order of preference.
     // A new generation of a pool call starts from the pool also when the session's model is not one of its models
     // (switched outside it, or the follow-up named the pool).
-    const skip = pool && (candidate ? previous && ownSegment && skipped(pool, recorded!) || unavailable(recorded!.provider) || !ownSegment && !!t.continueFrom
-      : !ownSegment && !!t.continueFrom);
+    const skip = pool && (previous && has(t.journal, "model-unavailable", previous) || (candidate ? previous && ownSegment && skipped(pool, recorded!) || unavailable(recorded!.provider) || !ownSegment && !!t.continueFrom
+      : !ownSegment && !!t.continueFrom));
     // A model the call was asked to use replaces the session's: launched with it, and holding its provider's slot.
     const wanted = requestedModel(t.journal, t.callId, t.model);
     // It outranks the pool's order at a new generation too, also when it names the model the session already has.
     // A requested model of the call's own pool keeps the pool: a used-up window still moves the call on.
     const keep = pool && candidates.some(m => m.provider === wanted?.provider && m.id === wanted?.id) ? pool : undefined;
-    if (wanted) return recorded && !freshFork && recorded.provider === wanted.provider && recorded.id === wanted.id
+    if (wanted && !failedModel(failures, wanted)) return recorded && !freshFork && recorded.provider === wanted.provider && recorded.id === wanted.id
       ? { candidates: [recorded], continuation: true, pool: keep }
       : { candidates: [wanted], continuation: false, pool: keep };
-    if (recorded && !freshFork && !skip) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined };
+    if (recorded && !freshFork && !skip && !failedModel(failures, recorded)) return { candidates: [recorded], continuation: true, pool: candidate ? pool : undefined,
+      spill: candidate && pool && !parentPinned(t) ? [recorded, ...candidates.map(m => matches(m, recorded) ? { ...m, id: recorded.id } : m)] : undefined };
     return { candidates, continuation: false, pool };
   }
   /** Resolve a bound answer before it waits for admission; also repairs an interrupted append pair. Called serially. */
@@ -709,11 +736,45 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await resolveQuestion(journal, call, item.qid, item.rev, "carried");
     }
   }
+  /** Model identity receipts are durable before the observer fences an unavailable execution. Serial sections only. */
+  async function unavailableModel(journal: JournalHandle, exec: string, selected: Model, actual: Model, reason: string) {
+    if (!has(journal, "model-unavailable", exec))
+      await journal.append("model-unavailable", { exec, selected, actual, reason: `selected ${selected.provider}/${selected.id}, pi would use ${actual.provider ?? "none"}/${actual.id}: ${reason}`, until: Date.now() + MODEL_RETRY_MS });
+  }
+  function allowedModels(journal: JournalHandle, exec: string): Model[] {
+    const log = journal.entries(), selected = log.find(e => e.type === "selected" && e.exec === exec)?.model as Model | undefined;
+    const models = selected ? [selected] : [];
+    for (const e of log) {
+      const envelope = e.envelope as Envelope | undefined;
+      if (e.type !== "forward" || e.dest !== callOf(exec) || envelope?.kind !== "model") continue;
+      if (log.some(r => r.type === "forward-delivered" && r.rid2 === e.rid2 && r.reason !== undefined)) continue;
+      if (log.some(r => r.type === "forward" && r.dest === e.dest && (r.envelope as Envelope)?.kind === "withdraw" && ((r.envelope as Envelope).body as WithdrawBody)?.rids?.includes(String(e.rid2)))) continue;
+      const body = envelope.body as ModelBody;
+      if (body.exec && body.exec !== exec) continue;
+      models.push({ provider: body.provider, id: body.model });
+    }
+    for (const e of log) if (e.type === "model-ready" && e.exec === exec && models.some(m => sameModel(m, e.selected as Model))) models.push(e.model as Model);
+    return models;
+  }
+  async function modelControl(journal: JournalHandle, exec: string, event: Record<string, unknown>) {
+    if (event.exec !== exec) return;
+    return serial(async () => {
+      if (event.type === CT.modelUnavailable) {
+        await unavailableModel(journal, exec, event.selected as Model, event.actual as Model, String(event.reason));
+        return false;
+      }
+      if (event.type === CT.modelReady && allowedModels(journal, exec).some(m => sameModel(m, event.selected as Model)) &&
+        !journal.entries().some(e => e.type === "model-ready" && e.exec === exec && sameModel(e.selected as Model, event.selected as Model)))
+        await journal.append("model-ready", { exec, selected: event.selected, model: event.model, virtual: event.virtual === true });
+      return !has(journal, "model-unavailable", exec);
+    });
+  }
   /** The model each execution last answered with (`selected`, then `model-used`), cached per execution. */
   const inUse = new Map<string, string>();
   async function switched(exec: string, journal: JournalHandle, event: Record<string, unknown>) {
     const message = event.message as { role?: string; provider?: string; model?: string } | undefined, provider = message?.provider;
     if (!provider) return;
+    let accepted = true;
     await serial(async () => {
       // Evidence of the model in use: the provider and model of each assistant message, recorded when it changes.
       if (message.role === "assistant" && message.model) {
@@ -723,6 +784,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           if (last) inUse.set(exec, `${last.provider}/${last.id}`);
         }
         if (inUse.get(exec) !== name) { await journal.append("model-used", { exec, model: { provider, id: message.model } }); inUse.set(exec, name); }
+        const virtual = journal.entries().findLast(e => e.type === "model-ready" && e.exec === exec)?.virtual === true;
+        if (!virtual && !allowedModels(journal, exec).some(m => sameModel(m, { provider, id: message.model! }))) {
+          const selected = journal.entries().find(e => e.type === "selected" && e.exec === exec)?.model as Model;
+          await unavailableModel(journal, exec, selected, { provider, id: message.model }, "child reported an unselected model");
+          accepted = false; return;
+        }
       }
       const target = holdings().find(h => h.exec === exec && h.pool === provider && h.reserved);
       if (!target) return;
@@ -732,6 +799,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       }
     });
     wake();
+    return accepted;
   }
   /** The model an execution last answered with, or was launched on. */
   function modelOf(journal: JournalHandle, exec: string): Model | undefined {
@@ -904,7 +972,20 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (!bound && pendingAnswer && !answerSettled(pendingAnswer, entries)) bound = pendingAnswer;
       if (exec) {
         await fence(journal, exec, { park: a });
-        await questions(t, entries = await readCall(journal, t.callId));
+        entries = await readCall(journal, t.callId);
+        await serial(() => repairConsumedAnswers(journal, t.callId, entries));
+        await questions(t, entries);
+        bound ??= journal.entries().findLast(e => e.type === "answer-bound" && e.call === t.callId && e.reason === "answered-in-session");
+        // A binding excuses only the execution it was bound to (the asker it ended) and the first launch after it while
+        // that launch never started a child. Every later or started execution is judged by its own evidence, so a
+        // child that dies before writing its exec marker counts toward lossBound instead of relaunching forever.
+        if (bound) {
+          const all = journal.entries(), execSeq = all.find(r => r.type === JT.exec && r.exec === exec)!.seq;
+          const firstAfter = !all.some(r => r.type === JT.exec && r.call === t.callId && r.seq > bound!.seq && r.seq < execSeq);
+          if (!(bound.seq > execSeq || firstAfter && !has(journal, "tracked", exec) &&
+            !digestOf(t.callId, entries).execAt.has(exec))) bound = undefined;
+        }
+        if (bound) await release(exec);
         // D6: after the fence the session is final. A bound answer it closed (answered, superseded, or re-asked as a newer
         // revision) is settled; if the session still has an open question of this call, the call does not launch: it
         // hibernates again on that question (its attention is open, so the parent is asked), and resumes only on a new
@@ -924,8 +1005,16 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs)
           return finish(journal, t.callId, exec, makeResult("timeout"));
         if (ev.budget || reached(totalUsage(journal.entries(), t.callId), t.spec.budget)) return finish(journal, t.callId, exec, makeResult("budget"));
+        for (const e of entries) if (e.customType === CT.modelUnavailable && e.data?.exec === exec)
+          await modelControl(journal, exec, { type: CT.modelUnavailable, ...e.data });
+        const modelFailure = entriesOf(journal, "model-unavailable", exec).at(-1);
+        if (modelFailure) {
+          const selected = entriesOf(journal, "selected", exec).at(-1);
+          if (!selected?.pool) return finish(journal, t.callId, exec, makeResult("failed", "", `model-unavailable: ${String(modelFailure.reason)}`));
+          await release(exec);
+        }
         // A child that never started (its launch failed for a reason of the environment) lost nothing: launch again.
-        if (!bound && !has(journal, "spawn-env-failed", exec)) {
+        if (!bound && !modelFailure && !has(journal, "spawn-env-failed", exec)) {
         // P28: an execution cut off while its only unfinished tool call is the open question's `ask` (before it
         // hibernated) was waiting, not working: it hibernates now and resumes with the answer, like a planned
         // hibernation; it is neither a loss nor, for `once`, an unknown outcome.
@@ -1042,26 +1131,70 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
             if (!q || interrupted(a) || segment < 0 || !((digest.questionAt.get(q.qid) ?? -1) > segment) || entriesOf(journal, "answer-bound").some(e => e.call === t.callId && e.qid === q.qid && e.rev === q.rev)) return;
             await serial(async () => {
               const attention = entriesOf(journal, JT.attention).find(e => isEntry(e, JT.attention) && e.item.qid === q.qid && e.item.call === t.callId && e.item.rev === q.rev);
-              if (attention && Date.now() - attention.ts >= (config.k?.hibernateMs ?? 120000) && !has(journal, JT.fenced, exec!) && hibernation(journal, t.callId)?.exec !== exec) {
+              const all = journal.entries();
+              if (attention && Date.now() - attention.ts >= (config.k?.hibernateMs ?? 120000) && !interrupted(a) && current(journal, t.callId) === exec &&
+                openAsked(all, t.callId, q.qid, q.rev) && !answerInFlight(all, t.callId) &&
+                !all.some(e => e.type === "answer-bound" && e.call === t.callId && e.qid === q.qid && e.rev === q.rev) &&
+                !has(journal, JT.fenced, exec!) && hibernation(journal, t.callId)?.exec !== exec) {
                 await journal.append("hibernated", { call: t.callId, exec, qid: q.qid, rev: q.rev }); a.wake();
               }
             });
           }, recordUsage: values => recordUsage(t, values), usage: entries => digestOf(t.callId, entries).usage,
           wrote: path => wrote(t, exec!, cwd, path),
+          modelControl: event => modelControl(journal, exec!, event),
           switched: event => switched(exec!, journal, event), answered: event => answered(t, exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
       } finally { await fence(journal, exec, { child, park: a }); a.live = undefined; }
     }
   }
   /**
-   * P28: an answer forwarded to the child while the question was still open but before the call hibernated (a restart
-   * or crash cut the asker off, or the planned hibernation fenced it first) never reached a live child. Once the call
-   * hibernates it is bound to the question like an answer given during hibernation; the forward is retired, so the
-   * reply "apply" already given (and any retry with the same rid) stays true.
+   * P28: reconcile an answer forwarded before an interrupted asker hibernated. A consumed answer continues the
+   * session; an unconsumed one binds like an answer given during hibernation and retires its original forward.
+   * The reply "apply" already given (and any retry with the same rid) stays true.
    */
   async function adoptAnswer(journal: JournalHandle, call: string, sleeping: Entry) {
     const entries = await readCall(journal, call);
-    await serial(() => adopt(journal, call, sleeping, entries));
+    await serial(async () => { await repairConsumedAnswers(journal, call, entries); await adopt(journal, call, sleeping, entries); });
+  }
+  /** A fenced asker may have consumed its forwarded answer before the fence. Publish the binding first, then its
+   *  derived resolution and delivery: every prefix is repaired on retry/recovery. Never resend the answer; the next
+   *  execution uses a plain continue in the same session. Called serially, only after the current execution is fenced. */
+  async function repairConsumedAnswers(journal: JournalHandle, call: string, entries: readonly SessionEntry[]) {
+    const exec = current(journal, call);
+    if (!exec || !has(journal, JT.fenced, exec) || sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) return;
+    const digest = digestOf(call, entries);
+    for (const f of entriesOf(journal, "forward").filter(e => e.dest === call)) {
+      const env = f.envelope as Envelope, qid = env.cond?.qid, rev = env.cond?.rev;
+      if (env.kind !== "answer" || !digest.questions.some(q => q.qid === qid && q.rev === rev) ||
+        journal.entries().some(e => e.type === "forward-retired" && e.rid2 === f.rid2)) continue;
+      const receipt = digest.receipts.get(String(f.rid2)), details = receipt?.message?.details ?? receipt?.details;
+      if (!receipt || details?.qid !== qid || details?.rev !== rev) continue;
+      // The binding must not outlive the evidence it derives: fsync the native receipt before journal publication.
+      await collectReceipts(call, [...entries]);
+      const binding = journal.entries().find(e => e.type === "answer-bound" && e.call === call && e.qid === qid && e.rev === rev);
+      // A normal settled turn needs no continuation, nor does an answer consumed in an earlier execution. A receipt
+      // in this execution counts even if observation already resolved its attention before the fence.
+      const sleeping = hibernation(journal, call), segment = digest.execAt.get(exec);
+      const at = entries.indexOf(receipt), consumedHere = segment !== undefined && at > segment;
+      // The execution stopped ON that ask: its result is the answer receipt and nothing ran after it (no report, no
+      // question, no tool call, no finished assistant turn, no other unfinished tool). Otherwise the execution went on
+      // working after the answer and its own evidence (report, once + dangling, loss) decides as usual.
+      const after = entries.slice(at + 1);
+      const stoppedOnAsk = consumedHere && receipt.message?.role === "toolResult" && receipt.message.toolName === "ask" &&
+        !evidence([...entries], exec).dangling.length &&
+        !after.some(e => e.type === "custom" && (e.customType === CT.report || e.customType === CT.question) ||
+          e.message?.role === "assistant" && ((Array.isArray(e.message.content) && e.message.content.some(b => b.type === "toolCall")) ||
+            (e.message.stopReason !== "aborted" && e.message.stopReason !== "error")));
+      const superseded = supersededBy(details);
+      const sleepingAnswered = sleeping?.exec === exec && (sleeping.qid === qid && sleeping.rev === rev ||
+        superseded.some(q => q.qid === sleeping.qid && q.rev === sleeping.rev));
+      if (!binding && (sleepingAnswered || stoppedOnAsk && !has(journal, "settled", exec)))
+        await journal.append("answer-bound", { call, qid, rev, rid: f.rid, rid2: f.rid2, hash: f.hash, reason: "answered-in-session",
+          ...(superseded.length ? { superseded } : {}) });
+      await resolveBoundAnswer(journal, call, qid, rev);
+      for (const q of superseded) await resolveQuestion(journal, call, q.qid, q.rev, "superseded");
+    }
+    await forwardsDelivered(journal, call, [...entries]);
   }
   /** The forward whose adoption was begun (its envelope withdrawn from the child's inbox) and not yet bound. */
   async function adoptionBegun(journal: JournalHandle, call: string): Promise<Entry | undefined> {
@@ -1073,8 +1206,19 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
    *  adoption was begun before a crash (its envelope is withdrawn, so it can reach the child only through this binding).
    *  Called serially. */
   async function adopt(journal: JournalHandle, call: string, sleeping: Entry, entries: readonly SessionEntry[], onlyBegun = false) {
-    const all = journal.entries();
-    if (boundAnswer(all, sleeping)) return;
+    const all = journal.entries(), bound = boundAnswer(all, sleeping);
+    if (bound) {
+      // Repair an adoption cut off after its binding but before resolution/retirement. The original forward and
+      // derived bound identity prove adoption; a consumed answer instead keeps its original delivered identity.
+      await resolveBoundAnswer(journal, call, bound.qid, bound.rev);
+      await resolveSuperseded(journal, call);
+      const f = all.find(e => e.type === "forward" && e.dest === call && e.rid === bound.rid &&
+        contentHash([String(e.rid2), "hibernated"]) === bound.rid2);
+      if (f && !all.some(e => e.type === "forward-retired" && e.rid2 === f.rid2))
+        await journal.append("forward-retired", { rid: f.rid, rid2: f.rid2, reason: "bound-to-hibernation" });
+      if (f) await (await outbox).markResolved(String(f.rid2));
+      return;
+    }
     const begun = await adoptionBegun(journal, call);
     const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
     // The answer to the question it hibernated on, else to another of its questions still open (an earlier one).
@@ -1151,6 +1295,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         const prior = ctx.journal.entries().find(e => e.type === "forward" && e.rid === req.rid && e.dest === dest);
         if (prior) {
           if (prior.hash !== hash) return { action: "reject", reason: "identity-conflict" } as const;
+          if ((prior.envelope as Envelope).kind === "answer") {
+            await repairConsumedAnswers(ctx.journal, dest, await readCall(ctx.journal, dest));
+            const exec = current(ctx.journal, dest);
+            if (exec && has(ctx.journal, JT.fenced, exec)) { active.get(dest)?.wake(); wake(); }
+          }
           if (!ctx.journal.entries().some(e => e.type === "forward-retired" && e.rid2 === prior.rid2)) await replayForward(prior);
           return { action: "apply" } as const;
         }
@@ -1163,6 +1312,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (sealed(ctx.journal, dest)) return { action: "reject", reason: req.kind === "send" && (req.body as SendBody).kind === "answer" ? "retired" : "call-sealed" } as const;
         if (req.kind === "send" && (req.body as SendBody).kind === "answer") {
           const sleeping = hibernation(ctx.journal, dest);
+          await repairConsumedAnswers(ctx.journal, dest, await readCall(ctx.journal, dest));
+          const exec = current(ctx.journal, dest);
+          if (exec && has(ctx.journal, JT.fenced, exec)) { active.get(dest)?.wake(); wake(); }
           // An adoption begun before a crash (the earlier answer withdrawn from the inbox, not yet bound) binds first.
           if (sleeping && current(ctx.journal, dest) === sleeping.exec && !boundAnswer(ctx.journal.entries(), sleeping) && await adoptionBegun(ctx.journal, dest))
             await adopt(ctx.journal, dest, sleeping, await readCall(ctx.journal, dest), true);
@@ -1304,6 +1456,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       for (const call of calls) {
         const session = await readCall(journal, call), values = sessionUsage(session, call);
         await serial(async () => {
+          await repairConsumedAnswers(journal, call, session);
           await forwardsDelivered(journal, call, session);
           const recorded = new Set(journal.entries().filter(e => e.type === "usage" && e.call === call).map(e => e.id));
           for (const u of values) if (!recorded.has(u.id)) await journal.append("usage", { call, ...u });

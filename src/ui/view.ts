@@ -1,5 +1,5 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { isLive, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { answerForwardedNote, isLive, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import type { CallStatus } from "../types.ts";
 import type { sessionFacts } from "./session.ts";
 import { oneLine } from "./frame.ts";
@@ -109,7 +109,7 @@ export function resultPhrase(call: CallSnapshot): string {
 export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, facts: Facts | undefined, now: number): string {
   if (call.phase === "sealed") return resultPhrase(call);
   const question = workflow.attention.find(a => a.kind === "question" && a.call === call.callId);
-  if (question) return `asking main agent: ${question.text}`;
+  if (question) return answerForwardedNote(call, now) || `asking main agent: ${question.text}`;
   const noProgress = workflow.attention.find(a => a.kind === "stall" && a.call === call.callId && a.id.startsWith("noprogress:"));
   // The alert's duration measures progress, whereas lastActivity also advances on provider retries.
   if (noProgress) return /no progress for [^(;]+/.exec(noProgress.text)?.[0].trim() ?? "no progress";
@@ -207,7 +207,7 @@ export function dockLines(workflows: readonly WorkflowSnapshot[], facts: Readonl
     // A running tool is activity; otherwise a minute without new evidence (no message, no tool) stops the spinner.
     const f = facts.get(c.callId), fresh = Boolean(f?.activity) || now - Math.max(c.lastActivity ?? 0, f?.lastActivity ?? 0, c.startedAt ?? 0) < 60_000;
     const mark = asking ? "?" : c.phase === "queued" ? "·" : fresh ? SPIN[Math.floor(now / 500) % SPIN.length]! : "…";
-    const phrase = asking ? `asks: ${w.attention.find(a => a.kind === "question" && a.call === c.callId)!.text}` : statusPhrase(c, w, f, now);
+    const phrase = answerForwardedNote(c, now) || (asking ? `asks: ${w.attention.find(a => a.kind === "question" && a.call === c.callId)!.text}` : statusPhrase(c, w, f, now));
     return rowText(`${mark} `, callName(w, c), name(f?.model ?? c.model), phrase, [], width, cols);
   });
   const more = active.length - shown.length;

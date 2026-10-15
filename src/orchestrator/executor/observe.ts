@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { stat as fileStat } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
-import { JT, attentionEntries, type Entry, type ProcInfo, type Spawned } from "../../types.ts";
+import { CT, JT, attentionEntries, type Entry, type ProcInfo, type Spawned } from "../../types.ts";
 import { callDir, callSession } from "../../paths.ts";
 import { monotoneTime } from "../../kernel/guards.ts";
 import type { CallTicket, OrchestratorConfig } from "../contract.ts";
@@ -29,7 +29,8 @@ type Dependencies = {
   /** This call's session usage (sessionUsage); an implementation that extends one array as the session grows lets each
    *  scan record only the values appended since the last one. */
   usage?(entries: SessionEntry[]): readonly { id: string; usage: Usage }[];
-  switched(event: Record<string, unknown>): Promise<void>;
+  switched(event: Record<string, unknown>): Promise<void | boolean>;
+  modelControl?(event: Record<string, unknown>): Promise<void | boolean>;
   /** An assistant message ended: an answer of a used-up provider makes it available again. */
   answered?(event: Record<string, unknown>): Promise<void>;
   wrote?(path: string): Promise<void>;
@@ -56,7 +57,7 @@ export async function observeExecution(d: Dependencies) {
   let size = (await fileStat(session).catch(() => ({ size: 0 }))).size, checkpoint = performance.now();
   let signal!: () => void;
   const boundary = new Promise<void>(resolve => { signal = resolve; d.setWake(resolve); });
-  let failure: unknown, pending: Promise<unknown> = Promise.resolve(), ending = false;
+  let failure: unknown, pending: Promise<unknown> = Promise.resolve(), ending = false, modelBlocked = false;
   const has = (type: string) => entriesOf(t.journal, type, exec).length > 0;
   const enqueue = (fn: () => Promise<unknown>) => { if (!ending) pending = pending.then(fn).catch(error => { failure = error; signal(); }); };
   const saveTime = () => serial(async () => {
@@ -137,12 +138,19 @@ export async function observeExecution(d: Dependencies) {
     // Stream deltas already updated receipt-time clocks; periodic checks bound decision latency.
     if (event.type === "message_update" || event.type === "tool_execution_update") return;
     enqueue(async () => {
+      if (modelBlocked) return;
+      if (event.type === CT.modelReady || event.type === CT.modelUnavailable) {
+        if (await d.modelControl?.(event) === false) { modelBlocked = true; signal(); }
+        return;
+      }
+      if ((event.type === "message_start" || event.type === "message_end") && await d.switched(event) === false) {
+        modelBlocked = true; signal(); return;
+      }
       const args = event.args as { path?: unknown } | undefined;
       if (event.type === "tool_execution_start" && (event.toolName === "edit" || event.toolName === "write") && typeof args?.path === "string") await d.wrote?.(args.path);
       const slim = observation(event);
       if (slim) {
         await serial(() => t.journal.append("observation", { exec, event: slim }));
-        if (event.type === "message_start") await d.switched(event);
         if (event.type === "message_end") { await d.recordUsage([{ id: String(slim.id), usage: slim.usage as Usage }]); await d.answered?.(event); }
       }
       await limits(); await stall(); await noProgress();
@@ -166,6 +174,9 @@ export async function observeExecution(d: Dependencies) {
       const nextSize = (await fileStat(session).catch(() => ({ size: 0 }))).size;
       if (nextSize > size) { clock.evidence(); size = nextSize; }
       const entries = await (d.read ? d.read() : readSession(session));
+      for (const e of entries) if (e.type === "custom" && (e.customType === CT.modelReady || e.customType === CT.modelUnavailable) && e.data?.exec === exec)
+        if (await d.modelControl?.({ type: e.customType, ...e.data }) === false) { modelBlocked = true; signal(); return; }
+      if (modelBlocked) return;
       await d.questions(entries);
       const values = d.usage ? d.usage(entries) : sessionUsage(entries, t.callId);
       if (values !== usageList) { usageList = values; usageSent = 0; }

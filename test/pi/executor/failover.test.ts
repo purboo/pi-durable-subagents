@@ -5,12 +5,13 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { FAUX, REPO, tempRoot } from "../../harness/pi.ts";
-import { journalPath, orchLedger } from "../../../src/paths.ts";
+import { callDir, callSession, journalPath, orchLedger } from "../../../src/paths.ts";
 import { openJournal } from "../../../src/kernel/journal.ts";
 import { ulid } from "../../../src/kernel/ids.ts";
+import { CT } from "../../../src/types.ts";
 import type { CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 import createExecutor from "../../../src/orchestrator/executor/index.ts";
-import { slotsView } from "../../../src/orchestrator/snapshot.ts";
+import { compactWorkflow, snapshotFromEntries, slotsView } from "../../../src/orchestrator/snapshot.ts";
 
 // Provider failover (todo 0b): a provider whose usage window is used up is avoided, then probed by one call.
 const QUOTA = fileURLToPath(new URL("quota-providers.ts", import.meta.url));
@@ -48,6 +49,41 @@ async function setup(t: TestContext, config: OrchestratorConfig, retry: Record<s
 }
 const providersOf = (f: Awaited<ReturnType<typeof setup>>, key: string) =>
   f.journal.entries().filter(e => e.type === "selected" && String(e.exec).includes(`/${key}@`)).map(e => (e.model as { provider: string }).provider);
+
+test("virtual selection routes to a physical provider without being fenced", { timeout: 30000 }, async t => {
+  const f = await setup(t, { writerLock: "off", k: { trackerMs: 20 } });
+  await writeFile(join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({ extensions: [FAUX, QUOTA, fileURLToPath(new URL("unavailable-provider.ts", import.meta.url))], defaultProvider: "qa", defaultModel: "m", retry: { enabled: false } }));
+  const ticket = f.ticket("a", "router/auto");
+  await f.journal.append("call", { key: "a", gen: 1, spec: ticket.spec });
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, "ok"); assert.equal(result.output, "answered by qb");
+  assert.deepEqual(await f.requests(), ["qb"]);
+  assert.equal(f.journal.entries().find(e => e.type === "model-ready")?.virtual, true);
+  assert.equal(f.journal.entries().some(e => e.type === "model-unavailable"), false);
+  const c = compactWorkflow(snapshotFromEntries(ticket.wid, f.journal.entries())).calls[0]!;
+  assert.equal(c.routedModel, "qb/m"); assert.equal(c.modelMismatch, undefined);
+});
+
+for (const pool of [true, false]) test(`model-unavailable: real pi restore with missing auth ${pool ? "fails over" : "fails clearly"} before any fallback request`, { timeout: 30000 }, async t => {
+  const f = await setup(t, { pools: { top: ["missing-auth/m", "qb/m"] }, k: { trackerMs: 20 } });
+  await writeFile(join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({ extensions: [FAUX, QUOTA, fileURLToPath(new URL("unavailable-provider.ts", import.meta.url))], defaultProvider: "qa", defaultModel: "m", retry: { enabled: false } }));
+  const ticket = f.ticket("a", pool ? "top" : "missing-auth/m"), exec = `${ticket.callId}#1.1`;
+  await f.journal.append("exec", { call: ticket.callId, exec }); await f.journal.append("fenced", { exec });
+  await mkdir(callDir(f.home, ticket.wid, "a", 1), { recursive: true });
+  await writeFile(callSession(f.home, ticket.wid, "a", 1), [
+    { type: "session", version: 3, id: "11111111-1111-4111-8111-111111111111", timestamp: new Date().toISOString(), cwd: ticket.cwd },
+    { type: "model_change", id: "model", parentId: null, timestamp: new Date().toISOString(), provider: "missing-auth", modelId: "m" },
+    { type: "custom", id: "exec", parentId: "model", timestamp: new Date().toISOString(), customType: CT.exec, data: { exec } },
+  ].map(e => JSON.stringify(e)).join("\n") + "\n");
+  const result = await f.executor.run(ticket);
+  assert.equal(result.status, pool ? "ok" : "failed");
+  if (pool) assert.equal(result.output, "answered by qb");
+  else assert.match(result.error!, /model-unavailable: selected missing-auth\/m, pi would use qa\/m:.*auth/);
+  assert.deepEqual(await f.requests(), pool ? ["qb"] : [], "neither the unauthenticated selection nor pi's default makes a request");
+  const failure = f.journal.entries().find(e => e.type === "model-unavailable")!;
+  assert.ok(failure); assert.match(String(failure.reason), /selected missing-auth\/m, pi would use qa\/m:.*auth/);
+  assert.deepEqual(providersOf(f, "a"), pool ? ["missing-auth", "qb"] : ["missing-auth"]);
+});
 
 test("failover: a pool call on a used-up provider continues on the next candidate, and new calls avoid it", { timeout: 60000 }, async t => {
   const f = await setup(t, { pools: { top: ["qa/m", "qb/m"] } });

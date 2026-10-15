@@ -37,6 +37,17 @@ export function openAsked(entries: readonly Entry[], call: string, qid: unknown,
     !entries.some(e => e.type === JT.attentionResolved && e.id === id && e.rev === rev) && !supersededByBinding(entries, call, qid, rev);
 }
 
+/** An answer already forwarded to any open question prevents a planned hibernation, even while its receipt is
+ *  unconfirmed. Read this inside the serial section that commits the hibernation, never from a prior snapshot. */
+export function answerInFlight(entries: readonly Entry[], call: string): boolean {
+  return entries.some(e => {
+    if (e.type !== "forward" || e.dest !== call) return false;
+    const env = e.envelope as { kind?: string; cond?: { qid?: string; rev?: number } } | undefined;
+    return env?.kind === "answer" && openAsked(entries, call, env.cond?.qid, env.cond?.rev) &&
+      !entries.some(r => r.type === "forward-retired" && r.rid2 === e.rid2);
+  });
+}
+
 /** D2: qid@rev of `call` was superseded by a durable binding: an `answer-bound` names it in `superseded`. The binding is
  *  the source of truth; the attention resolution `superseded` is derived from it (and may lag it across a crash). */
 export function supersededByBinding(entries: readonly Entry[], call: string, qid: unknown, rev: unknown): boolean {

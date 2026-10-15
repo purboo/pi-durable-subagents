@@ -146,6 +146,8 @@ export const CT = {
   withdrawn: "dsa-withdrawn",  // custom: { rid, rids } — tombstones AND the withdraw request's receipt (rebuild: withdrawn{rids} + applied{rid})
   question: "dsa-question",    // custom: { qid, rev, question }
   report: "dsa-report",        // custom: { exec, outcome, data?, artifacts? }
+  modelReady: "dsa-model-ready", // custom: { exec, selected, model, virtual } - canonical model activated before delivery
+  modelUnavailable: "dsa-model-unavailable", // custom: { exec, selected, actual, reason } - no request may follow
   model: "dsa-model",          // custom: { rid, provider, model } — model change receipt
   attention: "dsa-attention",  // custom_message (main session): details { items: {id, rev}[] }
   budget: "dsa-budget",        // custom: { exec, usage } — the child refused its next provider request: per-call budget reached (P31b)

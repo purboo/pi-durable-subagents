@@ -4,7 +4,7 @@ import { ASK_CUT, CT } from "../../types.ts";
 import type { Model } from "../../compat/model.ts";
 
 interface Block { type?: string; text?: string; id?: string; name?: string }
-interface Message { role?: string; content?: string | Block[]; stopReason?: string; errorMessage?: string; toolCallId?: string; isError?: boolean; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
+interface Message { role?: string; content?: string | Block[]; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
 export interface SessionEntry {
   type: string; id?: string; customType?: string; data?: Record<string, unknown>; message?: Message;
   provider?: string; modelId?: string; details?: Record<string, unknown>;
@@ -136,6 +136,9 @@ export function refusedByProvider(text: string): boolean {
 export function sessionModel(entries: SessionEntry[]): Model | undefined {
   // pi restores the model of the last model change or assistant message: a relaunch with `--model` on an existing
   // session records no model change, so only the answer tells which model the session went on with.
+  // Virtual answers name the routed physical model; only a later selection replaces the virtual one.
+  const selection = entries.findLast(e => e.type === "model_change" || e.type === "custom" && e.customType === CT.modelReady);
+  if (selection?.customType === CT.modelReady && selection.data?.virtual === true) return selection.data.model as Model;
   const last = entries.findLast(e => e.type === "model_change" && e.provider && e.modelId
     || e.type === "message" && e.message?.role === "assistant" && !!(e.message as { provider?: string }).provider && !!(e.message as { model?: string }).model);
   if (!last) return undefined;

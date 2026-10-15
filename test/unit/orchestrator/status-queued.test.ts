@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openJournal } from "../../../src/kernel/journal.ts";
 import { journalPath, orchLedger } from "../../../src/paths.ts";
-import { compactWorkflow, snapshotFromEntries, statusBrief, workflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
+import { answerForwardedNote, compactWorkflow, snapshotFromEntries, statusBrief, workflowSnapshot } from "../../../src/orchestrator/snapshot.ts";
 import { main } from "../../../src/cli/main.ts";
 import { deriveEntry } from "../../../src/events/derive.ts";
 import { foldWaits, waitInput, waitsOf } from "../../../src/events/waiting.ts";
@@ -57,6 +57,40 @@ test("answered but queued: snapshots, brief, CLI and UI stop asking before resum
   // A bound answer only closes the matching revision of the matching question.
   const newer = snapshotFromEntries(wid, [...bound, entry(9, "attention", { item: { ...item, rev: 2 } })]);
   assert.equal(newer.attention.length, 1); assert.equal(newer.calls[0]!.phase, "asking");
+});
+
+test("pending answers flag JSON and text status without confusing an unanswered question or an answered slot wait", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-forwarded-status-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const journal = await openJournal(journalPath(home, wid)); t.after(() => journal.close());
+  for (const { seq: _s, ts: _t, type, ...fields } of asked) await journal.append(type, fields);
+  const forward = await journal.append("forward", { dest: call, rid: "answer", rid2: "r2", envelope: { kind: "answer", cond: { qid: "q1", rev: 1 } } });
+  const c = workflowSnapshot(home, wid).calls[0]!;
+  assert.deepEqual(c.answerForwarded, { rid: "answer", qid: "q1", rev: 1, at: forward.ts });
+  assert.equal(c.phase, "asking");
+  assert.equal(answerForwardedNote(c, forward.ts + 29999), "");
+  assert.equal(answerForwardedNote(c, forward.ts + 180000), "answer forwarded 3m ago, not delivered");
+  // The journal does not change while the grace expires: cached snapshots must not freeze the warning.
+  t.mock.method(Date, "now", () => forward.ts + 180000);
+  assert.equal(statusBrief(home).active[0]!.calls[0]!.answerForwarded?.rid, "answer");
+  assert.equal(compactWorkflow(workflowSnapshot(home, wid)).calls[0]!.answerForwarded?.at, forward.ts);
+  for (const args of [[wid], [], [wid, "--tail", "1"]]) {
+    const output: string[] = [];
+    assert.equal(await main(["status", ...args], { env: { DSA_HOME: home }, write: text => output.push(text) }), 0);
+    assert.match(output.join("\n"), /asking: answer forwarded 3m ago, not delivered/);
+  }
+  const json: string[] = [];
+  assert.equal(await main(["status", wid, "--json"], { env: { DSA_HOME: home }, write: text => json.push(text) }), 0);
+  assert.equal(JSON.parse(json.join("\n")).calls[0].answerForwarded.rid, "answer");
+  assert.match(statusPhrase(c, workflowSnapshot(home, wid), undefined, Date.now()), /answer forwarded/);
+  assert.match(dockLines([workflowSnapshot(home, wid)], new Map(), () => "M", 150, Date.now()).join("\n"), /answer forwarded/);
+  await journal.append("forward-delivered", { call, rid: "answer", rid2: "r2" });
+  assert.equal(workflowSnapshot(home, wid).calls[0]!.answerForwarded, undefined);
+  await journal.append("forward", { dest: call, rid: "stale", rid2: "stale", envelope: { kind: "answer", cond: { qid: "q1", rev: 0 } } });
+  assert.equal(workflowSnapshot(home, wid).calls[0]!.answerForwarded, undefined, "another revision is not an answer to this question");
+  await journal.append("forward", { dest: call, rid: "retired", rid2: "retired", envelope: { kind: "answer", cond: { qid: "q1", rev: 1 } } });
+  await journal.append("forward-retired", { rid: "retired", rid2: "retired" });
+  assert.equal(workflowSnapshot(home, wid).calls[0]!.answerForwarded, undefined);
 });
 
 test("answer-bound clears asking in the waiting fold before a new execution exists", () => {
