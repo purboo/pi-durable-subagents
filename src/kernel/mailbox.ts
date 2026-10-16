@@ -17,16 +17,24 @@ export async function publishFile(dir: string, name: string, bytes: string | Uin
   const temp = join(dir, `.${ulid()}.tmp`), file = await open(temp, 'wx', 0o600);
   try {
     await file.writeFile(bytes); await file.sync(); await file.close();
-    try { await link(temp, target); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      let identical = false;
-      try { identical = same(await readFile(target)); } catch { /* An unreadable existing file is a conflict. */ }
+    for (let attempt = 0; ; attempt++) {
+      try { await link(temp, target); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        let existing: Buffer | undefined, identical = false;
+        try { existing = await readFile(target); }
+        catch (readError) {
+          // The recipient can consume an envelope between EEXIST and this read. Retry the no-replace link, at most
+          // five attempts; an already resolved recipient safely consumes a duplicate publication again.
+          if ((readError as NodeJS.ErrnoException).code === 'ENOENT' && attempt < 4) continue;
+        }
+        if (existing) try { identical = same(existing); } catch { /* Invalid existing content is a conflict. */ }
+        await syncDirectory(dir);
+        return identical ? 'exists-identical' : 'conflict';
+      }
       await syncDirectory(dir);
-      return identical ? 'exists-identical' : 'conflict';
+      return 'published';
     }
-    await syncDirectory(dir);
-    return 'published';
   } finally { await file.close(); await unlink(temp).catch(() => {}); }
 }
 /** P3, C11: Publish an immutable envelope with atomic no-replace semantics. */

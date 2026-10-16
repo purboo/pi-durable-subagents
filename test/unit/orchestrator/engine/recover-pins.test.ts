@@ -91,12 +91,101 @@ test('an intact terminal workflow is verified on its next use: a resume evaluate
   const recovered = b.engine.store.workflows.get(wf.wid)!;
   assert.ok(Object.getOwnPropertyDescriptor(recovered, 'pins')?.get, 'terminal pins are not resident');
   assert.equal(recovered.pins.source, 'unused', 'details load pins on demand');
-  assert.notStrictEqual(recovered.pins, recovered.pins, 'detail reads do not retain pins');
+  assert.strictEqual(recovered.pins, recovered.pins, 'a detail read caches the checked pins');
+  await delay(1100);
+  assert.ok(Object.getOwnPropertyDescriptor(recovered, 'pins')?.get, 'one-off detail pins are released after idle');
   const rid = await f.request(b, 'resume', { wid: wf.wid });
   assert.equal(f.decision(b, rid)?.type, JT.applied);
   assert.equal(b.evaluator.starts(wf.wid), 1);
   assert.equal(b.engine.store.verified(wf.wid), true);
   assert.ok(Object.getOwnPropertyDescriptor(recovered, 'pins')?.value, 'live work retains verified pins');
+});
+
+test('released pin details validate their record and cache the immutable fallback', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b);
+  const path = join(wf.scriptPath, '..', 'pins.json'), record = JSON.parse(await readFile(path, 'utf8'));
+  record.pins.agents = []; await writeFile(path, JSON.stringify(record));
+  assert.ok(wf.pins.agents.some(a => a.name === 'test'), 'a bad digest cannot replace the pinned agents');
+  assert.strictEqual(wf.pins, wf.pins);
+});
+
+test('released pin details raise the same error as ready when neither record nor snapshot loads', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b);
+  const intent = b.ledgers.orch.entries().find(e => e.type === 'create-intent' && e.wid === wf.wid)!;
+  await rm(join(wf.scriptPath, '..', 'pins.json'));
+  await rm(join(f.dir, (intent.snapshot as { path: string }).path));
+  let failure: unknown;
+  await assert.rejects(b.engine.store.ready(wf), error => { failure = error; return true; });
+  assert.throws(() => wf.pins, error => String(error) === String(failure));
+});
+
+test('historical revision tickets never read the current released pins', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b);
+  const rid = await f.request(b, 'revise', { wid: wf.wid, source: 'new source' });
+  assert.equal(f.decision(b, rid)?.type, JT.applied);
+  b.engine.store.releasePins(wf);
+  await rm(join(wf.scriptPath, '..', 'pins.json'));
+  const historical = await b.engine.store.atRevision(wf, 1);
+  assert.equal(historical.pins.source, 'unused'); assert.equal(historical.revision, 1);
+  assert.equal(wf.revision, 2);
+  assert.ok(Object.getOwnPropertyDescriptor(wf, 'pins')?.get, 'current pins were never loaded');
+});
+
+test('a same-process resume refuses missing released pins before recording resumed', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b, 'parked');
+  assert.equal(b.engine.store.verified(wf.wid), true);
+  const intent = b.ledgers.orch.entries().find(e => e.type === 'create-intent' && e.wid === wf.wid)!;
+  await rm(join(wf.scriptPath, '..', 'pins.json'));
+  await rm(join(f.dir, (intent.snapshot as { path: string }).path));
+  const rid = await f.request(b, 'resume', { wid: wf.wid });
+  assert.match(String(f.decision(b, rid)?.reason), /^pin-failed: .*ENOENT/);
+  assert.equal(wf.journal.entries().some(e => e.type === 'resumed'), false);
+  assert.equal(b.evaluator.starts(wf.wid), 1);
+});
+
+test('idle pin release between follow-up ready and dispatch reloads checked pins', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b);
+  const recordPath = join(wf.scriptPath, '..', 'pins.json'), record = JSON.parse(await readFile(recordPath, 'utf8'));
+  record.pins.agents = []; await writeFile(recordPath, JSON.stringify(record));
+  const ready = b.engine.store.ready.bind(b.engine.store);
+  t.mock.method(b.engine.store, 'ready', async (target: Workflow) => {
+    await ready(target); await delay(1100);
+    assert.ok(Object.getOwnPropertyDescriptor(target, 'pins')?.get, 'idle release occurs before dispatch');
+  });
+  const rid = await f.request(b, 'send', { to: `${wf.wid}/c`, kind: 'follow-up', message: 'more' });
+  assert.equal(f.decision(b, rid)?.type, JT.applied);
+  const call = `${wf.wid}@1/c@2`;
+  for (let i = 0; i < 500 && !wf.journal.entries().some(e => e.type === JT.sealed && e.call === call); i++) await delay(5);
+  assert.equal((wf.journal.entries().find(e => e.type === JT.sealed && e.call === call)?.result as { status?: string })?.status, 'ok');
+});
+
+test('held and already dispatched generations skip pins before building a ticket', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b);
+  const internal = b.engine as unknown as { dispatchGeneration(wf: Workflow, entry: Record<string, unknown>): void; generations: Set<string> };
+  const entry = { key: 'c', gen: 2, spec: { agent: 'test', task: 'more' } }, id = `${wf.wid}@1/c@2`;
+  Object.defineProperty(wf, 'pins', { configurable: true, get: () => { throw new Error('skipped generation loaded pins'); } });
+  internal.generations.add(id);
+  try { assert.doesNotThrow(() => internal.dispatchGeneration(wf, entry)); }
+  finally { internal.generations.delete(id); }
+  const drain = await f.request(b, 'drain', { wid: wf.wid });
+  assert.equal(f.decision(b, drain)?.type, JT.applied);
+  assert.doesNotThrow(() => internal.dispatchGeneration(wf, entry));
+});
+
+test('a held follow-up survives idle pin release and resumes with checked pins', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b);
+  await f.request(b, 'drain', { wid: wf.wid });
+  const rid = await f.request(b, 'send', { to: `${wf.wid}/c`, kind: 'follow-up', message: 'more' });
+  assert.equal(f.decision(b, rid)?.type, JT.applied);
+  await delay(1100);
+  assert.ok(Object.getOwnPropertyDescriptor(wf, 'pins')?.get);
+  const path = join(wf.scriptPath, '..', 'pins.json'), record = JSON.parse(await readFile(path, 'utf8'));
+  record.pins.agents = []; await writeFile(path, JSON.stringify(record));
+  const resume = await f.request(b, 'resume', { wid: wf.wid });
+  assert.equal(f.decision(b, resume)?.type, JT.applied);
+  const call = `${wf.wid}@1/c@2`;
+  for (let i = 0; i < 500 && !wf.journal.entries().some(e => e.type === JT.sealed && e.call === call); i++) await delay(5);
+  assert.equal((wf.journal.entries().find(e => e.type === JT.sealed && e.call === call)?.result as { status?: string })?.status, 'ok');
 });
 
 test('a tampered pinned file of a finished workflow refuses a revise and a follow-up before they use it', async t => {
