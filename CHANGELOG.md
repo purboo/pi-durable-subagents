@@ -8,16 +8,35 @@
   form (single call, `tasks`, `chain`, `runs.run` in a script, `run --request`) and takes `cwd`, `timeoutMs`
   (wall-clock from its start), `env` (added to the orchestrator's environment; `DSA_*` is reserved), `rerun` and
   `writer` (default `false`). See README, "Command calls".
+- An argv array runs a program, never shell syntax: its first element is looked up on the command's `PATH` (127 when
+  no program has it, 126 when the file is not executable), and a shell builtin name such as `exit` is not run as a
+  builtin. A string runs through `/bin/sh -c`. The wrapper that records the exit status works under any `env` the
+  command gets (`PATH` unset or bogus, `IFS`, locale).
 - Result: exit 0 is `ok`, another status `failed`, past `timeoutMs` `timeout`, `stop` `stopped`; `data` is
   `{exitCode, signal, durationMs}` and `output` the last 16 KiB of the interleaved stdout/stderr log. Stop and timeout
-  end the whole process tree, including detached descendants. Steer, follow-up, answer, model and notify are refused.
+  end the whole process tree, including detached descendants. Steer, follow-up, answer, model and notify are refused
+  with one reason, from the tool and the CLI alike (an `answer` without `qid` included).
+- The timeout counts from the command's start, also while no orchestrator runs: a command that ended in time is `ok`
+  or `failed` even when its result is recorded later, and one that ended after its deadline is `timeout` (its exit
+  status still in `data`).
 - A command outlives the orchestrator: a restart (also a forced one), an idle exit, a crash, a quitting pi session or
   `stop-all` leaves it running; the next orchestrator takes it over, or records its result if it ended meanwhile. It
   never runs twice at once. A process gone without an exit record ends `unknown`, or with `rerun: true` starts once
   more. Restart refusals do not count command calls as busy and say how many keep running.
+- A hold (`drain`, `stop-all`, a quitting pi) prevents a command call from starting and never stops one that started.
+  One not started yet (also one waiting for its worktree's writer lock, and the one `rerun`) starts after `resume`.
+  One that started runs to its end and its result is delivered as without the hold, also after an orchestrator
+  restart: a held workflow with a running command counts as pending work, so `start` and a pi session start an
+  orchestrator for it, and a workflow that is then complete finishes and sends its notice. A call it wants next waits
+  for `resume`.
 - In a chain, a command step gets no `{previous}` substitution; an agent step after it gets its output.
 - Status, describe and the subagent view show a command call's command, pid, attempt, elapsed time and log path
   instead of a model.
+- Fixed: an orchestrator started from inside a call (a subagent or a command running the CLI) inherited that call's
+  identity (`DSA_EXEC`, `DSA_CALL` and the other per-call variables), so the end or stop of that call could also end
+  the orchestrator. It now starts without them.
+- Downgrade: once a command call has run, an older version is unsupported. Its orchestrator exits at startup with
+  `Unknown pinned agent: undefined` and changes nothing; installing 1.0.44 again recovers.
 
 ## 1.0.43
 
