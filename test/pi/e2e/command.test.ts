@@ -11,18 +11,19 @@ import { journalPath, orchInbox, orchLedger } from "../../../src/paths.ts";
 import { readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { publishRequest } from "../../../src/kernel/mailbox.ts";
 import { JT, type CallResult, type Entry, type Request } from "../../../src/types.ts";
-import { main } from "../../../src/orchestrator/main.ts";
+import { main, type MainOptions } from "../../../src/orchestrator/main.ts";
+import createExecutor from "../../../src/orchestrator/executor/index.ts";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
 import { Containment } from "../../../src/platform/containment.ts";
 import type { OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 
 const ORIGIN = "main:command-test";
-async function stack(t: TestContext, config: OrchestratorConfig = { k: { idleExitMs: 600_000 } }) {
+async function stack(t: TestContext, config: OrchestratorConfig = { k: { idleExitMs: 600_000 } }, executor?: MainOptions["executor"]) {
   const root = tempRoot("dsa-e2e-cmd-"), home = join(root, "dsa"), cwd = join(root, "work");
   await mkdir(cwd, { recursive: true });
   const old = { DSA_PI_BIN: process.env.DSA_PI_BIN };
   process.env.DSA_PI_BIN = "/bin/false";
-  let controller = new AbortController(), orchestrator = main({ home, config, signal: controller.signal, discovery: { home: root } });
+  let controller = new AbortController(), orchestrator = main({ home, config, signal: controller.signal, discovery: { home: root }, ...(executor ? { executor } : {}) });
   let seq = 0;
   const send = async (kind: Request["kind"], body: unknown, rid?: string) => {
     const n = ++seq, req: Request = { rid: rid ?? `cmd-${n}`, from: ORIGIN, to: "orch", sseq: n, kind, body };
@@ -39,7 +40,7 @@ async function stack(t: TestContext, config: OrchestratorConfig = { k: { idleExi
   const sealed = (wid: string, key = "tasks:0") => until(() => journal(wid).find(e => e.type === JT.sealed && String(e.call).includes(`/${key}@`))?.result as CallResult | undefined, `sealed ${wid}/${key}`);
   const started = (wid: string, n = 1) => until(() => of(journal(wid), "command-started").filter(e => String(e.id).endsWith(`#${n}`))[0], `command-started #${n} of ${wid}`);
   const stop = async () => { controller.abort(); await orchestrator; };
-  const start = () => { controller = new AbortController(); orchestrator = main({ home, config, signal: controller.signal, discovery: { home: root } }); };
+  const start = () => { controller = new AbortController(); orchestrator = main({ home, config, signal: controller.signal, discovery: { home: root }, ...(executor ? { executor } : {}) }); };
   t.after(async () => {
     controller.abort(); await orchestrator.catch(() => {});
     // Leave no process behind, whatever the test did.
@@ -406,4 +407,79 @@ test("C-successor: an orchestrator started from inside a command carries no call
     try { process.kill(pid, "SIGTERM"); } catch { /* gone */ }
     await s.until(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, "successor exit").catch(() => {});
   }
+});
+
+test("F1: an adopted command whose result two observers see is exposed once; the next step runs after resume", { timeout: 90_000 }, async t => {
+  const s = await stack(t);
+  const go = join(s.root, "go");
+  const wid = await s.run({ source: `const a = await runs.run("a", {command: "while [ ! -e '${go}' ]; do sleep 0.05; done; echo a"});\n` +
+    `const b = await runs.run("b", {command: "echo b"});\nreturn [a.output, b.output];` });
+  await s.started(wid);
+  // Not held: the restart adopts the command and the replay dispatches it too.
+  await s.stop(); s.start();
+  await s.until(() => s.ledger().filter(e => e.type === "recovered").length === 2, "recovered");
+  await delay(600);
+  await s.send("drain", { fence: true });
+  await s.until(() => s.ledger().some(e => e.type === "drain"), "drain");
+  writeFileSync(go, "");
+  await s.sealed(wid, "a");
+  await s.until(() => s.journal(wid).some(e => e.type === "call" && e.key === "b"), "b proposed");
+  await delay(300);
+  await s.send("resume", {});
+  const b = await s.sealed(wid, "b");
+  assert.equal(b.status, "ok");
+  const done = await s.until(() => s.journal(wid).find(e => e.type === JT.done), "workflow-done");
+  assert.equal(done.status, "done", JSON.stringify(done));
+  assert.deepEqual(done.result, ["a\n", "b\n"]);
+  await delay(300);
+  const log = s.journal(wid);
+  assert.equal(log.filter(e => e.type === "exposed" && e.pos === 0).length, 1, "one exposure of step 1");
+  assert.equal(log.filter(e => e.type === JT.done).length, 1);
+  assert.equal(log.filter(e => e.type === JT.attention && (e.item as { id: string }).id === `finished:${wid}`).length, 1, "one finished notice");
+  // A restart replays the finished workflow without parking it.
+  await s.stop(); s.start();
+  await s.until(() => s.ledger().filter(e => e.type === "recovered").length === 3, "recovered again");
+  await delay(500);
+  assert.equal(s.journal(wid).filter(e => e.type === JT.done).length, 1, "no second workflow-done (no park)");
+});
+
+test("F2: a drain and a command's start decision are ordered: an intent after the drain starts no process", { timeout: 60_000 }, async t => {
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(r => { release = r; }), reached = new Promise<void>(r => { entered = r; });
+  let paused = false;
+  // The cut: the first command-intent append pauses until the drain request was handled (or could not be).
+  const executor: MainOptions["executor"] = (ledgers, options) => {
+    const real = createExecutor(ledgers, options);
+    return { ...real, run(ticket) {
+      const journal = ticket.journal, append = journal.append.bind(journal);
+      if (!(journal as { cut?: boolean }).cut) {
+        (journal as { cut?: boolean }).cut = true;
+        journal.append = (async (type: string, fields: Record<string, unknown>) => {
+          if (type === "command-intent" && !paused) { paused = true; entered(); await gate; }
+          return append(type, fields);
+        }) as typeof journal.append;
+      }
+      return real.run(ticket);
+    }, suspend: real.suspend.bind(real), shutdown: real.shutdown.bind(real) } as typeof real;
+  };
+  const s = await stack(t, undefined, executor);
+  const marker = join(s.root, "ran");
+  const wid = await s.run({ call: { command: `echo ran > '${marker}'; echo out` } });
+  await reached;
+  const drain = await s.send("drain", { fence: true });
+  // The drain cannot be recorded inside the paused start decision; give it the time it would need.
+  await delay(800);
+  release();
+  const ruled = await s.until(() => s.ledger().find(e => e.type === "drain" && e.rid === drain.rid), "drain recorded");
+  const intent = await s.until(() => of(s.journal(wid), "command-intent")[0], "intent");
+  await delay(1000);
+  const startedAfter = intent.ts > ruled.ts;
+  if (startedAfter) {
+    // (b) is the only other outcome, and then nothing may have started: the intent must not be there at all.
+    assert.fail(`intent at ${intent.ts} after the drain at ${ruled.ts}; started: ${of(s.journal(wid), "command-started").length}, marker: ${existsSync(marker)}`);
+  }
+  // (a): the intent came first, so the command started and runs to its end under the hold, its result delivered.
+  const result = await s.sealed(wid);
+  assert.equal(result.status, "ok"); assert.equal(result.output, "out\n");
+  await s.until(() => s.journal(wid).some(e => e.type === JT.done), "workflow-done under the hold");
 });

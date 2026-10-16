@@ -38,6 +38,9 @@ export interface CommandSpawn {
   env: NodeJS.ProcessEnv;
   /** The attempt directory (absolute): holds output.log and the exit record. */
   dir: string;
+  /** The last check, synchronous, after every preparation and immediately before the spawn (no await between them):
+   *  false starts no process (spawnCommand resolves undefined). */
+  proceed?: () => boolean;
 }
 export interface SpawnedCommand {
   /** The wrapper process (the session leader); `start` is its start token ("" when it ended before it was captured). */
@@ -49,12 +52,17 @@ export interface SpawnedCommand {
 /** The argv the wrapper runs: an argv as given (a program, never shell syntax), a string through `/bin/sh -c`. */
 export const commandArgv = (command: string | readonly string[]): string[] => typeof command === "string" ? ["/bin/sh", "-c", command] : [...command];
 
-/** Start a command (see the module comment). Rejects when it cannot start (a missing cwd, no /bin/sh). */
-export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand> {
+/** Start a command (see the module comment). Rejects when it cannot start (a missing cwd, no /bin/sh); undefined when
+ *  `proceed` said no. */
+export async function spawnCommand(spec: CommandSpawn & { proceed: () => boolean }): Promise<SpawnedCommand | undefined>;
+export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand>;
+export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand | undefined> {
   await mkdir(spec.dir, { recursive: true });
   const fd = openSync(join(spec.dir, COMMAND_LOG), "a");
   try {
-    const child = spawn("/bin/sh", ["-c", WRAPPER, "dsa-command", spec.dir, resolveMv(), ...commandArgv(spec.command)],
+    const mv = resolveMv(), argv = commandArgv(spec.command);
+    if (spec.proceed && !spec.proceed()) return undefined;
+    const child = spawn("/bin/sh", ["-c", WRAPPER, "dsa-command", spec.dir, mv, ...argv],
       { cwd: spec.cwd, env: spec.env, detached: true, stdio: ["ignore", fd, fd] });
     const exited = new Promise<void>(resolve => { child.once("exit", () => resolve()); child.once("error", () => resolve()); });
     await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
