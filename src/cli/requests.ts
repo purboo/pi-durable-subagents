@@ -4,7 +4,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { readJournalFold, readJournalSnapshot, type JournalFold } from "../kernel/journal.ts";
+import { findJournalEntry, readJournalFold, readJournalSnapshot, type JournalFold } from "../kernel/journal.ts";
 import { isResolution, lifecycleResolution } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
@@ -48,7 +48,13 @@ function waitMs(values: Flags, ctx: Context): number {
   if (raw !== undefined && !/^\d+$/.test(raw)) throw new Error("--wait-ms needs a non-negative integer");
   return raw !== undefined ? Number(raw) : ctx.waitMs ?? 60_000;
 }
-function ledger(home: string): Entry[] { return readJournalSnapshot(orchLedger(home)) as Entry[]; }
+function ledger(home: string, needles: readonly string[]): Entry[] {
+  return readJournalFold(orchLedger(home), undefined, () => [] as Entry[], (entries, entry) => { entries.push(entry); }, { needles })?.state ?? [];
+}
+// Shared state consulted by describe's waits/holds/fence readers; workflow/request facts also match their identity.
+const descriptionNeedles = ['created', 'pruned', 'drain', 'undrain', 'hold', 'release', 'switch-observed', 'skip', 'writer-hold',
+  'writer-release', 'config', 'config-rejected', 'restart', 'orchestrator', 'orchestrator-exit', 'recovered',
+  'provider-exhausted', 'provider-available', 'provider-probe'].map(type => `"type":${JSON.stringify(type)}`);
 function decision(entries: readonly Entry[], rid: string) {
   return lifecycleResolution(entries, rid);
 }
@@ -78,13 +84,18 @@ export interface Description {
 }
 /** The state of a request id (`{request}`) or a workflow (`{wid}`), with full texts (no clipping). */
 export async function describe(home: string, key: { request: string } | { wid: string }, now = Date.now()): Promise<Description> {
-  const entries = ledger(home);
-  if ("wid" in key) return describeWorkflow(home, key.wid, entries, now);
-  const rid = requestRid(key.request), found = await findRequest(home, rid);
+  if ("wid" in key) return describeWorkflow(home, key.wid, ledger(home, [...descriptionNeedles, JSON.stringify(key.wid)]), now);
+  const rid = requestRid(key.request), entries = ledger(home, [JSON.stringify(rid)]);
+  // A committed admitted envelope is immutable; reuse the same read when it already contains it.
+  const admitted = entries.find(e => e.type === 'request' && (e.request as Request).rid === rid);
+  const found = admitted ? { request: admitted.request as Request, admitted: true } : await findRequest(home, rid);
   if (!found) return { state: "absent", request: key.request };
   const head = { request: key.request, kind: found.request.kind, spec_digest: specDigest(found.request), ...labelsOf(found.request) };
   const decided = decision(entries, rid), created = createdBy(entries, rid);
-  if (found.request.kind === "run" && created) return { ...await describeWorkflow(home, String(created.wid), entries, now), ...head };
+  if (found.request.kind === "run" && created) {
+    const wid = String(created.wid), workflowEntries = ledger(home, [...descriptionNeedles, JSON.stringify(wid)]);
+    return { ...describeWorkflow(home, wid, workflowEntries, now), ...head };
+  }
   if (decided?.type === "rejected") return { state: "rejected", ...head, reason: String(decided.reason) };
   // A send or stop has no workflow of its own: its decision is the outcome.
   if (decided && found.request.kind !== "run") return { state: "applied", ...head };
@@ -96,9 +107,12 @@ function labelsOf(request: Request | undefined): { labels?: Record<string, strin
   return labels && typeof labels === "object" && Object.keys(labels).length ? { labels } : {};
 }
 /** The admitted run request that created `wid` (the ledger keeps it after a prune). */
-function runOf(entries: readonly Entry[], wid: string): { created?: Entry; run?: Request } {
+function runOf(home: string, entries: readonly Entry[], wid: string): { created?: Entry; run?: Request } {
   const created = entries.find(e => e.type === JT.created && e.wid === wid);
-  return { created, run: created ? entries.find(e => e.type === "request" && (e.request as Request).rid === created.rid)?.request as Request | undefined : undefined };
+  const rid = created?.rid;
+  const run = created ? findJournalEntry(orchLedger(home), e => e.type === "request" && (e.request as Request).rid === rid,
+    { needles: [JSON.stringify(rid)] })?.request as Request | undefined : undefined;
+  return { created, run };
 }
 /** The pinned agents of a workflow revision, read once on demand (the waiting check needs the model of a call that names none). */
 function pinnedAgentModel(home: string, wid: string, rev: number): (agent: string) => string | undefined {
@@ -111,7 +125,7 @@ function pinnedAgentModel(home: string, wid: string, rev: number): (agent: strin
 function describeWorkflow(home: string, wid: string, entries: readonly Entry[], now: number): Description {
   const pruned = entries.find(e => e.type === "pruned" && e.wid === wid);
   if (pruned) return { state: "pruned", wid, pruned: { ...(pruned.status !== undefined ? { status: String(pruned.status) } : {}), endedAt: Number(pruned.endedAt) },
-    ...(typeof pruned.request === "string" ? { request: pruned.request } : {}), ...(typeof pruned.spec_digest === "string" ? { spec_digest: pruned.spec_digest } : {}), ...labelsOf(runOf(entries, wid).run) };
+    ...(typeof pruned.request === "string" ? { request: pruned.request } : {}), ...(typeof pruned.spec_digest === "string" ? { spec_digest: pruned.spec_digest } : {}), ...labelsOf(runOf(home, entries, wid).run) };
   if (!/^[^/\\\0]+$/.test(wid) || wid === "." || wid === ".." || !existsSync(journalPath(home, wid))) return { state: "absent", wid };
   // The snapshot and the journal the wait fold reads must be the same bytes (a writer-wait appended between the two reads
   // would give a reason without its writerWait): read again until the journal did not move around the snapshot.
@@ -119,7 +133,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   for (let i = 0, again = readJournalSnapshot(journalPath(home, wid)) as Entry[]; again !== journal && i < 5; i++, again = readJournalSnapshot(journalPath(home, wid)) as Entry[]) {
     journal = again; wf = workflowSnapshot(home, wid);
   }
-  const { created, run } = runOf(entries, wid), id = created ? requestId(String(created.rid)) : undefined;
+  const { created, run } = runOf(home, entries, wid), id = created ? requestId(String(created.rid)) : undefined;
   const admitted = id ? run : undefined;
   const lstate = leaseState(home), slots = slotsView(home, now), leases = leaseCalls(lstate, now);
   // The same fold and decision the orchestrator's collector uses, from the disk snapshots.
@@ -179,18 +193,19 @@ export async function describeCommand(args: string[], ctx: Context): Promise<num
 // run / send / stop --request
 // ---------------------------------------------------------------------------------------------------------------------
 type Outcome = { type: "applied"; wid?: string } | { type: "rejected"; reason: string };
-/** Wait (bounded) for the request's decision: a run's `created` wid, or the lifecycle resolution. */
-async function outcome(home: string, rid: string, run: boolean, timeoutMs: number): Promise<Outcome | undefined> {
+type OutcomeState = { created?: string; decided?: Outcome };
+type OutcomePoll = { journal?: JournalFold<OutcomeState> };
+/** Wait (bounded) for the request's decision: a run's `created` wid, or the lifecycle resolution. A command can carry
+ *  its position across the pre-submit check and the wait; each call still stats and reads fresh appended bytes. */
+async function outcome(home: string, rid: string, run: boolean, timeoutMs: number, poll: OutcomePoll = {}): Promise<Outcome | undefined> {
   const deadline = performance.now() + timeoutMs;
-  type State = { created?: string; decided?: Outcome };
-  let journal: JournalFold<State> | undefined;
   for (;;) {
-    journal = readJournalFold<State>(orchLedger(home), journal, () => ({}), (state, entry) => {
+    poll.journal = readJournalFold<OutcomeState>(orchLedger(home), poll.journal, () => ({}), (state, entry) => {
       if (entry.rid !== rid) return;
       if (run && entry.type === JT.created && state.created === undefined) state.created = String(entry.wid);
       if (!state.decided && isResolution(entry)) state.decided = entry.type === "rejected" ? { type: "rejected", reason: String(entry.reason) } : { type: "applied" };
-    });
-    const state = journal?.state;
+    }, { needles: [JSON.stringify(rid)] });
+    const state = poll.journal?.state;
     if (state?.created !== undefined) return { type: "applied", wid: state.created };
     if (state?.decided?.type === "rejected") return state.decided;
     if (state?.decided && !run) return { type: "applied" };
@@ -213,7 +228,7 @@ async function submitAndWait(ctx: Context, seen: Seen, id: string, kind: "run" |
   Promise<{ code: number } | { sent: Sent; outcome: Outcome; earlier: boolean }> {
   // `created` is false only when the id was already decided before this invocation submitted (decisions are
   // monotonic); racing first attempts may all report created — the wid is what identifies the run.
-  const rid = requestRid(id), earlier = Boolean(await outcome(ctx.home, rid, kind === "run", 0));
+  const rid = requestRid(id), poll: OutcomePoll = {}, earlier = Boolean(await outcome(ctx.home, rid, kind === "run", 0, poll));
   let sent: Identified;
   try { sent = await submitIdentified(ctx.home, rid, kind, body, cond, ctx.env, ctx.starter); seen.submitted = !("conflict" in sent); }
   catch (error) {
@@ -225,7 +240,7 @@ async function submitAndWait(ctx: Context, seen: Seen, id: string, kind: "run" |
     throw error;
   }
   if ("conflict" in sent) return { code: await conflict(ctx, id, sent.digest, json) };
-  const result = await outcome(ctx.home, rid, kind === "run", wait);
+  const result = await outcome(ctx.home, rid, kind === "run", wait, poll);
   if (!result) return { code: pending(ctx, id, json) };
   const admitted = (await findRequest(ctx.home, rid))?.request;
   if (admitted && specDigest(admitted) !== sent.digest) return { code: await conflict(ctx, id, specDigest(admitted), json) };
@@ -307,10 +322,10 @@ async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<num
 /** `<run-id>` or `<wid>` → wid when that run id created one; `pending` when the run is known but has no workflow yet. */
 async function widOf(home: string, head: string): Promise<{ wid: string } | { pending: true }> {
   if (!REQUEST_ID.test(head)) return { wid: head };
-  const rid = requestRid(head), created = createdBy(ledger(home), rid);
+  const rid = requestRid(head), created = createdBy(ledger(home, [JSON.stringify(rid)]), rid);
   if (created) return { wid: String(created.wid) };
   const found = await findRequest(home, rid);
-  return found?.request.kind === "run" && decision(ledger(home), rid)?.type !== "rejected" ? { pending: true } : { wid: head };
+  return found?.request.kind === "run" && decision(ledger(home, [JSON.stringify(rid)]), rid)?.type !== "rejected" ? { pending: true } : { wid: head };
 }
 /** `--to <run-id>[/<key>] | <wid>/<key>` (+ `--call <key>`) → `<wid>/<key>`; a run of one call implies its key. */
 async function target(home: string, to: string, call: string | undefined, prior: Request | undefined): Promise<{ to: string } | { pending: true }> {
@@ -379,7 +394,8 @@ async function sendRequest(args: string[], ctx: Context, seen: Seen, batch?: str
   const id = text(values, "request"), to = text(values, "to"), kind = text(values, "kind"), json = values.json === true, wait = waitMs(values, ctx);
   seen.id = id; seen.json = json;
   if (!id || !to || !kind || positionals.length) throw new Error(SEND_USAGE);
-  const rid = requestRid(id), prior = (await findRequest(ctx.home, rid))?.request;
+  const related = [`${id}:1`, to.split('/')[0]!].filter(value => REQUEST_ID.test(value)).map(requestRid);
+  const rid = requestRid(id), prior = (await findRequest(ctx.home, rid, related))?.request;
   // A single send under an id that names a send to several calls (<id>:1 ...) is other content.
   if (!prior && await namesMany(ctx.home, id)) {
     ctx.write(json ? JSON.stringify({ request: id, error: "request-conflict" }) : `${id}: request-conflict - this id names a send to several calls; use a new id`);
@@ -438,7 +454,7 @@ function decided(ctx: Context, id: string, done: { sent: Sent; outcome: Outcome 
   const followed = done.sent.request.kind === "send" ? followUpReceipt(ctx.home, done.sent.request.rid, done.sent.request.body) : {};
   const opened = followed.generation !== undefined ? followed : undefined;
   // A notify says how it went (steered, held-until-answer or noted); a model send which model and when it applies.
-  const notified = done.sent.request.kind === "send" ? sendReceipt(ledger(ctx.home), done.sent.request.rid) : {};
+  const notified = done.sent.request.kind === "send" ? sendReceipt(ledger(ctx.home, [JSON.stringify(done.sent.request.rid)]), done.sent.request.rid) : {};
   const receipt = notified.delivery ? { delivery: notified.delivery, note: notified.note }
     : followed.delivery ? { delivery: followed.delivery, call: followed.call, note: followed.note } : {};
   const reply = { request: id, applied: true, ...(opened ? { generation: opened.generation, call: opened.call } : {}), ...receipt, spec_digest: done.sent.digest };

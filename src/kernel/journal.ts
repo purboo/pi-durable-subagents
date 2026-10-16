@@ -120,9 +120,34 @@ export function readJournalUncached(path: string): { ino: number; size: number; 
 }
 /** A compact reader's position, with no decoded history. `length` stops before an uncommitted tail. */
 export type JournalFold<T> = { dev: number; ino: number; size: number; length: number; seen: number; state: T };
+/** Find candidate byte positions once per chunk, then advance only as JSON lines pass them. Latin-1 preserves
+ *  byte offsets for literal multi-needle searches. Pending partial lines are included in the next chunk. */
+function lineCandidates(bytes: Buffer, needles: readonly Buffer[], pattern?: RegExp): (start: number, end: number) => boolean {
+  if (pattern) {
+    const text = bytes.toString('latin1');
+    pattern.lastIndex = 0;
+    let hit = pattern.exec(text);
+    return (start, end) => {
+      if (hit && hit.index < start) { pattern.lastIndex = start; hit = pattern.exec(text); }
+      return hit !== null && hit.index < end && hit.index + hit[0].length <= end;
+    };
+  }
+  const needle = needles[0];
+  let next = needle ? bytes.indexOf(needle) : -1;
+  return (start, end) => {
+    if (next >= 0 && next < start) next = bytes.indexOf(needle!, start);
+    return next >= start && next + needle!.length <= end;
+  };
+}
 /** Fold a committed prefix a bounded chunk at a time. Only one record (possibly larger than a chunk) is buffered;
- *  newly appended bytes extend the state, and replacement or shrink rebuilds it. Never repairs the journal. */
-export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefined, empty: () => T, apply: (state: T, entry: Entry, offset: number) => void): JournalFold<T> | undefined {
+ *  newly appended bytes extend the state, and replacement or shrink rebuilds it. Never repairs the journal.
+ *  With needles, every line is still framed and CRC-checked and counted in seen, but only JSON bytes containing a
+ *  needle are parsed/applied. The caller guarantees that every entry apply can act on contains a needle in its JSON
+ *  text (use JSON.stringify of a string field value, or a canonical key/value pair). False positives only cost a
+ *  parse. Syntax/envelope validation applies to parsed lines; skipped lines still preserve framing/CRC corruption
+ *  and torn-tail semantics. Keep the same needles and reducer when extending a prior fold. */
+export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefined, empty: () => T, apply: (state: T, entry: Entry, offset: number) => void,
+  options: { needles?: readonly string[] } = {}): JournalFold<T> | undefined {
   let fd: number;
   try { fd = openSync(path, 'r'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
@@ -131,36 +156,47 @@ export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefin
     if (prior && prior.dev === dev && prior.ino === ino && prior.size === size) return prior;
     const kept = prior && prior.dev === dev && prior.ino === ino && size >= prior.size;
     const record: JournalFold<T> = kept ? { ...prior, size } : { dev, ino, size, length: 0, seen: 0, state: empty() };
-    let offset = record.length, pending = Buffer.alloc(0);
+    // A literal newline cannot occur within one framed JSON line. Empty needles match every line.
+    let needles = options.needles?.map(needle => Buffer.from(needle)).filter(needle => !needle.includes(10));
+    if (needles?.some(needle => !needle.length)) needles = undefined;
+    // One literal alternation scans a chunk once for a set of types/IDs, instead of once for every needle.
+    const pattern = needles && needles.length > 1 ? new RegExp(needles.map(needle => needle.toString('latin1').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g') : undefined;
+    let offset = record.length, pending: Buffer[] = [];
     const buffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, size - offset)));
     while (offset < size) {
       const n = readSync(fd, buffer, 0, Math.min(buffer.length, size - offset), offset);
       if (!n) throw new Error(`Journal changed during read: ${path}`);
       offset += n;
-      const bytes = pending.length ? Buffer.concat([pending, buffer.subarray(0, n)]) : buffer.subarray(0, n);
+      const part = buffer.subarray(0, n);
+      if (pending.length && part.indexOf(10) < 0) { pending.push(Buffer.from(part)); continue; }
+      const bytes = pending.length ? Buffer.concat([...pending, part]) : part;
+      let candidate: ReturnType<typeof lineCandidates> | undefined;
       let start = 0, end: number;
       while ((end = bytes.indexOf(10, start)) >= 0) {
-        let entry: Entry;
+        let entry: Entry | undefined;
         try {
-          const json = unframeLine(bytes.subarray(start, end));
-          if (json === undefined) throw new Error('CRC');
-          entry = JSON.parse(json) as Entry;
-          if (entry.seq !== record.seen + 1 || !Number.isFinite(entry.ts) || typeof entry.type !== 'string') throw new Error('Envelope');
+          const line = bytes.subarray(start, end), json = line.subarray(9), head = frameHead(line);
+          if (line.length < 10 || head < 0 || crcValue(json) !== head) throw new Error('CRC');
+          if (!needles || (candidate ??= lineCandidates(bytes, needles, pattern))(start + 9, end)) {
+            entry = JSON.parse(json.toString('utf8')) as Entry;
+            if (entry.seq !== record.seen + 1 || !Number.isFinite(entry.ts) || typeof entry.type !== 'string') throw new Error('Envelope');
+          }
         } catch (cause) {
           if (offset - bytes.length + end !== size - 1) throw new Error(`Journal corruption at byte ${record.length}`, { cause });
           return record;
         }
-        apply(record.state, entry, record.length);
+        if (entry) apply(record.state, entry, record.length);
         record.seen++; record.length += end + 1 - start; start = end + 1;
       }
-      pending = Buffer.from(bytes.subarray(start));
+      pending = start < bytes.length ? [Buffer.from(bytes.subarray(start))] : [];
     }
     return record;
   } finally { closeSync(fd); }
 }
-/** Find one record without retaining history (request-time lookups that do not belong in a compact polling state). */
-export function findJournalEntry(path: string, match: (entry: Entry) => boolean): Entry | undefined {
-  return readJournalFold<{ found?: Entry }>(path, undefined, () => ({}), (state, entry) => { if (!state.found && match(entry)) state.found = entry; })?.state.found;
+/** Find the first matching record without retaining history. Needles have the same caller guarantee as
+ *  readJournalFold: every entry match can accept must contain a needle in its JSON text. */
+export function findJournalEntry(path: string, match: (entry: Entry) => boolean, options: { needles?: readonly string[] } = {}): Entry | undefined {
+  return readJournalFold<{ found?: Entry }>(path, undefined, () => ({}), (state, entry) => { if (!state.found && match(entry)) state.found = entry; }, options)?.state.found;
 }
 
 /** Read one framed entry at an offset indexed by this journal's single writer. Never retains a snapshot. */

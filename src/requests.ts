@@ -7,11 +7,11 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { contentHash } from './kernel/ids.ts';
-import { findJournalEntry, readJournalSnapshot } from './kernel/journal.ts';
+import { readJournalFold, type JournalFold } from './kernel/journal.ts';
 import { publishRequest, type Outbox } from './kernel/mailbox.ts';
 import { OsLock } from './platform/lock.ts';
 import { orchInbox, orchLedger, outboxRoot } from './paths.ts';
-import type { Conditions, Request, RequestKind } from './types.ts';
+import type { Conditions, Entry, Request, RequestKind } from './types.ts';
 
 export const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/;
 const PREFIX = 'req:';
@@ -57,15 +57,37 @@ export function specDigest(req: Pick<Request, 'kind' | 'body' | 'cond'>): string
   if (req.kind === 'send' && body && typeof body === 'object' && !Array.isArray(body)) { const { caller: _, ...rest } = body as Record<string, unknown>; body = rest; }
   return contentHash({ kind: req.kind, body, cond: req.cond });
 }
+// Repeated request checks verify the same immutable prefixes, including on either side of a lock. Retain only
+// negative positions, never envelopes: every check still stats the file and folds fresh appended bytes. The bound
+// covers several request IDs across many sender files without growing with a pi session's request history.
+const misses = new Map<string, JournalFold<{ found?: Entry }>>();
+function requestIn(path: string, rid: string, type: 'request' | 'sent', related: readonly string[]): Entry | undefined {
+  const probes = [...new Set([rid, ...related])], keyOf = (id: string) => JSON.stringify([path, id, type]);
+  const prior = probes.length === 1 ? misses.get(keyOf(rid)) : undefined, present = new Set<string>();
+  for (const id of probes) misses.delete(keyOf(id)); // A failed read must not retain partially extended state.
+  const record = readJournalFold<{ found?: Entry }>(path, prior, () => ({}), (state, entry) => {
+    if (entry.type !== type) return;
+    if (!state.found && (entry.request as Request).rid === rid) state.found = entry;
+    const id = (entry.request as Request | undefined)?.rid;
+    if (id !== undefined && probes.includes(id)) present.add(id);
+  }, { needles: probes.map(id => JSON.stringify(id)) });
+  // A superset scan proves an empty fold for each absent hinted ID at exactly the same verified prefix. Later
+  // decision points still stat and read appended bytes under their own filter, including after acquiring a lock.
+  // Do not cache a torn tail: a repair can replace it with a committed line at the same inode and size.
+  if (record && record.length === record.size) for (const id of probes) if (!present.has(id)) misses.set(keyOf(id), { ...record, state: {} });
+  while (misses.size > 1024) misses.delete(misses.keys().next().value!);
+  return record?.state.found;
+}
 /** The envelope recorded for `rid`: the orchestrator's admitted copy (ledger `request`, kept after prune), else any
- *  sender's outbox `sent` entry (published or about to be). Read-only. */
-export async function findRequest(home: string, rid: string): Promise<{ request: Request; admitted: boolean } | undefined> {
-  const admitted = findJournalEntry(orchLedger(home), e => e.type === 'request' && (e.request as Request).rid === rid);
+ *  sender's outbox `sent` entry (published or about to be). Read-only. Related IDs are only hints for sharing a
+ *  verified negative prefix; their eventual lookups still read fresh state and preserve first-match/file order. */
+export async function findRequest(home: string, rid: string, related: readonly string[] = []): Promise<{ request: Request; admitted: boolean } | undefined> {
+  const admitted = requestIn(orchLedger(home), rid, 'request', related);
   if (admitted) return { request: admitted.request as Request, admitted: true };
   const dir = join(outboxRoot(home), 'outbox');
   const names = await readdir(dir).catch(error => { if (error.code === 'ENOENT') return [] as string[]; throw error; });
   for (const name of names.filter(n => n.endsWith('.jsonl')).sort()) {
-    const sent = readJournalSnapshot(join(dir, name)).find(e => e.type === 'sent' && (e.request as Request).rid === rid);
+    const sent = requestIn(join(dir, name), rid, 'sent', related);
     if (sent) return { request: sent.request as Request, admitted: false };
   }
   return undefined;

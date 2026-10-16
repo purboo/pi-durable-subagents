@@ -76,13 +76,19 @@ export function readerHold(ix: ReaderLedger, wid: string, origin?: string): Drai
   return last?.type === "drain" && (!created || created.seq < last.seq) ? last : undefined;
 }
 const readers = new Map<string, JournalFold<ReaderLedger>>();
+// Canonical writer JSON: these are exactly the types that affect reader projections or applyLedger below.
+const needles = ['created', 'create-intent', 'revise-intent', 'pruned', 'drain', 'undrain', 'applied', 'rejected',
+  'send-note', 'hold', 'release', 'config', 'config-rejected', 'restart', 'orchestrator', 'orchestrator-exit',
+  'recovered', 'provider-exhausted', 'provider-available', 'provider-probe'].map(type => `"type":${JSON.stringify(type)}`);
+// Request records only affect labels/session for runs; the other request kinds have no reader projection.
+needles.push('"kind":"run"');
 export function readerLedger(home: string): JournalFold<ReaderLedger> {
   const path = orchLedger(home);
   // Drop any raw snapshot loaded by another read path in this process. This reader never creates one itself.
   forgetJournalSnapshot(path);
   try {
-    const record = readJournalFold(path, readers.get(path), emptyReaderLedger, applyReaderLedger);
-    if (record) { readers.set(path, record); return record; }
+    const record = readJournalFold(path, readers.get(path), emptyReaderLedger, applyReaderLedger, { needles });
+    if (record) { record.state.state.seen = record.seen; readers.set(path, record); return record; }
     readers.delete(path);
     return { dev: 0, ino: 0, size: 0, length: 0, seen: 0, state: emptyReaderLedger() };
   } catch (error) { readers.delete(path); throw error; } // a partial fold is never retried as an accepted prefix
