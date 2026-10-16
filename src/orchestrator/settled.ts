@@ -17,6 +17,7 @@ import { revisionEntries, terminalEntry, type Workflow } from "./store.ts";
 import { RECOVERY_VERSION } from "./executor/recovered.ts";
 import { sweepSeed, type SweepSeed } from "./executor/sweep.ts";
 import { callEntries } from "./executor/indexes.ts";
+import { unsealedCommandCalls } from "./executor/command.ts";
 
 /** Bump whenever the record gains a field or settledFacts a condition: every record is then rebuilt once. */
 export const SETTLED_VERSION = 2;
@@ -54,6 +55,8 @@ export function settledFacts(wf: Workflow, recovered: (call: string) => boolean)
     const call = String(e.call); calls.add(call);
     if (!fenced.has(String(e.exec))) return `unfenced:${String(e.exec)}`;
   }
+  // A command call with an attempt and no seal may still run: the next start adopts it.
+  for (const call of unsealedCommandCalls(log)) return `live:${call}`;
   for (const call of calls) {
     if (!ended.has(call)) return `live:${call}`;
     if (!recovered(call)) return `unrecovered:${call}`;
