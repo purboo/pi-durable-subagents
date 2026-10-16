@@ -1,7 +1,9 @@
 # Changelog
 
-## 1.0.44
+## 1.0.45
 
+- 1.0.44 was tagged but never published: its release checks failed on macOS. 1.0.45 is the first release with
+  command calls; on macOS, too, an argv whose program path does not exist ends with 127.
 - Command calls: a call spec with `command` (an argv array, or a string for `/bin/sh -c`) instead of `agent`/`task`
   runs the command without a model, a provider slot or tokens, and wakes the session that started it like any finished
   call. Use it for a long build, a test suite or a wait that should not keep an agent busy. It works in every launch
