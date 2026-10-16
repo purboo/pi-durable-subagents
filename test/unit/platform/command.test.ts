@@ -46,7 +46,9 @@ test("the wrapper records the status of argv, string and builtin commands; outpu
     assert.equal(record.status, status, JSON.stringify(command));
     if (output) assert.equal(readFileSync(join(dir, "output.log"), "utf8"), output);
     assert.ok(!existsSync(join(dir, "exit.tmp")));
-    await spawned.exited;
+    // The wrapper is unref'd: a timer keeps this test's event loop alive until its exit event arrives.
+    const keep = setInterval(() => {}, 1000);
+    try { await spawned.exited; } finally { clearInterval(keep); }
     assert.equal(await captureStart(spawned.pid), "", "the wrapper is gone (reaped)");
   }
 });
