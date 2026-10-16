@@ -392,7 +392,9 @@ export function waitCollector(src: WaitSources): (now?: number) => WaitsCollecte
       let hit = folds.get(wf.wid);
       if (hit?.entries !== entries) { hit = { entries, fold: foldWaits(wf.wid, entries, hit?.fold) }; folds.set(wf.wid, hit); }
       if (!liveWaitCalls(hit.fold).length) continue;
-      const agents = wf.pins?.agents;
+      // A pins load that fails (released pins, damaged record) leaves the agents unknown, as when pins are absent.
+      let agents: readonly { name: string; model?: string }[] | undefined;
+      try { agents = wf.pins?.agents; } catch { agents = undefined; }
       for (const [call, wait] of waitsOf(hit.fold, env, agents ? name => agents.find(a => a.name === name)?.model : undefined)) {
         const c = hit.fold.calls.get(call)!, m = runs.meta.get(wf.wid);
         current.set(call, wait);
