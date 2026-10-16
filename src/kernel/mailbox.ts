@@ -2,7 +2,7 @@ import { link, mkdir, open, readdir, readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Conditions, JournalHandle, Request, RequestKind } from '../types.ts';
 import { contentHash, ulid } from './ids.ts';
-import { openJournal, syncDirectory } from './journal.ts';
+import { journalEntryAt, openFoldedJournal, syncDirectory } from './journal.ts';
 
 type Publication = 'published' | 'exists-identical' | 'conflict';
 function safeName(name: string): string {
@@ -59,27 +59,30 @@ export async function scanInbox(inboxDir: string, report: (path: string, error: 
 
 /** P38: A single-authority durable sender; serialize send, replay and deletion. */
 export class Outbox {
-  private journal: JournalHandle;
+  private journal!: Pick<JournalHandle, 'append' | 'close'>;
+  private path: string;
   private sender: string;
   private inbox: (to: string) => string;
   private pending = new Map<string, Request>();
-  private sent = new Map<string, Request>();
+  /** Historical envelopes live only on disk; offsets keep idempotent sends and recovery lookups bounded. */
+  private offsets = new Map<string, number>();
   private high = new Map<string, number>();
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
-  private constructor(journal: JournalHandle, sender: string, inbox: (to: string) => string) {
-    this.journal = journal; this.sender = sender; this.inbox = inbox;
-    for (const entry of journal.entries()) {
+  private constructor(path: string, sender: string, inbox: (to: string) => string) {
+    this.path = path; this.sender = sender; this.inbox = inbox;
+  }
+  /** P38: Open outbox/<senderId>.jsonl; caller supplies recipient routing. Only pending envelopes stay resident. */
+  static async open(root: string, senderId: string, inbox: (to: string) => string): Promise<Outbox> {
+    const box = new Outbox(join(root, 'outbox', `${safeName(senderId)}.jsonl`), senderId, inbox);
+    box.journal = await openFoldedJournal(box.path, (entry, offset) => {
       if (entry.type === 'sent') {
         const req = entry.request as Request;
-        this.high.set(req.to, Math.max(this.high.get(req.to) ?? 0, req.sseq));
-        this.pending.set(req.rid, req); this.sent.set(req.rid, req);
-      } else if (entry.type === 'resolved') this.pending.delete(entry.rid as string);
-    }
-  }
-  /** P38: Open outbox/<senderId>.jsonl; caller supplies recipient routing. */
-  static async open(root: string, senderId: string, inbox: (to: string) => string): Promise<Outbox> {
-    return new Outbox(await openJournal(join(root, 'outbox', `${safeName(senderId)}.jsonl`)), senderId, inbox);
+        box.high.set(req.to, Math.max(box.high.get(req.to) ?? 0, req.sseq));
+        box.pending.set(req.rid, req); box.offsets.set(req.rid, offset);
+      } else if (entry.type === 'resolved') box.pending.delete(entry.rid as string);
+    });
+    return box;
   }
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     if (this.closed) return Promise.reject(new Error('Outbox closed'));
@@ -94,7 +97,7 @@ export class Outbox {
   send(to: string, kind: RequestKind, body: unknown, cond?: Conditions, opts: { rid?: string } = {}): Promise<Request> {
     const payload = structuredClone({ body, cond });
     return this.serial(async () => {
-      const prior = opts.rid ? this.sent.get(opts.rid) : undefined;
+      const prior = opts.rid ? this.recorded(opts.rid) : undefined;
       if (prior) {
         if (prior.to !== to || prior.kind !== kind || contentHash({ body: prior.body, cond: prior.cond }) !== contentHash({ body: payload.body, cond: payload.cond }))
           throw new Error(`Outbox identity conflict: ${opts.rid}`);
@@ -103,12 +106,15 @@ export class Outbox {
       }
       const req: Request = { rid: opts.rid ?? ulid(), from: this.sender, to, sseq: (this.high.get(to) ?? 0) + 1, kind, body: payload.body, ...(payload.cond ? { cond: payload.cond } : {}) };
       await this.journal.append('sent', { request: req });
-      this.high.set(to, req.sseq); this.pending.set(req.rid, req); this.sent.set(req.rid, req);
       await this.publish(req); return structuredClone(req);
     });
   }
   /** The envelope recorded as sent under `rid`, if any. */
-  recorded(rid: string): Request | undefined { const req = this.sent.get(rid); return req && structuredClone(req); }
+  recorded(rid: string): Request | undefined {
+    const offset = this.offsets.get(rid);
+    const req = this.pending.get(rid) ?? (offset === undefined ? undefined : journalEntryAt(this.path, offset).request as Request);
+    return req && structuredClone(req);
+  }
   /** The identities still awaiting terminal resolution, without copying their envelopes. */
   pendingRids(): Set<string> { return new Set(this.pending.keys()); }
   /** The recipients of unresolved envelopes. */
@@ -118,7 +124,7 @@ export class Outbox {
   /** P38: Record observed terminal resolution without deleting the sequence high-water. */
   markResolved(rid: string): Promise<void> { return this.serial(async () => {
     if (!this.pending.has(rid)) return;
-    await this.journal.append('resolved', { rid }); this.pending.delete(rid);
+    await this.journal.append('resolved', { rid });
   }); }
   /** C11: Drain outstanding operations before closing the durable log. */
   async close(): Promise<void> { this.closed = true; await this.queue; await this.journal.close(); }

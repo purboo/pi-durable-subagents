@@ -88,10 +88,15 @@ test('an intact terminal workflow is verified on its next use: a resume evaluate
   const f = await home(t), first = await f.boot(), wf = await f.finished(first, 'parked');
   const b = await f.boot();
   assert.equal(b.engine.store.verified(wf.wid), false);
+  const recovered = b.engine.store.workflows.get(wf.wid)!;
+  assert.ok(Object.getOwnPropertyDescriptor(recovered, 'pins')?.get, 'terminal pins are not resident');
+  assert.equal(recovered.pins.source, 'unused', 'details load pins on demand');
+  assert.notStrictEqual(recovered.pins, recovered.pins, 'detail reads do not retain pins');
   const rid = await f.request(b, 'resume', { wid: wf.wid });
   assert.equal(f.decision(b, rid)?.type, JT.applied);
   assert.equal(b.evaluator.starts(wf.wid), 1);
   assert.equal(b.engine.store.verified(wf.wid), true);
+  assert.ok(Object.getOwnPropertyDescriptor(recovered, 'pins')?.value, 'live work retains verified pins');
 });
 
 test('a tampered pinned file of a finished workflow refuses a revise and a follow-up before they use it', async t => {
@@ -118,6 +123,39 @@ test('an intact finished workflow runs a follow-up after verifying its pins', as
   for (let i = 0; i < 500 && !recovered.journal.entries().some(e => e.type === JT.sealed && e.call === generation); i++) await delay(5);
   assert.ok(recovered.journal.entries().some(e => e.type === 'fake-invoke' && e.call === generation));
   assert.equal(b.engine.store.verified(wf.wid), true);
+});
+
+test('terminal pins leave memory in the same process and an intact recovered workflow can revise', async t => {
+  const f = await home(t), first = await f.boot(), wf = await f.finished(first);
+  assert.ok(Object.getOwnPropertyDescriptor(wf, 'pins')?.get, 'a newly ended workflow releases pins');
+  const b = await f.boot(), recovered = b.engine.store.workflows.get(wf.wid)!;
+  const rid = await f.request(b, 'revise', { wid: wf.wid, source: 'new source', args: { n: 2 } });
+  assert.equal(f.decision(b, rid)?.type, JT.applied);
+  assert.equal(recovered.revision, 2);
+  assert.equal(recovered.pins.source, 'new source');
+  assert.deepEqual(recovered.pins.args, { n: 2 });
+  assert.equal(recovered.pins.agents.find(a => a.name === 'test')?.body, 'Synthetic.');
+  assert.equal(b.evaluator.starts(wf.wid), 1);
+});
+
+test('pins loaded by a refused terminal request are released after idle', async t => {
+  const f = await home(t), first = await f.boot(), wf = await f.finished(first);
+  const b = await f.boot(), recovered = b.engine.store.workflows.get(wf.wid)!;
+  const rid = await f.request(b, 'revise', { wid: wf.wid, source: 'new', workflow: '/unused' });
+  assert.match(String(f.decision(b, rid)?.reason), /invalid-revise/);
+  assert.equal(b.engine.store.verified(wf.wid), true);
+  await delay(1100);
+  assert.ok(Object.getOwnPropertyDescriptor(recovered, 'pins')?.get, 'a rejected request leaves no resident pins');
+  assert.equal(recovered.pins.source, 'unused');
+});
+
+test('a damaged released pin record cannot change a same-process follow-up', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b);
+  const record = join(wf.scriptPath, '..', 'pins.json'), parsed = JSON.parse(await readFile(record, 'utf8'));
+  parsed.pins.agents = []; await writeFile(record, JSON.stringify(parsed));
+  const rid = await f.request(b, 'send', { to: `${wf.wid}/c`, kind: 'follow-up', message: 'more' });
+  assert.equal(f.decision(b, rid)?.type, JT.applied);
+  assert.ok(wf.pins.agents.some(a => a.name === 'test'), 'the immutable snapshot supplies the original agent');
 });
 
 test('pruned and created indexes keep pruning and materialize semantics across starts and appends', async t => {
