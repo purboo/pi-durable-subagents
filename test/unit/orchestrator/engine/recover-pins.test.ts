@@ -168,3 +168,40 @@ test('a generation open at restart whose pinned script changed is sealed failed 
   assert.ok(log().some(e => e.type === 'fake-run' && e.call === next));
   assert.equal((log().find(e => e.type === JT.sealed && e.call === next)?.result as { status: string }).status, 'ok');
 });
+
+test('an open generation whose pins.json lost its agent list (and script changed) is sealed failed pin-failed; the engine goes on; a restart is idempotent', async t => {
+  const f = await home(t), first = await f.boot(), wf = await f.finished(first);
+  const spec = wf.journal.entries().find(e => e.type === 'call')!.spec;
+  await wf.journal.append('generation', { rid: 'fu', key: 'c', gen: 2, from: `${wf.wid}@1/c@1`, spec, revision: 1, opening: { rid: 'fu', kind: 'follow-up', message: 'more' } });
+  await writeFile(wf.scriptPath, 'return 999;');
+  const record = join(wf.scriptPath, '..', 'pins.json'), parsed = JSON.parse(await readFile(record, 'utf8'));
+  delete parsed.pins.agents; await writeFile(record, JSON.stringify(parsed));
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+  const id = `${wf.wid}@1/c@2`;
+  const settled = async (b: Booted) => {
+    const log = () => b.engine.store.workflows.get(wf.wid)!.journal.entries();
+    for (let i = 0; i < 500 && !log().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`); i++) await delay(5);
+    return log;
+  };
+  const b = await f.boot(), log = await settled(b);
+  const seals = () => log().filter(e => e.type === JT.sealed && e.call === id);
+  assert.equal(seals().length, 1);
+  const seal = seals()[0]!.result as { status: string; error: string };
+  assert.equal(seal.status, 'failed'); assert.match(seal.error, /^pin-failed: /);
+  assert.equal(log().some(e => e.type === 'fake-run' && e.call === id), false, 'no child ran');
+  assert.equal(errors.filter(e => e.includes('sealed failed')).length, 1);
+  const other = await f.finished(b);
+  assert.ok(other.journal.entries().some(e => e.type === 'fake-run'), 'another workflow still dispatches');
+  // A restart: nothing new for the sealed generation, the engine starts.
+  const length = log().length;
+  const again = await f.boot(), relog = await settled(again);
+  await again.engine.intake(); await delay(50);
+  assert.equal(relog().filter(e => e.type === JT.sealed && e.call === id).length, 1);
+  // (A sealed generation's post-seal steps are repeated by the fake as an invoke; it is not run or sealed again.)
+  assert.deepEqual(relog().slice(length).filter(e => (e.call === id && e.type !== 'fake-invoke') || (isEntry(e, JT.attention) && e.item.call === id)).map(e => e.type), []);
+  assert.equal(relog().some(e => e.type === 'fake-run' && e.call === id), false);
+  assert.equal(errors.filter(e => e.includes('sealed failed')).length, 1, 'logged once');
+  const rid = await f.request(again, 'stop', { target: wf.wid });
+  assert.equal(f.decision(again, rid)?.reason, 'terminal:done');
+});

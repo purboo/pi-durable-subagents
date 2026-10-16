@@ -663,16 +663,19 @@ export class Engine {
       void this.store.ready(wf).then(() => { if (current()) this.dispatchGeneration(wf, entry); }, error => {
         if (!current()) return;
         const reason = `pin-failed: ${error instanceof Error ? error.message : String(error)}`;
-        console.error(`durable-subagents: generation ${wf.wid}@${revision}/${String(entry.key)}@${String(entry.gen)} sealed failed: ${reason}`);
         try { this.dispatchGeneration(wf, entry, reason); } catch (failure) { console.error(`durable-subagents: ${String(failure)}`); }
       });
       return;
     }
-    const ticket: CallTicket = { ...this.ticket({ wf } as State, entry), ...(refusal !== undefined ? { refusal } : {}) }, id = ticket.callId;
+    // Pins not verified (a refusal, or the post-seal steps of a sealed generation): the ticket comes from the journal's
+    // entry alone, so a damaged pinned record cannot keep the call from sealing.
+    const ticket: CallTicket = refusal !== undefined || !this.store.verified(wf.wid) ? { ...this.unpinnedTicket(wf, entry), ...(refusal !== undefined ? { refusal } : {}) }
+      : this.ticket({ wf } as State, entry), id = ticket.callId;
     if (this.generations.has(id) || this.held(wf.wid) || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
     this.generations.add(id); wf.journal.resting = false;
-    void this.executor.run(ticket).then(() => this.background(async () => {
+    void this.executor.run(ticket).then(result => this.background(async () => {
       if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);
+      if (refusal !== undefined) console.error(`durable-subagents: generation ${id} sealed ${result.status}: ${result.error ?? refusal}`);
       await this.reopenForwarded(wf);
       if (!wf.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`))
         await wf.journal.append(JT.attention, { item: { id: `finished:${id}`, rev: 1, kind: 'finished', wid: wf.wid, call: id, text: finishedText(wf.wid, wf.journal.entries(), id), origin: wf.origin } });
@@ -730,6 +733,18 @@ export class Engine {
     return { wid: st.wf.wid, widRev: `${st.wf.wid}@${st.wf.revision}`, key: entry.key as string, gen: entry.gen as number,
       callId: `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`, spec, agent, workflowBudget: st.wf.pins.usageBudget, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal,
       ...(st.wf.originPath !== undefined ? { originSession: st.wf.originPath } : {}),
+      ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}),
+      ...(entry.type === 'generation' && typeof entry.model === 'string' ? { model: entry.model } : {}) };
+  }
+  /** A ticket from the generation entry alone (call id, key, gen, spec, model), none of the workflow's pinned metadata:
+   *  the agent is the spec's name only. For a call that is sealed without running, or only repeats post-seal steps. */
+  private unpinnedTicket(wf: Workflow, entry: Entry): CallTicket {
+    const spec = entry.spec as CallSpec, name = String(spec?.agent ?? '');
+    let agent: CallTicket['agent'] | undefined;
+    try { agent = wf.pins.agents.find(a => a.name === name); } catch { /* damaged pins: the placeholder below */ }
+    return { wid: wf.wid, widRev: `${wf.wid}@${wf.revision}`, key: String(entry.key), gen: Number(entry.gen), callId: `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`,
+      spec, cwd: resolve(wf.cwd, spec?.cwd ?? '.'), journal: wf.journal,
+      agent: agent ?? { name, description: '', body: '', sourcePath: '', source: 'project', systemPromptMode: 'append', inheritProjectContext: false, inheritSkills: false },
       ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}),
       ...(entry.type === 'generation' && typeof entry.model === 'string' ? { model: entry.model } : {}) };
   }
