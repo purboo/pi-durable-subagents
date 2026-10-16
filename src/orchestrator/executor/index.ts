@@ -13,7 +13,9 @@
 // n is 1, or 2 for the single rerun); command-started{call,id,pid,start,dir} after it (the wrapper's identity, the
 // attempt directory; its ts starts the wall-clock timeout); command-spawn-failed{call,id,error}: the command could not
 // start (it seals failed, never reruns); command-timeout{call,id}: the deadline passed, recorded before the process tree
-// is ended (as stop-intent is for a stop), so a crash during that fence still seals timeout.
+// is ended (as stop-intent is for a stop), so a crash during that fence still seals timeout; command-withdrawn{call,id}:
+// the intent was recorded but no process started (a retirement or the orchestrator's exit came first): a later start
+// decides again, as if there were no intent.
 // fence-failed{exec,error} is documented in sweep.ts. The orchestrator ledger owns hold/release{pool,slot,exec}
 // and mem{available,admitted,exec} (every admission; a repeated refusal at most every 30 s per call). All transitions are serialized before publication.
 import { mkdir, open, readdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
@@ -51,10 +53,11 @@ import { failedModel, modelFailures, MODEL_RETRY_MS, parentPinned, spillCandidat
 import { PENDING_NOTE, UNDELIVERED_FOLLOW_UP } from "../notes.ts";
 import { COMMAND_LOG, exitMeaning, readExitRecord, readTail, spawnCommand, type SpawnedCommand } from "../../platform/command.ts";
 import { captureStart } from "../../platform/proctable.ts";
-import { COMMAND_INTENT, COMMAND_SPAWN_FAILED, COMMAND_STARTED, COMMAND_TIMEOUT, commandDirName, commandId, retiredCommandAttempts } from "./command.ts";
+import { heldIn } from "../snapshot.ts";
+import { COMMAND_INTENT, COMMAND_SPAWN_FAILED, COMMAND_STARTED, COMMAND_TIMEOUT, COMMAND_WITHDRAWN, commandDirName, commandId, retiredCommandAttempts } from "./command.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
-type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean;
+type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean; commandStarting?: boolean;
   parking?: string; onPark: Set<() => void>; refusedAt?: number;
   /** Restart: set while its execution's child runs (from the launch gate to the fence) or its gates run before the seal. */
   live?: { exec: string; since: number; phase: "child" | "gate" } };
@@ -1020,25 +1023,58 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     wake();
     return value;
   }
-  /** The writer lock of a command call with `writer: true`, before its first attempt; false when interrupted first. */
-  async function commandWriter(a: Active): Promise<boolean> {
+  /** Whether a drain holds workflow `wid` now (the engine's hold rule): a held command call does not start. */
+  const held = (wid: string) => heldIn(orch.entries())(wid);
+  /** Why a command call cannot start attempt `n` now: retired or closed (the run ends), stopped (it seals), held (the
+   *  run ends; the engine runs the call again after resume), or undefined. */
+  const commandBlocked = (a: Active): "shutdown" | "stopped" | "held" | undefined => {
+    const t = a.ticket;
+    if (closed || a.suspended || a.retired || retiredCall(t.journal, t.callId)) return "shutdown";
+    if (stopped(a)) return "stopped";
+    if (held(t.wid)) return "held";
+    return undefined;
+  };
+  /** The writer lock of a command call with `writer: true`, before its first attempt; the reason it stopped waiting. */
+  async function commandWriter(a: Active): Promise<"shutdown" | "stopped" | "held" | undefined> {
     const t = a.ticket, root = await roots(t.cwd, "x") ?? await realpath(t.cwd).catch(() => t.cwd);
     for (;;) {
-      if (interrupted(a) || hasStopIntent(t.journal, t.callId)) return false;
+      const blocked = commandBlocked(a); if (blocked) return blocked;
       let signal!: () => void;
       const changed = new Promise<void>(resolve => { signal = resolve; waiters.add(resolve); });
-      if (await serial(async () => !interrupted(a) && await writerAdmit(a, root))) { waiters.delete(signal); return true; }
+      if (await serial(async () => !commandBlocked(a) && await writerAdmit(a, root))) { waiters.delete(signal); return undefined; }
       a.wake = signal;
       const timer = setTimeout(signal, commandTick());
       try { await changed; } finally { clearTimeout(timer); waiters.delete(signal); }
     }
   }
-  /** Start attempt `n` (its intent is recorded); records command-started, or command-spawn-failed when it cannot start. */
-  async function launchCommand(t: CallTicket, id: string, dir: string): Promise<SpawnedCommand | undefined> {
+  /** Record the intent of attempt `n` (the start decision): in one serial step with the checks of commandBlocked, so no
+   *  stop, retirement, close or hold slips in between. `a.commandStarting` marks the decision for suspend(). */
+  function commandIntent(a: Active, n: number): Promise<Entry | "shutdown" | "stopped" | "held"> {
+    const t = a.ticket, journal = t.journal, call = t.callId;
+    return serial(async () => {
+      const blocked = commandBlocked(a); if (blocked) return blocked;
+      const existing = entriesFor(journal, call).findLast(e => e.type === COMMAND_INTENT && e.n === n && !intentWithdrawn(journal, call, String(e.id), e.seq));
+      if (existing) return existing;
+      a.commandStarting = true;
+      return journal.append(COMMAND_INTENT, { call, id: commandId(call, n), n });
+    });
+  }
+  /** Whether a later command-withdrawn voids the intent at `seq` (no process was started for it). */
+  const intentWithdrawn = (journal: JournalHandle, call: string, id: string, seq: number) => entriesFor(journal, call).some(e => e.type === COMMAND_WITHDRAWN && e.id === id && e.seq > seq);
+  /** Start the attempt whose intent is recorded; records command-started, or command-spawn-failed when it cannot start.
+   *  Rechecked first: a stop means no process (the watch seals it stopped), a retirement or the orchestrator's exit
+   *  withdraws the intent (nothing started; the next start decides again). */
+  async function launchCommand(a: Active, id: string, dir: string): Promise<SpawnedCommand | undefined> {
+    const t = a.ticket;
     let spawned: SpawnedCommand;
     try {
       if (!(await stat(t.cwd).catch(() => undefined))?.isDirectory()) throw new Error(`cwd ${t.cwd} is not a directory`);
       await rm(join(dir, "exit"), { force: true }); await rm(join(dir, "exit.tmp"), { force: true });
+      if (stopped(a)) return undefined;
+      if (closed || a.retired || retiredCall(t.journal, t.callId)) {
+        await serial(() => t.journal.append(COMMAND_WITHDRAWN, { call: t.callId, id }));
+        return undefined;
+      }
       spawned = await spawnCommand({ command: t.spec.command!, cwd: t.cwd, dir,
         env: { ...process.env, ...t.spec.env, DSA_EXEC: id, DSA_CALL: t.callId, DSA_HOME: home } });
     } catch (error) {
@@ -1049,46 +1085,57 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     return spawned;
   }
   /** Run, adopt or settle a command call (see the journal records at the top). One attempt runs at a time; a lost first
-   *  attempt of a `rerun: true` call starts once more, only after a scan found none of its processes. */
+   *  attempt of a `rerun: true` call starts once more, only after a scan found none of its processes. A start (the
+   *  first attempt or the rerun) waits while the workflow is held: the run ends and the engine runs it after resume. */
   async function executeCommand(a: Active): Promise<CallResult> {
     const t = a.ticket, journal = t.journal, call = t.callId;
     const own = () => entriesFor(journal, call);
+    const dirOf = (n: number) => join(callDir(home, t.wid, t.key, t.gen), commandDirName(n));
     const fail = (error: string) => sealCommand(journal, t, commandId(call, 1), { status: "failed", error });
+    const latest = () => { const e = own().findLast(e => e.type === COMMAND_INTENT); return e && !intentWithdrawn(journal, call, String(e.id), e.seq) ? e : undefined; };
+    /** Start attempt `n`: the intent, then the process; undefined when it did not start (and the run goes on). */
+    const begin = async (n: number): Promise<{ spawned?: SpawnedCommand } | undefined> => {
+      const intent = await commandIntent(a, n);
+      if (intent === "stopped") return undefined;
+      if (intent === "shutdown" || intent === "held") throw shutdownError();
+      return { spawned: await launchCommand(a, String(intent.id), dirOf(n)) };
+    };
     let spawned: SpawnedCommand | undefined;
     for (;;) {
       const old = sealed(journal, call); if (old) return old;
       if (closed || a.retired || retiredCall(journal, call)) {
-        if (!closed) { const intent = own().findLast(e => e.type === COMMAND_INTENT); if (intent) await endCommand(String(intent.id), commandKnown(own().findLast(e => e.type === COMMAND_STARTED && e.id === intent.id))); }
+        if (!closed) { const intent = latest(); if (intent) await endCommand(String(intent.id), commandKnown(own().findLast(e => e.type === COMMAND_STARTED && e.id === intent.id))); }
         throw shutdownError();
       }
-      let intent = own().findLast(e => e.type === COMMAND_INTENT);
+      let intent = latest();
       if (!intent) {
         if (t.refusal !== undefined) return fail(t.refusal);
-        if (hasStopIntent(journal, call)) return sealCommand(journal, t, commandId(call, 1), { status: "stopped" });
-        // Interrupted while waiting for the lock: a stop is recorded in a moment (or the orchestrator exits).
-        if (t.spec.writer === true && !await commandWriter(a)) { await delay(20); continue; }
-        if (hasStopIntent(journal, call)) continue;
-        intent = await serial(() => journal.append(COMMAND_INTENT, { call, id: commandId(call, 1), n: 1 }));
-        spawned = await launchCommand(t, String(intent.id), join(callDir(home, t.wid, t.key, t.gen), commandDirName(1)));
+        const n = Math.max(1, ...own().filter(e => e.type === COMMAND_INTENT).map(e => Number(e.n)));
+        if (stopped(a)) return sealCommand(journal, t, commandId(call, n), { status: "stopped" });
+        if (t.spec.writer === true) {
+          const blocked = await commandWriter(a);
+          if (blocked === "stopped") continue;
+          if (blocked) throw shutdownError();
+        }
+        spawned = (await begin(n))?.spawned;
+        continue;
       }
-      const id = String(intent.id), n = Number(intent.n), dir = join(callDir(home, t.wid, t.key, t.gen), commandDirName(n));
+      const id = String(intent.id), n = Number(intent.n), dir = dirOf(n);
       const failed = own().find(e => e.type === COMMAND_SPAWN_FAILED && e.id === id);
       if (failed) return sealCommand(journal, t, id, { status: "failed", error: `Command could not start: ${String(failed.error)}` });
-      const outcome = await watchCommand(a, id, dir, spawned);
+      const outcome = await watchCommand(a, id, dir, intent, spawned);
       spawned = undefined;
       if (outcome !== "lost") return outcome;
       if (n === 1 && t.spec.rerun === true) {
-        // The scan found no process of the first attempt: start it once more (attempt 2 never reruns).
-        const next = await serial(async () => own().some(e => e.type === COMMAND_INTENT && e.n === 2) ? undefined : journal.append(COMMAND_INTENT, { call, id: commandId(call, 2), n: 2 }));
-        if (next) spawned = await launchCommand(t, String(next.id), join(callDir(home, t.wid, t.key, t.gen), commandDirName(2)));
-        continue;
+        // The scan found no process of the first attempt: start it once more (attempt 2 never reruns), a new start.
+        if (!own().some(e => e.type === COMMAND_INTENT && e.n === 2)) { spawned = (await begin(2))?.spawned; continue; }
       }
       return sealCommand(journal, t, id, { status: "unknown", error: "Command ended without an exit record" }, dir);
     }
   }
   /** Watch one attempt until it has an outcome: its exit record, a stop, its deadline, or its loss (no exit record and
    *  no process left). The orchestrator's exit ends the watch without touching the process (ExecutorShutdown). */
-  async function watchCommand(a: Active, id: string, dir: string, spawned?: SpawnedCommand): Promise<CallResult | "lost"> {
+  async function watchCommand(a: Active, id: string, dir: string, intent: Entry, spawned?: SpawnedCommand): Promise<CallResult | "lost"> {
     const t = a.ticket, journal = t.journal, call = t.callId;
     let watcher: FSWatcher | undefined;
     try { watcher = watch(dir, () => a.wake()); watcher.on("error", () => watcher?.close()); } catch { watcher = undefined; }
@@ -1096,16 +1143,21 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     try {
       for (;;) {
         const started = entriesFor(journal, call).findLast(e => e.type === COMMAND_STARTED && e.id === id), known = commandKnown(started);
+        // The timeout is wall clock from the start (command-started, else the intent: a crash before the started record),
+        // downtime included.
+        const deadline = t.spec.timeoutMs !== undefined ? (started ?? intent).ts + t.spec.timeoutMs : undefined;
         const exit = await readExitRecord(dir);
         if (exit) {
           // Processes the command left behind (background ones included) end with it, as a call's processes always do.
           if (!closed) await endCommand(id, known);
-          return await sealCommand(journal, t, id, { status: exit.status === 0 ? "ok" : "failed", ...exitResult(exit.status), at: exit.at }, dir);
+          // An exit after the deadline (seen late: the orchestrator was down) is a timeout, with the record's data.
+          const late = deadline !== undefined && exit.at > deadline;
+          return await sealCommand(journal, t, id, { status: late ? "timeout" : exit.status === 0 ? "ok" : "failed", ...exitResult(exit.status),
+            ...(late ? { error: `Command timed out after ${t.spec.timeoutMs} ms` } : {}), at: exit.at }, dir);
         }
         if (closed) throw shutdownError();
         if (a.retired || retiredCall(journal, call)) { await endCommand(id, known); throw shutdownError(); }
         if (hasStopIntent(journal, call)) { await endCommand(id, known); return await sealCommand(journal, t, id, { status: "stopped" }, dir); }
-        const deadline = started && t.spec.timeoutMs !== undefined ? started.ts + t.spec.timeoutMs : undefined;
         if (deadline !== undefined && Date.now() >= deadline || entriesFor(journal, call).some(e => e.type === COMMAND_TIMEOUT && e.id === id)) {
           await serial(async () => { if (!entriesFor(journal, call).some(e => e.type === COMMAND_TIMEOUT && e.id === id)) await journal.append(COMMAND_TIMEOUT, { call, id }); });
           await endCommand(id, known);
@@ -1758,7 +1810,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     suspend(only?: (wid: string) => boolean) {
       // A drain with fence does not fence command calls: they keep running and seal (the held workflow starts nothing
       // after them). Only the orchestrator's exit (shutdown) ends their watchers, leaving the processes running.
-      const suspendable = (a: Active) => closed || !isCommandCall(a.ticket.spec);
+      // One that has not started (no intent: waiting for the writer lock, say) is suspended like a call not launched.
+      const suspendable = (a: Active) => closed || !isCommandCall(a.ticket.spec) || (!a.commandStarting && !entriesFor(a.ticket.journal, a.ticket.callId).some(e => e.type === COMMAND_INTENT));
       if (only) { // scoped (one session's quit, one workflow): other workflows keep running and dispatching
         const targets = [...active.values()].filter(a => only(a.ticket.wid) && suspendable(a));
         for (const a of targets) { a.suspended = true; a.controller.abort(); a.wake(); }

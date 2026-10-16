@@ -107,14 +107,24 @@ function started(child: ChildProcess): Promise<void> {
   return new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
 }
 
+/** The variables the executor sets for one call's processes (a subagent, a command call, a gate). An orchestrator
+ *  started from inside a call (its CLI, a command that runs `start`) never carries them: with the call's DSA_EXEC it
+ *  would be one of that call's processes, and the call's fence (its end, a stop) would kill it. */
+export const PER_CALL_ENV = ["DSA_SESSION", "DSA_EXEC", "DSA_CALL", "DSA_INBOX", "DSA_JOURNAL", "DSA_SCHEMA", "DSA_BUDGET", "DSA_MODEL", "DSA_RESULT", "DSA_OUTPUT", "DSA_PROBE"] as const;
+/** `env` without PER_CALL_ENV. */
+export function orchestratorEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const rest = { ...env };
+  for (const name of PER_CALL_ENV) delete rest[name];
+  return rest;
+}
+
 /** Start the orchestrator at `entry`, detached, with `env` minus the starting session's DSA_SESSION (it serves every
- *  session) plus DSA_HOME and the resolved DSA_PI_BIN. In its own systemd scope when one is available (the scope execs
+ *  session) and every other per-call variable (PER_CALL_ENV) plus DSA_HOME and the resolved DSA_PI_BIN. In its own systemd scope when one is available (the scope execs
  *  the command: same environment, and the pid is the orchestrator's), else a plain detached process. */
 export async function launchOrchestrator(entry: string, env: NodeJS.ProcessEnv, options: LaunchOptions): Promise<Launched> {
   const pi = resolvePi(env);
   if (!pi.path && options.requirePi) throw new PiNotFound(pi.problem!);
-  const { DSA_SESSION: _session, ...rest } = env;
-  const childEnv: NodeJS.ProcessEnv = { ...rest, DSA_HOME: options.home, ...(pi.path ? { DSA_PI_BIN: pi.path } : {}) };
+  const childEnv: NodeJS.ProcessEnv = { ...orchestratorEnv(env), DSA_HOME: options.home, ...(pi.path ? { DSA_PI_BIN: pi.path } : {}) };
   const node = options.node ?? process.execPath, run = options.spawn ?? spawn;
   const runner = await scopeRunner(env, options);
   if (runner) {

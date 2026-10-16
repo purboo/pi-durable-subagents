@@ -297,8 +297,26 @@ export class Engine {
       if (!entry) continue;
       const release = this.hold(wf.wid);
       wf.journal.resting = false;
-      void this.executor.run(this.unpinnedTicket(wf, entry)).then(release, release);
+      void this.executor.run(this.unpinnedTicket(wf, entry)).then(() => this.background(async () => {
+        try { await this.deliverAdopted(wf, entry); } finally { release(); }
+      }), error => {
+        release();
+        if (!(error instanceof Error && error.name === 'ExecutorShutdown')) console.error(`durable-subagents: adopted command ${call}: ${String(error)}`);
+      });
     }
+  }
+  /** An adopted command call sealed: its result reaches the workflow as a dispatched call's does. The replay proposed
+   *  it without dispatching (a held workflow dispatches nothing): it is ready now, and the script goes on (a new call
+   *  it makes stays queued under the hold; a workflow that ends records done and its finished notice). One the replay
+   *  has not reached yet is found sealed when it gets there; one a dispatch runs is delivered by that dispatch. */
+  private async deliverAdopted(wf: Workflow, entry: Entry) {
+    const st = this.states.get(wf.wid);
+    if (!st || st.wf !== wf || this.terminal(wf) || entry.type !== 'call') return;
+    const pos = entry.pos as number, own = st.calls.get(pos);
+    if (!own || !st.proposed.has(pos) || st.running.has(pos) || st.ready.has(pos)) return;
+    const result = this.sealed(st, own);
+    if (!result) return;
+    st.ready.set(pos, result); await this.flush(st);
   }
   /** A successful call with a worktree whose removal (or keeping) is not recorded yet: its post-seal effect is due. */
   private worktreeUnsettled(wf: Workflow, call: string): boolean {
