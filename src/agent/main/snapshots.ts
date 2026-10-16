@@ -24,7 +24,8 @@ export class PendingOutboxReader {
       this.positions.set(path, record);
       if (this.positions.size > 64) this.positions.delete(this.positions.keys().next().value!);
     }
-    return record?.state ?? new Set<string>();
+    // A copy: the fold extends its state in place on the next read, so a returned set must not alias it.
+    return new Set(record?.state);
   }
 }
 
