@@ -179,6 +179,13 @@ export class Store {
   private verifying = new Map<string, Promise<void>>();
   /** A request can verify pins and then be refused before live work starts. Release those pins after the request. */
   private pinRest = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Share one accessor pair per store, so released history carries no per-workflow getter/setter closures. */
+  private readonly pinAccessors = (() => {
+    const store = this;
+    return { enumerable: true, configurable: true,
+      get(this: Workflow): Pins { const pins = store.releasedPins(this); this.pins = pins; store.restPins(this); return pins; },
+      set(this: Workflow, pins: Pins) { Object.defineProperty(this, 'pins', { value: pins, enumerable: true, configurable: true, writable: true }); } };
+  })();
   private restPins(wf: Workflow): void {
     if (!wf.journal.resting || !Object.hasOwn(Object.getOwnPropertyDescriptor(wf, 'pins') ?? {}, 'value')) return;
     clearTimeout(this.pinRest.get(wf.wid));
@@ -395,9 +402,7 @@ export class Store {
   releasePins(wf: Workflow): void {
     clearTimeout(this.pinRest.get(wf.wid)); this.pinRest.delete(wf.wid);
     if (Object.getOwnPropertyDescriptor(wf, 'pins')?.get) return;
-    Object.defineProperty(wf, 'pins', { enumerable: true, configurable: true,
-      get: () => { const pins = this.releasedPins(wf); wf.pins = pins; this.restPins(wf); return pins; },
-      set: (pins: Pins) => { Object.defineProperty(wf, 'pins', { value: pins, enumerable: true, configurable: true, writable: true }); } });
+    Object.defineProperty(wf, 'pins', this.pinAccessors);
   }
   /** A1: Verify the pinned files of a workflow materialized unverified (a terminal one) before its script, inputs, origin
    *  or pins are used again: the record's digest and every file's hash, else the snapshot path (which republishes a
