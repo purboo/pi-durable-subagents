@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.43
+
+Steady-state cost no longer grows with history. Behaviour, file formats and recorded decisions are unchanged.
+Measured on a copy of a real home (2084 workflows, 51k orchestrator ledger entries):
+
+- Orchestrator memory: after a restart and 60 s idle, RSS 751 MiB in 1.0.42 and about 320 MiB now (under 200 MiB a
+  minute later); JS heap 468 MiB -> 91 MiB. A terminal workflow releases its pinned agents and sources after 1 s idle
+  and reloads them, checked as before, when a request needs them; a damaged pin still seals only that follow-up
+  `pin-failed`. The sweep keeps process identities only for executions that were never fenced (a fenced execution
+  keeps its tag, so a straggler is still found and killed after a restart). The orchestrator's outbox keeps only
+  pending requests in memory.
+- Request intake costs the new work, not the history: the orchestrator folds its ledger incrementally and indexes open
+  requests, and decisions get a read-only view instead of a deep copy. With one request every 5 s the orchestrator used
+  26.6 CPU s/min in 1.0.42 and 1.7 now; a pass with nothing new fell from 264 ms to 0.5 ms.
+- CLI request lookups filter journal lines by bytes before decoding them and remember, per file, which request ids a
+  verified prefix does not contain (no envelopes are kept). `send`: 4.1 s -> 1.5 s CPU and 455 -> 130 MiB RSS; `run`
+  3.7 -> 1.2 s; `describe --key` 1.7 -> 1.0 s. A cold `status` is unchanged.
+- The pi session reads its own outbox incrementally instead of folding it on every poll.
+- A restart reaches the evaluator in about 2.5 s. Upgrading from 1.0.42 needs no one-time pass (the first start took
+  2.6 s on this home); upgrading from 1.0.41 still runs the one-time pass of 1.0.42 (about 40 s on this home).
+
 ## 1.0.42
 
 - The orchestrator starts in seconds on a large home. Measured on a copy of a real home (2084 workflows, 432 MB of
