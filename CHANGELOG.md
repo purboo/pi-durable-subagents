@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.42
+
+- The orchestrator starts in seconds on a large home. Measured on a copy of a real home (2084 workflows, 432 MB of
+  journals): a restart reached the evaluator after 82 s in 1.0.41 and after 3.5 s now; peak memory fell from 1.5 GiB
+  to about 710 MiB. Recovery records a receipt per recovered call and skips calls whose receipt is still current;
+  lookups that scanned every journal per call are indexed; pinned files of terminal workflows are checked when a
+  request needs them rather than at every start.
+- Settled workflows open without decoding their journals. A rebuildable record under `cache/settled/` (validated
+  against the journal's inode, size, entry count and last line; any mismatch takes the full path and rewrites it)
+  stands in until something reads or appends to the journal, which then decodes it in full. Only terminal workflows
+  with nothing left for recovery to do are eligible.
+- The first start after upgrading does a one-time pass that writes the receipts and records (about 40 s on the home
+  above).
+- A pinned file that changed no longer stops the orchestrator or leaves a generation hanging: the generation's call
+  is sealed `failed` with `pin-failed: <file>` without starting a child, and a follow-up runs again once the file is
+  restored. Resume, revise and follow-up of such a workflow are refused with `pin-failed`.
+- `status` says why a queued call does not move: `orchestrator starting (<age>)` while the orchestrator recovers
+  (also on the orchestrator line), the writer lock, a full provider (`waiting for a free slot (<provider> n/n)`) or a
+  used-up usage window. Without evidence it says only `queued`; an answered asker shows `queued (answered)`.
+- The orchestrator ledger records `recovery: true` on its start entry and a `recovered` entry with the recovery time
+  and counts.
+
 ## 1.0.41
 
 - An answer that races the planned hibernation no longer strands its call. In 1.0.40 the parent forwarded an answer,
