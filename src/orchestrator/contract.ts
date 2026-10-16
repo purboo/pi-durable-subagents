@@ -99,15 +99,17 @@ export interface Executor {
   /** Whether the recovery of sealed or retired `call` is complete (recorded, nothing concerned it since) and it holds
    *  no writer lock: an orchestrator start has nothing to repair for it. */
   recovered?(journal: JournalHandle, call: CallId): boolean;
-  /** True while any call is running or pending (used for idle exit, K6). */
+  /** True while any call is running or pending (used for idle exit, K6); a command call watched here counts until it
+   *  seals, also in a held workflow. */
   busy(): boolean;
   /** Drain with fence (stop-all, quit): fence every running execution (or only those of workflows `only` selects)
-   *  WITHOUT sealing; their run() promises reject with an Error named "ExecutorShutdown"; the executor stays open and a
+   *  WITHOUT sealing (command calls are not fenced: they keep running and seal); their run() promises reject with an Error named "ExecutorShutdown"; the executor stays open and a
    *  later run() continues the call. */
   suspend(only?: (wid: string) => boolean): Promise<void>;
   /** Restart: stop launching executions (children and gates before a seal) and report those running now; `resume()`
-   *  lets launches continue when the restart is refused. */
-  quiesce?(): { live: LiveExecution[]; resume(): void };
+   *  lets launches continue when the restart is refused. `commands`: command calls running now (never in `live`: they
+   *  keep running across a restart and the successor adopts them). */
+  quiesce?(): { live: LiveExecution[]; commands?: number; resume(): void };
   /** Orchestrator exit: suspend(), then close the outbox. */
   shutdown(): Promise<void>;
   /** Apply a config.json change between slot admissions (never inside one), then let waiting calls retry. */
