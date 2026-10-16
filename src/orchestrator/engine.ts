@@ -170,7 +170,7 @@ export class Engine {
   private settle(wf: Workflow) {
     if (wf.journal.closed) return;
     const quiet = wf.journal.resting = this.quiescent(wf);
-    if (quiet) this.recordSettled(wf);
+    if (quiet) { this.recordSettled(wf); this.store.releasePins(wf); }
   }
   /** Journal lengths of the workflows whose settled record (settled.ts) was last written or found not due. */
   private settledAt = new Map<string, number>();
@@ -326,7 +326,8 @@ export class Engine {
   }
   private async startWorkflow(wf: Workflow) {
     if (this.terminal(wf)) return;
-    if (!this.store.verified(wf.wid)) { await this.store.ready(wf); if (this.terminal(wf)) return; }
+    await this.store.ready(wf);
+    if (this.terminal(wf)) return;
     wf.journal.resting = false;
     await this.resolveFinished(wf);
     const log = revisionEntries(wf);

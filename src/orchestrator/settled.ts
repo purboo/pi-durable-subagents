@@ -102,7 +102,14 @@ export function readSettled(home: string, wid: string): SettledRecord | undefine
   const record = readCache(settledPath(home, wid)) as SettledRecord | undefined;
   if (!record || record.v !== SETTLED_VERSION || record.recovery !== RECOVERY_VERSION || record.wid !== wid) return undefined;
   if (!record.journal || typeof record.journal.size !== "number" || !record.done || typeof record.revision !== "number" || !Array.isArray(record.sweep) || !Array.isArray(record.resumed)) return undefined;
-  for (const s of record.sweep) if (typeof s?.exec !== "string" || typeof s.call !== "string" || !Array.isArray(s.tracked) || s.tracked.some(id => typeof id !== "string" || !/^\d+ /.test(id))) return undefined;
+  // Version 2 records held fenced tags with obsolete pid/start lineage. Keep their tags only; no rebuild is needed.
+  const tags: string[] = [];
+  for (const s of record.sweep as unknown[]) {
+    if (typeof s === "string") tags.push(s);
+    else if (s && typeof s === "object" && typeof (s as { exec?: unknown }).exec === "string") tags.push((s as { exec: string }).exec);
+    else return undefined;
+  }
+  record.sweep = tags;
   return record;
 }
 /** Write the record of a settled workflow from its decoded journal (best effort: a failure only costs a decode at the

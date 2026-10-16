@@ -204,7 +204,7 @@ test('settledFacts names why a workflow is not settled', async t => {
   assert.equal(settledFacts(w, () => true), `unfenced:${exec}`);
   await w.journal.append(JT.fenced, { exec });
   assert.equal(settledFacts(w, () => false), `unrecovered:${call}`);
-  assert.deepEqual((settledFacts(w, () => true) as { sweep: unknown }).sweep, [{ exec, call, tracked: [] }]);
+  assert.deepEqual((settledFacts(w, () => true) as { sweep: unknown }).sweep, [exec]);
   await w.journal.append('forward', { rid: 'x', rid2: 'x2', dest: call, envelope: { kind: 'notify' } });
   assert.equal(settledFacts(w, () => true), 'open-forward:x2');
   await w.journal.append('forward-delivered', { rid: 'x', rid2: 'x2', call });

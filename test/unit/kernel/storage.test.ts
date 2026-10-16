@@ -72,6 +72,53 @@ test('failed publication stays durable and is recovered before next sequence', a
   box = await Outbox.open(dir, 'sender', () => inbox); await box.republishPending();
   assert.equal((await scanInbox(inbox))[0]!.sseq, 1); assert.equal((await box.send('orch', 'run', {})).sseq, 2); await box.close();
 });
+test('resolved outbox envelopes leave memory while disk lookups preserve retries, conflicts and pending replay', async t => {
+  const root = await fixture(t), inbox = join(root, 'inbox');
+  let box = await Outbox.open(root, 'orch', () => inbox);
+  t.after(() => box.close());
+  const resolved = await box.send('child', 'task', { text: 'x'.repeat(10000) }, { after: 'a' }, { rid: 'resolved' });
+  const pending = await box.send('child', 'steer', { text: 'pending' }, undefined, { rid: 'pending' });
+  await box.markResolved(resolved.rid);
+  await unlink(join(inbox, `${resolved.rid}.json`));
+  const assertResident = () => {
+    const state = box as unknown as { pending: Map<string, Request>; sent?: Map<string, Request>; journal: { entries(): unknown } };
+    assert.deepEqual([...state.pending.keys()], ['pending']);
+    assert.equal(state.sent, undefined, 'resolved envelopes have no in-memory history map');
+    assert.throws(() => state.journal.entries(), /does not retain entries/, 'the durable writer retains no decoded history either');
+  };
+  assertResident();
+  assert.deepEqual(box.recorded('resolved'), resolved);
+  await box.close();
+  // Folded recovery repairs the same torn tails as the regular journal writer.
+  await appendFile(join(root, 'outbox/orch.jsonl'), 'torn');
+  box = await Outbox.open(root, 'orch', () => inbox);
+  assertResident();
+  assert.deepEqual(await box.send('child', 'task', resolved.body, { after: 'a' }, { rid: 'resolved' }), resolved);
+  assert.deepEqual(box.recorded('pending'), pending);
+  assert.deepEqual(box.recorded('unknown'), undefined);
+  const clone = box.recorded('resolved')!; (clone.body as { text: string }).text = 'changed';
+  assert.deepEqual(box.recorded('resolved'), resolved);
+  for (const [to, kind, body, cond] of [
+    ['other', 'task', resolved.body, { after: 'a' }],
+    ['child', 'steer', resolved.body, { after: 'a' }],
+    ['child', 'task', {}, { after: 'a' }],
+    ['child', 'task', resolved.body, { after: 'b' }],
+  ] as const) await assert.rejects(box.send(to, kind, body, cond, { rid: 'resolved' }), /identity conflict/);
+  await unlink(join(inbox, `${pending.rid}.json`)); await box.republishPending();
+  assert.deepEqual(await scanInbox(inbox), [pending], 'a resolved retry never republishes; pending survives restart');
+  assert.equal((await box.send('child', 'notify', { message: 'next' })).sseq, 3);
+});
+
+test('folded outbox rejects mid-file corruption without changing the journal', async t => {
+  const root = await fixture(t), inbox = join(root, 'inbox');
+  const box = await Outbox.open(root, 'sender', () => inbox);
+  await box.send('orch', 'run', {}); await box.send('orch', 'run', {}); await box.close();
+  const path = join(root, 'outbox/sender.jsonl'), bytes = await readFile(path);
+  bytes[0] = bytes[0] === 48 ? 49 : 48; await writeFile(path, bytes);
+  await assert.rejects(Outbox.open(root, 'sender', () => inbox), /corruption/);
+  assert.deepEqual(await readFile(path), bytes);
+});
+
 test('tail truncation and appends fsync before success; file creation syncs directory', async t => {
   const dir = await fixture(t), path = join(dir, 'journal');
   const probe = await open(join(dir, 'probe'), 'w');

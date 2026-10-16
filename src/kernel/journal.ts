@@ -122,7 +122,7 @@ export function readJournalUncached(path: string): { ino: number; size: number; 
 export type JournalFold<T> = { dev: number; ino: number; size: number; length: number; seen: number; state: T };
 /** Fold a committed prefix a bounded chunk at a time. Only one record (possibly larger than a chunk) is buffered;
  *  newly appended bytes extend the state, and replacement or shrink rebuilds it. Never repairs the journal. */
-export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefined, empty: () => T, apply: (state: T, entry: Entry) => void): JournalFold<T> | undefined {
+export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefined, empty: () => T, apply: (state: T, entry: Entry, offset: number) => void): JournalFold<T> | undefined {
   let fd: number;
   try { fd = openSync(path, 'r'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
@@ -150,7 +150,7 @@ export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefin
           if (offset - bytes.length + end !== size - 1) throw new Error(`Journal corruption at byte ${record.length}`, { cause });
           return record;
         }
-        apply(record.state, entry);
+        apply(record.state, entry, record.length);
         record.seen++; record.length += end + 1 - start; start = end + 1;
       }
       pending = Buffer.from(bytes.subarray(start));
@@ -161,6 +161,25 @@ export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefin
 /** Find one record without retaining history (request-time lookups that do not belong in a compact polling state). */
 export function findJournalEntry(path: string, match: (entry: Entry) => boolean): Entry | undefined {
   return readJournalFold<{ found?: Entry }>(path, undefined, () => ({}), (state, entry) => { if (!state.found && match(entry)) state.found = entry; })?.state.found;
+}
+
+/** Read one framed entry at an offset indexed by this journal's single writer. Never retains a snapshot. */
+export function journalEntryAt(path: string, offset: number): Entry {
+  const fd = openSync(path, 'r');
+  try {
+    const chunks: Buffer[] = [], buffer = Buffer.alloc(4096);
+    for (let pos = offset; ;) {
+      const n = readSync(fd, buffer, 0, buffer.length, pos);
+      if (!n) throw new Error(`Missing journal entry at byte ${offset}`);
+      const end = buffer.subarray(0, n).indexOf(10);
+      chunks.push(Buffer.from(buffer.subarray(0, end < 0 ? n : end)));
+      if (end >= 0) break;
+      pos += n;
+    }
+    const json = unframeLine(Buffer.concat(chunks));
+    if (json === undefined) throw new Error(`Journal corruption at byte ${offset}`);
+    return JSON.parse(json) as Entry;
+  } finally { closeSync(fd); }
 }
 
 /** How long a resting journal keeps its descriptor after its last append (a burst of appends opens it once). */
@@ -174,6 +193,10 @@ export function openJournalDescriptors(): number { return descriptors; }
  *  descriptor once its appends are done and reopens it for the next append; its entries stay in memory. */
 export async function openJournal(path: string): Promise<JournalHandle> {
   return (await openHandle(path))!;
+}
+/** A1, C11: The same durable writer with a streaming fold instead of resident history. The reducer must not throw. */
+export async function openFoldedJournal(path: string, apply: (entry: Entry, offset: number) => void): Promise<Pick<JournalHandle, 'append' | 'close'>> {
+  return (await openHandle(path, undefined, apply))!;
 }
 /** What a lazy open checks a journal against: its file identity and size, how many entries it has, and its last
  *  framed line (`tail`: its CRC-32, `tailLength`: its bytes with the newline). */
@@ -241,8 +264,8 @@ function loadSync(path: string, expect: JournalExpectation): { entries: Entry[];
     return { entries: decoded.entries, size: decoded.length };
   } finally { closeSync(fd); }
 }
-async function openHandle(path: string, lazy?: JournalExpectation): Promise<JournalHandle | undefined> {
-  let entries: Entry[] | undefined, size: number, file: FileHandle | undefined;
+async function openHandle(path: string, lazy?: JournalExpectation, apply?: (entry: Entry, offset: number) => void): Promise<JournalHandle | undefined> {
+  let entries: Entry[] | undefined, size: number, file: FileHandle | undefined, count = lazy?.count ?? 0;
   if (lazy) size = lazy.size;
   else {
   await mkdir(dirname(path), { recursive: true });
@@ -252,9 +275,14 @@ async function openHandle(path: string, lazy?: JournalExpectation): Promise<Jour
     return open(path, 'a+');
   });
   try {
-    const bytes = await first.readFile(), decoded = decode(bytes);
-    entries = decoded.entries; size = decoded.length;
-    if (decoded.length !== bytes.length) { await first.truncate(decoded.length); await first.sync(); }
+    if (apply) {
+      const folded = readJournalFold(path, undefined, () => undefined, (_state, entry, offset) => apply(freeze(entry), offset))!;
+      size = folded.length; count = folded.seen;
+    } else {
+      const decoded = decode(await first.readFile());
+      entries = decoded.entries; size = decoded.length; count = entries.length;
+    }
+    if (size !== (await first.stat()).size) { await first.truncate(size); await first.sync(); }
     if (created) { await first.sync(); await syncDirectory(dirname(path)); }
   } catch (error) { await first.close(); throw error; }
   file = first;
@@ -262,6 +290,7 @@ async function openHandle(path: string, lazy?: JournalExpectation): Promise<Jour
   }
   /** The entries, decoding a lazy handle's file first. */
   const all = (): Entry[] => {
+    if (apply) throw new Error('Folded journal does not retain entries');
     if (!entries) { const loaded = loadSync(path, lazy!); entries = loaded.entries; size = loaded.size; }
     return entries;
   };
@@ -297,23 +326,26 @@ async function openHandle(path: string, lazy?: JournalExpectation): Promise<Jour
     // it saw (the event pump reads new entries per tick without copying the journal).
     committed: () => all(),
     get loaded() { return entries !== undefined; },
-    count: () => entries ? entries.length : lazy!.count,
+    count: () => count,
     onAppend: undefined,
     append<T extends string>(type: T, fields: Record<string, unknown>): Promise<Entry<T>> {
       if (closed) return Promise.reject(new Error('Journal closed'));
       const frozen = structuredClone(fields);
       const operation = queue.then(async () => {
         if (failed) throw failed;
-        const entries = all();
-        const entry = { ...frozen, seq: entries.length + 1, ts: Date.now(), type } as Entry<T>;
+        if (!apply) all();
+        const entry = { ...frozen, seq: count + 1, ts: Date.now(), type } as Entry<T>;
         const json = JSON.stringify(entry), bytes = Buffer.from(json), line = `${crc32(bytes)} ${json}\n`;
         let target: FileHandle;
         try { target = await reopen(); }
         catch (error) { unwritten.add(error as object); throw error; }
         await target.writeFile(line);
         await target.sync();
+        const offset = size;
         size += Buffer.byteLength(line);
-        entries.push(freeze(JSON.parse(json))); view = undefined; appends++;
+        const committed = freeze(JSON.parse(json)) as Entry;
+        if (apply) apply(committed, offset); else entries!.push(committed);
+        count++; view = undefined; appends++;
         rest();
         try { handle.onAppend?.(); } catch (error) { console.error(`durable-subagents: journal listener failed: ${String(error)}`); }
         return structuredClone(entry);

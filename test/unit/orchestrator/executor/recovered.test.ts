@@ -145,7 +145,7 @@ test("completeCalls reads only entries after the earliest current receipt and fo
   assert.deepEqual([...completeCalls(journal, "W")], [b], "a forward-retired of a forward to the call concerns it");
 });
 
-test("a settled journal opened lazily is recovered without decoding; the sweep still scans its tracked identities", async t => {
+test("a settled journal opened lazily is recovered without decoding; the sweep retains tags without process identities", async t => {
   const f = await fixture(t);
   await f.journal.append("tracked", { exec: f.exec, pid: 4242, start: "77" });
   await f.journal.append("tracked", { exec: f.exec, pid: 4242, start: "77" });
@@ -156,7 +156,7 @@ test("a settled journal opened lazily is recovered without decoding; the sweep s
   const { journalExpectation, openLazyJournal } = await import("../../../../src/kernel/journal.ts");
   const { sweepSeed } = await import("../../../../src/orchestrator/executor/sweep.ts");
   const seed = sweepSeed(f.journal), expect = journalExpectation(f.journal)!;
-  assert.deepEqual(seed, [{ exec: f.exec, call: f.call, tracked: ["4242 77"] }]);
+  assert.deepEqual(seed, [f.exec]);
   const lazy = (await openLazyJournal(f.journal.path, expect))!;
   const scans: ReadonlyMap<string, readonly ProcInfo[]>[] = [];
   const watching: Containment = { ...containment, async scan(known) { scans.push(known); return new Map([...known.keys()].map(exec => [exec, []])); } };
@@ -168,7 +168,7 @@ test("a settled journal opened lazily is recovered without decoding; the sweep s
   for (let i = 0; i < 200 && scans.length < 3; i++) await new Promise(r => setTimeout(r, 10));
   assert.ok(scans.length >= 3, "several sweeps ran");
   assert.equal(sessionReads(), before);
-  assert.deepEqual(scans[0]?.get(f.exec), [{ pid: 4242, ppid: 0, start: "77" }]);
+  assert.deepEqual(scans[0]?.get(f.exec), []);
   assert.equal(lazy.loaded, false, "neither recovery nor the sweep decoded it");
 });
 
