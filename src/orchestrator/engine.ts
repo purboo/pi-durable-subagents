@@ -675,7 +675,7 @@ export class Engine {
     this.generations.add(id); wf.journal.resting = false;
     void this.executor.run(ticket).then(result => this.background(async () => {
       if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);
-      if (refusal !== undefined) console.error(`durable-subagents: generation ${id} sealed ${result.status}: ${result.error ?? refusal}`);
+      if (refusal !== undefined) console.error(`durable-subagents: generation ${id} sealed ${result.status}${result.status === 'failed' ? `: ${result.error ?? refusal}` : ''}`);
       await this.reopenForwarded(wf);
       if (!wf.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`))
         await wf.journal.append(JT.attention, { item: { id: `finished:${id}`, rev: 1, kind: 'finished', wid: wf.wid, call: id, text: finishedText(wf.wid, wf.journal.entries(), id), origin: wf.origin } });
