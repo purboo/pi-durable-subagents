@@ -34,7 +34,8 @@ test("the wrapper records the status of argv, string and builtin commands; outpu
     [["exit", "7"], 127, ""], // argv runs a program: a shell builtin name is looked up as one (none exists)
     [["export", "A=1"], 127, ""], // a special builtin: no system ships it as a program
     [["cd", "/"], onPath("cd") ? 0 : 127, ""], // macOS ships /usr/bin/cd (a program that runs the builtin); Linux has none
-    [["/no/such/command"], 127, ""],
+    [["/no/such/command"], 127, ""], // 127 on every /bin/sh (bash 3.2, the macOS one, reports 126 by itself)
+    [["no/such/command"], 127, ""],
     ["kill -TERM $$", 143, ""],
   ];
   for (const [i, [command, status, output]] of cases.entries()) {

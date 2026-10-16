@@ -20,8 +20,9 @@ export const OUTPUT_TAIL_BYTES = 16 * 1024;
  *  only shell builtins and that absolute `mv` with every expansion quoted, so they work under any environment the
  *  command gets (PATH unset or bogus, IFS, LC_*). The argv runs through `exec` in a subshell: it is always a program
  *  (looked up on the command's PATH; a shell builtin name such as `exit` is no builtin there, 127 when no program has
- *  it), and its end, however it comes, never skips recording the status. */
-const WRAPPER = 'd="$1"; m="$2"; shift 2; ( exec "$@" ); s="$?"; printf "%s\\n" "$s" > "$d/exit.tmp" && "$m" -f "$d/exit.tmp" "$d/exit"; exit "$s"';
+ *  it), and its end, however it comes, never skips recording the status. A program named by a path that does not exist
+ *  is 127 before `exec`: some shells (bash 3.2, the macOS /bin/sh) report 126 for it instead. */
+const WRAPPER = 'd="$1"; m="$2"; shift 2; ( case "$1" in (*/*) [ -e "$1" ] || { printf "%s: %s: not found\\n" "$0" "$1" >&2; exit 127; } ;; esac; exec "$@" ); s="$?"; printf "%s\\n" "$s" > "$d/exit.tmp" && "$m" -f "$d/exit.tmp" "$d/exit"; exit "$s"';
 
 /** `mv` for the wrapper: from this process's PATH, else /bin or /usr/bin; resolved once. */
 let mvPath: string | undefined;
