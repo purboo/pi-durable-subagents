@@ -2,7 +2,7 @@
 import { forgetJournalSnapshot, readJournalFold, type JournalFold } from "../kernel/journal.ts";
 import { orchLedger } from "../paths.ts";
 import { JT, type Entry } from "../types.ts";
-import { applyLedger, emptyLedger, type LedgerState } from "./ledger.ts";
+import { LEDGER_ENTRY_TYPES, applyLedger, emptyLedger, type LedgerState } from "./ledger.ts";
 import { labelsOf } from "../events/derive.ts";
 
 type Created = Pick<Entry, "seq" | "ts"> & { wid: unknown; rid: unknown; origin: unknown };
@@ -28,6 +28,10 @@ export function emptyReaderLedger(): ReaderLedger {
   return { created: new Map(), origins: new Map(), intents: new Map(), revisions: new Map(), pruned: new Set(), labels: new Map(), runLabels: new Map(), sessions: new Map(), runSessions: new Map(),
     byWid: new Map(), byOrigin: new Map(), state: emptyLedger(), createdRids: new Map(), decisions: new Map(), resolutions: new Map(), sendNotes: new Map() };
 }
+/** Reader-only projections, combined with applyLedger's type list by the byte filter. */
+export const READER_ENTRY_TYPES = [JT.created, 'create-intent', 'revise-intent', 'request', 'pruned', 'drain', 'undrain',
+  JT.applied, JT.rejected, 'send-note'] as const;
+const discardedLedgerTypes: readonly string[] = ['switch-observed', 'skip', 'writer-hold', 'writer-release'];
 export function applyReaderLedger(ix: ReaderLedger, e: Entry): void {
   if (e.type === JT.created) {
     if (!ix.created.has(e.wid)) ix.created.set(e.wid, { seq: e.seq, ts: e.ts, wid: e.wid, rid: e.rid, origin: e.origin });
@@ -66,7 +70,7 @@ export function applyReaderLedger(ix: ReaderLedger, e: Entry): void {
   // applyLedger is shared with the orchestrator; reader projections discard execution-only switch history/skips.
   // A holder needs only pool/slot/exec, not any extra payload the entry might carry.
   if (e.type === "hold") applyLedger(ix.state, { seq: e.seq, ts: e.ts, type: e.type, pool: e.pool, slot: e.slot, exec: e.exec });
-  else if (e.type !== "switch-observed" && e.type !== "skip" && e.type !== "writer-hold" && e.type !== "writer-release") applyLedger(ix.state, e);
+  else if (!discardedLedgerTypes.includes(e.type)) applyLedger(ix.state, e);
   ix.state.seen++;
 }
 export function readerHold(ix: ReaderLedger, wid: string, origin?: string): Drain | undefined {
@@ -77,9 +81,8 @@ export function readerHold(ix: ReaderLedger, wid: string, origin?: string): Drai
 }
 const readers = new Map<string, JournalFold<ReaderLedger>>();
 // Canonical writer JSON: these are exactly the types that affect reader projections or applyLedger below.
-const needles = ['created', 'create-intent', 'revise-intent', 'pruned', 'drain', 'undrain', 'applied', 'rejected',
-  'send-note', 'hold', 'release', 'config', 'config-rejected', 'restart', 'orchestrator', 'orchestrator-exit',
-  'recovered', 'provider-exhausted', 'provider-available', 'provider-probe'].map(type => `"type":${JSON.stringify(type)}`);
+const needles = [...new Set([...READER_ENTRY_TYPES.filter(type => type !== 'request'),
+  ...LEDGER_ENTRY_TYPES.filter(type => !discardedLedgerTypes.includes(type))])].map(type => `"type":${JSON.stringify(type)}`);
 // Request records only affect labels/session for runs; the other request kinds have no reader projection.
 needles.push('"kind":"run"');
 export function readerLedger(home: string): JournalFold<ReaderLedger> {

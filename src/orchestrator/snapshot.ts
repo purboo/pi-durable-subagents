@@ -668,6 +668,9 @@ function forgetRemovedWorkflows(home: string, names: string[], pruned: Set<strin
   }
 }
 
+/** Ledger types that determine holdOf/heldIn (other ledgerIndex projections do not affect holds). */
+export const HOLD_ENTRY_TYPES = [JT.created, 'drain', 'undrain'] as const;
+
 /** Drain: the one hold rule. drain/undrain entries apply to every workflow (no scope), one session's (`origin`) or one
  *  workflow (`wid`). A workflow is held when the newest entry that applies to it is a drain recorded after it was created. */
 export function holdOf(ledger: readonly Entry[], wid: string, origin?: string): Entry | undefined {
