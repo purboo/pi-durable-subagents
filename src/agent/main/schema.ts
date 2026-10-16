@@ -12,7 +12,7 @@ export const parameters = Type.Object({
   tasks: Type.Optional(Type.Array(Type.Any(), { description: `Parallel calls. ${stepsDoc}` })),
   chain: Type.Optional(Type.Array(Type.Any(), { description: `Sequential calls ({previous} = previous output). ${stepsDoc}` })),
   agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
-  command: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "A command call instead of agent+task: an argv array runs directly, a string through /bin/sh -c. No model or slot; it survives restarts. Result data {exitCode, signal, durationMs}, output = the last 16 KiB of stdout+stderr." })),
+  command: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "A command call instead of agent+task: an argv array runs a program (PATH lookup, no shell: a builtin is not a builtin), a string runs through /bin/sh -c. No model or slot; it survives restarts. Result data {exitCode, signal, durationMs}, output = the last 16 KiB of stdout+stderr." })),
   env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Command calls: variables added to the environment (DSA_* reserved)." })),
   rerun: Type.Optional(Type.Boolean({ description: "Command calls: start the command once more when it vanished without an exit record (machine restart) instead of sealing unknown; for idempotent commands." })),
   cwd: Type.Optional(Type.String({ description: "Run directory (default: this session's). Relative workflow, inputs and call cwd paths resolve against it." })),

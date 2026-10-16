@@ -92,10 +92,32 @@ function unfinishedJournal(path: string, known?: { ino: number; size: number; en
   decided.set(path, { ino: read.ino, size: read.size, unfinished });
   return unfinished;
 }
+/** R3: Whether a journal has a started command call: a `command-intent` whose call has no seal. A hold never stops
+ *  one, so an orchestrator must watch and seal it even while its workflow is held. Cached by file identity. */
+const commanded = new Map<string, { ino: number; size: number; running: boolean }>();
+function startedCommand(path: string, known?: { ino: number; size: number; entries: readonly Entry[] }): boolean {
+  let stat;
+  try { stat = statSync(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; commanded.delete(path); return false; }
+  if (!stat.isFile()) { commanded.delete(path); return false; } // unreadable held work stays held
+  const hit = commanded.get(path);
+  if (hit && hit.ino === stat.ino && hit.size === stat.size) return hit.running;
+  let read = known;
+  try { read ??= readJournalUncached(path); } catch { commanded.delete(path); return false; }
+  if (!read) { commanded.delete(path); return false; }
+  const intents = new Set<string>();
+  for (const e of read.entries) {
+    if (e.type === "command-intent") intents.add(String(e.call));
+    else if (e.type === JT.sealed) intents.delete(String(e.call));
+  }
+  commanded.set(path, { ino: read.ino, size: read.size, running: intents.size > 0 });
+  return intents.size > 0;
+}
 /** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation,
  *  unless a drain (stop-all) holds it: held work waits for an explicit resume, which starts the orchestrator itself.
- *  Stops at the first unfinished workflow (newest first); a held workflow the ledger attributes is skipped without
- *  reading its journal, and an unchanged journal is not read again. */
+ *  R3: a held workflow with a started, unsealed command call is pending all the same (the hold does not stop it).
+ *  Stops at the first unfinished workflow (newest first); a held workflow is read only for a started command call
+ *  (startedCommand), and an unchanged journal is not read again. */
 export function unfinishedWorkflow(home: string, fresh = false): boolean {
   const { record, names } = readerWorkflowListing(home, fresh), ix = record.state, { created, pruned } = ix;
   const ids = [...new Set([...[...created.keys()].map(String), ...names].filter(wid => !pruned.has(wid)))].sort().reverse();
@@ -104,11 +126,11 @@ export function unfinishedWorkflow(home: string, fresh = false): boolean {
     // The hold rule is the one workflows() applies: the ledger's `created` names the origin a drain may hold; only for
     // a wid the ledger has no `created` for is the journal read first, for a `created` entry of its own.
     const known = created.get(wid);
-    if (known && readerHold(ix, wid, known.origin as string | undefined)) continue;
+    if (known && readerHold(ix, wid, known.origin as string | undefined)) { if (startedCommand(path)) return true; continue; }
     let read: ReturnType<typeof readJournalUncached>;
     if (!known) {
       read = readJournalUncached(path);
-      if (readerHold(ix, wid, read?.entries.find(e => e.type === JT.created)?.origin as string | undefined)) continue;
+      if (readerHold(ix, wid, read?.entries.find(e => e.type === JT.created)?.origin as string | undefined)) { if (startedCommand(path, read)) return true; continue; }
     }
     if (unfinishedJournal(path, read)) return true;
   }
