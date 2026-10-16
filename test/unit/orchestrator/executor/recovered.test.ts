@@ -2,7 +2,8 @@
 // while the receipt is current and nothing concerns the call since.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -12,6 +13,7 @@ import { callDir, callInbox, callSession, journalPath, orchLedger } from "../../
 import { CT, JT, type Containment, type Entry, type JournalHandle, type ProcInfo } from "../../../../src/types.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 import createExecutor from "../../../../src/orchestrator/executor/index.ts";
+import createEffects from "../../../../src/orchestrator/executor/effects/index.ts";
 import { sessionReads } from "../../../../src/orchestrator/executor/session.ts";
 import { RECOVERED, RECOVERY_VERSION, completeCalls, concernedCalls, concerns } from "../../../../src/orchestrator/executor/recovered.ts";
 
@@ -187,4 +189,53 @@ test("a refused ticket is sealed failed with its reason through the unprepared p
   assert.equal(spawned, 0); assert.equal(prepared, 0);
   const own = f.journal.entries().filter(e => e.call === call || e.exec === `${call}#1.1`).map(e => e.type);
   assert.deepEqual(own.filter(t => ([JT.exec, JT.fenced, JT.sealed] as string[]).includes(t)), [JT.exec, JT.fenced, JT.sealed]);
+});
+
+test("a refusal runs no gate and publishes no output with the real effects: an existing artifact at its output path is unchanged", async t => {
+  const f = await fixture(t);
+  let spawned = 0;
+  const watching: Containment = { ...containment, async spawn(...args) { spawned++; return containment.spawn(...args); } };
+  const ledgers = { home: f.home, orch: f.orch, config: { k: { trackerMs: 20 } } };
+  const executor = createExecutor(ledgers, { effects: createEffects(ledgers, watching), containment: watching, memory: async () => 1e6, sweepMs: 60000 });
+  t.after(() => executor.shutdown());
+  // The predecessor's accepted artifact at the absolute output path the refused follow-up reuses.
+  const artifact = join(f.home, "report.md"), absent = join(f.home, "fresh.md");
+  await writeFile(artifact, "accepted");
+  for (const [key, output] of [["b", artifact], ["d", absent]] as const) {
+    const call = `${f.wid}@1/${key}@2`, spec = { agent: "test", task: "task", output, gate: { command: "echo '{\"ok\":true}'", output: "json" as const } };
+    const ticket: CallTicket = { wid: f.wid, widRev: `${f.wid}@1`, key, gen: 2, callId: call, spec, cwd: f.home, journal: f.journal,
+      agent: { name: "test", description: "test", body: "test", sourcePath: "fixture", source: "project", systemPromptMode: "replace", inheritProjectContext: false, inheritSkills: false },
+      refusal: "pin-failed: Pinned content conflict: /x/script.js" };
+    const result = await executor.run(ticket);
+    assert.equal(result.status, "failed"); assert.match(String(result.error), /^pin-failed: /);
+    const own = f.journal.entries().filter(e => e.call === call).map(e => e.type);
+    assert.ok(!own.some(t => ["gate-intent", "gate", "output-intent", "output"].includes(t)), own.join(","));
+  }
+  assert.equal(spawned, 0, "no gate process, no child");
+  assert.equal(await readFile(artifact, "utf8"), "accepted"); assert.equal(existsSync(absent), false);
+});
+
+test("an inbox directory whose sync fails gets no receipt this start (other calls do); the next start syncs it again although it is empty", async t => {
+  const f = await fixture(t);
+  const other = `${f.wid}@1/b@1`, otherExec = `${other}#1.1`;
+  await f.journal.append("call", { key: "b", gen: 1, pos: 1, spec: { agent: "test", task: "task" } });
+  await f.journal.append(JT.exec, { call: other, exec: otherExec }); await f.journal.append(JT.fenced, { exec: otherExec });
+  await f.journal.append(JT.sealed, { call: other, exec: otherExec, result: { key: "b", gen: 1, status: "ok", ok: true, output: "" } });
+  const inbox = callInbox(f.home, f.wid, "a", 1), otherInbox = callInbox(f.home, f.wid, "b", 1);
+  for (const dir of [inbox, otherInbox]) { await mkdir(dir, { recursive: true }); await writeFile(join(dir, "left.json"), "{}"); }
+  const synced: string[] = [];
+  const start = async (failing: boolean) => {
+    const executor = createExecutor({ home: f.home, orch: f.orch, config: { k: { trackerMs: 20 } } }, { effects, containment, memory: async () => 1e6, sweepMs: 60000,
+      syncDirectory: async dir => { synced.push(dir); if (failing && dir === inbox) throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" }); } });
+    t.after(() => executor.shutdown());
+    await executor.recover(f.wid, f.journal, { batch: true }); await executor.finishRecovery!();
+  };
+  const receipts = (call: string) => f.journal.entries().filter(e => e.type === RECOVERED && e.call === call).length;
+  await start(true);
+  assert.deepEqual(await readdir(inbox), [], "removed, but not durably");
+  assert.equal(receipts(f.call), 0, "no receipt after a failed sync"); assert.equal(receipts(other), 1);
+  synced.length = 0;
+  await start(false);
+  assert.ok(synced.includes(inbox), "synced although nothing was left to remove");
+  assert.equal(receipts(f.call), 1); assert.equal(receipts(other), 1);
 });
