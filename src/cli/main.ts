@@ -75,7 +75,7 @@ export function parseArgs(args: string[]): Arguments {
 const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
 /** Notes recorded for a call that is not running (send kind "notify"); its next follow-up carries them. */
 const notesLine = (n?: number) => n ? ` · ${n} note${n > 1 ? "s" : ""} pending` : "";
-/** Why a queued call does not start, when the orchestrator ledger says so (an answered asker: its own note); nothing
+/** Why a queued call does not start, when the orchestrator ledger says so (an answered asker: "(answered)" first); nothing
  *  while a drain holds its workflow (it waits for resume, as the UI says). A writer-lock wait has its own suffix. */
 const answeredNote = (c: { phase?: string; answered?: string; answerForwarded?: AnswerForwarded; writerWait?: { root: string }; queuedFor?: QueueWait; queued?: string }, paused?: boolean) => {
   const forwarded = answerForwardedNote(c);
@@ -83,7 +83,7 @@ const answeredNote = (c: { phase?: string; answered?: string; answerForwarded?: 
   if (c.phase !== "queued" || paused) return "";
   const why = c.queued ?? (c.queuedFor ? queuedText(c.queuedFor) : undefined);
   if (c.writerWait && why === `waiting for the writer lock of ${c.writerWait.root}`) return c.answered ? " (answered)" : ""; // its own suffix says it
-  if (c.answered) return why && !why.startsWith("waiting for a free slot") ? ` (answered): ${why}` : " (answered, waiting for a slot)";
+  if (c.answered) return why ? ` (answered): ${why}` : " (answered)"; // no slot claim without a full provider
   return why ? `: ${why}` : "";
 };
 /** P25, T10: Render journal-derived status (one line per call, last output line only) without live orchestrator memory. */
