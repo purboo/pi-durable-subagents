@@ -1,7 +1,7 @@
 import { restartInputError } from "../../orchestrator/restart.ts";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { readJournalSnapshot } from "../../kernel/journal.ts";
+import { readJournalFold } from "../../kernel/journal.ts";
 import { generationRids } from "../../orchestrator/notes.ts";
 import { journalPath } from "../../paths.ts";
 import type { CallSpec, Conditions, Entry, RequestKind, RunBody } from "../../types.ts";
@@ -54,7 +54,8 @@ export function followUpReceipt(home: string, rid: string, body: unknown): { gen
   if (send?.kind !== "follow-up" || typeof send.to !== "string") return {};
   const wid = send.to.split("/")[0]!.split("@")[0]!, path = journalPath(home, wid);
   if (!existsSync(path)) return {};
-  const log = readJournalSnapshot(path) as Entry[], opened = log.find(e => e.type === "generation" && generationRids(e).includes(rid));
+  const log = readJournalFold(path, undefined, () => [] as Entry[], (entries, entry) => { entries.push(entry); }, { needles: [JSON.stringify(rid)] })?.state ?? [];
+  const opened = log.find(e => e.type === "generation" && generationRids(e).includes(rid));
   if (opened) return { generation: Number(opened.gen), call: `${wid}/${String(opened.key)}` };
   const queued = log.find(e => e.type === "forward" && e.rid === rid);
   if (!queued) return {};
