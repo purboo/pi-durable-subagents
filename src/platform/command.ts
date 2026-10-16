@@ -9,15 +9,26 @@ import { mkdir, readFile, stat, open } from "node:fs/promises";
 import { constants } from "node:os";
 import { join } from "node:path";
 import { captureStart } from "./proctable.ts";
+import { findOnPath } from "./launch.ts";
 
 export const COMMAND_LOG = "output.log";
 export const COMMAND_EXIT = "exit";
 /** The output a result carries: the last bytes of `output.log`. */
 export const OUTPUT_TAIL_BYTES = 16 * 1024;
 
-/** The wrapper: `$1` is the attempt directory, the rest the command's argv. The command runs in a subshell, so a shell
- *  builtin as argv[0] (`exit 3`, `exec ...`, `cd ...`) ends the subshell, never the wrapper before it records the status. */
-const WRAPPER = 'd=$1; shift; ( "$@" ); s=$?; printf "%s\\n" "$s" > "$d/exit.tmp" && mv -f "$d/exit.tmp" "$d/exit"; exit $s';
+/** The wrapper: `$1` is the attempt directory, `$2` the absolute `mv`, the rest the command's argv. Its own steps use
+ *  only shell builtins and that absolute `mv` with every expansion quoted, so they work under any environment the
+ *  command gets (PATH unset or bogus, IFS, LC_*). The argv runs through `exec` in a subshell: it is always a program
+ *  (looked up on the command's PATH; a shell builtin name such as `exit` is no builtin there, 127 when no program has
+ *  it), and its end, however it comes, never skips recording the status. */
+const WRAPPER = 'd="$1"; m="$2"; shift 2; ( exec "$@" ); s="$?"; printf "%s\\n" "$s" > "$d/exit.tmp" && "$m" -f "$d/exit.tmp" "$d/exit"; exit "$s"';
+
+/** `mv` for the wrapper: from this process's PATH, else /bin or /usr/bin; resolved once. */
+let mvPath: string | undefined;
+export function resolveMv(PATH = process.env.PATH): string {
+  mvPath ??= findOnPath("mv", PATH) ?? findOnPath("mv", "/bin:/usr/bin") ?? "/bin/mv";
+  return mvPath;
+}
 
 export interface CommandSpawn {
   /** The command: an argv array is executed directly, a string runs through `/bin/sh -c`. */
@@ -35,7 +46,7 @@ export interface SpawnedCommand {
   exited: Promise<void>;
 }
 
-/** The argv the wrapper runs. */
+/** The argv the wrapper runs: an argv as given (a program, never shell syntax), a string through `/bin/sh -c`. */
 export const commandArgv = (command: string | readonly string[]): string[] => typeof command === "string" ? ["/bin/sh", "-c", command] : [...command];
 
 /** Start a command (see the module comment). Rejects when it cannot start (a missing cwd, no /bin/sh). */
@@ -43,7 +54,7 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand> 
   await mkdir(spec.dir, { recursive: true });
   const fd = openSync(join(spec.dir, COMMAND_LOG), "a");
   try {
-    const child = spawn("/bin/sh", ["-c", WRAPPER, "dsa-command", spec.dir, ...commandArgv(spec.command)],
+    const child = spawn("/bin/sh", ["-c", WRAPPER, "dsa-command", spec.dir, resolveMv(), ...commandArgv(spec.command)],
       { cwd: spec.cwd, env: spec.env, detached: true, stdio: ["ignore", fd, fd] });
     const exited = new Promise<void>(resolve => { child.once("exit", () => resolve()); child.once("error", () => resolve()); });
     await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });

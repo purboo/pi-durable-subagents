@@ -74,6 +74,20 @@ test("the starter passes the resolved pi as DSA_PI_BIN and never the starting se
   assert.deepEqual(calls[0]!.env, { PATH: bin, OTHER: "x", DSA_HOME: "/h", DSA_PI_BIN: pi });
 });
 
+test("an orchestrator started from inside a call never carries the call's identity (DSA_EXEC, DSA_CALL, ...)", async t => {
+  const dir = await root(t), bin = join(dir, "bin"), pi = await executable(bin, "pi");
+  const call = { DSA_EXEC: "W@1/a@1#1.1", DSA_CALL: "W@1/a@1", DSA_INBOX: "/i", DSA_JOURNAL: "/j", DSA_MODEL: "p/m", DSA_SCHEMA: "/s", DSA_BUDGET: "{}",
+    DSA_RESULT: "/r", DSA_OUTPUT: "/o", DSA_SESSION: "s1", DSA_HOME: "/old", DSA_CACHE_HOME: "/c" };
+  for (const scope of [false, true]) {
+    const { calls, spawn } = recorder();
+    await launchOrchestrator("/entry.js", { PATH: bin, OTHER: "x", ...call, ...(scope ? { XDG_RUNTIME_DIR: "/run/user/1", USER: "u1" } : {}) },
+      { home: "/h", spawn, platform: scope ? "linux" : "darwin", node: "/node", linger: () => true, probe: async () => true });
+    const env = calls.at(-1)!.env;
+    for (const name of Object.keys(call)) if (!["DSA_HOME", "DSA_CACHE_HOME"].includes(name)) assert.equal(env[name], undefined, name);
+    assert.equal(env.DSA_HOME, "/h"); assert.equal(env.DSA_PI_BIN, pi); assert.equal(env.DSA_CACHE_HOME, "/c"); assert.equal(env.OTHER, "x");
+  }
+});
+
 test("scope launch selection: systemd-run on Linux with a lingering user manager when its probe works, else a detached process", async t => {
   const dir = await root(t), bin = join(dir, "bin"), runner = await executable(bin, "systemd-run");
   await executable(bin, "pi");

@@ -2,11 +2,11 @@
 // any launch of a subagent would fail. Real processes, an isolated DSA_HOME per test.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { detachedSleep, tempRoot } from "../../harness/pi.ts";
+import { detachedSleep, REPO, tempRoot } from "../../harness/pi.ts";
 import { journalPath, orchInbox, orchLedger } from "../../../src/paths.ts";
 import { readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { publishRequest } from "../../../src/kernel/mailbox.ts";
@@ -300,4 +300,110 @@ test("command call integration: a tool-built chain runs command steps, status an
   assert.match(String((agentCall.spec as { task: string }).task), /^summarize: second-\{previous\}/);
   const done = statusView(s.home).workflows?.find(w => w.wid === wid)?.calls?.find(c => c.key === "second");
   assert.equal(done?.pid, undefined, "no pid after the seal");
+});
+
+test("C-hold-queued: a command waiting for the writer lock does not start under a drain with fence; it runs after resume", { timeout: 60_000 }, async t => {
+  const s = await stack(t);
+  const wid = await s.run({ tasks: [{ key: "a", command: "sleep 1.5; echo A", writer: true }, { key: "b", command: "echo B", writer: true }] });
+  await s.until(() => of(s.journal(wid), "writer-wait").length > 0 && of(s.journal(wid), "command-started").length === 1, "a runs, b waits for the lock");
+  await s.send("drain", { fence: true });
+  const a = await s.sealed(wid, "a");
+  assert.equal(a.status, "ok");
+  await delay(1500);
+  assert.ok(!of(s.journal(wid), "command-intent").some(e => String(e.call).includes("/b@")), "b did not start under the hold");
+  await s.send("resume", {});
+  const b = await s.sealed(wid, "b");
+  assert.equal(b.status, "ok", JSON.stringify(b));
+  assert.equal(b.output, "B\n");
+});
+
+test("C-hold-adopt: under a drain, a restart adopts the command and delivers its result; a held chain starts no next step", { timeout: 90_000 }, async t => {
+  const s = await stack(t);
+  const marker = join(s.root, "b-ran");
+  const single = await s.run({ call: { command: "sleep 2; echo single" } });
+  const chain = await s.run({ source: `const a = await runs.run("a", {command: "sleep 2; echo a"});\n` +
+    `const b = await runs.run("b", {command: ["sh", "-c", "touch '${marker}'"]});\nreturn [a.output, b.output];` });
+  await s.started(single); await s.started(chain);
+  await s.send("drain", {});
+  await s.until(() => s.ledger().some(e => e.type === "drain"), "drain recorded");
+  await s.stop(); s.start();
+  const result = await s.sealed(single);
+  assert.equal(result.status, "ok"); assert.equal(result.output, "single\n");
+  const done = await s.until(() => s.journal(single).find(e => e.type === JT.done), "single workflow done without a resume");
+  assert.equal(done.status, "done", JSON.stringify(done));
+  await s.until(() => s.journal(single).some(e => e.type === JT.attention && (e.item as { id: string }).id === `finished:${single}`), "finished notice");
+  const a = await s.sealed(chain, "a");
+  assert.equal(a.status, "ok");
+  await delay(1500);
+  assert.ok(!existsSync(marker), "step 2 waits for the resume");
+  assert.ok(!s.journal(chain).some(e => e.type === JT.done));
+  await s.send("resume", {});
+  const chainDone = await s.until(() => s.journal(chain).find(e => e.type === JT.done), "chain done after resume");
+  assert.equal(chainDone.status, "done", JSON.stringify(chainDone));
+  assert.deepEqual(chainDone.result, ["a\n", ""]);
+});
+
+test("C-rerun-held: attempt 1 lost under a hold reruns only after resume, exactly once", { timeout: 90_000 }, async t => {
+  const s = await stack(t);
+  const marks = join(s.root, "marks");
+  const wid = await s.run({ call: { command: `echo start >> '${marks}'; sleep 3; echo end >> '${marks}'`, rerun: true } });
+  const first = await s.started(wid);
+  await s.until(() => existsSync(marks), "first start");
+  await s.send("drain", {});
+  await s.until(() => s.ledger().some(e => e.type === "drain"), "drain recorded");
+  await s.stop();
+  await new Containment().fence(String(first.id), []);
+  s.start();
+  await s.until(() => s.ledger().filter(e => e.type === "recovered").length >= 2, "recovered");
+  await delay(2000);
+  assert.deepEqual(of(s.journal(wid), "command-intent").map(e => e.n), [1], "no rerun under the hold");
+  assert.ok(!of(s.journal(wid), JT.sealed).length, "unsealed while held");
+  await s.send("resume", {});
+  const result = await s.sealed(wid);
+  assert.equal(result.status, "ok", JSON.stringify(result));
+  assert.deepEqual(of(s.journal(wid), "command-intent").map(e => e.n), [1, 2]);
+  assert.equal(readFileSync(marks, "utf8"), "start\nstart\nend\n");
+});
+
+test("C-path: the wrapper records the status under PATH=/nonexistent (absolute argv, builtin-only string, rerun once)", { timeout: 60_000 }, async t => {
+  const s = await stack(t);
+  const marks = join(s.root, "ran");
+  const env = { PATH: "/nonexistent" };
+  const argv = await s.run({ call: { command: ["/bin/sh", "-c", "exit 0"], env } });
+  const builtins = await s.run({ call: { command: "echo hi; exit 0", env } });
+  const rerun = await s.run({ call: { command: `echo run >> '${marks}'`, env, rerun: true } });
+  for (const wid of [argv, builtins, rerun]) {
+    const result = await s.sealed(wid);
+    assert.equal(result.status, "ok", JSON.stringify(result));
+    assert.ok(existsSync(join(String((await s.started(wid)).dir), "exit")));
+  }
+  assert.equal(readFileSync(marks, "utf8"), "run\n");
+  assert.deepEqual(of(s.journal(rerun), "command-intent").map(e => e.n), [1]);
+});
+
+test("C-successor: an orchestrator started from inside a command carries no call identity, survives its end and seals it", { timeout: 90_000 }, async t => {
+  const s = await stack(t);
+  const go = join(s.root, "go"), cli = join(REPO, "src/cli/main.ts");
+  const wid = await s.run({ call: { command: `while [ ! -e '${go}' ]; do sleep 0.1; done; '${process.execPath}' '${cli}' start >/dev/null; sleep 2; echo done`, env: { XDG_RUNTIME_DIR: "" } } }); // no systemd scope for the successor
+  const first = await s.started(wid);
+  await s.stop();
+  writeFileSync(go, "");
+  const successor = await s.until(() => s.ledger().filter(e => e.type === "orchestrator").at(-1)?.pid !== process.pid && s.ledger().filter(e => e.type === "orchestrator").at(-1), "successor started");
+  const pid = Number(successor.pid);
+  try {
+  if (process.platform === "linux") {
+    const environ = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
+    assert.ok(!environ.some(v => /^DSA_(EXEC|CALL)=/.test(v)), environ.filter(v => v.startsWith("DSA_")).join(" "));
+    assert.ok(environ.includes(`DSA_HOME=${s.home}`));
+  }
+  const result = await s.sealed(wid);
+  assert.equal(result.status, "ok", JSON.stringify(result));
+  assert.equal(result.output, "done\n");
+  await delay(500);
+  process.kill(pid, 0); // still runs: the call's end did not fence it
+  assert.deepEqual(await tagged(String(first.id)), []);
+  } finally {
+    try { process.kill(pid, "SIGTERM"); } catch { /* gone */ }
+    await s.until(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, "successor exit").catch(() => {});
+  }
 });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,7 +30,8 @@ test("the wrapper records the status of argv, string and builtin commands; outpu
   const cases: [string | string[], number, string][] = [
     [["sh", "-c", "echo a; echo b >&2; exit 4"], 4, "a\nb\n"],
     ["echo s; exit 0", 0, "s\n"],
-    [["exit", "7"], 7, ""], // a builtin as argv[0] ends its subshell, not the wrapper
+    [["exit", "7"], 127, ""], // argv runs a program: a shell builtin name is looked up as one (none exists)
+    [["cd", "/"], 127, ""],
     [["/no/such/command"], 127, ""],
     ["kill -TERM $$", 143, ""],
   ];
@@ -45,6 +46,34 @@ test("the wrapper records the status of argv, string and builtin commands; outpu
     await spawned.exited;
     assert.equal(await captureStart(spawned.pid), "", "the wrapper is gone (reaped)");
   }
+});
+
+test("the wrapper records the status under any environment of the command (PATH unset or bogus, IFS, LC_*)", async t => {
+  const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
+  // PATH unset: the shell's default path finds `true`; a bogus PATH finds nothing.
+  const envs: NodeJS.ProcessEnv[] = [{}, { PATH: "/nonexistent" }, { PATH: "/nonexistent", IFS: "/", LC_ALL: "xx_XX.bogus", LANG: "C" }];
+  for (const [i, env] of envs.entries()) for (const [j, [command, status]] of ([["exit 4", 4], [["/bin/sh", "-c", "exit 5"], 5], [["true"], i === 0 ? 0 : 127]] as const).entries()) {
+    const dir = join(root, `d ${i} ${j}`); // a space in the path: every expansion is quoted
+    await spawnCommand({ command: command as string | string[], cwd: root, dir, env });
+    assert.equal((await finished(dir)).status, status, `${JSON.stringify(env)} ${JSON.stringify(command)}`);
+  }
+});
+
+test("argv looks its program up on the command's PATH (a printf program wins over the shell's builtin)", async t => {
+  const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = join(root, "bin"); mkdirSync(bin);
+  writeFileSync(join(bin, "printf"), "#!/bin/sh\necho program \"$@\"\n", { mode: 0o755 });
+  const dir = join(root, "c");
+  await spawnCommand({ command: ["printf", "x"], cwd: root, dir, env: { PATH: `${bin}:/usr/bin:/bin` } });
+  assert.equal((await finished(dir)).status, 0);
+  assert.equal(readFileSync(join(dir, "output.log"), "utf8"), "program x\n");
+  writeFileSync(join(bin, "noexec"), "x", { mode: 0o644 });
+  const other = join(root, "n");
+  await spawnCommand({ command: ["noexec"], cwd: root, dir: other, env: { PATH: bin } });
+  assert.equal((await finished(other)).status, 126, "found but not executable: 126");
+  const missing = join(root, "m");
+  await spawnCommand({ command: ["no-such-program"], cwd: root, dir: missing, env: { PATH: bin } });
+  assert.equal((await finished(missing)).status, 127, "missing: 127");
 });
 
 test("the command runs detached in its own session with stdin at /dev/null", async t => {
