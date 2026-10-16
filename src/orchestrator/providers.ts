@@ -5,6 +5,9 @@
 //   provider-available{provider, exec}: it answered; a release of the probe's slot without an outcome frees the probe.
 import type { Entry } from "../types.ts";
 
+/** Entry types consumed by foldExhaustion, shared with filtered ledger readers. */
+export const EXHAUSTION_ENTRY_TYPES = ['provider-exhausted', 'provider-available', 'provider-probe', 'release'] as const;
+
 export interface Exhaustion { since: number; nextTry: number; error: string; probe?: string }
 
 /** Apply one orchestrator ledger entry to the map of used-up providers. */

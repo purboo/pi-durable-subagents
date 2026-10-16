@@ -11,9 +11,13 @@
 //   restart{rid,force,reason?,initiator?,from?,live}: accepted restart; the next start consumes its status provenance.
 //     Old records lack reason/initiator/from and remain readable (A1).
 //   writer-hold/writer-release{root,call}: the writer lock of a worktree root, held by one call until it ends.
-import { foldExhaustion, type Exhaustion } from "./providers.ts";
+import { EXHAUSTION_ENTRY_TYPES, foldExhaustion, type Exhaustion } from "./providers.ts";
 import type { OrchestratorConfig } from "./contract.ts";
 import { isEntry, type Entry, type EntryOf, type RestartInitiator } from "../types.ts";
+
+/** Entry types consumed by applyLedger (excluding fold bookkeeping), shared with filtered readers. */
+export const LEDGER_ENTRY_TYPES = ['hold', 'release', 'switch-observed', 'skip', 'config', 'config-rejected',
+  'restart', 'orchestrator', 'recovered', 'writer-hold', 'writer-release', 'orchestrator-exit', ...EXHAUSTION_ENTRY_TYPES] as const;
 
 export interface RestartAudit { ts: number; reason?: string; initiator?: RestartInitiator; from?: string }
 export interface LedgerState {

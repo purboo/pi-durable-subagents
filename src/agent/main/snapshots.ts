@@ -2,11 +2,31 @@ import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { forgetJournalSnapshot, journalAppends, readJournalSnapshot, readJournalUncached } from "../../kernel/journal.ts";
+import { forgetJournalSnapshot, journalAppends, readJournalFold, readJournalSnapshot, readJournalUncached, type JournalFold } from "../../kernel/journal.ts";
 import { journalPath } from "../../paths.ts";
 import { CT, JT, type AttentionItem, type Entry } from "../../types.ts";
 import { openGeneration, readerWorkflowListing, releaseLoadedSettledJournals, releaseSettledJournals, SETTLED_RECHECK_MS, unresolvedAttention, workflowDigest, workflowDigestChecked, type WorkflowDigest } from "../../orchestrator/snapshot.ts";
 import { readerHold, readerLedgerIdentity } from "../../orchestrator/reader-ledger.ts";
+
+/** Session-outbox reader: retain only pending identities and a verified position, not sent envelopes/history. */
+export class PendingOutboxReader {
+  private readonly positions = new Map<string, JournalFold<Set<string>>>();
+  clear(): void { this.positions.clear(); }
+  read(path: string): ReadonlySet<string> {
+    const prior = this.positions.get(path);
+    this.positions.delete(path); // Never retry partially applied state after a failed read.
+    const record = readJournalFold(path, prior, () => new Set<string>(), (pending, entry) => {
+      if (entry.type === 'sent') pending.add((entry.request as { rid: string }).rid);
+      else if (entry.type === 'resolved') pending.delete(String(entry.rid));
+    }, { needles: ['"type":"sent"', '"type":"resolved"'] });
+    // A torn tail may be repaired at unchanged size; do not reuse that file identity as a committed position.
+    if (record && record.length === record.size) {
+      this.positions.set(path, record);
+      if (this.positions.size > 64) this.positions.delete(this.positions.keys().next().value!);
+    }
+    return record?.state ?? new Set<string>();
+  }
+}
 
 /** P15, P25: Read workflow snapshots without modifying another domain's history; a wid with an orchestrator.jsonl
  *  `pruned{wid}` entry is gone (housekeeping), even while its directory is still being removed. A settled workflow
