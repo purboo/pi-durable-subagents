@@ -19,7 +19,9 @@ export function restartInputError(body: RestartBody, subagent = false): string |
   if (body.token !== undefined && (typeof body.token !== "string" || !/^[a-f0-9]{12}$/.test(body.token))) return "restart force needs the 12-hex token from a refused restart; first show the user the running executions";
   return undefined;
 }
-export function restartRefusal(home: string, live: readonly RestartExecution[], body: RestartBody, tool = false, now = Date.now()): string | undefined {
+/** `commands`: command calls running now. They are never in `live` (nor in the token): a restart leaves them running and
+ *  the successor adopts them; a refusal shown for other executions says so in one line. */
+export function restartRefusal(home: string, live: readonly RestartExecution[], body: RestartBody, tool = false, now = Date.now(), commands = 0): string | undefined {
   const invalid = restartInputError(body);
   if (invalid) return invalid;
   if (!live.length) return undefined;
@@ -45,6 +47,7 @@ export function restartRefusal(home: string, live: readonly RestartExecution[], 
       `${origin}:`, ...executions.map(l => `  ${l.wid}/${l.key} ${age(now - l.since)}${l.phase === "gate" ? " gate" : ""}${leases.has(l.callId) ? ` ${leases.get(l.callId)}` : ""}`),
     ]),
     ...(others.length ? ["not fenced (a restart leaves these leases held):", ...others] : []),
+    ...(commands > 0 ? [`not fenced: ${commands} command call${commands === 1 ? "" : "s"} keep${commands === 1 ? "s" : ""} running across the restart`] : []),
     `token: ${token}`,
     tool ? `to fence exactly these: subagents {action:"restart", force:"${token}", reason:"<why>"}` : `to fence exactly these: pi-durable-subagents restart --force ${token} --reason "<why>"`,
   ].join("\n");

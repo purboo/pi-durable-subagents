@@ -38,6 +38,7 @@ import { parseModel } from '../compat/model.ts';
 import { PENDING_NOTE, generationRids, openingMessage, pendingFollowUps, pendingNotes, unsettledForward, unsettledNotify } from './notes.ts';
 import { journalAppends } from '../kernel/journal.ts';
 import { callEntries, entriesOf } from './executor/indexes.ts';
+import { unsealedCommandCalls } from './executor/command.ts';
 import { lazy, writeSettled } from './settled.ts';
 import { STATS_EVERY_MS, readBytes, writeStats, type OrchestratorStats } from './stats.ts';
 
@@ -278,10 +279,26 @@ export class Engine {
       for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) if (!this.settledGeneration(wf, entry)) this.dispatchGeneration(wf, entry);
       await this.reopenForwarded(wf);
     }
+    // Command calls outlive the orchestrator: each with an attempt and no seal is adopted, also in a held or ended
+    // workflow (whose replay dispatches nothing), and watched until it seals.
+    for (const wf of this.store.workflows.values()) if (!lazy(wf)) this.adoptCommands(wf);
     await this.intake();
     for (const wf of this.store.workflows.values()) this.settle(wf);
     this.startWaiting();
     return { workflows: this.store.workflows.size, calls, skipped };
+  }
+  /** Watch every unsealed command call of the current revision (Executor.run is idempotent per call: a replay's
+   *  dispatch of the same call joins the same run). */
+  private adoptCommands(wf: Workflow) {
+    for (const call of unsealedCommandCalls(wf.journal.entries())) {
+      const m = /^(.*)@(\d+)\/(.*)@(\d+)$/.exec(call);
+      if (!m || Number(m[2]) !== wf.revision) continue;
+      const entry = revisionEntries(wf).find(e => (e.type === 'call' || e.type === 'generation') && String(e.key) === m[3] && Number(e.gen) === Number(m[4]));
+      if (!entry) continue;
+      const release = this.hold(wf.wid);
+      wf.journal.resting = false;
+      void this.executor.run(this.unpinnedTicket(wf, entry)).then(release, release);
+    }
   }
   /** A successful call with a worktree whose removal (or keeping) is not recorded yet: its post-seal effect is due. */
   private worktreeUnsettled(wf: Workflow, call: string): boolean {
@@ -576,7 +593,7 @@ export class Engine {
         // A claimed subagent call only restricts (it cannot force); otherwise the main session's sender is authoritative.
         const initiator = body.initiator && 'call' in body.initiator ? body.initiator : req.from.startsWith('main:') ? { origin: req.from } : body.initiator ?? { origin: req.from };
         const gate = this.executor.quiesce?.() ?? { live: [], resume() {} };
-        const reason = restartRefusal(this.ledgers.home, gate.live.map(l => ({ ...l, origin: this.store.workflows.get(l.wid)?.origin })), body, req.from.startsWith('main:'));
+        const reason = restartRefusal(this.ledgers.home, gate.live.map(l => ({ ...l, origin: this.store.workflows.get(l.wid)?.origin })), body, req.from.startsWith('main:'), Date.now(), gate.commands ?? 0);
         if (reason) { gate.resume(); return { action: 'reject', reason }; }
         try { await this.ledgers.orch.append('restart', { rid: req.rid, force: force && gate.live.length > 0, reason: body.reason, initiator, from: req.from, live: gate.live.map(l => l.exec) }); }
         catch (error) { gate.resume(); throw error; }
@@ -626,6 +643,7 @@ export class Engine {
     const log = wf.journal.entries(), has = (type: string, field: string, value: unknown) => log.some(e => e.type === type && e[field] === value);
     const openGeneration = log.some(e => e.type === 'generation' && !has(JT.sealed, 'call', `${wf.wid}@${e.revision}/${e.key}@${e.gen}`) && !has('retired', 'call', `${wf.wid}@${e.revision}/${e.key}@${e.gen}`));
     const liveExec = log.some(e => e.type === JT.exec && !has(JT.fenced, 'exec', e.exec) && !has(JT.sealed, 'call', e.call));
+    if (unsealedCommandCalls(log).length) return 'running-command';
     if (openGeneration || liveExec || this.running.has(wf.wid) || [...this.generations].some(id => id.startsWith(`${wf.wid}@`))) return 'open-generation';
     if (log.some(e => e.type === 'fence-failed' && !log.some(r => r.seq > e.seq && ((r.type === JT.fenced && r.exec === e.exec) || (r.type === 'gate' && r.id === e.exec) ||
       (r.type === JT.attentionResolved && r.id === `fence:${String(e.exec)}`))))) return 'fence-failed';
