@@ -88,6 +88,11 @@ export interface JournalHandle {
   resting?: boolean;
   /** Whether the handle holds its file descriptor now. */
   readonly descriptorOpen?: boolean;
+  /** False while a lazily opened handle has not decoded its file (see openLazyJournal): entries(), committed() and
+   *  append() decode it first. Absent or true: the entries are in memory. */
+  readonly loaded?: boolean;
+  /** How many entries the journal has, without decoding a lazy handle. */
+  count?(): number;
 }
 
 // ---------------------------------------------------------------------------

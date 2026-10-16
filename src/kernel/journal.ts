@@ -1,5 +1,5 @@
 import { open, mkdir, type FileHandle } from 'node:fs/promises';
-import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync, readSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as zlib from 'node:zlib';
 import type { Entry, JournalHandle } from '../types.ts';
@@ -173,23 +173,100 @@ export function openJournalDescriptors(): number { return descriptors; }
 /** A1, C11: Repair only the tail, then serialize durable framed appends. A resting handle (`resting = true`) closes its
  *  descriptor once its appends are done and reopens it for the next append; its entries stay in memory. */
 export async function openJournal(path: string): Promise<JournalHandle> {
+  return (await openHandle(path))!;
+}
+/** What a lazy open checks a journal against: its file identity and size, how many entries it has, and its last
+ *  framed line (`tail`: its CRC-32, `tailLength`: its bytes with the newline). */
+export interface JournalExpectation { ino: number; size: number; count: number; tail: string; tailLength: number }
+/** The expectation a journal handle meets now (its committed bytes, read back from the file), for a later lazy open;
+ *  undefined when the file has no complete entry or does not end at the committed length. */
+export function journalExpectation(journal: JournalHandle): JournalExpectation | undefined {
+  const entries = journal.committed?.() ?? journal.entries(), count = entries.length;
+  if (!count) return undefined;
+  let fd: number;
+  try { fd = openSync(journal.path, 'r'); } catch { return undefined; }
+  try {
+    const { ino, size } = fstatSync(fd), tail = lastLine(fd, size);
+    if (!tail) return undefined;
+    // The last line must be the last committed entry (a torn tail is truncated by every open, never trusted).
+    const json = unframeLine(tail.subarray(0, tail.length - 1));
+    if (json === undefined || (JSON.parse(json) as Entry).seq !== count) return undefined;
+    return { ino, size, count, tail: crc32(tail), tailLength: tail.length };
+  } catch { return undefined; } finally { closeSync(fd); }
+}
+/** The last line of the file (with its newline), when the file ends with one. Reads from the end in chunks. */
+function lastLine(fd: number, size: number): Buffer | undefined {
+  if (!size) return undefined;
+  let chunk = 4096, buffer = Buffer.alloc(0);
+  for (let end = size; ;) {
+    const start = Math.max(0, end - chunk), part = Buffer.alloc(end - start);
+    for (let read = 0; read < part.length;) { const n = readSync(fd, part, read, part.length - read, start + read); if (!n) return undefined; read += n; }
+    buffer = Buffer.concat([part, buffer]);
+    if (buffer[buffer.length - 1] !== 10) return undefined;
+    const previous = buffer.lastIndexOf(10, buffer.length - 2);
+    if (previous >= 0) return buffer.subarray(previous + 1);
+    if (start === 0) return buffer;
+    end = start; chunk *= 2;
+  }
+}
+/** A1, C11: A journal handle that decodes nothing yet: when the file still is what `expect` describes (same inode and
+ *  size, the same last line), the handle reports `loaded: false` and `count()` from it, and decodes the whole file
+ *  (verifying it as openJournal does) on the first access to its entries or the first append. Undefined when the file
+ *  is not what was expected: the caller opens it eagerly. Decoding later finds the same bytes or throws (one writer). */
+export async function openLazyJournal(path: string, expect: JournalExpectation): Promise<JournalHandle | undefined> {
+  let fd: number;
+  try { fd = openSync(path, 'r'); } catch { return undefined; }
+  try {
+    const { ino, size } = fstatSync(fd);
+    if (ino !== expect.ino || size !== expect.size || expect.count < 1 || expect.tailLength < 10 || expect.tailLength > size) return undefined;
+    const tail = Buffer.alloc(expect.tailLength);
+    for (let read = 0; read < tail.length;) { const n = readSync(fd, tail, read, tail.length - read, size - tail.length + read); if (!n) return undefined; read += n; }
+    if (tail[tail.length - 1] !== 10 || tail.indexOf(10) !== tail.length - 1 || crc32(tail) !== expect.tail) return undefined;
+    if (size > tail.length) {
+      const before = Buffer.alloc(1);
+      if (readSync(fd, before, 0, 1, size - tail.length - 1) !== 1 || before[0] !== 10) return undefined;
+    }
+  } catch { return undefined; } finally { closeSync(fd); }
+  return openHandle(path, expect);
+}
+/** Decode a journal synchronously as openJournal does (a torn tail is truncated), for a lazy handle's first access. */
+function loadSync(path: string, expect: JournalExpectation): { entries: Entry[]; size: number } {
+  const fd = openSync(path, 'r+');
+  try {
+    const { ino, size } = fstatSync(fd);
+    if (ino !== expect.ino || size !== expect.size) throw new Error(`Journal changed while not loaded: ${path} has ${size} bytes, ${expect.size} expected`);
+    const bytes = readFileSync(fd), decoded = decode(bytes);
+    if (decoded.entries.length !== expect.count) throw new Error(`Journal changed while not loaded: ${path} has ${decoded.entries.length} entries, ${expect.count} expected`);
+    if (decoded.length !== bytes.length) { ftruncateSync(fd, decoded.length); fsyncSync(fd); }
+    return { entries: decoded.entries, size: decoded.length };
+  } finally { closeSync(fd); }
+}
+async function openHandle(path: string, lazy?: JournalExpectation): Promise<JournalHandle | undefined> {
+  let entries: Entry[] | undefined, size: number, file: FileHandle | undefined;
+  if (lazy) size = lazy.size;
+  else {
   await mkdir(dirname(path), { recursive: true });
   let created = false;
   const first = await open(path, 'ax+').then(f => { created = true; return f; }, async error => {
     if (error.code !== 'EEXIST') throw error;
     return open(path, 'a+');
   });
-  let entries: Entry[], size: number;
   try {
     const bytes = await first.readFile(), decoded = decode(bytes);
     entries = decoded.entries; size = decoded.length;
     if (decoded.length !== bytes.length) { await first.truncate(decoded.length); await first.sync(); }
     if (created) { await first.sync(); await syncDirectory(dirname(path)); }
   } catch (error) { await first.close(); throw error; }
-  let file: FileHandle | undefined = first;
+  file = first;
   descriptors++;
+  }
+  /** The entries, decoding a lazy handle's file first. */
+  const all = (): Entry[] => {
+    if (!entries) { const loaded = loadSync(path, lazy!); entries = loaded.entries; size = loaded.size; }
+    return entries;
+  };
   let queue: Promise<unknown> = Promise.resolve(), closed = false, failed: unknown, view: Entry[] | undefined;
-  let resting = false, restTimer: ReturnType<typeof setTimeout> | undefined;
+  let resting = lazy !== undefined, restTimer: ReturnType<typeof setTimeout> | undefined;
   // Only this process writes the file (A2): a reopened file that is not exactly what was committed was changed by
   // someone else, and appending to it could interleave records.
   const reopen = async (): Promise<FileHandle> => {
@@ -215,16 +292,19 @@ export async function openJournal(path: string): Promise<JournalHandle> {
   const handle: JournalHandle = {
     path,
     // Shared frozen view, rebuilt only after an append (entries are immutable, see freeze()).
-    entries: () => view ??= Object.freeze(entries.slice()) as Entry[],
+    entries: () => view ??= Object.freeze(all().slice()) as Entry[],
     // The growing array itself (no copy): it is only ever appended to, so a reader may keep it and read below a length
     // it saw (the event pump reads new entries per tick without copying the journal).
-    committed: () => entries,
+    committed: () => all(),
+    get loaded() { return entries !== undefined; },
+    count: () => entries ? entries.length : lazy!.count,
     onAppend: undefined,
     append<T extends string>(type: T, fields: Record<string, unknown>): Promise<Entry<T>> {
       if (closed) return Promise.reject(new Error('Journal closed'));
       const frozen = structuredClone(fields);
       const operation = queue.then(async () => {
         if (failed) throw failed;
+        const entries = all();
         const entry = { ...frozen, seq: entries.length + 1, ts: Date.now(), type } as Entry<T>;
         const json = JSON.stringify(entry), bytes = Buffer.from(json), line = `${crc32(bytes)} ${json}\n`;
         let target: FileHandle;

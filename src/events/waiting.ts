@@ -337,7 +337,7 @@ export function startWaiting(options: { collect: () => WaitsCollected | Promise<
 // The orchestrator's collector.
 // ---------------------------------------------------------------------------------------------------------------------
 /** A workflow as the orchestrator holds it (Store `Workflow`): its in-memory journal and pinned agents. */
-export interface WaitWorkflow { wid: string; journal: Pick<JournalHandle, "entries">; pins?: { agents?: readonly { name: string; model?: string }[] } }
+export interface WaitWorkflow { wid: string; journal: Pick<JournalHandle, "entries" | "loaded">; pins?: { agents?: readonly { name: string; model?: string }[] } }
 export interface WaitSources {
   home: string;
   /** The workflows in memory, e.g. `() => engine.store.workflows.values()`. */
@@ -386,6 +386,8 @@ export function waitCollector(src: WaitSources): (now?: number) => WaitsCollecte
     const current = new Map<string, Wait>(), meta = new Map<string, WaitMeta>(), present = new Set<string>();
     for (const wf of src.workflows()) {
       present.add(wf.wid);
+      // A journal not decoded is a settled workflow's (orchestrator/settled.ts): it has no live call, so no wait.
+      if (wf.journal.loaded === false) continue;
       const entries = wf.journal.entries();
       let hit = folds.get(wf.wid);
       if (hit?.entries !== entries) { hit = { entries, fold: foldWaits(wf.wid, entries, hit?.fold) }; folds.set(wf.wid, hit); }

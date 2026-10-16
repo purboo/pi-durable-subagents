@@ -901,7 +901,16 @@ subagent only watching it.
 The restart ledger records the reason and initiator; after the next start,
 `status` shows who forced it and why for 24 hours.
 
-An orchestrator reads requests only after it has recovered its workflows, so
+An orchestrator reads requests only after it has recovered its workflows. Its
+start costs the unfinished work plus a small check per finished workflow, not
+the size of finished history: a call whose recovery completed is recorded in its
+journal and not read again until something concerns it, and a settled workflow
+(ended, nothing open) opens without decoding its journal, from a rebuildable
+record in `DSA_HOME/cache/settled`; the journal is read when a request needs it.
+Pinned files of a finished workflow are verified when a resume, revise or
+follow-up uses them; a changed file refuses that request (`pin-failed`). The
+ledger's `orchestrator` entry has `recovery: true`, and a `recovered` entry with
+the time taken follows when recovery ends. So
 a `restart` sent to one that just started waits for it (and says so); if no
 orchestrator reaches the request in time, `restart` exits 75 and the request
 stays pending — it is decided later, so do not send another.

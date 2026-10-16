@@ -13,7 +13,8 @@ import { discoverAgents, type AgentDefinition, type DiscoveryOptions } from '../
 import { parseFrontmatter } from '../compat/frontmatter.ts';
 import { compileFanout } from '../compat/fanout.ts';
 import { contentHash, ulid } from '../kernel/ids.ts';
-import { openJournal, syncDirectory } from '../kernel/journal.ts';
+import { openJournal, openLazyJournal, syncDirectory } from '../kernel/journal.ts';
+import { readSettled, settledPath, type SettledFacts } from './settled.ts';
 import { publishFile } from '../kernel/mailbox.ts';
 import { digestDir, factsDir, journalPath, pinnedDir, workflowDir } from '../paths.ts';
 import { JT, type Entry, type JournalHandle, type Request, type RunBody, type ReviseBody } from '../types.ts';
@@ -25,7 +26,9 @@ export interface Pins {
 }
 /** `pins` in memory carry neither the origin branch nor input bytes (both can be tens of MB per workflow); they are read
  *  from the published files: `originPath` (pinned origin.jsonl, when the run has an origin) and `inputs`. */
-export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string>; originPath?: string }
+export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string>; originPath?: string;
+  /** The settled record it was opened from (settled.ts): consult it only while its journal is not loaded. */
+  settled?: SettledFacts }
 type SnapshotRef = { path: string; hash: string };
 /** pinned/<rN>/pins.json: the in-memory pins of a published revision, valid for the snapshot hash it names. */
 type PinRecord = { snapshot: string; digest: string; pins: Pins; inputs: Record<string, string>; origin: boolean; files: Record<string, string> };
@@ -401,6 +404,7 @@ export class Store {
     await syncDirectory(join(this.ledgers.home, 'staging')).catch(error => { if (error.code !== 'ENOENT') throw error; });
     // Readers' caches of it (derived, never authoritative: no sync needed).
     await rm(join(digestDir(this.ledgers.home), `${wid}.json`), { force: true });
+    await rm(settledPath(this.ledgers.home, wid), { force: true });
     const cached = await readdir(digestDir(this.ledgers.home)).catch(error => { if (error.code !== 'ENOENT') throw error; return []; });
     for (const name of cached) if (name.startsWith(`${wid}.json.`) && name.endsWith('.tmp')) await rm(join(digestDir(this.ledgers.home), name), { force: true });
     await rm(join(factsDir(this.ledgers.home), wid), { recursive: true, force: true });
@@ -422,6 +426,20 @@ export class Store {
     if (existing) return existing;
     if (this.pruned().has(wid)) throw new Error(`Workflow ${wid} was pruned`);
     const path = journalPath(this.ledgers.home, wid);
+    // A settled workflow (settled.ts) whose journal is still what its record describes opens without decoding it.
+    const settled = readSettled(this.ledgers.home, wid), lazy = settled && await openLazyJournal(path, settled.journal);
+    if (settled && lazy) {
+      try {
+        const current = settled.revised ?? intent, files = await this.pinnedFiles(wid, settled.revision, current, false);
+        const facts: SettledFacts = { revision: settled.revision, ...(settled.revised ? { revised: settled.revised } : {}), done: settled.done, resumed: settled.resumed, quiet: settled.quiet, calls: settled.calls, sweep: settled.sweep };
+        const wf: Workflow = { wid, revision: settled.revision, origin: intent.origin as string, cwd: intent.cwd as string, journal: lazy, ...files, settled: facts };
+        this.unverified.set(wid, { revision: settled.revision, intent: current });
+        lazy.onAppend = () => this.appended?.(wid);
+        this.workflows.set(wid, wf);
+        if (!this.index().created.has(String(intent.rid))) await this.ledgers.orch.append(JT.created, { rid: intent.rid, wid, origin: intent.origin });
+        return wf;
+      } catch (error) { this.workflows.delete(wid); this.unverified.delete(wid); await lazy.close(); throw error; }
+    }
     // A new workflow publishes its pins before its journal exists (a failed publication leaves no journal).
     const fresh = await stat(path).then(() => false, error => { if (error.code === 'ENOENT') return true; throw error; });
     const first = fresh ? await this.pinnedFiles(wid, 1, intent) : undefined;
