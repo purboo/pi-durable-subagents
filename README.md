@@ -225,9 +225,9 @@ subagents({ chain: [{ command: ["npm", "test"] }, { agent: "worker", task: "Fix 
 
 | Field | Meaning |
 |---|---|
-| `command` | An array runs as argv, without a shell; a string runs through `/bin/sh -c`. |
+| `command` | An array runs a program with those arguments, never shell syntax: its first element is looked up in the command's `PATH` (exit 127 when there is none), and a shell builtin is not run as a builtin (`["exit", "7"]` looks for a program named `exit`). A string runs through `/bin/sh -c`. |
 | `cwd` | Its directory, resolved like an agent call's. |
-| `timeoutMs` | Wall-clock time from its start, including time the orchestrator was down. |
+| `timeoutMs` | Wall-clock time from its start, including time the orchestrator was down (see the result table). |
 | `env` | Variables added to the environment (`DSA_*` names are reserved). |
 | `rerun` | `true`: when the process vanished without an exit record (the machine restarted), start it once more instead of ending `unknown`. For idempotent commands. |
 | `writer` | `true`: take its worktree's writer lock (default `false`). |
@@ -245,7 +245,7 @@ the same home; it cannot force a restart.
 |---|---|
 | exits 0 | `ok` |
 | exits with another status or is killed by a signal | `failed`, error `Command exited <status>` / `Command killed by <SIG>` |
-| runs longer than `timeoutMs` | `timeout` |
+| ends after its deadline (start + `timeoutMs`), or still runs then | `timeout`, error `Command timed out after <ms> ms` |
 | is stopped (`stop`) | `stopped` |
 | vanished without an exit record, no `rerun` | `unknown`, error `Command ended without an exit record` |
 
@@ -254,11 +254,25 @@ the same home; it cannot force a restart.
 tree); `steer`, `follow-up`, `answer`, `model` and `notify` are refused with
 `command call: <kind> is not supported (stop it, or start a new call)`.
 
+The deadline counts from the command's start, also while no orchestrator
+runs: a command that ended in time is `ok` (or `failed`) even when the
+orchestrator records it later, and one that ended after its deadline is
+`timeout` (with its exit in `data`) although nothing had to stop it.
+
 A command outlives the orchestrator: a restart (also a forced one), an idle
 exit or a crash leaves it running, and the next orchestrator takes it over or
 records its result if it ended meanwhile. The restart busy list does not count
-it. Neither does a quit pi or `stop-all` stop it: it runs to its end and its
-result is recorded; the held workflow just starts nothing after it.
+it.
+
+A hold (`drain`, `stop-all`, a quit pi) prevents starting, never stops what
+started. A command call that has not started yet (also one waiting for its
+worktree's writer lock) waits while its workflow is held and starts after
+`resume`. One that has started runs to its end; its result is recorded and
+delivered to its workflow as without the hold, also after an orchestrator
+restart (`start` and the pi session's starter start an orchestrator for it):
+a workflow that is then complete finishes and sends its notice, and a call it
+wants next waits for `resume`. The one `rerun` of a lost command is a new
+start, so under a hold it waits for `resume` too.
 
 In a chain, a command step gets no `{previous}` (its command is not changed);
 an agent step after a command step gets the command's output as `{previous}`.

@@ -47,9 +47,10 @@ async function fixture(t: test.TestContext) {
   };
   const spec = async (name: string, value: unknown) => { const path = join(root, name); await writeFile(path, JSON.stringify(value)); return path; };
   const inbox = async () => (await readdir(orchInbox(home)).catch(() => [] as string[])).filter(n => n.endsWith('.json'));
-  const boot = async () => {
+  const boot = async (options: { scripts?: boolean } = {}) => {
     const orch = await openJournal(orchLedger(home)), ledgers = { home, orch, config: { k: { idleExitMs: 30 } } };
-    const engine = new Engine(ledgers, fakeExecutor(ledgers, { hold: 'held' }), { evaluator: new ManualEvaluator(), discovery: { home: root, agentDir: join(root, 'agent'), globalNpmRoot: null } });
+    // scripts: the real evaluator runs workflow scripts (the default manual one only records messages).
+    const engine = new Engine(ledgers, fakeExecutor(ledgers, { hold: 'held' }), { ...(options.scripts ? {} : { evaluator: new ManualEvaluator() }), discovery: { home: root, agentDir: join(root, 'agent'), globalNpmRoot: null } });
     await engine.recover();
     engines.push({ engine, close: async () => { await engine.close().catch(() => {}); await orch.close(); } });
     return engine;
@@ -381,4 +382,43 @@ test('Run --request takes command call bodies: a single command and command step
   await assert.rejects(f.cli(['run', '--request', 'cmd-3', '--spec', await f.spec('e.json', { command: 'true', model: 'p/m' })]), /model is not allowed in a command call/);
   await assert.rejects(f.cli(['run', '--request', 'cmd-4', '--spec', await f.spec('g.json', { tasks: [{ command: 'true' }], command: 'x' })]), /command cannot be set beside tasks: put it in a step/);
   assert.deepEqual((await f.inbox()).sort(), ['req:cmd-1.json', 'req:cmd-2.json']);
+});
+
+test('R8: an answer to a command call, running or sealed, with or without qid/rev, from the tool and the CLI, gets the pinned reason', async t => {
+  const f = await fixture(t), engine = await f.boot({ scripts: true });
+  f.pump(engine);
+  const keys = ['HOME', 'DSA_HOME', 'PI_CODING_AGENT_DIR', 'PI_OFFLINE', 'DSA_ORCHESTRATOR_ENTRY'] as const;
+  const old = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  let tool: { execute: (...args: unknown[]) => Promise<{ details: unknown }> } | undefined;
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+  const context = { cwd: f.cwd, hasUI: false, isIdle: () => false, ui: { notify() {} },
+    sessionManager: { getSessionId: () => 'answer-session', getSessionFile: () => undefined, getLeafId: () => undefined } };
+  Object.assign(process.env, f.env);
+  f.defer(() => { for (const k of keys) if (old[k] === undefined) delete process.env[k]; else process.env[k] = old[k]; });
+  const { registerMain } = await import('../../../src/agent/main.ts');
+  registerMain({ on(name: string, fn: never) { handlers.set(name, fn); }, registerTool(value: never) { tool = value; }, sendMessage() {} } as never);
+  await handlers.get('session_start')!({}, context);
+  f.defer(() => handlers.get('session_shutdown')!({ reason: 'reload' }, context));
+  const call = async (args: Record<string, unknown>) => (await tool!.execute('id', args, undefined, undefined, context)).details as Record<string, unknown>;
+  const run = await call({ source: "return await runs.all([{key:'held', command:['sleep','100']}, {key:'done', command:'true'}]);" });
+  const wid = String(run.wid);
+  const journal = () => readJournalSnapshot(journalPath(f.home, wid));
+  const deadline = Date.now() + 10_000;
+  while (!journal().some(e => e.type === JT.sealed && String(e.call).endsWith('/done@1'))) { if (Date.now() > deadline) throw new Error(`done not sealed: ${JSON.stringify(run)} ${JSON.stringify(journal().map(e => e.type))}`); await new Promise(r => setTimeout(r, 20)); }
+  const reason = 'command call: answer is not supported (stop it, or start a new call)';
+  let n = 0;
+  for (const key of ['held', 'done']) {
+    const to = `${wid}/${key}`;
+    assert.deepEqual(await call({ action: 'send', kind: 'answer', to, message: 'x' }), { applied: false, reason }, `tool, ${key}, no qid`);
+    assert.deepEqual(await call({ action: 'send', kind: 'answer', to, qid: 'q-made-up', message: 'x' }), { applied: false, reason }, `tool, ${key}, qid only`);
+    const withRev = await call({ action: 'send', kind: 'answer', to, qid: 'q-made-up', rev: 3, message: 'x' });
+    assert.deepEqual([withRev.applied, withRev.reason], [false, reason], `tool, ${key}, qid+rev: ${JSON.stringify(withRev)}`);
+    for (const extra of [[], ['--qid', 'q-made-up'], ['--qid', 'q-made-up', '--rev', '2']]) {
+      const out = await f.cli(['send', '--request', `ans-${++n}`, '--to', to, '--kind', 'answer', '--message', 'x', ...extra, '--json'], { waitMs: 5000 });
+      assert.equal(out.code, 1, out.out);
+      const reply = JSON.parse(out.out);
+      assert.deepEqual([reply.applied, reply.reason], [false, reason], `cli, ${key}, ${extra.join(' ')}`);
+    }
+  }
+  assert.ok(!journal().some(e => e.type === JT.sealed && String(e.call).endsWith('/held@1')), 'held still runs');
 });
