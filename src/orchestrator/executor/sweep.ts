@@ -75,17 +75,19 @@ const sweeps = new WeakMap<JournalHandle, SweepState>();
  *  `pid start` (a tracked execution records only these; the sweep matches them against live processes). */
 export type SweepSeed = { exec: string; call: string; failed?: true; tracked: string[] };
 export function sweepSeed(journal: JournalHandle): SweepSeed[] {
-  const { failed, tracked, execs } = indexSweep(journal);
+  const { failed, fenced, tracked, execs } = indexSweep(journal);
   return execs.map(e => {
     const exec = String(e.exec);
     const ids = [...new Set((tracked.get(exec) ?? []).map(p => `${p.pid} ${p.start}`))];
-    return { exec, call: String(e.call), ...(failed.has(exec) ? { failed: true as const } : {}), tracked: ids };
+    // Only a failure not fenced since is still a failure: a fenced one would make the sweep record (and decode) again.
+    return { exec, call: String(e.call), ...(failed.has(exec) && !fenced.has(exec) ? { failed: true as const } : {}), tracked: ids };
   });
 }
 const procOf = (id: string): ProcInfo => { const space = id.indexOf(" "); return { pid: Number(id.slice(0, space)), ppid: 0, start: id.slice(space + 1) }; };
-/** The sweep state of a journal that is not decoded, from its seed (every execution fenced, no open gate). */
+/** The sweep state of a journal that is not decoded, from its seed (every execution fenced, no open gate): no failed
+ *  fence is open (settledFacts requires it), so none is seeded, also from an older record. */
 export function seededSweep(seed: readonly SweepSeed[]): SweepState {
-  return { count: 0, fenced: new Set(seed.map(s => s.exec)), retired: new Set(), failed: new Set(seed.filter(s => s.failed).map(s => s.exec)), gated: new Set(),
+  return { count: 0, fenced: new Set(seed.map(s => s.exec)), retired: new Set(), failed: new Set(), gated: new Set(),
     tracked: new Map(seed.map(s => [s.exec, s.tracked.map(procOf)])), execs: seed.map(s => ({ seq: 0, ts: 0, type: JT.exec, exec: s.exec, call: s.call })) as Entry[], gates: [] };
 }
 

@@ -908,9 +908,14 @@ journal and not read again until something concerns it, and a settled workflow
 (ended, nothing open) opens without decoding its journal, from a rebuildable
 record in `DSA_HOME/cache/settled`; the journal is read when a request needs it.
 Pinned files of a finished workflow are verified when a resume, revise or
-follow-up uses them; a changed file refuses that request (`pin-failed`). The
-ledger's `orchestrator` entry has `recovery: true`, and a `recovered` entry with
-the time taken follows when recovery ends. So
+follow-up uses them; a changed file refuses that request (`pin-failed`). A
+follow-up generation that is already open when its files no longer verify (at a
+restart, say) is sealed `failed` without starting a subagent, with an error
+starting `pin-failed: ` that names the file; the workflow ends again, and once
+the file is restored a later follow-up runs. The first start after upgrading
+makes a one-time pass that writes these records and receipts (tens of seconds
+on a large home). The ledger's `orchestrator` entry has `recovery: true`, and a
+`recovered` entry with the time taken follows when recovery ends. So
 a `restart` sent to one that just started waits for it (and says so); if no
 orchestrator reaches the request in time, `restart` exits 75 and the request
 stays pending — it is decided later, so do not send another.
