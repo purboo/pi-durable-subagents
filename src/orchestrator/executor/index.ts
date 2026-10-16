@@ -140,6 +140,8 @@ export const SPAWN_CONSOLE_MS = 600_000;
 export default function createExecutor(ledgers: Ledgers, options: { memory?: () => Promise<number>; sweepMs?: number; effects?: CallEffects; containment?: Containment;
   /** The pi subagents run (absolute; the orchestrator resolved it at start); a bare `pi` from PATH without one. */
   pi?: string; spawnRetryMs?: number;
+  /** Tests: the directory sync of an inbox cleanup (kernel/journal.ts syncDirectory by default). */
+  syncDirectory?: (dir: string) => Promise<void>;
   /** Observes each slot attempt that admitted nothing: the execution and the providers it found full. */
   attempted?: (exec: string, full: readonly string[]) => void } = {}): Executor {
   const { home, config, orch } = ledgers;
@@ -298,15 +300,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       done.add(rid);
     }
   }
+  /** Remove a sealed call's inbox files, then sync the directory: the removals are durable before anything recorded
+   *  after them (a `recovered` receipt). The directory is synced whenever it exists, also when it is already empty (an
+   *  earlier attempt may have removed the files and failed to sync); a failure rejects (the caller records no receipt). */
   async function collectSealed(call: string) {
     const sender = await outbox, dir = inbox(call);
-    let removed = false;
-    for (const name of await readdir(dir).catch(error => { ignoreMissing(error); return []; })) {
+    let exists = true;
+    for (const name of await readdir(dir).catch(error => { ignoreMissing(error); exists = false; return []; })) {
       if (name.endsWith(".json") && !name.startsWith(".")) await sender.markResolved(name.slice(0, -5));
-      await rm(join(dir, name), { force: true }); removed = true;
+      await rm(join(dir, name), { force: true });
     }
-    // The removals are durable before anything recorded after them (a `recovered` receipt); best effort.
-    if (removed) await syncDirectory(dir).catch(error => console.error(`durable-subagents: sync of ${dir} failed: ${String(error)}`));
+    if (exists) await (options.syncDirectory ?? syncDirectory)(dir);
   }
   /** Sealed or retired calls a batched recovery read, finished by finishRecovery. */
   const unfinished: { journal: JournalHandle; calls: string[] }[] = [];
@@ -429,7 +433,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   async function finish(journal: JournalHandle, call: string, exec: string, result: CallResult) {
     const a = active.get(call);
-    if (a && !sealed(journal, call) && !["stopped", "timeout", "budget"].includes(result.status)) {
+    // A refused call (CallTicket.refusal) runs none of the pre-seal effects (gate, output publication): it did no work.
+    if (a && a.ticket.refusal === undefined && !sealed(journal, call) && !["stopped", "timeout", "budget"].includes(result.status)) {
       const started = Date.now(), prior = activeTotal(journal.entries(), call);
       const check = async () => {
         if (stopped(a)) a.controller.abort();

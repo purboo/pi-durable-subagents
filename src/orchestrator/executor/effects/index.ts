@@ -19,7 +19,8 @@ export default function createEffects(ledgers: Ledgers, containment: Containment
       const cwd = await prepareWorktree(t); await prepareFork(t, cwd, ctx.sessionPath); return { cwd };
     }),
     beforeSeal: (t, exec, result, ctl) => serial(t.callId, async () => {
-      if (ctl.signal.aborted || ["stopped", "timeout", "budget"].includes(result.status)) return result;
+      // A refused call did no work: no gate, no output (the executor does not call this for one either).
+      if (t.refusal !== undefined || ctl.signal.aborted || ["stopped", "timeout", "budget"].includes(result.status)) return result;
       const intent = t.journal.entries().find(e => e.type === "wt-intent" && e.call === t.callId);
       const gated = await runGate(t, ledgers.home, intent ? String(intent.path) : t.cwd, exec, result, ctl.signal, containment);
       if (ctl.signal.aborted) return result;
