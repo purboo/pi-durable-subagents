@@ -31,6 +31,8 @@ test("the orchestrator records its package version while it holds the lock, and 
   assert.match(packageVersion(), /^\d+\.\d+\.\d+/);
   // Subagents reach `pi-durable-subagents hold` through the shim the orchestrator writes at start.
   assert.match(readFileSync(join(home, "bin", "pi-durable-subagents"), "utf8"), /src\/cli\/main\.ts' "\$@"/);
+  // Until its `recovered` entry the orchestrator is shown as starting; afterwards the same version carries no note.
+  for (let i = 0; i < 200 && !readJournalSnapshot(orchLedger(home)).some(e => e.type === "recovered"); i++) await delay(10);
   assert.deepEqual(runningOrchestrator(home), { orchestrator: `${packageVersion()} (pid ${process.pid})` }, "the same version: no note");
   controller.abort(); await run;
   assert.equal(readJournalSnapshot(orchLedger(home)).at(-1)!.type, "orchestrator-exit");
