@@ -2,7 +2,8 @@
 // package, which the CLI (sharing tool.ts) must not import: it runs from the package directory.
 import { Type } from "@earendil-works/pi-ai";
 
-const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, schema?, gate?, isolation?, context?, budget?, once?, tools?, skills?, writer?, key?}; " +
+const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, schema?, gate?, isolation?, context?, budget?, once?, tools?, skills?, writer?, key?} " +
+  "or command specs {command, cwd?, timeoutMs?, env?, rerun?, writer?, key?}; " +
   "each call is addressed as '<wid>/<key>', where key is the step's own unique key or else 'tasks:<i>' / 'chain:<i>'.";
 
 export const parameters = Type.Object({
@@ -11,6 +12,9 @@ export const parameters = Type.Object({
   tasks: Type.Optional(Type.Array(Type.Any(), { description: `Parallel calls. ${stepsDoc}` })),
   chain: Type.Optional(Type.Array(Type.Any(), { description: `Sequential calls ({previous} = previous output). ${stepsDoc}` })),
   agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
+  command: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "A command call instead of agent+task: an argv array runs directly, a string through /bin/sh -c. No model or slot; it survives restarts. Result data {exitCode, signal, durationMs}, output = the last 16 KiB of stdout+stderr." })),
+  env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Command calls: variables added to the environment (DSA_* reserved)." })),
+  rerun: Type.Optional(Type.Boolean({ description: "Command calls: start the command once more when it vanished without an exit record (machine restart) instead of sealing unknown; for idempotent commands." })),
   cwd: Type.Optional(Type.String({ description: "Run directory (default: this session's). Relative workflow, inputs and call cwd paths resolve against it." })),
   to: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "send: '<wid>/<key>', or a list of them for steer, notify, follow-up and model (one request per call; answer takes one)." })),
   kind: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("notify"), Type.Literal("follow-up"), Type.Literal("answer"), Type.Literal("model")])),
@@ -20,7 +24,7 @@ export const parameters = Type.Object({
   maxCalls: Type.Optional(Type.Integer({ minimum: 1 })), inputs: Type.Optional(Type.Record(Type.String(), Type.String())),
   name: Type.Optional(Type.String()),
   labels: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "run: your labels, e.g. {node, attempt}: at most 32 keys [A-Za-z0-9_.:-]{1,64}, string values of at most 256 characters, 4096 bytes of JSON; part of the request's content (spec_digest), shown by describe and on its events." })),
-  timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number). Omit unless a hard limit is needed; prefer budgets." })),
+  timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number; a command call: wall-clock time since it started). Omit unless a hard limit is needed; prefer budgets." })),
   key: Type.Optional(Type.String({ description: "A single agent/task run: the call's key. status with wid: that call's full result." })),
   tail: Type.Optional(Type.Integer({ minimum: 1, description: "status with wid: the last N lines of each call's result (unclipped, at most 4000 characters per call)." })),
   grep: Type.Optional(Type.String({ description: "status with wid: only the lines of each call's result matching this case-sensitive JS regular expression, run in-process: avoid nested quantifiers such as (a+)+; it tests the first 2000 characters of a line and the last 5000 lines (with tail: grep first, then the last N)." })),

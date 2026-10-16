@@ -1,15 +1,39 @@
 import { AssistantMessageComponent, UserMessageComponent, ToolExecutionComponent, getMarkdownTheme, getSelectListTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { Input, SelectList, fuzzyFilter, matchesKey, truncateToWidth, visibleWidth, type Component, type SelectItem, type OverlayOptions, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Input, SelectList, fuzzyFilter, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type SelectItem, type OverlayOptions, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { CallSnapshot, WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import { CT } from "../types.ts";
 import { UiActions, UiData } from "./data.ts";
-import { callName, workflowName, doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, listRows, modelLabel, pendingText, resultPhrase, statusPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
+import { callName, workflowName, doneOrder, isOpen, plainReason, toggleOpen, duration, keepSelection, summaryText, listRows, modelColumn, modelLabel, pendingText, resultPhrase, statusPhrase, rowText, toolCount, type ListRow, type ViewState } from "./view.ts";
 import { fitWidth, frame, inner } from "./frame.ts";
 import { thinkingElapsed } from "./thinking.ts";
 import { thoughtSummary } from "./session.ts";
 
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/** A command call runs a process: it takes no message and no model; only stop controls it. */
+const isCommand = (c: CallSnapshot | undefined) => c?.command !== undefined;
+const COMMAND_NOTE = "a command call takes no messages or model; x or /stop stops it";
+
+/** The watch view's second head line of a command call: "running · pid 123 · 2m05s · <log>" / "failed · exit 3 · 41s". */
+export function commandHead(c: CallSnapshot, w: WorkflowSnapshot, now: number): string {
+  const r = c.result, data = r?.data as { exitCode?: unknown; signal?: unknown; durationMs?: unknown } | undefined, log = c.commandRun?.log;
+  const ended = r ? [r.status, typeof data?.exitCode === "number" ? `exit ${data.exitCode}` : typeof data?.signal === "string" ? data.signal : "",
+    typeof data?.durationMs === "number" ? duration(data.durationMs) : ""] : [statusPhrase(c, w, undefined, now)];
+  return [...ended, log ?? ""].filter(Boolean).join(" · ");
+}
+/** The watch view's body of a command call: the whole command, then its result's output (the last 16 KiB of its log)
+ *  once it ended, else where its output goes. */
+export function commandTranscript(c: CallSnapshot, w: WorkflowSnapshot, now: number): string[] {
+  const lines = [`$ ${c.command ?? ""}`, ""];
+  if (c.result) {
+    if (c.result.error) lines.push(c.result.error, "");
+    lines.push(...(c.result.output ? c.result.output.replace(/\n+$/, "").split("\n") : ["(no output)"]));
+  } else if (c.phase === "queued") lines.push(statusPhrase(c, w, undefined, now));
+  else lines.push(`${statusPhrase(c, w, undefined, now)}${c.commandRun?.log ? `; output goes to ${c.commandRun.log}` : ""}`);
+  return lines;
+}
+/** One output line wrapped to the panel; control characters (also escape sequences a command printed) are dropped. */
+const wrapLine = (line: string, width: number): string[] => wrapTextWithAnsi(line.replace(/\t/g, "  ").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, ""), Math.max(1, width));
 
 /** UI §2–3: A single pi component owns list/watch navigation while the main agent keeps running. */
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -129,6 +153,7 @@ export class SubagentScreen implements Component {
   }
   private modelMenu(target?: CallSnapshot) {
     const c = target ?? this.current().c; if (!c) return;
+    if (isCommand(c)) { if (target) this.listNotice = { text: COMMAND_NOTE, until: Date.now() + 5000 }; else this.notice = COMMAND_NOTE; return; }
     this.menuTitle = `Model for ${c.key}`;
     const models = this.ctx.modelRegistry.getAvailable();
     this.menuItems = models.map(m => ({ value: `${m.provider}/${m.id}`, label: this.name(`${m.provider}/${m.id}`) }));
@@ -152,7 +177,7 @@ export class SubagentScreen implements Component {
     this.menu.onSelect = onSelect; this.menu.onCancel = onCancel;
   }
   private thinkingMenu() {
-    const { c } = this.current(); if (!c) return;
+    const { c } = this.current(); if (!c || isCommand(c)) return;
     const model = this.data.facts.get(c.callId)?.model ?? c.model; if (!model) return;
     this.menuTitle = `Thinking for ${c.key}`;
     this.menuItems = levels.map(value => ({ value, label: value }));
@@ -166,6 +191,7 @@ export class SubagentScreen implements Component {
   }
   private cycleThinking() {
     const { c } = this.current(); if (!c) return;
+    if (isCommand(c)) { this.notice = COMMAND_NOTE; return; }
     const facts = this.data.facts.get(c.callId), model = facts?.model ?? c.model;
     if (!model) { this.notice = "Model not yet recorded"; return; }
     const level = levels[(levels.indexOf(facts?.thinking ?? "off") + 1) % levels.length]!;
@@ -180,7 +206,8 @@ export class SubagentScreen implements Component {
       void this.send({ action: "send", to: c.callId, kind: "model", model }, `switched ${c.key} to ${model}`); return;
     }
     if (message === "/stop") { void this.send({ action: "stop", target: c.callId }, `stopped ${c.key}`); return; }
-    if (message.startsWith("/")) { this.notice = "Commands: /model, /stop"; return; }
+    if (message.startsWith("/")) { this.notice = isCommand(c) ? "Commands: /stop" : "Commands: /model, /stop"; return; }
+    if (isCommand(c)) { this.notice = COMMAND_NOTE; return; }
     const q = w.attention.find(a => a.kind === "question" && a.call === c.callId);
     // A finished call cannot be steered: typing to it continues it (a follow-up), as the note says.
     const kind = followUp || c.phase === "sealed" ? "follow-up" : q ? "answer" : "steer";
@@ -217,7 +244,8 @@ export class SubagentScreen implements Component {
       else if (!this.busy) {
         const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined, w = row?.workflow;
         const asking = c && w?.attention.some(a => a.kind === "question" && a.call === c.callId);
-        if (key === "s" && c && c.phase !== "sealed") this.beginListInput("steer", row!);
+        if (isCommand(c) && "sfam".includes(key)) this.listNotice = { text: COMMAND_NOTE, until: Date.now() + 5000 };
+        else if (key === "s" && c && c.phase !== "sealed") this.beginListInput("steer", row!);
         else if (key === "f" && c?.phase === "sealed") this.beginListInput("follow-up", row!);
         else if (key === "a" && c && asking) this.beginListInput("answer", row!);
         else if (key === "m" && c) this.modelMenu(c);
@@ -249,7 +277,7 @@ export class SubagentScreen implements Component {
     if (event.type !== "click" || event.button !== "left" || !this.watching || this.doneTab) return;
     // Panel coordinates: row 0 is the top border, column 2 is the first content column.
     if (event.y === 2) {
-      const { c, w } = this.current(); if (!c || !w) return;
+      const { c, w } = this.current(); if (!c || !w || isCommand(c)) return;
       const facts = this.data.facts.get(c.callId), model = `${callName(w, c)} · ${this.name(facts?.model ?? c.model)} ▾ · `;
       const x = event.x - 2;
       if (x < visibleWidth(model)) this.modelMenu();
@@ -262,6 +290,7 @@ export class SubagentScreen implements Component {
     if (event.y === this.inputRow) return this.input.handleMouse({ ...event, x: event.x - 2, y: 0 });
   }
   private transcript(c: CallSnapshot, w: WorkflowSnapshot, width: number): { lines: string[]; thoughts: number[] } {
+    if (isCommand(c)) return { lines: commandTranscript(c, w, Date.now()).flatMap(line => line ? wrapLine(line, width) : [""]), thoughts: [] };
     const entries = this.data.sessions.get(c.callId) ?? [], lines: string[] = [], thoughts: number[] = [];
     const tools = new Map<string, ToolExecutionComponent>();
     // A `{ thought }` part is an expanded thinking block: like pi, a click anywhere on it collapses it again.
@@ -361,7 +390,7 @@ export class SubagentScreen implements Component {
       const rowWidth = Math.max(1, size.width - 2);
       this.rows = this.doneTab && w ? doneOrder(w.calls).map(c => {
         const f = this.data.facts.get(c.callId);
-        return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", callName(w, c), this.name(f?.model ?? c.model), resultPhrase(c), [toolCount(f?.tools)], rowWidth) };
+        return { id: c.callId, kind: "call" as const, workflow: w, call: c, failed: !c.result?.ok, text: rowText("  ", callName(w, c), modelColumn(c, f, this.name), resultPhrase(c), [toolCount(f?.tools)], rowWidth) };
       }) : listRows(this.data.workflows, this.state, this.data.facts, this.name, rowWidth);
       height = this.height(Math.max(1, this.rows.length) + footerRows); size = inner(width, height); // inner width does not depend on height
       this.selected = keepSelection(this.rows, this.selectedId, this.selected);
@@ -376,10 +405,11 @@ export class SubagentScreen implements Component {
       const row = this.selectedRow(), c = row?.kind === "call" ? row.call : undefined;
       const asking = c && row?.workflow?.attention.some(a => a.kind === "question" && a.call === c.callId);
       const narrow = size.width < 72;
+      const agent = c && !isCommand(c);
       const keys = [narrow ? "↑↓" : "↑ ↓ select", row && row.kind !== "preview" ? `Enter ${narrow ? "" : row.kind === "workflow" ? (isOpen(row.workflow!, this.state) ? "collapse" : "expand") : row.kind === "call" ? "watch" : "open"}`.trim() : "",
-        c && c.phase !== "sealed" ? (narrow ? "s" : "s steer") : "", c?.phase === "sealed" ? (narrow ? "f" : "f follow-up") : "",
+        agent && c.phase !== "sealed" ? (narrow ? "s" : "s steer") : "", agent && c.phase === "sealed" ? (narrow ? "f" : "f follow-up") : "",
         c && c.phase !== "sealed" || row?.kind === "workflow" && row.workflow?.status === "running" ? (narrow ? "x" : "x stop") : "",
-        c ? (narrow ? "m" : "m model") : "", asking ? (narrow ? "a" : "a answer") : "", row?.workflow?.paused ? (narrow ? "r" : "r resume") : "", "Esc back"].filter(Boolean).join(" · ");
+        agent ? (narrow ? "m" : "m model") : "", asking ? (narrow ? "a" : "a answer") : "", row?.workflow?.paused ? (narrow ? "r" : "r resume") : "", "Esc back"].filter(Boolean).join(" · ");
       const notice = this.listNotice && this.listNotice.until > Date.now() ? this.listNotice.text : "";
       const footer = this.listInput ? this.listInput.editor.render(size.width) : this.stopTarget ? [`Stop ${this.stopTarget.name}? y confirm · any other key cancels`] : notice ? [notice] : [];
       const body = this.rows.length ? lines.slice(0, Math.max(0, size.height - footer.length)) : ["No subagents"];
@@ -392,14 +422,16 @@ export class SubagentScreen implements Component {
     const tabs = size.width < 60 ? `${callName(w, c)} ${w.calls.indexOf(c) + 1}/${w.calls.length}` : `${[...active.map(c => callName(w, c)), ...(done ? [`${done} done`] : [])].join(" · ")}    ← → switch`;
     const tools = toolCount(facts?.tools), pending = pendingText(c.pending), rule = this.theme.fg("borderMuted", "─".repeat(size.width));
     const switching = c.switching ? ` → ${this.name(c.switching)} (requested)` : "";
-    const head = [tabs, `${callName(w, c)} · ${this.name(facts?.model ?? c.model)} ▾${switching} · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
+    // A command call shows its command, process and log instead of a model, thinking level and spend.
+    const head = isCommand(c) ? [tabs, `${callName(w, c)} · ${modelColumn(c, facts, this.name)}`, this.theme.fg("dim", commandHead(c, w, Date.now())), rule]
+      : [tabs, `${callName(w, c)} · ${this.name(facts?.model ?? c.model)} ▾${switching} · ${facts?.thinking ?? "off"} ▾${tools ? ` · ${tools}` : ""}${pending ? ` · ${pending}` : ""}`,
       this.theme.fg("dim", this.spend(c, facts)), ...(c.phase === "queued" && c.answered ? [statusPhrase(c, w, facts, Date.now())] : []), rule];
     const asking = w.attention.some(a => a.kind === "question" && a.call === c.callId);
-    const placeholder = `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
+    const placeholder = isCommand(c) ? `${c.phase === "sealed" ? "Finished" : "Running"} command · /stop stops it` : `${c.phase === "sealed" ? "Continue" : asking ? "Reply to" : "Steer"} ${c.key}…${this.uses < 3 ? "   / for commands" : ""}`;
     const empty = new Input({ prompt: "", placeholder, placeholderStyle: text => this.theme.fg("dim", text) });
     empty.focused = this.focused;
     const editor = this.input.getValue() ? this.input.render(size.width) : empty.render(size.width);
-    const hint = this.input.getValue().startsWith("/") ? "/model · /stop" : this.notice;
+    const hint = this.input.getValue().startsWith("/") ? (isCommand(c) ? "/stop" : "/model · /stop") : this.notice;
     const transcript = this.transcript(c, w, size.width), available = Math.max(1, size.height - head.length - editor.length - 2);
     const bottom = Math.max(0, transcript.lines.length - available);
     // Scrolling back down to the end resumes following, as in pi's own transcript.

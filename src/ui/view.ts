@@ -1,5 +1,5 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { answerForwardedNote, isLive, queuedText, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { answerForwardedNote, commandLine, isLive, queuedText, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import type { CallStatus } from "../types.ts";
 import type { sessionFacts } from "./session.ts";
 import { oneLine } from "./frame.ts";
@@ -30,6 +30,10 @@ export function modelLabel(model: string | undefined, find: (provider: string, i
   // A display name that already names its provider ("GLM-5.3 (acme)") is never suffixed again.
   const named = (word: string) => Boolean(word) && new RegExp(`(^|[^a-z0-9])${word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`, "i").test(name);
   return suffix.toLowerCase() === family || named(provider) || named(suffix) ? name : `${name} (${suffix})`;
+}
+/** UI §2: The model column of a call: a command call shows its command instead ("command: npm test"). */
+export function modelColumn(c: Pick<CallSnapshot, "command" | "model">, f: Pick<Facts, "model"> | undefined, name: ModelName): string {
+  return c.command !== undefined ? `command: ${commandLine(c.command, 40)}` : name(f?.model ?? c.model);
 }
 /** UI §2–3: Count committed tool calls compactly; zero is not shown. */
 export const toolCount = (n: number | undefined) => n ? `${n} tool${n === 1 ? "" : "s"}` : "";
@@ -115,6 +119,11 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   if (noProgress) return /no progress for [^(;]+/.exec(noProgress.text)?.[0].trim() ?? "no progress";
   if (workflow.attention.some(a => a.kind === "stall" && a.call === call.callId)) return `no activity for ${duration(now - Math.max(call.lastActivity ?? call.startedAt ?? now, facts?.lastActivity ?? 0))}`;
   if (call.phase === "queued") return workflow.paused ? "paused · r resumes" : queuedPhrase(call, now);
+  // A command call has no session: its process and how long it runs (from the start of its attempt).
+  if (call.command !== undefined) {
+    const run = call.commandRun, age = duration(Math.max(0, now - (call.startedAt ?? now)));
+    return run?.pid !== undefined ? `running · pid ${run.pid}${(run.attempt ?? 1) > 1 ? ` · attempt ${run.attempt}` : ""} · ${age}` : `starting · ${age}`;
+  }
   // Liveness (UI §2): the age of the newest evidence ticks, and resets whenever the agent does anything.
   const since = duration(Math.max(0, now - Math.max(call.lastActivity ?? 0, facts?.lastActivity ?? 0, call.startedAt ?? 0)));
   if (facts?.activity) return `${facts.activity} · ${since}`;
@@ -147,13 +156,14 @@ export function workflowName(w: Pick<WorkflowSnapshot, "name" | "labels">): stri
   const values = Object.values(w.labels ?? {}).map(v => String(v).replace(/\s+/g, " ").trim()).filter(Boolean);
   return values.length ? values.join(" ") : undefined;
 }
-export function callName(w: Pick<WorkflowSnapshot, "name" | "labels" | "calls">, c: Pick<CallSnapshot, "key" | "gen" | "agent">): string {
+export function callName(w: Pick<WorkflowSnapshot, "name" | "labels" | "calls">, c: Pick<CallSnapshot, "key" | "gen" | "agent"> & { command?: string }): string {
   const keys = [...new Set(w.calls.map(x => x.key))], gen = c.gen > 1 ? `@${c.gen}` : "", name = workflowName(w);
   if (keys.length === 1 && name) return `${name}${gen}`;
   if (!GENERATED.test(c.key)) return `${c.key}${gen}`;
   const peers = keys.filter(k => GENERATED.test(k) && w.calls.find(x => x.key === k)?.agent === c.agent)
     .sort((a, b) => Number(GENERATED.exec(a)![1]) - Number(GENERATED.exec(b)![1]));
-  return `${c.agent}${peers.length > 1 ? ` ${peers.indexOf(c.key) + 1}` : ""}${gen}`;
+  // A command call has no agent: it goes by "command" (numbered like an agent's when there are several).
+  return `${c.agent || (c.command !== undefined ? "command" : "")}${peers.length > 1 ? ` ${peers.indexOf(c.key) + 1}` : ""}${gen}`;
 }
 
 const WORDS: Record<CallStatus, string> = { ok: "done", stopped: "stopped", failed: "failed", "gate-failed": "failed", timeout: "timeout", budget: "budget", unknown: "unknown", skipped: "skipped", parked: "parked" };
@@ -211,14 +221,15 @@ export function dockLines(workflows: readonly WorkflowSnapshot[], facts: Readonl
     const line = ended && now - (ended.endedAt ?? 0) < 10 * 60_000 ? mainLine(workflows, now) : undefined;
     return line ? [truncateToWidth(line, Math.max(1, width))] : [];
   }
-  const cols = { key: Math.min(20, Math.max(...active.map(a => visibleWidth(callName(a.w, a.c))))), model: Math.min(20, Math.max(...active.map(a => visibleWidth(name(facts.get(a.c.callId)?.model ?? a.c.model))))) };
+  const cols = { key: Math.min(20, Math.max(...active.map(a => visibleWidth(callName(a.w, a.c))))), model: Math.min(20, Math.max(...active.map(a => visibleWidth(modelColumn(a.c, facts.get(a.c.callId), name))))) };
   const shown = active.slice(0, rows);
   const lines = shown.map(({ w, c, asking }) => {
     // A running tool is activity; otherwise a minute without new evidence (no message, no tool) stops the spinner.
-    const f = facts.get(c.callId), fresh = Boolean(f?.activity) || now - Math.max(c.lastActivity ?? 0, f?.lastActivity ?? 0, c.startedAt ?? 0) < 60_000;
+    // A running command call is busy as long as its process runs.
+    const f = facts.get(c.callId), fresh = Boolean(f?.activity) || c.command !== undefined && c.phase === "running" || now - Math.max(c.lastActivity ?? 0, f?.lastActivity ?? 0, c.startedAt ?? 0) < 60_000;
     const mark = asking ? "?" : c.phase === "queued" ? "·" : fresh ? SPIN[Math.floor(now / 500) % SPIN.length]! : "…";
     const phrase = answerForwardedNote(c, now) || (asking ? `asks: ${w.attention.find(a => a.kind === "question" && a.call === c.callId)!.text}` : statusPhrase(c, w, f, now));
-    return rowText(`${mark} `, callName(w, c), name(f?.model ?? c.model), phrase, [], width, cols);
+    return rowText(`${mark} `, callName(w, c), modelColumn(c, f, name), phrase, [], width, cols);
   });
   const more = active.length - shown.length;
   lines.push(truncateToWidth(`${more ? `+${more} more · ` : ""}${summaryText(workflows, now)} · ↓ subagents`, Math.max(1, width)));
@@ -257,11 +268,11 @@ export function listRows(workflows: readonly WorkflowSnapshot[], state: ViewStat
   // Aligned columns across the whole list (UI §2): key and model start at the same column on every row.
   const shownCalls = visible.flatMap(w => w.calls.map(c => ({ w, c })));
   const cols = { key: Math.min(24, Math.max(0, ...shownCalls.map(({ w, c }) => visibleWidth(callName(w, c))))),
-    model: Math.min(26, Math.max(0, ...shownCalls.map(({ c }) => visibleWidth(name(facts.get(c.callId)?.model ?? c.model))))) };
+    model: Math.min(26, Math.max(0, ...shownCalls.map(({ c }) => visibleWidth(modelColumn(c, facts.get(c.callId), name))))) };
   const callRow = (w: WorkflowSnapshot, c: CallSnapshot, indent: string, preview?: string, dim = false) => {
     const f = facts.get(c.callId), age = c.phase === "sealed" ? `${duration(now - (c.endedAt ?? now))} ago` : c.startedAt ? duration(now - c.startedAt) : "";
     // A requested switch shows at once (it applies when the current step ends; until then it would look as if it had failed).
-    const shown = c.switching ? `${name(f?.model ?? c.model)} → ${name(c.switching)}` : name(f?.model ?? c.model);
+    const shown = c.switching ? `${name(f?.model ?? c.model)} → ${name(c.switching)}` : modelColumn(c, f, name);
     const text = rowText(indent, callName(w, c), shown, statusPhrase(c, w, f, now), [pendingMarker(c.pending), toolCount(f?.tools), age], width, cols);
     rows.push({ id: c.callId, kind: "call", workflow: w, call: c, failed: Boolean(failed(c)), dim, text });
     // Overview (UI §2): every active agent shows what it last said, thought or saw, without opening it.

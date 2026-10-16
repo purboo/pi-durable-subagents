@@ -1,9 +1,12 @@
 import { Text } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { plainReason, queuedPhrase } from "./view.ts";
+import { commandLine, commandText } from "../orchestrator/snapshot.ts";
 
 type Args = Record<string, unknown>;
-type Step = { key?: unknown; agent?: unknown };
+type Step = { key?: unknown; agent?: unknown; command?: unknown };
+/** A step's agent, or "command" for a command step. */
+const who = (s: Step) => s.command !== undefined ? "command" : String(s.agent ?? "?");
 const short = (id: unknown) => typeof id === "string" ? (id.length > 12 ? `${id.slice(0, 10)}…` : id) : "";
 const clip = (s: string, n: number) => s.length > n ? `${s.slice(0, n - 1)}…` : s;
 
@@ -12,15 +15,16 @@ export function callLine(args: Args): string {
   const steps = (Array.isArray(args.tasks) ? args.tasks : Array.isArray(args.chain) ? args.chain : []) as Step[];
   const agents = (list: Step[]) => {
     const counts = new Map<string, number>();
-    for (const s of list) counts.set(String(s.agent ?? "?"), (counts.get(String(s.agent ?? "?")) ?? 0) + 1);
+    for (const s of list) counts.set(who(s), (counts.get(who(s)) ?? 0) + 1);
     return [...counts].map(([a, n]) => n > 1 ? `${a}×${n}` : a).join(", ");
   };
   switch (args.action) {
     case "run": {
       const what = Array.isArray(args.tasks) ? `${steps.length} in parallel (${agents(steps)})`
-        : Array.isArray(args.chain) ? `chain of ${steps.length} (${steps.map(s => String(s.agent ?? "?")).join(" → ")})`
+        : Array.isArray(args.chain) ? `chain of ${steps.length} (${steps.map(who).join(" → ")})`
         : typeof args.source === "string" ? `workflow script (${args.source.split("\n").length} lines)`
-        : typeof args.workflow === "string" ? `workflow ${args.workflow}` : `${String(args.agent ?? "?")}: ${clip(String(args.task ?? "").split("\n")[0]!, 70)}`;
+        : typeof args.workflow === "string" ? `workflow ${args.workflow}`
+        : args.command !== undefined ? `command: ${clip(commandLine(commandText(args.command)), 70)}` : `${String(args.agent ?? "?")}: ${clip(String(args.task ?? "").split("\n")[0]!, 70)}`;
       return `run ${typeof args.name === "string" ? `${args.name} · ` : ""}${what}`;
     }
     case "send": return `send ${String(args.kind ?? "")} → ${String(args.to ?? "")}${typeof args.message === "string" ? `: ${clip(args.message.split("\n")[0]!, 70)}` : typeof args.model === "string" ? `: ${args.model}` : ""}`;
@@ -38,7 +42,7 @@ export function resultLines(details: unknown): string[] {
   const d = (details ?? {}) as Record<string, unknown>;
   if (typeof d.wid === "string" && typeof d.key === "string" && typeof d.phase === "string") {
     const r = d.result as { status?: string } | undefined;
-    return [`${d.key} · ${r?.status ?? (d.phase === "queued" ? queuedPhrase(d as Parameters<typeof queuedPhrase>[0], Date.now()) : d.phase)}${typeof d.model === "string" ? ` · ${d.model}` : ""}`];
+    return [`${d.key} · ${r?.status ?? (d.phase === "queued" ? queuedPhrase(d as Parameters<typeof queuedPhrase>[0], Date.now()) : d.phase)}${typeof d.model === "string" ? ` · ${d.model}` : ""}${typeof d.command === "string" ? ` · command: ${commandLine(d.command, 60)}` : ""}`];
   }
   if (typeof d.wid === "string" && !Array.isArray(d.calls)) return [`started workflow ${d.wid}`, ...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : [])];
   if (d.applied === true) return ["✓ applied"];

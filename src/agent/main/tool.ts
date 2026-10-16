@@ -10,7 +10,14 @@ import { compileFanout } from "../../compat/fanout.ts";
 import { checkLabels } from "../../events/labels.ts";
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
-export const stepDefaults = ["agent", "model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once", "writer"];
+export const stepDefaults = ["agent", "model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once", "writer", "env", "rerun"];
+/** The run-level defaults a command step takes; agent steps take the others (env and rerun belong to command calls). */
+const commandDefaults = new Set(["timeoutMs", "writer", "env", "rerun"]), agentOnly = new Set(["env", "rerun"]);
+/** The run-level defaults that apply to one step: a command step skips agent-only fields, an agent step skips env/rerun. */
+function defaultsFor(step: Args, defaults: Args): Args {
+  const command = step.command !== undefined;
+  return Object.fromEntries(Object.entries(defaults).filter(([k]) => command ? commandDefaults.has(k) : !agentOnly.has(k)));
+}
 
 type Args = Record<string, unknown>;
 function string(args: Args, name: string): string {
@@ -88,7 +95,10 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
   // A task beside tasks/chain is refused with what to do, before the launch form is inferred (with or without action).
   if ((args.action === undefined || args.action === "run") && listRun && args.task !== undefined)
     throw new Error(`task cannot be set beside ${args.tasks !== undefined ? "tasks" : "chain"}: agent+task is a single call; give each step its own task (a top-level agent alone is the default agent of every step)`);
-  const launchForms = [args.task !== undefined || args.agent !== undefined && !listRun, args.tasks !== undefined,
+  // So is a command: a command call is a launch form of its own, or a step of the list.
+  if ((args.action === undefined || args.action === "run") && listRun && args.command !== undefined)
+    throw new Error(`command cannot be set beside ${args.tasks !== undefined ? "tasks" : "chain"}: put it in a step ({command, ...}); a top-level command is a single command call`);
+  const launchForms = [args.task !== undefined || args.command !== undefined || args.agent !== undefined && !listRun, args.tasks !== undefined,
     args.chain !== undefined, args.workflow !== undefined, args.source !== undefined];
   const action = args.action === undefined && launchForms.filter(Boolean).length === 1 ? "run" : args.action;
   if (typeof action !== "string" || !action) throw new Error("action is required: run, agents, send, stop, revise, status, resume, drain, restart");
@@ -96,9 +106,9 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
     const { action: _, workflow, source, tasks, chain, args: inputs, name, usageBudget, maxCalls, inputs: files, labels, by: _by, request: _request, ...spec } = args;
     const steps = tasks !== undefined || chain !== undefined;
     // With tasks/chain a top-level agent (no task) is the default agent of every step, like model or timeoutMs.
-    const single = spec.task !== undefined || spec.agent !== undefined && !steps;
+    const single = spec.task !== undefined || spec.command !== undefined || spec.agent !== undefined && !steps;
     const choices = [workflow, source, tasks, chain, single ? spec : undefined];
-    if (choices.filter(v => v !== undefined).length !== 1) throw new Error("run requires exactly one of workflow, source, tasks, chain, or agent/task (with tasks/chain, a top-level agent without task is the steps' default agent)");
+    if (choices.filter(v => v !== undefined).length !== 1) throw new Error("run requires exactly one of workflow, source, tasks, chain, agent/task or command (with tasks/chain, a top-level agent without task is the steps' default agent)");
     // A top-level cwd on a workflow/tasks/chain/source run is the run's directory: relative paths (the workflow file,
     // inputs, per-call cwd) resolve against it and calls default to it. It used to be ignored, so a relative
     // workflow path was looked up in the session's directory instead.
@@ -119,7 +129,7 @@ export function request(args: Args, cwd: string): { kind: RequestKind; body: unk
       const list = tasks ?? chain;
       if (!Array.isArray(list) || !list.length) throw new Error("tasks/chain must be nonempty");
       const kind = tasks !== undefined ? "tasks" : "chain";
-      body[kind] = list.map((value, i) => call(value && typeof value === "object" && !Array.isArray(value) ? { ...defaults, ...value } : value, runCwd, `${kind}[${i}]`));
+      body[kind] = list.map((value, i) => call(value && typeof value === "object" && !Array.isArray(value) ? { ...defaultsFor(value as Args, defaults), ...value } : value, runCwd, `${kind}[${i}]`));
       compileFanout(kind === "tasks" ? { tasks: body.tasks! } : { chain: body.chain! }); // duplicate keys fail here, not at admission
     } else body.call = call(spec, cwd, "call");
     if (inputs !== undefined) body.args = inputs;
