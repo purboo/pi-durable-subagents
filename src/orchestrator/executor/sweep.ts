@@ -68,25 +68,31 @@ type SweepHooks = {
   /** The sweep state of a journal not decoded yet (seededSweep), so the sweep does not decode it. */
   seeded?: (journal: JournalHandle) => readonly string[] | undefined;
 };
-type SweepState = { count: number; fenced: Set<unknown>; retired: Set<unknown>; failed: Set<unknown>; gated: Set<unknown>; tracked: Map<string, ProcInfo[]>; execs: Entry[]; gates: Entry[] };
+type SweepState = { count: number; fenced: Map<unknown, number>; retired: Set<unknown>; failed: Set<unknown>; gated: Set<unknown>; tracked: Map<string, ProcInfo[]>; execs: Entry[]; gates: Entry[] };
 const sweeps = new WeakMap<JournalHandle, SweepState>();
 export type SweepSeed = string;
 export function sweepSeed(journal: JournalHandle): SweepSeed[] {
-  return [...indexSweep(journal).fenced] as string[];
+  return [...indexSweep(journal).fenced].sort((a, b) => a[1] - b[1]).map(([exec]) => String(exec));
 }
-/** Settled executions are fenced: only tags can match later stragglers. Share the compact list with the store. */
+/** Settled executions need only tags, in exec-entry order. Share the store's list; older test seeds keep their stored
+ *  order until the journal is naturally decoded. Released object seeds already have exec-entry order. */
 export function seededSweep(seed: readonly SweepSeed[]): readonly string[] { return seed; }
 
 /** A1: Fold old history during recovery, so the first sweep does not allocate it on the timer path. */
 export function indexSweep(journal: JournalHandle) {
   let state = sweeps.get(journal);
-  if (!state) { state = { count: 0, fenced: new Set(), retired: new Set(), failed: new Set(), gated: new Set(), tracked: new Map(), execs: [], gates: [] }; sweeps.set(journal, state); }
+  if (!state) { state = { count: 0, fenced: new Map(), retired: new Set(), failed: new Set(), gated: new Set(), tracked: new Map(), execs: [], gates: [] }; sweeps.set(journal, state); }
   const { fenced, retired, failed, gated, tracked, execs, gates } = state, entries = journal.entries();
   while (state.count < entries.length) {
     const e = entries[state.count++]!;
     if (e.type === JT.exec) execs.push(e);
     else if (e.type === "gate-intent") gates.push(e);
-    else if (e.type === JT.fenced) { fenced.add(e.exec); tracked.delete(String(e.exec)); failed.delete(e.exec); }
+    else if (e.type === JT.fenced) {
+      // One sequence number per retained tag preserves exec order without retaining the exec or its processes.
+      if (!fenced.has(e.exec)) fenced.set(e.exec, execs.find(exec => exec.exec === e.exec)?.seq ?? e.seq);
+      tracked.delete(String(e.exec));
+    }
+    else if (e.type === JT.attentionResolved && typeof e.id === "string" && e.id.startsWith("fence:")) failed.delete(e.id.slice(6));
     else if (e.type === "retired") retired.add(e.call);
     else if (e.type === "fence-failed") failed.add(e.exec);
     else if (e.type === "gate") { gated.add(e.id); tracked.delete(String(e.id)); failed.delete(e.id); }
@@ -111,24 +117,24 @@ export async function sweepExecutions(journals: Iterable<JournalHandle>, contain
   for (const journal of journals) {
     const seed = journal.loaded === false ? hooks.seeded?.(journal) : undefined;
     if (seed) {
-      for (const exec of seed) targets.push({ journal, exec, call: exec.slice(0, exec.lastIndexOf("#")), fenced: true, failed: false, tracked: [] });
+      for (const exec of seed) targets.push({ journal, exec, call: exec.slice(0, exec.lastIndexOf("#")), fenced: true, failed: !!hooks.failing?.(exec), tracked: [] });
       continue;
     }
     const { fenced, retired, failed, gated, tracked, execs, gates } = indexSweep(journal);
-    for (const id of fenced) {
-      const exec = String(id);
-      targets.push({ journal, exec, call: exec.slice(0, exec.lastIndexOf("#")), fenced: true, failed: failed.has(id), tracked: [] });
-    }
     // A gate whose recovery fence failed has no outcome yet; it is retried here until its processes are gone.
     for (const e of gates) {
       const id = String(e.id);
       if (e.type === "gate-intent" && !gated.has(id) && (failed.has(id) || hooks.failing?.(id)))
         targets.push({ journal, exec: id, call: String(e.call), fenced: false, failed: true, tracked: tracked.get(id) ?? [] });
     }
-    for (const e of execs) {
-      const exec = String(e.exec), isFailed = failed.has(exec) || !!hooks.failing?.(exec);
-      if (fenced.has(exec) || retired.has(e.call) || isFailed)
-        targets.push({ journal, exec, call: String(e.call), fenced: fenced.has(exec), failed: isFailed, tracked: tracked.get(exec) ?? [] });
+    const ordered = [
+      ...execs.map(e => ({ exec: String(e.exec), call: String(e.call), order: e.seq, fenced: false })),
+      ...[...fenced].map(([id, order]) => { const exec = String(id); return { exec, call: exec.slice(0, exec.lastIndexOf("#")), order, fenced: true }; }),
+    ].sort((a, b) => a.order - b.order);
+    for (const e of ordered) {
+      const isFailed = failed.has(e.exec) || !!hooks.failing?.(e.exec);
+      if (e.fenced || retired.has(e.call) || isFailed)
+        targets.push({ journal, exec: e.exec, call: e.call, fenced: e.fenced, failed: isFailed, tracked: e.fenced ? [] : tracked.get(e.exec) ?? [] });
     }
   }
   if (!targets.length) return;

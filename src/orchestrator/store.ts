@@ -32,6 +32,17 @@ export interface Workflow { wid: string; revision: number; origin: string; cwd: 
 type SnapshotRef = { path: string; hash: string };
 /** pinned/<rN>/pins.json: the in-memory pins of a published revision, valid for the snapshot hash it names. */
 type PinRecord = { snapshot: string; digest: string; pins: Pins; inputs: Record<string, string>; origin: boolean; files: Record<string, string> };
+type PinnedFiles = Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'>;
+/** The same record checks for asynchronous verification and a synchronous released-pins reload. */
+function pinRecordFiles(dir: string, hash: string, record: PinRecord, verify: boolean): PinnedFiles | undefined {
+  const { digest, ...body } = record;
+  if (body.snapshot !== hash || typeof digest !== 'string' || (verify && contentHash(body) !== digest)) return undefined;
+  if (!body.pins || typeof body.pins !== 'object' || !body.inputs || typeof body.inputs !== 'object' || !body.files || typeof body.files !== 'object') return undefined;
+  const names = publishedFiles(Object.values(body.inputs).map(String), body.origin === true);
+  if (names.length !== Object.keys(body.files).length || names.some(name => !Object.hasOwn(body.files, name))) return undefined;
+  return { pins: body.pins, scriptPath: join(dir, 'script.js'), inputs: Object.fromEntries(Object.entries(body.inputs).map(([name, file]) => [name, join(dir, String(file))])),
+    originPath: body.origin === true ? join(dir, 'origin.jsonl') : undefined };
+}
 /** Every file publishPins writes for one revision, relative to its directory (inputs given relative too). */
 function publishedFiles(inputs: string[], origin: boolean): string[] {
   return [...new Set(['script.js', 'args.json', 'agents.json', 'inputs.json', ...inputs, ...(origin ? ['origin.jsonl'] : [])])];
@@ -340,15 +351,11 @@ export class Store {
   /** The files `pins.json` in `dir` records for snapshot `hash`, when the record and every file verify; else undefined.
    *  Without `verify`, only the record's form is checked (its digest and the file hashes are left to `ready`). */
   private async recorded(dir: string, hash: string, verify: boolean | 'record' = true): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'> | undefined> {
-    const { digest, ...body } = JSON.parse(await readFile(join(dir, 'pins.json'), 'utf8')) as PinRecord;
-    // The digest covers everything the record decides (pins, input names → files, origin, file hashes).
-    if (body.snapshot !== hash || typeof digest !== 'string' || (verify && contentHash(body) !== digest)) return undefined;
-    if (!body.pins || typeof body.pins !== 'object' || !body.inputs || typeof body.inputs !== 'object' || !body.files || typeof body.files !== 'object') return undefined;
-    const names = publishedFiles(Object.values(body.inputs).map(String), body.origin === true);
-    if (names.length !== Object.keys(body.files).length || names.some(name => !Object.hasOwn(body.files, name))) return undefined;
-    if (verify === true) for (const name of names) if (body.files[name] !== await fileHash(join(dir, name))) return undefined;
-    return { pins: body.pins, scriptPath: join(dir, 'script.js'), inputs: Object.fromEntries(Object.entries(body.inputs).map(([name, file]) => [name, join(dir, String(file))])),
-      originPath: body.origin === true ? join(dir, 'origin.jsonl') : undefined };
+    const record = JSON.parse(await readFile(join(dir, 'pins.json'), 'utf8')) as PinRecord;
+    const files = pinRecordFiles(dir, hash, record, verify !== false);
+    if (!files) return undefined;
+    if (verify === true) for (const name of Object.keys(record.files)) if (record.files[name] !== await fileHash(join(dir, name))) return undefined;
+    return files;
   }
   /** P14, A2: Publish a new revision only after the engine has retired its predecessor. */
   async revise(intent: Entry): Promise<void> {
@@ -359,13 +366,37 @@ export class Store {
     Object.assign(wf, files, { revision });
     this.unverified.delete(wf.wid);
   }
-  /** Release terminal pins. Detail readers load a temporary copy; ready promotes them before live work resumes. */
+  private pinIntent(wf: Workflow): Entry {
+    const intent = wf.revision === 1 ? this.index().createByWid.get(wf.wid)
+      : wf.journal.loaded === false ? wf.settled?.revised : wf.journal.entries().findLast(e => e.type === 'revised');
+    if (!intent) throw new Error(`Missing pinned revision: ${wf.wid}@${wf.revision}`);
+    return intent;
+  }
+  /** Reload metadata with ready's form/digest checks and immutable-snapshot fallback, without rechecking file bytes. */
+  private releasedPins(wf: Workflow): Pins {
+    const intent = this.pinIntent(wf), hash = intent.pins ? contentHash(intent.pins) : (intent.snapshot as SnapshotRef).hash;
+    const dir = wf.revision === 1 ? pinnedDir(this.ledgers.home, wf.wid) : join(pinnedDir(this.ledgers.home, wf.wid), `r${wf.revision}`);
+    try {
+      const recorded = pinRecordFiles(dir, hash, JSON.parse(readFileSync(join(dir, 'pins.json'), 'utf8')) as PinRecord, true);
+      if (recorded) return recorded.pins;
+    } catch { /* The same immutable fallback as ready's asynchronous reload. */ }
+    let source = intent.pins as Pins | undefined;
+    if (!source) {
+      const ref = intent.snapshot as SnapshotRef | undefined;
+      if (!ref) throw new Error('Missing pinned snapshot');
+      const snapshot = JSON.parse(readFileSync(join(this.ledgers.home, ref.path), 'utf8')) as Snapshot;
+      if (contentHash(snapshot) !== ref.hash || !snapshot.pins) throw new Error('Staged snapshot hash mismatch');
+      source = snapshot.pins;
+    }
+    const { origin: _origin, inputs: _inputs, ...pins } = source;
+    return { ...pins, inputs: {} };
+  }
+  /** Release terminal pins. The next read caches checked metadata until the same idle release runs again. */
   releasePins(wf: Workflow): void {
     clearTimeout(this.pinRest.get(wf.wid)); this.pinRest.delete(wf.wid);
     if (Object.getOwnPropertyDescriptor(wf, 'pins')?.get) return;
-    const dir = wf.revision === 1 ? pinnedDir(this.ledgers.home, wf.wid) : join(pinnedDir(this.ledgers.home, wf.wid), `r${wf.revision}`);
     Object.defineProperty(wf, 'pins', { enumerable: true, configurable: true,
-      get: () => (JSON.parse(readFileSync(join(dir, 'pins.json'), 'utf8')) as PinRecord).pins,
+      get: () => { const pins = this.releasedPins(wf); wf.pins = pins; this.restPins(wf); return pins; },
       set: (pins: Pins) => { Object.defineProperty(wf, 'pins', { value: pins, enumerable: true, configurable: true, writable: true }); } });
   }
   /** A1: Verify the pinned files of a workflow materialized unverified (a terminal one) before its script, inputs, origin
@@ -376,8 +407,7 @@ export class Store {
     if (!this.unverified.has(wf.wid)) {
       const revision = wf.revision, unloaded = Object.getOwnPropertyDescriptor(wf, 'pins')?.get;
       if (unloaded) {
-        const intent = wf.revision === 1 ? this.index().createByWid.get(wf.wid) : wf.journal.entries().findLast(e => e.type === 'revised');
-        if (!intent) throw new Error(`Missing pinned revision: ${wf.wid}@${wf.revision}`);
+        const intent = this.pinIntent(wf);
         const dir = wf.revision === 1 ? pinnedDir(this.ledgers.home, wf.wid) : join(pinnedDir(this.ledgers.home, wf.wid), `r${wf.revision}`);
         const hash = intent.pins ? contentHash(intent.pins) : (intent.snapshot as SnapshotRef).hash;
         const recorded = await this.recorded(dir, hash, 'record').catch(() => undefined);
@@ -415,7 +445,8 @@ export class Store {
       ? this.index().createByWid.get(wf.wid)
       : wf.journal.entries().find(e => e.type === 'revised' && e.revision === revision);
     if (!intent) throw new Error(`Missing pinned revision: ${wf.wid}@${revision}`);
-    return { ...wf, revision, ...await this.pinnedFiles(wf.wid, revision, intent) };
+    const { wid, origin, cwd, journal, settled } = wf;
+    return { wid, origin, cwd, journal, ...(settled ? { settled } : {}), revision, ...await this.pinnedFiles(wid, revision, intent) };
   }
   /** A1, housekeeping: Wids with a committed pruned entry; they are gone and never materialize again. */
   pruned(): ReadonlySet<string> { return this.index().pruned; }

@@ -94,6 +94,21 @@ test('a settled workflow is written a record and opens lazily at the next start;
   assert.equal(lazy.journal.loaded, false, 'nor did the event pump');
 });
 
+test('ready reloads revision two from settled metadata without decoding its lazy journal', async t => {
+  const f = await home(t), a = await f.boot(), w = await f.finished(a);
+  const rid = await f.request(a, 'revise', { wid: w.wid, source: 'revision two' });
+  assert.equal(f.decision(a, rid)?.type, JT.applied);
+  a.evaluator.receive({ t: 'done', wid: w.wid, ev: a.evaluator.ev(w.wid), result: 2 });
+  await a.engine.intake();
+  const b = await f.boot(), lazy = f.wf(b, w.wid);
+  assert.equal(lazy.revision, 2); assert.equal(lazy.journal.loaded, false);
+  await b.engine.store.ready(lazy);
+  b.engine.store.releasePins(lazy);
+  await b.engine.store.ready(lazy);
+  assert.equal(lazy.pins.source, 'revision two');
+  assert.equal(lazy.journal.loaded, false, 'the revised snapshot comes from the settled record');
+});
+
 test('a follow-up on a lazy workflow decodes it and runs as before', async t => {
   const f = await home(t), a = await f.boot(), w = await f.finished(a);
   const b = await f.boot(), lazy = f.wf(b, w.wid);

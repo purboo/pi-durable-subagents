@@ -538,7 +538,7 @@ export class Engine {
       // them): a changed file refuses the resume before anything is recorded.
       for (const wf of this.store.workflows.values()) {
         const done = this.terminal(wf);
-        if (!inScope(wf) || this.store.verified(wf.wid) || !(done?.status === 'parked' || (releasing && !done))) continue;
+        if (!inScope(wf) || !(done?.status === 'parked' || (releasing && (!done || this.openFollowUps(wf))))) continue;
         try { await this.store.ready(wf); } catch (error) { return { action: 'reject', reason: `pin-failed: ${String(error)}` }; }
       }
       if (releasing && !replayed) await this.ledgers.orch.append('undrain', { rid: req.rid, ...(wid ? { wid } : origin ? { origin } : {}) });
@@ -691,6 +691,8 @@ export class Engine {
     try { return await run; } finally { if (this.opening.get(wid) === tail) this.opening.delete(wid); }
   }
   private dispatchGeneration(wf: Workflow, entry: Entry, refusal?: string) {
+    const id = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
+    if (this.generations.has(id) || this.held(wf.wid) || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
     // A finished workflow's pinned files are verified before a generation of it runs (the ticket names its origin); a
     // sealed generation's run only repeats post-seal steps, which read no pinned file. When they do not verify, the
     // generation is sealed failed (`pin-failed: …`) without a child, like any call that cannot be prepared: the engine
@@ -707,8 +709,7 @@ export class Engine {
     // Pins not verified (a refusal, or the post-seal steps of a sealed generation): the ticket comes from the journal's
     // entry alone, so a damaged pinned record cannot keep the call from sealing.
     const ticket: CallTicket = refusal !== undefined || !this.store.verified(wf.wid) ? { ...this.unpinnedTicket(wf, entry), ...(refusal !== undefined ? { refusal } : {}) }
-      : this.ticket({ wf } as State, entry), id = ticket.callId;
-    if (this.generations.has(id) || this.held(wf.wid) || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
+      : this.ticket({ wf } as State, entry);
     this.generations.add(id); wf.journal.resting = false;
     void this.executor.run(ticket).then(result => this.background(async () => {
       if (!wf.journal.entries().some(e => e.type === JT.sealed && e.call === id)) throw new Error(`Generation returned without seal: ${id}`);

@@ -41,6 +41,56 @@ test("P23 sweep kills a tagged straggler launched after a durable fence", { time
   assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 });
 
+test('F1 a crash between fenced and attention-resolved is repaired by the sweep', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsa-fence-crash-')), journal = await openJournal(join(root, 'workflow'));
+  t.after(async () => { await journal.close(); await rm(root, { recursive: true, force: true }); });
+  const exec = 'w@1/k@1#1.1', call = 'w@1/k@1';
+  await journal.append(JT.exec, { exec, call });
+  await recordFenceFailure(journal, exec, call, new Error('Fence timeout'));
+  await journal.append(JT.fenced, { exec });
+  const calls: unknown[] = [];
+  await sweepExecutions([journal], { scan: async () => new Map(), fence: async () => {} }, {
+    fenced: async (j, id, _call, wasFenced) => { calls.push([id, wasFenced]); await resolveFenceAttention(j, id); },
+  });
+  assert.deepEqual(calls, [[exec, true]]);
+  assert.ok(journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${exec}`));
+});
+
+test('F1 fenced failures retry until attention resolution, then release retry state', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsa-fence-resolve-')), journal = await openJournal(join(root, 'workflow'));
+  t.after(async () => { await journal.close(); await rm(root, { recursive: true, force: true }); });
+  const exec = 'w@1/k@1#1.1', call = 'w@1/k@1';
+  await journal.append(JT.exec, { exec, call });
+  await recordFenceFailure(journal, exec, call, new Error('Fence timeout'));
+  await journal.append(JT.fenced, { exec });
+  assert.ok(indexSweep(journal).failed.has(exec), 'a durable fence alone does not resolve its attention');
+  await resolveFenceAttention(journal, exec);
+  assert.equal(indexSweep(journal).failed.has(exec), false);
+  for (const seeded of [false, true]) {
+    const failing = new Set([exec]), calls: string[] = [];
+    const handle = seeded ? { ...journal, loaded: false } : journal;
+    const hooks = { failing: (id: string) => failing.has(id), seeded: () => [exec],
+      fenced: async (_j: unknown, id: string) => { calls.push(id); failing.delete(id); } };
+    await sweepExecutions([handle], { scan: async () => new Map(), fence: async () => {} }, hooks);
+    await sweepExecutions([handle], { scan: async () => new Map(), fence: async () => {} }, hooks);
+    assert.deepEqual(calls, [exec], 'a fenced in-process failure is cleared exactly once');
+  }
+});
+
+test('sweep targets and new settled seeds follow exec entry order, not fence completion order', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsa-sweep-order-')), journal = await openJournal(join(root, 'workflow'));
+  t.after(async () => { await journal.close(); await rm(root, { recursive: true, force: true }); });
+  const ids = ['w@1/a@1#1.1', 'w@1/b@1#1.1', 'w@1/c@1#1.1'];
+  for (const exec of ids) await journal.append(JT.exec, { exec, call: exec.split('#')[0] });
+  await journal.append(JT.fenced, { exec: ids[2] });
+  await journal.append(JT.fenced, { exec: ids[1] });
+  await journal.append('retired', { call: 'w@1/a@1' });
+  const fences: string[] = [];
+  await sweepExecutions([journal], { scan: async () => new Map(ids.map(id => [id, [{ pid: 1, ppid: 0, start: 's' }]])), fence: async id => { fences.push(id); } });
+  assert.deepEqual(fences, ids);
+  assert.deepEqual(sweepSeed(journal), ids.slice(1));
+});
+
 test('fenced executions retain only tags and settled seeds share the compact tag list', async t => {
   const root = await mkdtemp(join(tmpdir(), 'dsa-sweep-compact-'));
   const journal = await openJournal(join(root, 'workflow'));
