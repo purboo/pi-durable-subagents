@@ -125,11 +125,11 @@ export function statusPhrase(call: CallSnapshot, workflow: WorkflowSnapshot, fac
   return `thinking · ${since}`;
 }
 /** Why a queued call does not start, only as far as the orchestrator ledger says (CallSnapshot.queuedFor): a call is
- *  never said to wait for a slot without a full provider. An answered asker keeps its own phrase. */
+ *  never said to wait for a slot without a full provider, an answered asker neither ("queued (answered)"). */
 export function queuedPhrase(call: Pick<CallSnapshot, "answered" | "queuedFor">, now: number): string {
   const why = call.queuedFor;
   if (why?.reason === "starting") return `queued: ${queuedText(why, now, duration)}`;
-  if (call.answered) return why && why.reason !== "slot" ? `queued (answered): ${why.detail}` : "queued (answered, waiting for a slot)";
+  if (call.answered) return why ? `queued (answered): ${why.detail}` : "queued (answered)";
   return why ? `queued: ${queuedText(why, now, duration)}` : "queued";
 }
 function failed(c: CallSnapshot) { return c.phase === "sealed" && c.result && !c.result.ok && c.result.status !== "skipped"; }
