@@ -104,3 +104,22 @@ test("C-no-started: a live tagged attempt with no started record is held to its 
   assert.deepEqual(await tagged(id), []);
   assert.ok(!f.journal.entries().some(e => e.type === JT.sealed && (e.result as CallResult).status !== "timeout"));
 });
+
+test("F3: a stop recorded while the spawn prepares (its mkdir) starts no process and seals stopped", { timeout: 60_000 }, async t => {
+  const fs = (await import("node:fs/promises")).default, { syncBuiltinESMExports } = await import("node:module");
+  const f = await setup(t);
+  const call = f.ticket({ command: "echo side-effect > marker" }), mkdirReal = fs.mkdir;
+  let injected = false;
+  fs.mkdir = (async (...args: Parameters<typeof mkdirReal>) => {
+    if (!injected && String(args[0]).endsWith("/command-1")) { injected = true; await f.journal.append("stop-intent", { call: call.callId }); }
+    return mkdirReal(...args);
+  }) as typeof mkdirReal;
+  syncBuiltinESMExports();
+  let result: CallResult;
+  try { result = await f.executor.run(call); } finally { fs.mkdir = mkdirReal; syncBuiltinESMExports(); }
+  assert.ok(injected, "the stop was recorded during the mkdir");
+  assert.equal(result.status, "stopped", JSON.stringify(result));
+  assert.ok(!f.journal.entries().some(e => e.type === "command-started"), "no command-started");
+  await delay(300);
+  assert.ok(!existsSync(join(f.cwd, "marker")), "no side effect");
+});
