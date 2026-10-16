@@ -4,7 +4,7 @@ import { realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { binDir, dsaHome, orchLedger, orchLock } from '../paths.ts';
 import { removeStaleTemps, writeShim } from '../platform/lease.ts';
-import { launchOrchestrator, resolvePi } from '../platform/launch.ts';
+import { launchOrchestrator, PER_CALL_ENV, resolvePi } from '../platform/launch.ts';
 import { openJournal } from '../kernel/journal.ts';
 import { OsLock } from '../platform/lock.ts';
 import { captureStart } from '../platform/proctable.ts';
@@ -29,7 +29,8 @@ export type ExitReason = { reason: 'idle' | 'restart' | 'signal' | 'error'; sign
  *  applied restart request ended it (the caller starts the successor once the lock is released). */
 export async function main(options: MainOptions = {}): Promise<{ restart?: true }> {
   // Serves every session: whichever pi session started it, its children and their CLI runs must not name that session.
-  delete process.env.DSA_SESSION;
+  // Nor any call's identity, should it have been started from inside one (its processes inherit this environment).
+  for (const name of PER_CALL_ENV) delete process.env[name];
   const home = options.home ?? dsaHome();
   await mkdir(home, { recursive: true });
   const lock = await new OsLock().tryAcquire(orchLock(home));
