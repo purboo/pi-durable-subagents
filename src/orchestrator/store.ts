@@ -397,6 +397,8 @@ export class Store {
     const { origin: _origin, inputs: _inputs, ...pins } = source;
     return { ...pins, inputs: {} };
   }
+  /** Whether the workflow's pins are in memory (not released behind the lazy accessor). */
+  pinsResident(wf: Workflow): boolean { return !Object.getOwnPropertyDescriptor(wf, 'pins')?.get; }
   /** Release terminal pins. The next read caches checked metadata until the same idle release runs again. */
   releasePins(wf: Workflow): void {
     clearTimeout(this.pinRest.get(wf.wid)); this.pinRest.delete(wf.wid);

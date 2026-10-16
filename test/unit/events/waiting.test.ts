@@ -270,6 +270,18 @@ test('wait collector: in-memory journals and ledger → waits with request id an
   assert.equal(leaseReads, before);
 });
 
+test('the waits collector never throws on a failing pins load: the agents are unknown, as without pins', () => {
+  const orch = journal(), w = journal();
+  orch.add('hold', { pool: 'probe', slot: 0, exec: 'other#1.1' });
+  w.add('wf-created', { revision: 1 }); w.add('call', { pos: 0, key: 'a', gen: 1, spec: { agent: 'x' } }); w.add('exec', { exec: `${call('W1', 'a')}#1.1`, call: call('W1', 'a') }, 100);
+  const failing = { wid: 'W1', journal: w, get pins(): never { throw new Error('ENOENT: pins.json'); } };
+  const absent = { wid: 'W1', journal: w };
+  const got = waitCollector({ home: '/nonexistent', workflows: () => [failing], orch, leases: () => [] })(NOW);
+  const want = waitCollector({ home: '/nonexistent', workflows: () => [absent], orch, leases: () => [] })(NOW);
+  assert.deepEqual([...got.current], [...want.current]);
+  assert.deepEqual([...got.meta], [...want.meta]);
+});
+
 test('Describe (CLI, disk snapshots) and the collector (orchestrator memory) agree on the same journals', async t => {
   const home = await mkdtemp(join(tmpdir(), 'dsa-waiting-')); t.after(() => rm(home, { recursive: true, force: true }));
   const orch = await openJournal(orchLedger(home)), wid = '01WTAGREE', j = await openJournal(journalPath(home, wid));

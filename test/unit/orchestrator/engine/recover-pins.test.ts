@@ -175,6 +175,27 @@ test('idle pin release between follow-up ready and dispatch reloads checked pins
   assert.equal((wf.journal.entries().find(e => e.type === JT.sealed && e.call === call)?.result as { status?: string })?.status, 'ok');
 });
 
+test('a pins getter that throws after ready seals only that follow-up pin-failed; nothing escapes dispatch', async t => {
+  const f = await home(t), b = await f.boot(), wf = await f.finished(b);
+  const ready = b.engine.store.ready.bind(b.engine.store);
+  let calls = 0;
+  t.mock.method(b.engine.store, 'ready', async (target: Workflow) => {
+    await ready(target);
+    // The dispatch-side ready (after admission's) leaves a getter that throws, as a load failing after verification.
+    if (++calls === 1) b.engine.store.releasePins(target); // released between admission and dispatch: dispatch must ready again
+    else Object.defineProperty(target, 'pins', { configurable: true, enumerable: true, get: () => { throw new Error('ENOENT: pins.json'); },
+      set: (pins: unknown) => { Object.defineProperty(target, 'pins', { value: pins, configurable: true, enumerable: true, writable: true }); } });
+  });
+  const rid = await f.request(b, 'send', { to: `${wf.wid}/c`, kind: 'follow-up', message: 'more' });
+  assert.equal(f.decision(b, rid)?.type, JT.applied);
+  const call = `${wf.wid}@1/c@2`;
+  for (let i = 0; i < 500 && !wf.journal.entries().some(e => e.type === JT.sealed && e.call === call); i++) await delay(5);
+  const sealed = wf.journal.entries().find(e => e.type === JT.sealed && e.call === call);
+  assert.equal((sealed?.result as { status?: string })?.status, 'failed');
+  assert.match(JSON.stringify(sealed?.result), /pin-failed: ENOENT: pins\.json/);
+  assert.equal(calls, 2, 'one admission ready, one dispatch ready; no retry loop');
+});
+
 test('held and already dispatched generations skip pins before building a ticket', async t => {
   const f = await home(t), b = await f.boot(), wf = await f.finished(b);
   const internal = b.engine as unknown as { dispatchGeneration(wf: Workflow, entry: Record<string, unknown>): void; generations: Set<string> };
@@ -202,6 +223,31 @@ test('a held follow-up survives idle pin release and resumes with checked pins',
   const call = `${wf.wid}@1/c@2`;
   for (let i = 0; i < 500 && !wf.journal.entries().some(e => e.type === JT.sealed && e.call === call); i++) await delay(5);
   assert.equal((wf.journal.entries().find(e => e.type === JT.sealed && e.call === call)?.result as { status?: string })?.status, 'ok');
+});
+
+test('an undrain is not refused by a done workflow with damaged released pins; only its held follow-up seals pin-failed', async t => {
+  const f = await home(t), b = await f.boot(), damaged = await f.finished(b), parked = await f.finished(b, 'parked');
+  const drain = await f.request(b, 'drain', {});
+  assert.equal(f.decision(b, drain)?.type, JT.applied);
+  const follow = await f.request(b, 'send', { to: `${damaged.wid}/c`, kind: 'follow-up', message: 'more' });
+  assert.equal(f.decision(b, follow)?.type, JT.applied);
+  // Damage the pin record and remove the immutable snapshot, then let the idle release drop the resident pins.
+  const intent = b.ledgers.orch.entries().find(e => e.type === 'create-intent' && e.wid === damaged.wid)!;
+  await writeFile(join(damaged.scriptPath, '..', 'pins.json'), 'not json');
+  await rm(join(f.dir, (intent.snapshot as { path: string }).path));
+  await delay(1100);
+  assert.ok(Object.getOwnPropertyDescriptor(damaged, 'pins')?.get, 'pins released before the undrain');
+  const starts = b.evaluator.starts(parked.wid);
+  const resume = await f.request(b, 'resume', {});
+  assert.equal(f.decision(b, resume)?.type, JT.applied, 'one workflow\'s damaged pins do not refuse the whole undrain');
+  assert.ok(parked.journal.entries().some(e => e.type === 'resumed' && e.rid === resume), 'the other workflow is released');
+  assert.equal(b.evaluator.starts(parked.wid), starts + 1);
+  const call = `${damaged.wid}@1/c@2`;
+  for (let i = 0; i < 500 && !damaged.journal.entries().some(e => e.type === JT.sealed && e.call === call); i++) await delay(5);
+  const sealed = damaged.journal.entries().find(e => e.type === JT.sealed && e.call === call);
+  assert.equal((sealed?.result as { status?: string })?.status, 'failed');
+  assert.match(JSON.stringify(sealed?.result), /pin-failed/);
+  assert.equal(damaged.journal.entries().some(e => e.type === 'resumed'), false, 'a done workflow is never resumed');
 });
 
 test('a tampered pinned file of a finished workflow refuses a revise and a follow-up before they use it', async t => {
