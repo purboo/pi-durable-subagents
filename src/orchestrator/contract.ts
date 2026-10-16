@@ -65,6 +65,9 @@ export interface CallEffects {
   recover(journal: JournalHandle): Promise<void>;
 }
 
+/** What one workflow's recovery did: calls recovered (read and repaired) and calls skipped as already recovered. */
+export interface RecoveryCounts { calls: number; skipped: number }
+
 /** An execution whose child (or gate before its seal) runs now. */
 export interface LiveExecution { wid: Wid; key: string; gen: number; callId: CallId; exec: string; since: number; phase: "child" | "gate" }
 
@@ -82,7 +85,13 @@ export interface Executor {
   retire(widRev: WidRev): Promise<void>;
   /** Startup recovery for one workflow, BEFORE the engine replays it: fence every exec without JT.fenced
    *  (using persisted tracked identities), and re-derive pool holdings. Unsealed calls are settled later via run(). */
-  recover(wid: Wid, journal: JournalHandle): Promise<void>;
+  recover(wid: Wid, journal: JournalHandle, options?: { batch?: boolean }): Promise<RecoveryCounts | void>;
+  /** After batched recover() calls (`batch: true`) of every workflow: the steps that do not depend on one workflow
+   *  (worktree reminders, outbox republication) and the end of each sealed call's recovery (inbox cleanup, receipt). */
+  finishRecovery?(): Promise<void>;
+  /** Whether the recovery of sealed or retired `call` is complete (recorded, nothing concerned it since) and it holds
+   *  no writer lock: an orchestrator start has nothing to repair for it. */
+  recovered?(journal: JournalHandle, call: CallId): boolean;
   /** True while any call is running or pending (used for idle exit, K6). */
   busy(): boolean;
   /** Drain with fence (stop-all, quit): fence every running execution (or only those of workflows `only` selects)

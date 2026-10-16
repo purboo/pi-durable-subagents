@@ -6,6 +6,7 @@ import { publishFile } from "../../../kernel/mailbox.ts";
 import { callDir } from "../../../paths.ts";
 import { validate } from "../../../agent/child/schema.ts";
 import { fenceAttentionResolved, recordFenceFailure, recordOnce } from "../sweep.ts";
+import { entriesOf } from "../indexes.ts";
 import type { CallResult, Containment, Entry, JournalHandle, ProcInfo } from "../../../types.ts";
 import type { CallTicket } from "../../contract.ts";
 
@@ -51,10 +52,13 @@ async function fenceGate(journal: JournalHandle, intent: Entry, containment: Pic
 /** P30, A5, F1: Fence unresolved gate identities before recording their outcome as unknown; a gate whose fence fails
  *  never fails recovery: it stays without an outcome and the executor sweep retries it every K1. */
 export async function recoverGates(journal: JournalHandle, containment: Pick<Containment, "fence">): Promise<void> {
-  for (const intent of journal.entries().filter(e => e.type === "gate-intent")) {
+  const intents = entriesOf(journal, "gate-intent");
+  if (!intents.length) return;
+  const outcomes = new Set(entriesOf(journal, "gate").map(e => String(e.id)));
+  for (const intent of intents) {
     const id = String(intent.id);
-    if (journal.entries().some(e => e.type === "gate" && e.id === id)) continue;
-    if (await fenceGate(journal, intent, containment)) await gateRetired(journal, id);
+    if (outcomes.has(id)) continue;
+    if (await fenceGate(journal, intent, containment)) { await gateRetired(journal, id); outcomes.add(id); }
   }
 }
 function apply(result: CallResult, record: Entry): CallResult {

@@ -107,3 +107,20 @@ test("status shows who forced the latest restart and why for 24 hours, on one li
   const later = foldLedger(emptyLedger(), [...entries(["restart", { rid: "r1", force: true, reason: "x", live: [] }], ["orchestrator", { version: "1.0.21", pid: 1, restart: true }]), ...entries(["orchestrator", { version: "1.0.21", pid: process.pid }]).map(e => ({ ...e, seq: 3, ts: 1003 }))]);
   assert.equal(orchestratorView(later, "1.0.21", 2000).orchestrator, `1.0.21 (pid ${process.pid})`);
 });
+
+test("the start entry announces recovery and a `recovered` entry of the same pid follows once recovery returns", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-recovered-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const controller = new AbortController();
+  const run = main({ home, signal: controller.signal, config: { k: { idleExitMs: 60_000 } }, executor: ledgers => fakeExecutor(ledgers),
+    discovery: { home, agentDir: join(home, "config"), globalNpmRoot: null } });
+  for (let i = 0; i < 500 && !readJournalSnapshot(orchLedger(home)).some(e => e.type === "recovered"); i++) await delay(10);
+  controller.abort(); await run;
+  const ledger = readJournalSnapshot(orchLedger(home)), start = ledger.findIndex(e => e.type === "orchestrator"), done = ledger.findIndex(e => e.type === "recovered");
+  assert.equal(ledger[start]!.recovery, true);
+  assert.ok(done > start);
+  const { type: _type, seq: _seq, ts: _ts, ms, ...rest } = ledger[done]!;
+  assert.deepEqual(rest, { pid: process.pid, workflows: 0, calls: 0, skipped: 0 });
+  assert.ok(typeof ms === "number" && ms >= 0);
+  assert.equal(ledger.filter(e => e.type === "recovered").length, 1);
+});

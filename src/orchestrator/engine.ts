@@ -37,6 +37,7 @@ import { eventsLog } from '../paths.ts';
 import { parseModel } from '../compat/model.ts';
 import { PENDING_NOTE, generationRids, openingMessage, pendingFollowUps, pendingNotes, unsettledForward, unsettledNotify } from './notes.ts';
 import { journalAppends } from '../kernel/journal.ts';
+import { callEntries, entriesOf } from './executor/indexes.ts';
 import { STATS_EVERY_MS, readBytes, writeStats, type OrchestratorStats } from './stats.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
@@ -180,39 +181,55 @@ export class Engine {
   private started = Date.now();
   private terminal(wf: Workflow) { return terminalEntry(revisionEntries(wf)); }
   private lifecycle(): DecisionRecord[] { return this.ledgers.orch.entries().filter(e => ['admitted', 'applied', 'rejected', 'withdrawn'].includes(e.type)) as unknown as DecisionRecord[]; }
-  /** A2, P10: Recover executor authority before replaying each unfinished workflow. */
-  async recover(): Promise<void> {
+  /** A2, P10: Recover executor authority before replaying each unfinished workflow. Returns what it recovered: the
+   *  workflows, the calls the executor read and repaired, and those it skipped as already recovered. */
+  async recover(): Promise<{ workflows: number; calls: number; skipped: number }> {
     await this.store.recover();
     // Before any recovery append, so every journal entry from here on is derived promptly (and a new log derives
     // everything still on disk).
     await this.events.open();
+    // An executor that can finish a batch runs its workflow-independent steps once, after every workflow.
+    const batch = this.executor.finishRecovery !== undefined ? { batch: true } : undefined;
+    let calls = 0, skipped = 0;
     for (const wf of this.store.workflows.values()) {
-      await this.executor.recover(wf.wid, wf.journal);
+      const counts = await this.executor.recover(wf.wid, wf.journal, batch);
+      if (counts) { calls += counts.calls; skipped += counts.skipped; }
       // A seal may survive a crash before post-seal effects, even after workflow completion.
       let revision = 1;
       for (const entry of wf.journal.entries()) {
         if (entry.type === 'revised') revision = Number(entry.revision);
         if (entry.type !== 'call' && entry.type !== 'generation') continue;
         const call = `${wf.wid}@${revision}/${entry.key}@${entry.gen}`;
-        const log = wf.journal.entries();
-        const result = log.find(e => e.type === JT.sealed && e.call === call)?.result as CallResult | undefined;
-        if (result?.status !== 'ok' || !log.some(e => e.type === 'wt-intent' && e.call === call) ||
-          log.some(e => ['wt-removed', 'wt-kept'].includes(e.type) && e.call === call)) continue;
+        if (!this.worktreeUnsettled(wf, call)) continue;
         const original = await this.store.atRevision(wf, revision);
         await this.executor.run(this.ticket({ wf: original } as State, entry));
       }
     }
+    await this.executor.finishRecovery?.();
     await this.startHost();
     for (const intent of this.ledgers.orch.entries().filter(e => e.type === 'revise-intent')) await this.revise(intent);
     for (const wf of this.store.workflows.values()) {
       if (!this.terminal(wf)) await this.startWorkflow(wf);
       else await this.attention(wf);
-      for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
+      for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) if (!this.settledGeneration(wf, entry)) this.dispatchGeneration(wf, entry);
       await this.reopenForwarded(wf);
     }
     await this.intake();
     for (const wf of this.store.workflows.values()) this.settle(wf);
     this.startWaiting();
+    return { workflows: this.store.workflows.size, calls, skipped };
+  }
+  /** A successful call with a worktree whose removal (or keeping) is not recorded yet: its post-seal effect is due. */
+  private worktreeUnsettled(wf: Workflow, call: string): boolean {
+    const log = callEntries(wf.journal, call), result = log.find(e => e.type === JT.sealed)?.result as CallResult | undefined;
+    return result?.status === 'ok' && log.some(e => e.type === 'wt-intent') && !log.some(e => e.type === 'wt-removed' || e.type === 'wt-kept');
+  }
+  /** A sealed generation a start need not run again: the executor has nothing to recover for it, its finished attention
+   *  is recorded and no worktree effect is due (running it would only repeat these post-seal steps). */
+  private settledGeneration(wf: Workflow, entry: Entry): boolean {
+    const id = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
+    if (!callEntries(wf.journal, id).some(e => e.type === JT.sealed) || !this.executor.recovered?.(wf.journal, id) || this.worktreeUnsettled(wf, id)) return false;
+    return entriesOf(wf.journal, JT.attention).some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`);
   }
   /** Every k.waitCheckMs (read here, at orchestrator start), why each live call does not move, as `waiting`/`moving`
    *  events through the pump. The tracker starts from the log's latest transition per call, so a restart repeats none
@@ -245,6 +262,7 @@ export class Engine {
   }
   private async startWorkflow(wf: Workflow) {
     if (this.terminal(wf)) return;
+    if (!this.store.verified(wf.wid)) { await this.store.ready(wf); if (this.terminal(wf)) return; }
     wf.journal.resting = false;
     await this.resolveFinished(wf);
     const log = revisionEntries(wf);
@@ -400,6 +418,8 @@ export class Engine {
         // Pending notes and undelivered follow-ups ride on the opening message, recorded in the same entry (consumed
         // exactly once). A notify or follow-up whose fate the seal has not settled yet may still become one: wait for it.
         if (unsettledForward(revisionEntries(wf), from)) return { action: 'defer' } as const;
+        // A1: the generation runs from the workflow's pinned files: verify them (once per process) before opening it.
+        try { await this.store.ready(wf); } catch (error) { return { action: 'reject', reason: `pin-failed: ${String(error)}` } as const; }
         if (send.model !== undefined) await this.note(req.rid, send.model, 'next-generation');
         const opened = await this.openGeneration(wf, entry, from, { rid: req.rid, message: send.message ?? '', ...(send.model !== undefined ? { model: send.model } : {}) });
         this.dispatchGeneration(wf, opened); return { action: 'apply' } as const;
@@ -447,6 +467,13 @@ export class Engine {
         if (target && final(target) && !took(target)) return { action: 'reject', reason: `terminal:${final(target)} — start a new run` };
         if (target && !parked(target) && !took(target)) return { action: 'reject', reason: 'not-parked: already running' };
         if (!target && ![...this.store.workflows.values()].some(wf => inScope(wf) && (parked(wf) || took(wf)))) return { action: 'reject', reason: 'nothing-to-resume' };
+      }
+      // A1: the pinned files of a finished workflow this resume starts are verified first (a start no longer hashes
+      // them): a changed file refuses the resume before anything is recorded.
+      for (const wf of this.store.workflows.values()) {
+        const done = this.terminal(wf);
+        if (!inScope(wf) || this.store.verified(wf.wid) || !(done?.status === 'parked' || (releasing && !done))) continue;
+        try { await this.store.ready(wf); } catch (error) { return { action: 'reject', reason: `pin-failed: ${String(error)}` }; }
       }
       if (releasing && !replayed) await this.ledgers.orch.append('undrain', { rid: req.rid, ...(wid ? { wid } : origin ? { origin } : {}) });
       for (const wf of this.store.workflows.values()) {
@@ -592,6 +619,13 @@ export class Engine {
     try { return await run; } finally { if (this.opening.get(wid) === tail) this.opening.delete(wid); }
   }
   private dispatchGeneration(wf: Workflow, entry: Entry) {
+    // A finished workflow's pinned files are verified before a generation of it runs (the ticket names its origin).
+    if (!this.store.verified(wf.wid)) {
+      const revision = wf.revision;
+      void this.store.ready(wf).then(() => { if (wf.revision === revision && this.store.workflows.get(wf.wid) === wf) this.dispatchGeneration(wf, entry); },
+        error => this.background(async () => { throw error; }));
+      return;
+    }
     const ticket = this.ticket({ wf } as State, entry), id = ticket.callId;
     if (this.generations.has(id) || this.held(wf.wid) || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
     this.generations.add(id); wf.journal.resting = false;
