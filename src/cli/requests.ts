@@ -4,8 +4,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { readJournalSnapshot } from "../kernel/journal.ts";
-import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
+import { readJournalFold, readJournalSnapshot, type JournalFold } from "../kernel/journal.ts";
+import { isResolution, lifecycleResolution } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
 import { NOTIFY_SINCE, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
@@ -50,8 +50,7 @@ function waitMs(values: Flags, ctx: Context): number {
 }
 function ledger(home: string): Entry[] { return readJournalSnapshot(orchLedger(home)) as Entry[]; }
 function decision(entries: readonly Entry[], rid: string) {
-  const records = entries.filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[];
-  return reduceLifecycle(records).resolved.get(rid);
+  return lifecycleResolution(entries, rid);
 }
 const createdBy = (entries: readonly Entry[], rid: string) => entries.find(e => e.type === JT.created && e.rid === rid);
 async function stdin(): Promise<string> { const chunks: Buffer[] = []; for await (const chunk of process.stdin) chunks.push(chunk as Buffer); return Buffer.concat(chunks).toString("utf8"); }
@@ -183,12 +182,18 @@ type Outcome = { type: "applied"; wid?: string } | { type: "rejected"; reason: s
 /** Wait (bounded) for the request's decision: a run's `created` wid, or the lifecycle resolution. */
 async function outcome(home: string, rid: string, run: boolean, timeoutMs: number): Promise<Outcome | undefined> {
   const deadline = performance.now() + timeoutMs;
+  type State = { created?: string; decided?: Outcome };
+  let journal: JournalFold<State> | undefined;
   for (;;) {
-    const entries = ledger(home), created = run ? createdBy(entries, rid) : undefined;
-    if (created) return { type: "applied", wid: String(created.wid) };
-    const decided = decision(entries, rid);
-    if (decided?.type === "rejected") return { type: "rejected", reason: String(decided.reason) };
-    if (decided && !run) return { type: "applied" };
+    journal = readJournalFold<State>(orchLedger(home), journal, () => ({}), (state, entry) => {
+      if (entry.rid !== rid) return;
+      if (run && entry.type === JT.created && state.created === undefined) state.created = String(entry.wid);
+      if (!state.decided && isResolution(entry)) state.decided = entry.type === "rejected" ? { type: "rejected", reason: String(entry.reason) } : { type: "applied" };
+    });
+    const state = journal?.state;
+    if (state?.created !== undefined) return { type: "applied", wid: state.created };
+    if (state?.decided?.type === "rejected") return state.decided;
+    if (state?.decided && !run) return { type: "applied" };
     if (performance.now() >= deadline) return undefined;
     await delay(Math.min(100, Math.max(0, deadline - performance.now())));
   }

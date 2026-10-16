@@ -113,9 +113,9 @@ test('identity conflict cannot replace original pending binding or terminal reso
   assert.equal(reduceLifecycle(records).resolved.get('a')?.type, 'applied');
   assert.equal(records.filter(r => r.type === 'applied').length, 1);
 });
-test('planning and a mutating domain decider cannot mutate input or lifecycle state', () => {
+test('planning gives a decider a request copy and a lifecycle view of the current call', () => {
   const req = request('a', 1), original = structuredClone(req);
-  planDecisions([], [req], (r, state) => { r.body = 'mutated'; (state.admitted as Map<string, unknown>).clear(); return apply(); });
+  planDecisions([], [req], (r, state) => { r.body = 'mutated'; assert.equal(state.admitted.has('a'), true); assert.equal(state.resolved.has('a'), false); return apply(); });
   assert.deepEqual(req, original);
 });
 test('A conflicting duplicate of a resolved rid records nothing and never replaces the resolution', () => {

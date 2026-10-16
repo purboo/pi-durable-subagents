@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { Outbox, scanInbox } from "../kernel/mailbox.ts";
-import { readJournalSnapshot } from "../kernel/journal.ts";
-import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
+import { readJournalFold, readJournalSnapshot, type JournalFold } from "../kernel/journal.ts";
+import { isResolution } from "../kernel/lifecycle.ts";
 import { OsLock } from "../platform/lock.ts";
 import { launchOrchestrator } from "../platform/launch.ts";
 import { orchInbox, orchLedger, orchLock, outboxRoot } from "../paths.ts";
@@ -34,7 +34,7 @@ async function pendingOutboxes(home: string): Promise<boolean> {
   const dir = join(outboxRoot(home), "outbox");
   const names = await readdir(dir).catch(error => { if (error.code === "ENOENT") return [] as string[]; throw error; });
   const ledger = readJournalSnapshot(orchLedger(home));
-  const decided = reduceLifecycle(ledger.filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[]).resolved;
+  const decided = new Set(ledger.filter(isResolution).map(e => String(e.rid)));
   const created = new Set(ledger.filter(e => e.type === JT.created).map(e => String(e.rid)));
   for (const name of names.filter(n => n.endsWith(".jsonl"))) {
     const pending = new Map<string, Request>();
@@ -61,10 +61,14 @@ export async function start(home: string, env: NodeJS.ProcessEnv, starter: (home
 /** P6, housekeeping: Wait (bounded) until the ledger resolves `rid`; undefined when it is still pending at the deadline. */
 export async function resolution(home: string, rid: string, timeoutMs: number, interval = 100): Promise<{ type: "applied" | "rejected"; reason?: string } | undefined> {
   const deadline = performance.now() + timeoutMs;
+  type State = { resolved?: { type: "applied" | "rejected"; reason?: string } };
+  let journal: JournalFold<State> | undefined;
   for (;;) {
-    const records = readJournalSnapshot(orchLedger(home)).filter(e => [JT.admitted, JT.applied, JT.rejected, JT.withdrawn].includes(e.type as typeof JT.admitted)) as unknown as DecisionRecord[];
-    const resolved = reduceLifecycle(records).resolved.get(rid);
-    if (resolved) return resolved.type === "rejected" ? { type: "rejected", reason: String(resolved.reason) } : { type: "applied" };
+    // The compact reader retains only this rid's first terminal decision and reads appended bytes on each poll.
+    journal = readJournalFold<State>(orchLedger(home), journal, () => ({}), (state, entry) => {
+      if (!state.resolved && entry.rid === rid && isResolution(entry)) state.resolved = entry.type === "rejected" ? { type: "rejected", reason: String(entry.reason) } : { type: "applied" };
+    });
+    if (journal?.state.resolved) return journal.state.resolved;
     if (performance.now() >= deadline) return undefined;
     await delay(interval);
   }
@@ -113,8 +117,11 @@ async function withSender<T>(home: string, fn: (outbox: Outbox, sender: string) 
   try {
     const outbox = await Outbox.open(outboxRoot(home), sender, () => orchInbox(home));
     try {
-      const records = readJournalSnapshot(orchLedger(home)).filter(e => ["admitted", "applied", "rejected", "withdrawn"].includes(e.type)) as unknown as DecisionRecord[];
-      for (const rid of reduceLifecycle(records).resolved.keys()) await outbox.markResolved(rid);
+      const pending = outbox.pendingRids();
+      if (pending.size) {
+        const ledger = readJournalSnapshot(orchLedger(home));
+        for (const entry of ledger) if (isResolution(entry) && pending.delete(String(entry.rid))) await outbox.markResolved(String(entry.rid));
+      }
       await outbox.republishPending();
       return await fn(outbox, sender);
     } finally { await outbox.close(); }

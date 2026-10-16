@@ -18,7 +18,7 @@ export function openness(state: { open: readonly Question[]; closed: ReadonlySet
   return state.open.some(q => q.qid === transition.qid && q.rev === transition.rev) && !state.closed.has(`${transition.qid}@${transition.rev}`);
 }
 /** A4, V5, P5: Dependencies must be earlier admissions, and resolved before application. */
-export function dependency(state: { order: ReadonlyMap<string, number>; resolved: ReadonlySet<string> }, transition: { rid: string; after?: string; phase: 'admission' | 'application' }): boolean {
+export function dependency(state: { order: ReadonlyMap<string, number>; resolved: Pick<ReadonlySet<string>, 'has'> }, transition: { rid: string; after?: string; phase: 'admission' | 'application' }): boolean {
   if (transition.after === undefined) return true;
   const earlier = state.order.get(transition.after), current = state.order.get(transition.rid);
   return earlier !== undefined && current !== undefined && earlier < current && (transition.phase === 'admission' || state.resolved.has(transition.after));

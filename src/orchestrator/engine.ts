@@ -17,7 +17,7 @@ import { mkdir, readdir, unlink } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { contentHash } from '../kernel/ids.ts';
-import { planDecisions, reduceLifecycle, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
+import { LifecycleFold, planDecisions, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
 import { SESSION_ID, requestId, specDigest } from '../requests.ts';
@@ -197,7 +197,46 @@ export class Engine {
   }
   private started = Date.now();
   private terminal(wf: Workflow) { return lazy(wf) ? wf.settled.done : terminalEntry(revisionEntries(wf)); }
-  private lifecycle(): DecisionRecord[] { return this.ledgers.orch.entries().filter(e => ['admitted', 'applied', 'rejected', 'withdrawn'].includes(e.type)) as unknown as DecisionRecord[]; }
+  private intakeFold = new LifecycleFold();
+  private intakeSeen = 0;
+  /** Journal positions preserve retained-envelope order, even for repeated request entries. */
+  private retained = new Map<number, Request>();
+  private retainedAt = new Map<string, Set<number>>();
+  private sends = new Map<string, { at: number; request: Request }[]>();
+  private rejectedStages = new Set<string>();
+  private withdrawnStages = new Set<string>();
+  /** One writer appends committed entries; folds never advance past an uncommitted append or an awaited decision. */
+  private lifecycle(): LifecycleFold {
+    const entries = this.ledgers.orch.committed?.() ?? this.ledgers.orch.entries();
+    for (; this.intakeSeen < entries.length; this.intakeSeen++) {
+      const entry = entries[this.intakeSeen]!;
+      if (entry.type === 'request') {
+        const request = entry.request as Request;
+        if (request.kind === 'send') {
+          const sent = this.sends.get(request.rid) ?? [];
+          sent.push({ at: this.intakeSeen, request }); this.sends.set(request.rid, sent);
+        }
+        if (!this.intakeFold.resolved.has(request.rid)) {
+          this.retained.set(this.intakeSeen, request);
+          const positions = this.retainedAt.get(request.rid) ?? new Set<number>();
+          positions.add(this.intakeSeen); this.retainedAt.set(request.rid, positions);
+        }
+      } else if (['admitted', 'applied', 'rejected', 'withdrawn'].includes(entry.type)) {
+        const record = entry as unknown as DecisionRecord;
+        this.intakeFold.apply(record);
+        if (record.type === 'withdrawn') for (const rid of record.rids) this.withdrawnStages.add(rid);
+        else {
+          const resolution = this.intakeFold.resolved.get(record.rid);
+          if (resolution) {
+            for (const at of this.retainedAt.get(record.rid) ?? []) this.retained.delete(at);
+            this.retainedAt.delete(record.rid);
+            if (resolution.type === 'rejected' && ['run', 'revise'].includes(this.intakeFold.admitted.get(record.rid)?.kind ?? '')) this.rejectedStages.add(record.rid);
+          }
+        }
+      }
+    }
+    return this.intakeFold;
+  }
   /** A2, P10: Recover executor authority before replaying each unfinished workflow. Returns what it recovered: the
    *  workflows, the calls the executor read and repaired, and those it skipped as already recovered. */
   async recover(): Promise<{ workflows: number; calls: number; skipped: number }> {
@@ -305,17 +344,16 @@ export class Engine {
   private async pollIntake() {
     const files = await readdir(orchInbox(this.ledgers.home)).catch(error => { if (error.code === 'ENOENT') return [] as string[]; throw error; });
     const last = this.consumed;
-    if (!files.length && last && !last.pending && last.length === this.ledgers.orch.entries().length) return;
+    const length = this.ledgers.orch.count?.() ?? (this.ledgers.orch.committed?.() ?? this.ledgers.orch.entries()).length;
+    if (!files.length && last && !last.pending && last.length === length) return;
     await this.consume();
   }
   private async consume() {
     this.passes.push(Date.now());
     const scanned = (await scanInbox(orchInbox(this.ledgers.home))).filter(r => r.to === 'orch');
-    const before = reduceLifecycle(this.lifecycle()), staged = new Set<string>();
-    // Only unresolved admitted envelopes can still be decided: a resolved one only re-binds its own rid (A1), so the
-    // pass hashes and clones what is open, not the whole request history.
-    const retained = this.ledgers.orch.entries().filter(e => e.type === 'request' && !before.resolved.has((e.request as Request).rid)).map(e => e.request as Request);
-    const candidates = [...retained, ...scanned];
+    const before = this.lifecycle(), staged = new Set<string>();
+    // The watermark index removes envelopes only after a committed terminal resolution.
+    const candidates = [...this.retained.values(), ...scanned];
     for (const request of candidates) {
       if (!['run', 'revise'].includes(request.kind) || before.admitted.has(request.rid) || before.tombstones.has(request.rid) || staged.has(request.rid)) continue;
       await this.store.stage(request as Request<RunBody>, this.discovery);
@@ -344,18 +382,16 @@ export class Engine {
       const resolution = planDecisions(this.lifecycle(), candidates, req => req.rid === selected!.rid ? decision : { action: 'defer' });
       for (const { type, ...fields } of resolution) await this.ledgers.orch.append(type, fields);
     }
-    const view = reduceLifecycle(this.lifecycle());
-    for (const [rid, resolution] of view.resolved) {
-      if (resolution.type === 'rejected' && ['run', 'revise'].includes(view.admitted.get(rid)?.kind ?? '')) await this.store.discardStage(rid);
+    const view = this.lifecycle();
+    for (const pending of [this.rejectedStages, this.withdrawnStages]) {
+      for (const rid of pending) { await this.store.discardStage(rid); pending.delete(rid); }
     }
-    for (const rid of view.tombstones) await this.store.discardStage(rid);
     for (const req of scanned) {
       if (view.resolved.has(req.rid) || (view.admitted.has(req.rid) && view.admitted.get(req.rid)!.hash !== contentHash(req))) {
         await unlink(join(orchInbox(this.ledgers.home), `${req.rid}.json`)).catch(error => { if (error.code !== 'ENOENT') throw error; });
       }
     }
-    const after = reduceLifecycle(this.lifecycle());
-    this.consumed = { length: this.ledgers.orch.entries().length, pending: [...after.admitted.keys()].some(rid => !after.resolved.has(rid)) };
+    this.consumed = { length: this.intakeSeen, pending: view.open.size > 0 };
   }
   private findCall(to: string, bareWid = false): { wf: Workflow; entry: Entry } | undefined {
     for (const wf of this.store.workflows.values()) {
@@ -379,9 +415,9 @@ export class Engine {
   private context(wf: Workflow, entry: Entry) { return { journal: wf.journal, widRev: `${wf.wid}@${wf.revision}` as const, key: entry.key as string, gen: entry.gen as number }; }
   private async withdraw(req: Request) {
     const rids = (req.body as { rids: string[] }).rids;
+    this.lifecycle();
+    const sent = [...new Set(rids)].flatMap(rid => this.sends.get(rid) ?? []).sort((a, b) => a.at - b.at).map(item => item.request);
     for (const wf of this.store.workflows.values()) {
-      const requests = this.ledgers.orch.entries().filter(e => e.type === 'request').map(e => e.request as Request);
-      const sent = requests.filter(r => r.kind === 'send' && rids.includes(r.rid));
       const visited = new Set<string>();
       for (const target of sent) {
         const found = this.findCall((target.body as SendBody).to, true);
