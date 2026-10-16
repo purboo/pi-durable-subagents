@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openJournal } from "../../../../src/kernel/journal.ts";
 import { Containment } from "../../../../src/platform/containment.ts";
-import { recordFenceFailure, recordOnce, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
+import { indexSweep, seededSweep, sweepSeed, recordFenceFailure, recordOnce, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
 import { gateRetired } from "../../../../src/orchestrator/executor/effects/gate.ts";
 import { JT, type Entry, type ProcInfo } from "../../../../src/types.ts";
 import { setTimeout as delay } from "node:timers/promises";
@@ -39,6 +39,46 @@ test("P23 sweep kills a tagged straggler launched after a durable fence", { time
   await sweepExecutions([journal], new Containment());
   assert.equal((await child.exited).signal, "SIGKILL");
   assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+});
+
+test('fenced executions retain only tags and settled seeds share the compact tag list', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsa-sweep-compact-'));
+  const journal = await openJournal(join(root, 'workflow'));
+  t.after(async () => { await journal.close(); await rm(root, { recursive: true, force: true }); });
+  await journal.append(JT.exec, { exec: 'w@1/a@1#1.1', call: 'w@1/a@1' });
+  await journal.append('tracked', { exec: 'w@1/a@1#1.1', pid: 7, start: 'old' });
+  assert.equal(indexSweep(journal).tracked.size, 1);
+  await journal.append(JT.fenced, { exec: 'w@1/a@1#1.1' });
+  const indexed = indexSweep(journal);
+  assert.equal(indexed.tracked.size, 0, 'durable fences release every process identity');
+  assert.equal(indexed.execs.length, 0, 'no execution object remains for a fenced tag');
+  const seed = sweepSeed(journal);
+  assert.deepEqual(seed, ['w@1/a@1#1.1']);
+  assert.strictEqual(seededSweep(seed), seed, 'the executor shares the store tag list');
+});
+
+test('restart sweep fences an unfenced retired execution using its persisted identity after its tag changes', { timeout: 10000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsa-sweep-restart-'));
+  const path = join(root, 'workflow'), containment = new Containment(), exec = `restart-${process.pid}-${Date.now()}#1.1`;
+  let journal = await openJournal(path);
+  t.after(async () => { await containment.fence(`${exec}-changed-tag`, []); await journal.close(); await rm(root, { recursive: true, force: true }); });
+  const child = await containment.spawn({ exec: `${exec}-changed-tag`, command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], cwd: root, env: {} });
+  const processes: ProcInfo[] = [{ pid: child.pid, ppid: process.pid, start: child.start }];
+  assert.ok(child.start);
+  await journal.append(JT.exec, { exec, call: 'w@1/a@1' });
+  for (const p of processes) await journal.append('tracked', { exec, pid: p.pid, start: p.start });
+  await journal.append('retired', { call: 'w@1/a@1' });
+  await journal.close(); journal = await openJournal(path);
+  const fresh = new Containment();
+  assert.equal((await fresh.scan(new Map([[exec, []]]))).get(exec)?.length, 0, 'the old execution tag cannot find it');
+  const fences: number[] = [];
+  await sweepExecutions([journal], {
+    async scan(known) { assert.ok(known.get(exec)?.some(p => p.pid === child.pid)); return fresh.scan(known); },
+    async fence(id, known) { fences.push(known.length); await fresh.fence(id, known); },
+  }, { fenced: async (j, id) => { await j.append(JT.fenced, { exec: id }); } });
+  assert.ok(fences[0]! > 0);
+  assert.equal((await child.exited).signal, 'SIGKILL');
+  assert.equal(indexSweep(journal).tracked.size, 0);
 });
 
 test("F1 F2 one scan per sweep; a failing exec is reported and never stops the others; failed fences are retried", async t => {

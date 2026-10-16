@@ -29,6 +29,32 @@ async function fixture(t: TestContext) {
   const warnings = async (rid: string) => JSON.parse(await readFile(join(home, "staging", rid, "snapshot.json"), "utf8")).warnings as string[] | undefined;
   return { home, cwd, agents, ledgers, store, discovery, run, warnings, staging: (rid: string) => join(home, "staging", rid) };
 }
+test('a delayed pin reload cannot overwrite a concurrently published revision', async t => {
+  const f = await fixture(t), req = f.run('reload-old', { source: 'old' });
+  await f.store.stage(req, f.discovery); const wf = await f.store.create(req);
+  t.after(() => f.store.close());
+  const revise = { ...f.run('reload-new', {}), kind: 'revise' as const, body: { wid: wf.wid, source: 'new' } };
+  await f.store.stage(revise, f.discovery);
+  const intent = await f.store.revisionIntent(revise, wf);
+  await wf.journal.append(JT.done, { status: 'done' }); f.store.releasePins(wf);
+  const internal = f.store as unknown as { recorded(...args: unknown[]): Promise<{ pins: unknown } | undefined> };
+  const recorded = internal.recorded.bind(internal);
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  t.mock.method(internal, 'recorded', async (...args: unknown[]) => {
+    const result = await recorded(...args);
+    if (args[2] === 'record') { entered(); await gate; }
+    return result;
+  });
+  const reloading = f.store.ready(wf);
+  await started;
+  try { await f.store.revise(intent); }
+  finally { release(); }
+  await reloading;
+  assert.equal(wf.revision, 2); assert.equal(wf.pins.source, 'new');
+});
+
 test("A1 terminal memoization follows done, resume and revision appends", async t => {
   const f = await fixture(t), req = f.run("cache", { source: "return 1;" });
   await f.store.stage(req, f.discovery); const wf = await f.store.create(req);
