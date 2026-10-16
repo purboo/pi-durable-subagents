@@ -21,7 +21,7 @@ import { LifecycleFold, planDecisions, type DecisionRecord, type Decision } from
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
 import { SESSION_ID, requestId, specDigest } from '../requests.ts';
-import { JT, attentionEntries, isEntry, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type RestartBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
+import { JT, attentionEntries, isCommandCall, isEntry, type Entry, type Request, type RunBody, type ReviseBody, type DrainBody, type RestartBody, type ResumeBody, type PruneBody, type SendBody, type EvalToOrch, type CallResult, type CallSpec } from '../types.ts';
 import type { DiscoveryOptions } from '../compat/agents.ts';
 import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { isForceRestart, restartRefusal } from './restart.ts';
@@ -774,7 +774,10 @@ export class Engine {
     if (!this.ledgers.orch.entries().some(e => e.type === 'send-note' && e.rid === rid)) await this.ledgers.orch.append('send-note', { rid, model, effect });
   }
   private ticket(st: State, entry: Entry): CallTicket {
-    const spec = entry.spec as CallSpec, agent = st.wf.pins.agents.find(a => a.name === spec.agent);
+    const spec = entry.spec as CallSpec;
+    // A command call runs no agent: its ticket carries the placeholder agent of an unpinned ticket.
+    if (isCommandCall(spec)) return this.unpinnedTicket(st.wf, entry);
+    const agent = st.wf.pins.agents.find(a => a.name === spec.agent);
     if (!agent) throw new Error(`Unknown pinned agent: ${spec.agent}`);
     return { wid: st.wf.wid, widRev: `${st.wf.wid}@${st.wf.revision}`, key: entry.key as string, gen: entry.gen as number,
       callId: `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`, spec, agent, workflowBudget: st.wf.pins.usageBudget, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal,
@@ -842,7 +845,8 @@ export class Engine {
     const park = (error: string) => this.finish(st.wf, 'parked', undefined, error);
     if (message.t === 'call') {
       // An unknown agent name refuses that call (the script gets a failed result naming the available agents), like an invalid spec.
-      const agent = st.wf.pins.agents.find(a => a.name === message.spec.agent) ?? null;
+      // A command call names no agent (its fingerprint pins agent null).
+      const command = isCommandCall(message.spec), agent = command ? null : st.wf.pins.agents.find(a => a.name === message.spec.agent) ?? null;
       const fingerprint = contentHash({ spec: message.spec, agent }), old = st.outputs.get(message.pos);
       if (st.proposed.has(message.pos) || (old && (!['call', 'refused', 'reused'].includes(old.type) || old.key !== message.key || old.fingerprint !== fingerprint))) return park(`Replay mismatch at ${message.pos}`);
       if (!old && [...st.calls.values()].some(e => e.key === message.key)) return park(`Duplicate call key: ${message.key}`);
@@ -858,7 +862,7 @@ export class Engine {
         const reused = history.findLast(e => e.type === JT.sealed && matching.includes(String(e.call)));
         const fields = { pos: message.pos, key: message.key, spec: message.spec, fingerprint };
         const problems = validateCallSpec(message.spec);
-        if (!problems.length && !agent) problems.push(unknownAgent(message.spec.agent, st.wf.pins.agents));
+        if (!problems.length && !agent && !command) problems.push(unknownAgent(message.spec.agent, st.wf.pins.agents));
         // A malformed spec from a script never runs: the script gets a failed result naming every problem.
         if (problems.length) entry = await st.wf.journal.append('refused', { ...fields, reason: `invalid spec: ${problems.join('; ')}` });
         else if (reused) entry = await st.wf.journal.append('reused', { ...fields, from: reused.call, gen: (reused.result as CallResult).gen });

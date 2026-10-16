@@ -1,6 +1,9 @@
 import { schemaProblems } from "../agent/child/schema.ts";
 
-const fields = new Set(["agent", "task", "model", "cwd", "timeoutMs", "output", "schema", "gate", "isolation", "context", "budget", "once", "tools", "skills", "key", "writer"]);
+const fields = new Set(["agent", "task", "model", "cwd", "timeoutMs", "output", "schema", "gate", "isolation", "context", "budget", "once", "tools", "skills", "key", "writer", "command", "env", "rerun"]);
+/** Fields a command call takes; every other known field belongs to agent calls. */
+export const COMMAND_FIELDS = ["command", "cwd", "timeoutMs", "env", "rerun", "writer", "key"] as const;
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 type Spec = Record<string, unknown>;
 const isObject = (v: unknown): v is Spec => v !== null && typeof v === "object" && !Array.isArray(v);
 const positive = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
@@ -37,6 +40,8 @@ export function validateCallSpec(spec: unknown, options: { fanout?: boolean } = 
     if (!fields.has(k)) errors.push(`unknown field "${k}"`);
     else if (k === "key" && !options.fanout) errors.push("key is only allowed in tasks/chain steps");
   }
+  if (has("command")) return [...errors, ...commandProblems(s, options)];
+  for (const k of ["env", "rerun"]) if (has(k)) errors.push(`${k} is only allowed in a command call`);
   if (!text(s.agent)) errors.push(`agent must be a non-empty string${has("agent") ? got(s.agent) : ""}`);
   if (!text(s.task)) errors.push("task must be a non-empty string");
   for (const k of ["model", "cwd", "output"]) if (has(k) && typeof s[k] !== "string") errors.push(`${k} must be a string${got(s[k])}`);
@@ -49,6 +54,29 @@ export function validateCallSpec(spec: unknown, options: { fanout?: boolean } = 
   if (has("once") && typeof s.once !== "boolean") errors.push(`once must be a boolean${got(s.once)}`);
   if (has("writer") && typeof s.writer !== "boolean") errors.push(`writer must be a boolean${got(s.writer)}`);
   for (const k of ["tools", "skills"]) if (has(k) && (!Array.isArray(s[k]) || !(s[k] as unknown[]).every(v => typeof v === "string"))) errors.push(`${k} must be an array of strings${got(s[k])}`);
+  if (options.fanout && has("key") && !text(s.key)) errors.push("key must be a non-empty string");
+  return errors;
+}
+
+/** A command call: command (argv array or sh string) plus cwd, timeoutMs, env, rerun, writer, key; nothing else. */
+function commandProblems(s: Spec, options: { fanout?: boolean }): string[] {
+  const errors: string[] = [], has = (k: string) => s[k] !== undefined;
+  for (const k of Object.keys(s)) if (has(k) && fields.has(k) && !(COMMAND_FIELDS as readonly string[]).includes(k)) errors.push(`${k} is not allowed in a command call`);
+  const c = s.command;
+  if (Array.isArray(c)) {
+    if (!c.length || !c.every(v => typeof v === "string") || !text(c[0])) errors.push(`command must be a non-empty string or an array of strings with a non-empty first element${got(c)}`);
+  } else if (!text(c)) errors.push(`command must be a non-empty string or an array of strings with a non-empty first element${got(c)}`);
+  if (has("cwd") && typeof s.cwd !== "string") errors.push(`cwd must be a string${got(s.cwd)}`);
+  if (has("timeoutMs") && !positive(s.timeoutMs)) errors.push(`timeoutMs must be a positive number (milliseconds)${got(s.timeoutMs)}`);
+  if (has("env")) {
+    if (!isObject(s.env)) errors.push(`env must be an object of strings${got(s.env)}`);
+    else for (const [k, v] of Object.entries(s.env)) {
+      if (!ENV_NAME.test(k)) errors.push(`env name ${JSON.stringify(k)} is not a valid variable name`);
+      else if (k.startsWith("DSA_")) errors.push(`env name ${k} is reserved (DSA_*)`);
+      if (typeof v !== "string") errors.push(`env.${k} must be a string${got(v)}`);
+    }
+  }
+  for (const k of ["rerun", "writer"]) if (has(k) && typeof s[k] !== "boolean") errors.push(`${k} must be a boolean${got(s[k])}`);
   if (options.fanout && has("key") && !text(s.key)) errors.push("key must be a non-empty string");
   return errors;
 }
