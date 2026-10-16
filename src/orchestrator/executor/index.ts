@@ -1062,7 +1062,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   /** Whether a later command-withdrawn voids the intent at `seq` (no process was started for it). */
   const intentWithdrawn = (journal: JournalHandle, call: string, id: string, seq: number) => entriesFor(journal, call).some(e => e.type === COMMAND_WITHDRAWN && e.id === id && e.seq > seq);
   /** Start the attempt whose intent is recorded; records command-started, or command-spawn-failed when it cannot start.
-   *  Rechecked first: a stop means no process (the watch seals it stopped), a retirement or the orchestrator's exit
+   *  Rechecked synchronously right before the spawn: a stop means no process (the watch seals it stopped), a retirement or the orchestrator's exit
    *  withdraws the intent (nothing started; the next start decides again). */
   async function launchCommand(a: Active, id: string, dir: string): Promise<SpawnedCommand | undefined> {
     const t = a.ticket;
@@ -1070,13 +1070,20 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     try {
       if (!(await stat(t.cwd).catch(() => undefined))?.isDirectory()) throw new Error(`cwd ${t.cwd} is not a directory`);
       await rm(join(dir, "exit"), { force: true }); await rm(join(dir, "exit.tmp"), { force: true });
-      if (stopped(a)) return undefined;
-      if (closed || a.retired || retiredCall(t.journal, t.callId)) {
-        await serial(() => t.journal.append(COMMAND_WITHDRAWN, { call: t.callId, id }));
+      // The last check is synchronous, right before the spawn (spawnCommand calls it after its own preparation).
+      let refused: "stopped" | "withdrawn" | undefined;
+      const proceed = () => {
+        if (stopped(a)) refused = "stopped";
+        else if (closed || a.retired || retiredCall(t.journal, t.callId)) refused = "withdrawn";
+        return refused === undefined;
+      };
+      const result = await spawnCommand({ command: t.spec.command!, cwd: t.cwd, dir, proceed,
+        env: { ...process.env, ...t.spec.env, DSA_EXEC: id, DSA_CALL: t.callId, DSA_HOME: home } });
+      if (!result) {
+        if (refused === "withdrawn") await serial(() => t.journal.append(COMMAND_WITHDRAWN, { call: t.callId, id }));
         return undefined;
       }
-      spawned = await spawnCommand({ command: t.spec.command!, cwd: t.cwd, dir,
-        env: { ...process.env, ...t.spec.env, DSA_EXEC: id, DSA_CALL: t.callId, DSA_HOME: home } });
+      spawned = result;
     } catch (error) {
       await serial(() => t.journal.append(COMMAND_SPAWN_FAILED, { call: t.callId, id, error: String(error instanceof Error ? error.message : error).slice(0, 300) }));
       return undefined;
@@ -1800,6 +1807,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       }
     },
     busy: () => active.size > 0,
+    exclusive: fn => serial(fn),
     quiesce() {
       paused = true;
       const live = [...active.values()].filter(a => a.live).map(a => ({ wid: a.ticket.wid, key: a.ticket.key, gen: a.ticket.gen, callId: a.ticket.callId, ...a.live! }));

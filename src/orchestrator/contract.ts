@@ -106,6 +106,9 @@ export interface Executor {
    *  WITHOUT sealing (command calls are not fenced: they keep running and seal); their run() promises reject with an Error named "ExecutorShutdown"; the executor stays open and a
    *  later run() continues the call. */
   suspend(only?: (wid: string) => boolean): Promise<void>;
+  /** Run `fn` as one step of the executor's serial queue: every command call's start decision (its intent append) is
+   *  ordered against it. The engine records a drain this way. `fn` must not wait for the engine's request queue. */
+  exclusive?<T>(fn: () => Promise<T>): Promise<T>;
   /** Restart: stop launching executions (children and gates before a seal) and report those running now; `resume()`
    *  lets launches continue when the restart is refused. `commands`: command calls running now (never in `live`: they
    *  keep running across a restart and the successor adopts them). */
