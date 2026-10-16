@@ -31,6 +31,12 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
       await ticket.journal.append('fake-invoke', { call: ticket.callId, key: ticket.key, workflowBudget: ticket.workflowBudget, ...(ticket.originSession ? { originSession: ticket.originSession } : {}) });
       const old = ticket.journal.entries().find(e => e.type === JT.sealed && e.call === ticket.callId);
       if (old) return old.result as CallResult;
+      // A refused ticket is sealed failed without running (like the executor's never-prepared path).
+      if (ticket.refusal !== undefined) {
+        const result: CallResult = { key: ticket.key, gen: ticket.gen, status: 'failed', ok: false, output: '', error: ticket.refusal };
+        await ticket.journal.append(JT.sealed, { call: ticket.callId, exec: `${ticket.callId}#1.1`, result });
+        return result;
+      }
       while (paused) await new Promise<void>(resolve => { unpaused.add(resolve); });
       live.add(ticket.callId);
       await ticket.journal.append('fake-run', { call: ticket.callId, key: ticket.key });
