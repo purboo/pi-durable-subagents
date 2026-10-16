@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { dsaHome } from "../paths.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger } from "../paths.ts";
-import { answerForwardedNote, modelStatusText, queuedText, type QueueWait, allWorkflows, eventsFromEntries, heldWorkflows, isLive, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, type AnswerForwarded, compactWorkflow, labelsText, outputSelect, statusCompactDetail, type StatusCompactDetail } from "../orchestrator/snapshot.ts";
+import { answerForwardedNote, modelStatusText, queuedText, type QueueWait, allWorkflows, eventsFromEntries, heldWorkflows, isLive, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, type AnswerForwarded, compactWorkflow, commandFacts, commandStatus, type CommandStatus, labelsText, outputSelect, statusCompactDetail, type StatusCompactDetail } from "../orchestrator/snapshot.ts";
 import { statsLine } from "../orchestrator/stats.ts";
 import { resolution, start, startOrchestrator, submit, type Control } from "./control.ts";
 import { doctor, renderDoctor, size } from "./doctor.ts";
@@ -86,13 +86,15 @@ const answeredNote = (c: { phase?: string; answered?: string; answerForwarded?: 
   if (c.answered) return why ? ` (answered): ${why}` : " (answered)"; // no slot claim without a full provider
   return why ? `: ${why}` : "";
 };
+/** A command call's place of a model: " command: <clipped> (pid 123, 2m)" / " command: <clipped> (exit 3)". */
+const commandSuffix = (c: CommandStatus) => c.command === undefined ? "" : ` command: ${c.command}${commandFacts(c) ? ` (${commandFacts(c)})` : ""}`;
 /** P25, T10: Render journal-derived status (one line per call, last output line only) without live orchestrator memory. */
 export function renderStatus(wf: WorkflowSnapshot & { scriptLog?: string }): string {
   const sealed = wf.counts.sealed, total = wf.calls.length, used = wf.usage && (wf.usage.input || wf.usage.output || wf.usage.costUsd);
   return [`${wf.wid}@${wf.rev}${wf.labels ? ` ${labelsText(wf.labels)}` : ""}${wf.name ? ` ${wf.name}` : ""}: ${wf.followUps ? `follow-up running (run ${wf.status})` : wf.status}${wf.error ? ` (${clip(wf.error, 300)})` : ""} · ${sealed}/${total} sealed${used ? ` · ${formatUsage(wf.usage!)}` : ""}`,
     ...wf.calls.map(c => {
       const last = c.result?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1), err = c.result?.error;
-      return `  ${c.key}@${c.gen} ${c.result?.status ?? c.phase}${answeredNote(c, wf.paused)}${c.model ? ` ${c.model}` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage && (c.usage.input || c.usage.output) ? ` ${formatUsage(c.usage)}` : ""}${last ? ` ${JSON.stringify(clip(last, 160))}` : err ? ` (${clip(err, 160)})` : ""}${c.sharedWorktree ? ` (shares worktree with ${c.sharedWorktree.join(", ")})` : ""}${c.writerWait && !c.result && c.phase !== "sealed" ? ` (waiting for writer lock: ${c.writerWait.root} held by ${c.writerWait.holder})` : ""}${notesLine(c.notesPending)}${modelStatusText(c)}`;
+      return `  ${c.key}@${c.gen} ${c.result?.status ?? c.phase}${answeredNote(c, wf.paused)}${commandSuffix(commandStatus(c))}${c.model ? ` ${c.model}` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage && (c.usage.input || c.usage.output) ? ` ${formatUsage(c.usage)}` : ""}${last ? ` ${JSON.stringify(clip(last, 160))}` : err ? ` (${clip(err, 160)})` : ""}${c.sharedWorktree ? ` (shares worktree with ${c.sharedWorktree.join(", ")})` : ""}${c.writerWait && !c.result && c.phase !== "sealed" ? ` (waiting for writer lock: ${c.writerWait.root} held by ${c.writerWait.holder})` : ""}${notesLine(c.notesPending)}${modelStatusText(c)}`;
     }),
     ...wf.attention.map(a => `  ${a.kind}: ${JSON.stringify(clip(a.text, 300))}`),
     ...(wf.scriptLog ? [`  script log: ${wf.scriptLog}`] : [])].join("\n");
@@ -105,7 +107,7 @@ export function renderSelected(wf: StatusCompactDetail): string {
 /** P25, T10: Render the compact status projection shared with the `subagents` tool. */
 export function renderView(view: StatusView): string {
   const lines = view.workflows.map(w => [`${w.wid}@${w.rev}${w.labels ? ` ${labelsText(w.labels)}` : ""}${w.name ? ` ${w.name}` : ""}: ${w.followUps ? `follow-up running (run ${w.status})` : w.status}${w.error ? ` (${clip(w.error, 200)})` : ""} · ${w.done}/${w.planned ?? w.calls.length}${w.planned === undefined && w.status === "running" ? "+" : ""} done${w.usage.input || w.usage.output || w.usage.costUsd ? ` · ${formatUsage(w.usage)}` : ""}`,
-    ...w.calls.map(c => `  ${c.key}@${c.gen} ${c.status ?? c.phase}${answeredNote(c, w.paused)}${c.hibernated ? " (hibernated, no slot)" : ""}${c.model ? ` ${c.model}` : ""}${c.switching ? ` \u2192 ${c.switching} (requested)` : ""}${c.switchFailed ? ` (switch refused: ${c.switchFailed})` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage ? ` ${formatUsage(c.usage)}` : ""}${c.lastLine ? ` ${JSON.stringify(c.lastLine)}` : c.error ? ` (${c.error})` : ""}${c.sharedWorktree ? ` (shares worktree with ${c.sharedWorktree.join(", ")})` : ""}${c.writerWait && c.phase !== "sealed" ? ` (waiting for writer lock: ${c.writerWait.root} held by ${c.writerWait.holder})` : ""}${c.lease && c.phase !== "sealed" ? ` (${c.lease})` : ""}${notesLine(c.notesPending)}${modelStatusText(c)}`),
+    ...w.calls.map(c => `  ${c.key}@${c.gen} ${c.status ?? c.phase}${answeredNote(c, w.paused)}${commandSuffix(c)}${c.hibernated ? " (hibernated, no slot)" : ""}${c.model ? ` ${c.model}` : ""}${c.switching ? ` \u2192 ${c.switching} (requested)` : ""}${c.switchFailed ? ` (switch refused: ${c.switchFailed})` : ""}${c.tools ? ` tools:${c.tools}` : ""}${c.usage ? ` ${formatUsage(c.usage)}` : ""}${c.lastLine ? ` ${JSON.stringify(c.lastLine)}` : c.error ? ` (${c.error})` : ""}${c.sharedWorktree ? ` (shares worktree with ${c.sharedWorktree.join(", ")})` : ""}${c.writerWait && c.phase !== "sealed" ? ` (waiting for writer lock: ${c.writerWait.root} held by ${c.writerWait.holder})` : ""}${c.lease && c.phase !== "sealed" ? ` (${c.lease})` : ""}${notesLine(c.notesPending)}${modelStatusText(c)}`),
     ...w.attention.map(a => `  ${a.kind}: ${JSON.stringify(a.text.split("\n")[0])}`)].join("\n"));
   if (view.paused) lines.unshift(`${view.paused} (pi-durable-subagents resume)`);
   if (view.olderFinished) lines.push(`(+${view.olderFinished} older finished workflows; status <wid> shows one in detail)`);

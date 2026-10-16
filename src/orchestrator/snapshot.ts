@@ -3,7 +3,7 @@
 import { initiatorSummary, restartLine } from "./restart.ts";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { compileFanout } from "../compat/fanout.ts";
+import { FANOUT_BODIES } from "../compat/fanout.ts";
 import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends, readJournalRecord, readJournalSnapshot, readJournalUncached, type JournalRecord } from "../kernel/journal.ts";
 import { readCache, writeCache } from "../kernel/cache.ts";
 import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
@@ -60,8 +60,30 @@ export function modelStatusText(c: ModelStatus, now = Date.now()): string {
     (c.routedModel ? ` (routed ${c.routedModel})` : "") +
     (m ? ` (used ${m.used}, selected ${m.selected})` : "") + (c.modelUnavailable ? ` (model-unavailable: ${c.modelUnavailable})` : "");
 }
+/** A command call's command as one line: an argv array joined with spaces (an argument that needs it single-quoted as
+ *  for sh), a string as it is. */
+export function commandText(command: unknown): string {
+  if (Array.isArray(command)) return command.map(a => { const s = String(a); return /^[A-Za-z0-9_./:=@%+,-]+$/.test(s) ? s : `'${s.replaceAll("'", "'\\''")}'`; }).join(" ");
+  return String(command ?? "");
+}
+/** A command clipped to one display line of at most `n` characters ("command: <clipped>" in status and the UI). */
+export function commandLine(command: string, n = 80): string {
+  return clip(command.replace(/\s+/g, " ").trim(), n);
+}
+/** A command call's facts while it runs or after it ended, from its `command-intent`/`command-started` records. */
+export interface CommandFacts {
+  /** The attempt (1, or 2 for the single rerun) and its id `command:<callId>#<n>`. */
+  attempt?: number; id?: string;
+  /** The process started for the attempt (absent between the intent and the start). */
+  pid?: number;
+  /** `<attempt dir>/output.log`: stdout and stderr, interleaved. */
+  log?: string;
+}
 export interface CallSnapshot extends ModelStatus {
   key: string; gen: number; callId: string; agent: string; phase: CallPhase;
+  /** A command call (no agent or model): its command as one line (commandText), and its process facts. A running command
+   *  call is `running` from its intent; `startedAt` is the start of its latest attempt (`command-started`). */
+  command?: string; commandRun?: CommandFacts;
   /** Other calls named by an open shared-worktree reminder. */
   sharedWorktree?: string[];
   result?: CallResult;
@@ -144,8 +166,8 @@ export function progressOf(wf: Pick<WorkflowSnapshot, "calls" | "planned" | "sta
   return { done, total: wf.planned ?? latest.size, plus: wf.planned === undefined && wf.status === "running" };
 }
 
-// v12 §4: the exact bodies compileFanout emits after the `const steps = [...];` line, so only true fanouts count as planned.
-const fanoutBodies = [compileFanout({ tasks: [] }).source, compileFanout({ chain: [] }).source].map(s => s.slice(s.indexOf("\n") + 1));
+// v12 §4: the exact bodies compileFanout emits (or emitted) after the `const steps = [...];` line, so only true fanouts count as planned.
+const fanoutBodies = FANOUT_BODIES;
 /** v12 §4: The planned total of a pinned script: its steps count when it is a compiled tasks/chain fanout; scripts have none. */
 export function plannedFromScript(source: string): number | undefined {
   const cut = source.indexOf("\n"), head = source.slice(0, Math.max(0, cut)), rest = source.slice(cut + 1);
@@ -192,6 +214,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
   let terminal = current.findLast(e => e.type === JT.done || (e.type === "resumed" && !e.call));
   const calls = new Map<string, CallSnapshot>();
   const byExec = new Map<string, CallSnapshot>();
+  const byCommand = new Map<string, CallSnapshot>(); // command attempt id -> its call
   const hibernating = new Map<string, string>(); // callId → exec that decided to hibernate and is not fenced yet
   const fenced = new Set<string>();
   const resolved = new Set<string>();
@@ -217,7 +240,9 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         const result = e.type === "refused" ? refusedResult(key, e.reason) :
           e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
         const wanted = (e.spec as { model?: unknown } | undefined)?.model;
+        const command = (e.spec as { command?: unknown } | undefined)?.command;
         calls.set(callId, { key, gen, callId, pos: Number(e.pos), agent: String((e.spec as { agent?: string } | undefined)?.agent ?? ""),
+          ...(command !== undefined ? { command: commandText(command) } : {}),
           // Until a slot is acquired (`selected`), show the model the call asked for, not nothing.
           ...(typeof wanted === "string" && wanted ? { model: wanted } : {}),
           phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),
@@ -232,6 +257,19 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         // (otherwise a call still waiting for a slot reads "thinking · 2m").
         call.exec = String(e.exec); delete call.poolWait; delete call.usedModel; delete call.virtualModel; call.phase = "queued"; call.startedAt ??= e.ts; call.lastActivity = e.ts; byExec.set(call.exec, call);
         if (!call.answered) { delete call.hibernated; hibernating.delete(call.callId); }
+      } else if (e.type === "command-intent") {
+        // A command call runs from its intent until its seal; it never has an `exec`, so nothing treats it as an execution.
+        const call = calls.get(String(e.call));
+        if (call && call.phase !== "sealed") {
+          call.commandRun = { attempt: Number(e.n) || 1, id: String(e.id) }; call.phase = "running"; call.startedAt = e.ts; call.lastActivity = e.ts;
+          delete call.writerWait; byCommand.set(String(e.id), call);
+        }
+      } else if (e.type === "command-started") {
+        const call = byCommand.get(String(e.id)), dir = e.dir;
+        if (call && call.commandRun?.id === e.id) {
+          call.commandRun = { ...call.commandRun, ...(Number.isSafeInteger(e.pid) ? { pid: Number(e.pid) } : {}), ...(typeof dir === "string" ? { log: join(dir, "output.log") } : {}) };
+          call.startedAt = e.ts; call.lastActivity = e.ts;
+        }
       } else if (e.type === "slot-wait") {
         const call = byExec.get(String(e.exec));
         if (call && call.exec === e.exec) {
@@ -764,7 +802,8 @@ const providerOf = (model: string) => { try { return parseModel(model).provider;
 export function queueWait(c: CallSnapshot, state: LedgerState, now = Date.now(), starting = orchestratorStarting(state)): QueueWait | undefined {
   if (c.phase !== "queued") return undefined;
   if (starting) return { reason: "starting", detail: "orchestrator starting", since: starting.since };
-  const settings = state.config?.settings ?? {}, pools = settings.pools ?? {}, wanted = c.poolWait?.model ?? c.model ?? settings.defaultModel;
+  // A command call takes no provider slot: only the orchestrator's start and a writer lock hold it back.
+  const settings = state.config?.settings ?? {}, pools = settings.pools ?? {}, wanted = c.command !== undefined ? undefined : c.poolWait?.model ?? c.model ?? settings.defaultModel;
   let providers: string[] = [];
   if (wanted && Object.hasOwn(pools, wanted)) { try { providers = [...new Set(resolveModel(wanted, pools).map(m => m.provider).filter((p): p is string => !!p))]; } catch { /* an invalid pool: unknown */ } }
   else if (wanted) { const p = providerOf(wanted); if (p) providers = [p]; }
@@ -912,7 +951,29 @@ export function formatUsage(u: Usage): string {
   return `${n(u.input)} in / ${n(u.output)} out${u.costUsd > 0 ? `, $${u.costUsd.toFixed(u.costUsd < 0.01 ? 4 : 2)}` : ""}`;
 }
 
-export interface StatusCall extends ModelStatus {
+/** A command call's line facts in status: its clipped command, the pid while it runs, its exit after the seal. */
+export interface CommandStatus {
+  /** The command, clipped to one line (a command call has no model). */
+  command?: string;
+  /** The running attempt's process, its attempt when it is the rerun (2), and the time since it started. */
+  pid?: number; attempt?: number; for?: string;
+  /** After the seal: the exit status, or the signal that ended it (result data). */
+  exitCode?: number; signal?: string;
+}
+/** The CommandStatus of a command call (empty for an agent call): pid only while it is live. */
+export function commandStatus(c: Pick<CallSnapshot, "command" | "commandRun" | "phase" | "result" | "startedAt">, now = Date.now()): CommandStatus {
+  if (c.command === undefined) return {};
+  const run = c.commandRun, data = c.result?.data as { exitCode?: unknown; signal?: unknown } | undefined, live = c.phase !== "sealed" && run !== undefined;
+  return { command: commandLine(c.command),
+    ...(live && run.pid !== undefined ? { pid: run.pid } : {}), ...(live && (run.attempt ?? 1) > 1 ? { attempt: run.attempt } : {}),
+    ...(live && c.startedAt !== undefined ? { for: age(now - c.startedAt) } : {}),
+    ...(typeof data?.exitCode === "number" ? { exitCode: data.exitCode } : {}), ...(typeof data?.signal === "string" ? { signal: data.signal } : {}) };
+}
+/** "pid 123" / "exit 3" / "SIGKILL" of a command call's status line (empty for an agent call or before the start). */
+export function commandFacts(c: CommandStatus): string {
+  return [c.pid !== undefined ? `pid ${c.pid}` : "", c.attempt ? `attempt ${c.attempt}` : "", c.for ?? "", c.exitCode !== undefined ? `exit ${c.exitCode}` : "", c.signal ?? ""].filter(Boolean).join(", ");
+}
+export interface StatusCall extends ModelStatus, CommandStatus {
   key: string; gen: number; callId: string; phase: CallPhase;
   sharedWorktree?: string[];
   status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage;
@@ -989,7 +1050,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
     ...(wf.planned !== undefined ? { planned: wf.planned } : {}), done: progress.done,
     calls: wf.calls.map(c => {
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
-      return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...modelStatus(c), ...(r ? { status: r.status, ok: r.ok } : {}),
+      return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...modelStatus(c), ...commandStatus(c), ...(r ? { status: r.status, ok: r.ok } : {}),
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
@@ -1047,7 +1108,7 @@ const tokens = (u?: Usage) => { const n = u ? u.input + u.output : 0; return n >
 /** The latest generation of every key, in first-call order. */
 const latestCalls = (wf: Pick<WorkflowSnapshot, "calls">) => [...new Map(wf.calls.map(c => [c.key, c] as const)).values()];
 
-export interface BriefCall extends ModelStatus {
+export interface BriefCall extends ModelStatus, CommandStatus {
   key: string; agent: string; phase: CallPhase; model?: string;
   sharedWorktree?: string[];
   /** Since the call started, and since its last activity (shown when quiet for a minute or more). */
@@ -1227,12 +1288,13 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
   const brief = (w: WorkflowSnapshot): BriefWorkflow => {
     const p = progressOf(w), open = w.attention.filter(a => a.kind !== "finished");
     const calls = latestCalls(w).filter(c => c.phase !== "sealed" || (c.result && !c.result.ok) || c.notesPending).map((c): BriefCall => {
-      const live = c.phase !== "sealed", quiet = c.lastActivity !== undefined ? now - c.lastActivity : undefined;
-      return { key: c.key, agent: c.agent, phase: c.phase, ...modelStatus(c), ...(c.model ? { model: c.model } : {}),
+      // A command call shows its command, pid and age instead of a model, quiet time and tokens.
+      const live = c.phase !== "sealed", quiet = c.lastActivity !== undefined ? now - c.lastActivity : undefined, agent = c.command === undefined;
+      return { key: c.key, agent: c.agent, phase: c.phase, ...modelStatus(c), ...(c.model ? { model: c.model } : {}), ...commandStatus(c, now),
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
         ...(live && c.startedAt !== undefined ? { for: age(now - c.startedAt) } : {}),
-        ...(live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
-        ...(live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
+        ...(agent && live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
+        ...(agent && live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
         ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
         ...(c.hibernated ? { hibernated: true as const } : {}), ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
         ...(live && byCall.get(c.callId) ? { lease: byCall.get(c.callId) } : {}),

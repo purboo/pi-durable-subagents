@@ -8,7 +8,7 @@ import { findJournalEntry, readJournalFold, readJournalSnapshot, type JournalFol
 import { isResolution, lifecycleResolution } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
-import { NOTIFY_SINCE, HOLD_ENTRY_TYPES, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, HOLD_ENTRY_TYPES, commandLine, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
@@ -66,6 +66,9 @@ async function stdin(): Promise<string> { const chunks: Buffer[] = []; for await
 export type DescribeState = "absent" | "pending" | "rejected" | "running" | "asking" | "sealed" | "pruned" | "applied";
 export interface DescribedCall {
   key: string; gen: number; phase: CallSnapshot["phase"]; agent: string; model?: string;
+  /** A command call (no agent or model): its command on one line (clipped), its attempt (1, or 2 for the rerun), the
+   *  pid and time since its start while it runs, and its log (`<attempt dir>/output.log`). */
+  command?: string; attempt?: number; pid?: number; elapsed?: string; log?: string;
   status?: CallResult["status"]; ok?: boolean; error?: string; output?: string; data?: unknown;
   /** Unsealed calls: why they wait — writer lock, resource lease, the provider's slot use and exhaustion (as `status`);
    *  `reason` (WAIT_REASONS precedence), its status line `detail` and `since` (ms) when the call does not move. */
@@ -144,7 +147,11 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
       ...(c.writerWait ? { writerWait: c.writerWait } : {}), ...(leases.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
       ...(line(slots.slots, c.model) ? { slot: line(slots.slots, c.model) } : {}), ...(line(slots.exhausted, c.model) ? { exhausted: line(slots.exhausted, c.model) } : {}),
       ...(c.hibernated ? { hibernated: true as const } : {}), ...waits.get(c.callId) };
+    const run = c.command !== undefined ? c.commandRun : undefined, live = !r && run !== undefined;
     return { key: c.key, gen: c.gen, phase: c.phase, agent: c.agent, ...(c.model ? { model: c.model } : {}),
+      ...(c.command !== undefined ? { command: commandLine(c.command, 200) } : {}), ...(run?.attempt !== undefined ? { attempt: run.attempt } : {}),
+      ...(live && run.pid !== undefined ? { pid: run.pid } : {}), ...(live && c.startedAt !== undefined ? { elapsed: commandAge(now - c.startedAt) } : {}),
+      ...(run?.log ? { log: run.log } : {}),
       ...(r ? { status: r.status, ok: r.ok, ...(r.error ? { error: r.error } : {}), output: r.output, ...(r.data !== undefined ? { data: r.data } : {}) } : {}),
       ...(waiting && Object.keys(waiting).length ? { waiting } : {}) };
   });
@@ -163,13 +170,22 @@ export function lastFence(journal: readonly Entry[], orch: readonly Entry[]): De
   const fence = journal.findLast(e => e.type === JT.fenced && !ended.has(String(e.exec)));
   return fence ? { at: Number(fence.ts), exec: String(fence.exec), reason: fenceReason(journal, orch, fence) } : undefined;
 }
+/** A running command call's age: "42s", "3m05s", "1h02m". */
+function commandAge(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(s / 3600)}h${String(Math.floor(s / 60) % 60).padStart(2, "0")}m`;
+}
 export function renderDescription(d: Description): string {
   const lines = [`${d.request ?? d.wid}: ${d.state}${d.reason ? ` (${d.reason})` : ""}${d.wid && d.request ? ` — ${d.wid}` : ""}${d.status && d.state !== d.status ? ` · ${d.status}` : ""}`];
   if (d.labels) lines.push(`  labels: ${Object.entries(d.labels).map(([k, v]) => `${k}=${v}`).join(" ")}`);
   if (d.pruned) lines.push(`  pruned: ${d.pruned.status ?? "?"} at ${new Date(d.pruned.endedAt ?? 0).toISOString()}`);
   if (d.error) lines.push(`  error: ${d.error}`);
   for (const c of d.calls ?? []) {
-    lines.push(`  ${c.key}@${c.gen} ${c.agent} ${c.phase}${c.status ? ` ${c.status}` : ""}${c.model ? ` (${c.model})` : ""}${c.error ? ` — ${c.error}` : ""}`);
+    const facts = [c.pid !== undefined ? `pid ${c.pid}` : "", c.attempt !== undefined ? `attempt ${c.attempt}` : "", c.elapsed ?? ""].filter(Boolean).join(", ");
+    lines.push(c.command !== undefined
+      ? `  ${c.key}@${c.gen} command ${c.phase}${c.status ? ` ${c.status}` : ""}${facts ? ` (${facts})` : ""}${c.error ? ` — ${c.error}` : ""}`
+      : `  ${c.key}@${c.gen} ${c.agent} ${c.phase}${c.status ? ` ${c.status}` : ""}${c.model ? ` (${c.model})` : ""}${c.error ? ` — ${c.error}` : ""}`);
+    if (c.command !== undefined) lines.push(`    command: ${c.command}`, ...(c.log ? [`    log: ${c.log}`] : []));
     if (c.waiting) lines.push(`    waiting: ${JSON.stringify(c.waiting)}`);
     if (c.data !== undefined) lines.push(`    data: ${JSON.stringify(c.data)}`);
     if (c.output) lines.push(...c.output.split("\n").map(l => `    | ${l}`));
@@ -277,7 +293,7 @@ export function runSession(flag: string | undefined, env: NodeJS.ProcessEnv): st
   return inherited && SESSION_ID.test(inherited) ? inherited : undefined;
 }
 /** `run --request <id> --spec <file|-> [--session <id>] [--cwd <dir>] [--json] [--wait-ms <n>]`. The spec is the `subagents` run
- *  form ({agent,task,…} or {tasks|chain:[…],…}); it is validated by the tool's own normalizer and agent check. */
+ *  form ({agent,task,…}, {command,…} or {tasks|chain:[…],…}); it is validated by the tool's own normalizer and agent check. */
 export const runCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, runRequest);
 async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const { values, positionals } = flags(args, { request: "value", spec: "value", cwd: "value", labels: "value", session: "value", json: "flag", "wait-ms": "value" });

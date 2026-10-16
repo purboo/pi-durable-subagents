@@ -27,7 +27,7 @@ test("v12 §6: tool description teaches discovery, addresses, verb meaning and l
   } finally {
     for (const [name, value] of Object.entries(old)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
   }
-  for (const phrase of ["agents:", "Available agents:", "<wid>/<key>", "single-call", "steer", "follow-up", "answer", "model", "stop", "drain", "resume", "status", "↓", "Enter", "s steer", "x stop", "m model", "a answer", "f follow-up", "Never force without the user's explicit approval", "force:'<token>'", "Subagents cannot force"]) {
+  for (const phrase of ["agents:", "Available agents:", "<wid>/<key>", "single-call", "steer", "follow-up", "answer", "model", "stop", "drain", "resume", "status", "↓", "Enter", "s steer", "x stop", "m model", "a answer", "f follow-up", "Never force without the user's explicit approval", "force:'<token>'", "Subagents cannot force", "A command call {command:", "data {exitCode, signal, durationMs}", "only stop controls it"]) {
     assert.ok(description.includes(phrase), `missing ${phrase}`);
   }
 });
