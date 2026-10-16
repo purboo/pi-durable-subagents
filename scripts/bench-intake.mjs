@@ -19,7 +19,7 @@ async function command(bin, args, options = {}, limitMs = 180_000) {
   } finally { clearTimeout(timer); }
 }
 function isolated(home) {
-  const env = { ...process.env, DSA_HOME: home, DSA_PI_BIN: '/bin/false' };
+  const env = { ...process.env, DSA_HOME: home, DSA_PI_BIN: '/usr/bin/false' };
   for (const key of ['DSA_EXEC', 'DSA_CALL', 'DSA_JOURNAL', 'DSA_INBOX', 'DSA_MODEL', 'DSA_SESSION', 'NODE_OPTIONS']) delete env[key];
   return env;
 }

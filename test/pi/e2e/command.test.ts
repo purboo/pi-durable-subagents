@@ -1,8 +1,8 @@
-// End-to-end command calls on the real stack (engine + executor + evaluator), without pi: DSA_PI_BIN is /bin/false, so
+// End-to-end command calls on the real stack (engine + executor + evaluator), without pi: DSA_PI_BIN is `false`, so
 // any launch of a subagent would fail. Real processes, an isolated DSA_HOME per test.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -22,7 +22,7 @@ async function stack(t: TestContext, config: OrchestratorConfig = { k: { idleExi
   const root = tempRoot("dsa-e2e-cmd-"), home = join(root, "dsa"), cwd = join(root, "work");
   await mkdir(cwd, { recursive: true });
   const old = { DSA_PI_BIN: process.env.DSA_PI_BIN };
-  process.env.DSA_PI_BIN = "/bin/false";
+  process.env.DSA_PI_BIN = FALSE;
   let controller = new AbortController(), orchestrator = main({ home, config, signal: controller.signal, discovery: { home: root }, ...(executor ? { executor } : {}) });
   let seq = 0;
   const send = async (kind: Request["kind"], body: unknown, rid?: string) => {
@@ -52,6 +52,11 @@ async function stack(t: TestContext, config: OrchestratorConfig = { k: { idleExi
   return { root, cwd, home, send, ledger, journal, until, created, run, sealed, started, stop, start, get orchestrator() { return orchestrator; } };
 }
 const of = (entries: Entry[], type: string) => entries.filter(e => e.type === type);
+/** An executable that always fails: macOS has no /bin/false, only /usr/bin/false (Linux has both). */
+const FALSE = ["/usr/bin/false", "/bin/false"].find(p => existsSync(p)) ?? "/usr/bin/false";
+/** Every command output.log under `home`, for a failure message. */
+const outputs = (home: string) => (readdirSync(home, { recursive: true }) as string[]).filter(p => p.endsWith("output.log"))
+  .map(p => `${p}: ${readFileSync(join(home, p), "utf8").slice(-2000)}`).join("\n");
 /** Live processes carrying the tag `id` (DSA_EXEC). */
 const tagged = async (id: string) => (await new ProcessTable().list(new Set([id]), { fresh: true })).filter(p => p.tag === id);
 
@@ -389,7 +394,8 @@ test("C-successor: an orchestrator started from inside a command carries no call
   const first = await s.started(wid);
   await s.stop();
   writeFileSync(go, "");
-  const successor = await s.until(() => s.ledger().filter(e => e.type === "orchestrator").at(-1)?.pid !== process.pid && s.ledger().filter(e => e.type === "orchestrator").at(-1), "successor started");
+  const successor = await s.until(() => s.ledger().filter(e => e.type === "orchestrator").at(-1)?.pid !== process.pid && s.ledger().filter(e => e.type === "orchestrator").at(-1), "successor started")
+    .catch(error => { throw new Error(`${error.message}; command output:\n${outputs(s.home)}`); });
   const pid = Number(successor.pid);
   try {
   if (process.platform === "linux") {

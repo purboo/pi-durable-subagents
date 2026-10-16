@@ -79,7 +79,8 @@ test("scan discovers untagged descendants and ignores mismatched start tokens", 
   const tag = randomUUID(); const c = new Containment();
   try {
     const parent = await c.spawn(spec(tag, "/bin/sh", ["-c", "env -u DSA_EXEC sleep 60 & wait"]));
-    const child = await until(async () => (await c.scan(new Map())).get(tag)?.find(p => p.pid !== parent.pid));
+    // The forked shell still carries the tag until it execs `env -u DSA_EXEC`: wait for the untagged sleep itself.
+    const child = await until(async () => (await c.scan(new Map())).get(tag)?.find(p => p.pid !== parent.pid && p.tag === undefined));
     assert.equal(child.tag, undefined);
     const fresh = new Containment();
     await fresh.fence("nonexistent", [{ ...child, start: "wrong" }]);
