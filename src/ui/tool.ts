@@ -1,6 +1,6 @@
 import { Text } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { plainReason } from "./view.ts";
+import { plainReason, queuedPhrase } from "./view.ts";
 
 type Args = Record<string, unknown>;
 type Step = { key?: unknown; agent?: unknown };
@@ -38,7 +38,7 @@ export function resultLines(details: unknown): string[] {
   const d = (details ?? {}) as Record<string, unknown>;
   if (typeof d.wid === "string" && typeof d.key === "string" && typeof d.phase === "string") {
     const r = d.result as { status?: string } | undefined;
-    return [`${d.key} · ${r?.status ?? (d.phase === "queued" && d.answered ? "queued (answered, waiting for a slot)" : d.phase)}${typeof d.model === "string" ? ` · ${d.model}` : ""}`];
+    return [`${d.key} · ${r?.status ?? (d.phase === "queued" ? queuedPhrase(d as Parameters<typeof queuedPhrase>[0], Date.now()) : d.phase)}${typeof d.model === "string" ? ` · ${d.model}` : ""}`];
   }
   if (typeof d.wid === "string" && !Array.isArray(d.calls)) return [`started workflow ${d.wid}`, ...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : [])];
   if (d.applied === true) return ["✓ applied"];
@@ -56,7 +56,9 @@ export function resultLines(details: unknown): string[] {
       return `${w.name ?? short(w.wid)} · ${w.paused ? "paused" : w.followUps ? `follow-up running (run ${w.status})` : w.status} · ${w.progress} done${failed ? ` · ${failed} not ok` : ""}${asks ? ` · ${asks} asking` : ""}${alerts ? ` · ${alerts} alert${alerts > 1 ? "s" : ""}` : ""}`;
     });
     const finished = Array.isArray(d.finished) ? d.finished.length + Number(d.olderFinished ?? 0) : 0;
-    return [...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : []), ...(rows.length ? rows.slice(0, 6) : ["nothing running"]),
+    // The orchestrator line ("1.0.42 (pid 7, starting 12s)") while it recovers: nothing queued starts until then.
+    const starting = typeof d.orchestrator === "string" ? /^[^(]*\(pid \d+, starting ([^)]+)\)/.exec(d.orchestrator)?.[1] : undefined;
+    return [...(typeof d.paused === "string" ? [`⚠ ${d.paused}`] : []), ...(starting ? [`orchestrator starting (${starting})`] : []), ...(rows.length ? rows.slice(0, 6) : ["nothing running"]),
       ...(rows.length > 6 ? [`… ${rows.length - 6} more`] : []), ...(finished ? [`${finished} finished`] : [])];
   }
   if (Array.isArray(d.workflows)) {

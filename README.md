@@ -228,6 +228,19 @@ script run from its bash tool): pi exports `DSA_SESSION`, and `run` names that
 session (see `--session` below). Other sessions' and a terminal's runs are
 not shown.
 
+A queued subagent says why it does not start, as far as the orchestrator has
+recorded it, and `queued` alone when nothing is known:
+
+| phrase | meaning |
+| --- | --- |
+| `queued: orchestrator starting (12s)` | the orchestrator is still recovering workflows after a start; nothing is dispatched yet (`status` shows `orchestrator: <version> (pid N, starting 12s)`, the summary line `3 queued: orchestrator starting (12s)`) |
+| `queued: <provider> usage window used up` | every provider it can start on is used up |
+| `queued: waiting for the writer lock of <root>` | another call writes in the same worktree |
+| `queued: waiting for a free slot (<provider> 4/4)` | every provider it can start on is full |
+| `queued (answered, waiting for a slot)` / `paused · r resumes` | an answered asker waiting to run again / a drained workflow |
+
+The CLI and the tool's status (`queued` per call) say the same.
+
 The list is also where you act. The footer shows the keys for the selected
 row: `Enter` watch, `s` steer, `f` follow-up, `x` stop (asks `y` first),
 `m` model, `a` answer. A one-line input opens at the bottom (paste works),
