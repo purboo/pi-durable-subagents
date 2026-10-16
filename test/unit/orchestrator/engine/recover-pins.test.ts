@@ -119,6 +119,22 @@ test('released pin details raise the same error as ready when neither record nor
   assert.throws(() => wf.pins, error => String(error) === String(failure));
 });
 
+test('cached detail pins are released after a slow file verification fails past the idle deadline', async t => {
+  const f = await home(t), first = await f.boot(), wf = await f.finished(first);
+  const b = await f.boot(), recovered = b.engine.store.workflows.get(wf.wid)!;
+  assert.equal(recovered.pins.source, 'unused');
+  const internal = b.engine.store as unknown as { pinnedFiles(...args: unknown[]): Promise<unknown> };
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  t.mock.method(internal, 'pinnedFiles', async () => { await gate; throw new Error('Pinned content conflict: slow verification'); });
+  const verifying = assert.rejects(b.engine.store.ready(recovered), /Pinned content conflict/);
+  await delay(1100);
+  assert.ok(Object.getOwnPropertyDescriptor(recovered, 'pins')?.value, 'verification still uses the cached details');
+  release(); await verifying;
+  await delay(1100);
+  assert.ok(Object.getOwnPropertyDescriptor(recovered, 'pins')?.get, 'a failed verification still schedules idle release');
+});
+
 test('historical revision tickets never read the current released pins', async t => {
   const f = await home(t), b = await f.boot(), wf = await f.finished(b);
   const rid = await f.request(b, 'revise', { wid: wf.wid, source: 'new source' });

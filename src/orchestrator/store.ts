@@ -186,7 +186,7 @@ export class Store {
       set(this: Workflow, pins: Pins) { Object.defineProperty(this, 'pins', { value: pins, enumerable: true, configurable: true, writable: true }); } };
   })();
   private restPins(wf: Workflow): void {
-    if (!wf.journal.resting || !Object.hasOwn(Object.getOwnPropertyDescriptor(wf, 'pins') ?? {}, 'value')) return;
+    if (wf.journal.closed || !wf.journal.resting || !Object.hasOwn(Object.getOwnPropertyDescriptor(wf, 'pins') ?? {}, 'value')) return;
     clearTimeout(this.pinRest.get(wf.wid));
     const revision = wf.revision;
     const timer = setTimeout(() => {
@@ -437,8 +437,7 @@ export class Store {
       })().finally(() => this.verifying.delete(wf.wid));
       this.verifying.set(wf.wid, run);
     }
-    await run;
-    this.restPins(wf);
+    try { await run; } finally { this.restPins(wf); }
   }
   /** Whether a workflow's pinned files were verified in this process (see ready). */
   verified(wid: string): boolean { return !this.unverified.has(wid); }
