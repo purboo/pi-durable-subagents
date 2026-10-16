@@ -12,6 +12,7 @@ import { retiredCommandAttempts, unsealedCommandCalls } from "../../../src/orche
 import type { Entry } from "../../../src/types.ts";
 
 const dirOf = () => mkdtempSync(join(tmpdir(), "dsa-command-"));
+const onPath = (name: string) => (process.env.PATH ?? "").split(":").some(d => d && existsSync(join(d, name)));
 async function finished(dir: string) {
   for (let i = 0; i < 200; i++) { const r = await readExitRecord(dir); if (r) return r; await delay(25); }
   throw new Error("no exit record");
@@ -31,7 +32,8 @@ test("the wrapper records the status of argv, string and builtin commands; outpu
     [["sh", "-c", "echo a; echo b >&2; exit 4"], 4, "a\nb\n"],
     ["echo s; exit 0", 0, "s\n"],
     [["exit", "7"], 127, ""], // argv runs a program: a shell builtin name is looked up as one (none exists)
-    [["cd", "/"], 127, ""],
+    [["export", "A=1"], 127, ""], // a special builtin: no system ships it as a program
+    [["cd", "/"], onPath("cd") ? 0 : 127, ""], // macOS ships /usr/bin/cd (a program that runs the builtin); Linux has none
     [["/no/such/command"], 127, ""],
     ["kill -TERM $$", 143, ""],
   ];
@@ -79,11 +81,14 @@ test("argv looks its program up on the command's PATH (a printf program wins ove
 test("the command runs detached in its own session with stdin at /dev/null", async t => {
   const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
   const dir = join(root, "c");
-  const spawned = await spawnCommand({ command: "cat; ps -o sid= -p $$; ps -o pid= -p $$", cwd: root, dir, env: process.env });
+  // Linux ps reports the session id; macOS ps has no session id keyword, so there the process group stands in
+  // (setsid makes the wrapper the leader of a new session and of a new process group).
+  const key = process.platform === "linux" ? "sid" : "pgid";
+  const spawned = await spawnCommand({ command: `cat; ps -o ${key}= -p $$; ps -o pid= -p $$`, cwd: root, dir, env: process.env });
   await finished(dir);
   const [sid, pid] = readFileSync(join(dir, "output.log"), "utf8").trim().split(/\s+/).map(Number);
   assert.notEqual(sid, process.pid);
-  assert.ok(sid === spawned.pid, `the wrapper leads the session (sid ${sid}, wrapper ${spawned.pid}, sh ${pid})`);
+  assert.ok(sid === spawned.pid, `the wrapper leads the session (${key} ${sid}, wrapper ${spawned.pid}, sh ${pid})`);
   await assert.rejects(spawnCommand({ command: "true", cwd: join(root, "missing"), dir: join(root, "d"), env: process.env }));
 });
 
