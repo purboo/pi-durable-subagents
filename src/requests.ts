@@ -59,35 +59,45 @@ export function specDigest(req: Pick<Request, 'kind' | 'body' | 'cond'>): string
 }
 // Repeated request checks verify the same immutable prefixes, including on either side of a lock. Retain only
 // negative positions, never envelopes: every check still stats the file and folds fresh appended bytes. The bound
-// covers several request IDs across many sender files without growing with a pi session's request history.
-const misses = new Map<string, JournalFold<{ found?: Entry }>>();
-function requestIn(path: string, rid: string, type: 'request' | 'sent', related: readonly string[]): Entry | undefined {
-  const probes = [...new Set([rid, ...related])], keyOf = (id: string) => JSON.stringify([path, id, type]);
-  const prior = probes.length === 1 ? misses.get(keyOf(rid)) : undefined, present = new Set<string>();
-  for (const id of probes) misses.delete(keyOf(id)); // A failed read must not retain partially extended state.
-  const record = readJournalFold<{ found?: Entry }>(path, prior, () => ({}), (state, entry) => {
+// counts files, not hinted IDs: one hinted lookup cannot evict its earlier files within the file budget.
+const misses = new Map<string, JournalFold<Set<string>>>(), MISS_FILES = 1024, MISS_IDS = 64;
+function requestIn(path: string, rid: string, type: 'request' | 'sent', related: readonly string[], touched: Set<string>): Entry | undefined {
+  const probes = [...new Set([rid, ...related])].slice(0, MISS_IDS), key = JSON.stringify([path, type]);
+  touched.add(key);
+  const known = misses.get(key);
+  misses.delete(key); // A failed read must not retain a partially extended prefix or absence set.
+  const reusable = known && probes.every(id => known.state.has(id));
+  // Watch every cached absent ID while extending: otherwise an appended envelope could invalidate an older hint.
+  const watched = new Set(reusable ? known.state : probes);
+  let found: Entry | undefined;
+  const record = readJournalFold<Set<string>>(path, reusable ? { ...known, state: watched } : undefined, () => watched, (absent, entry) => {
     if (entry.type !== type) return;
-    if (!state.found && (entry.request as Request).rid === rid) state.found = entry;
-    const id = (entry.request as Request | undefined)?.rid;
-    if (id !== undefined && probes.includes(id)) present.add(id);
-  }, { needles: probes.map(id => JSON.stringify(id)) });
-  // A superset scan proves an empty fold for each absent hinted ID at exactly the same verified prefix. Later
-  // decision points still stat and read appended bytes under their own filter, including after acquiring a lock.
-  // Do not cache a torn tail: a repair can replace it with a committed line at the same inode and size.
-  if (record && record.length === record.size) for (const id of probes) if (!present.has(id)) misses.set(keyOf(id), { ...record, state: {} });
-  while (misses.size > 1024) misses.delete(misses.keys().next().value!);
-  return record?.state.found;
+    const id = (entry.request as Request).rid;
+    absent.delete(id);
+    if (!found && id === rid) found = entry;
+  }, { needles: [...watched].map(id => JSON.stringify(id)) });
+  // Keep positions and absent IDs only, never the found envelope. Torn tails cannot be cached: a repair may
+  // commit a line at the same inode/size. Each future check still stats and folds freshly appended bytes.
+  if (record && record.length === record.size && record.state.size) {
+    if (misses.size >= MISS_FILES) {
+      // More files than the budget: omit later positions rather than evict this lookup's earliest files.
+      const evict = [...misses.keys()].find(candidate => !touched.has(candidate));
+      if (evict !== undefined) misses.delete(evict);
+    }
+    if (misses.size < MISS_FILES) misses.set(key, record);
+  }
+  return found;
 }
 /** The envelope recorded for `rid`: the orchestrator's admitted copy (ledger `request`, kept after prune), else any
  *  sender's outbox `sent` entry (published or about to be). Read-only. Related IDs are only hints for sharing a
  *  verified negative prefix; their eventual lookups still read fresh state and preserve first-match/file order. */
 export async function findRequest(home: string, rid: string, related: readonly string[] = []): Promise<{ request: Request; admitted: boolean } | undefined> {
-  const admitted = requestIn(orchLedger(home), rid, 'request', related);
+  const touched = new Set<string>(), admitted = requestIn(orchLedger(home), rid, 'request', related, touched);
   if (admitted) return { request: admitted.request as Request, admitted: true };
   const dir = join(outboxRoot(home), 'outbox');
   const names = await readdir(dir).catch(error => { if (error.code === 'ENOENT') return [] as string[]; throw error; });
   for (const name of names.filter(n => n.endsWith('.jsonl')).sort()) {
-    const sent = requestIn(join(dir, name), rid, 'sent', related);
+    const sent = requestIn(join(dir, name), rid, 'sent', related, touched);
     if (sent) return { request: sent.request as Request, admitted: false };
   }
   return undefined;

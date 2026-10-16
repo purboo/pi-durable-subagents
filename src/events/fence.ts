@@ -3,6 +3,9 @@
 // before the one it derives, so a re-derivation after a crash sees the same history).
 import { JT, type Entry } from "../types.ts";
 
+/** Orchestrator entry types read by fenceReason; workflow entries are read separately. */
+export const FENCE_LEDGER_TYPES = ['restart', 'orchestrator', 'orchestrator-exit'] as const;
+
 export type FenceReason = "restart-force" | "orchestrator-crash" | "process-died";
 
 /** Executions whose fence did NOT interrupt work: every execution ends with a fence; one interrupted work only when

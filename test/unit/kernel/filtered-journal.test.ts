@@ -9,49 +9,63 @@ const framed = (entries: Entry[]) => entries.map(e => frameLine(JSON.stringify(e
 function random(seed: number): (n: number) => number { return n => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % n; }; }
 const broken = (line: string) => (line[0] === '0' ? '1' : '0') + line.slice(1);
 
-test('filtered folds equal full folds over 400 randomized journals, tails, growth, replacement and shrink', async t => {
+test('filtered folds equal full folds over 400 randomized multi-chunk journals and appended polls', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dsa-filtered-fold-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const path = join(dir, 'journal'), replacement = join(dir, 'replacement');
+  const ids = ['a', 'b.c', 'x+y', '\u00e9\u96ea', 'q|z', 'req:k:[1]'];
+  const sizes = [0, 10, 1000, 30000, 65000, 65536 - 40, 70000];
+  const counts = new Set<number>(); let splitUtf8 = false;
   for (let seed = 1; seed <= 400; seed++) {
-    const pick = random(seed), rid = `wanted-${seed}${seed % 3 ? '' : '\u96ea'}${seed % 5 ? '' : '.+[\\]'}`, extraNeedle = `extra.+[\\]${seed}`;
-    const needles = [JSON.stringify(rid), ...(seed % 2 ? [] : [JSON.stringify(extraNeedle)])];
-    const entries: Entry[] = Array.from({ length: 10 + pick(40) }, (_, i) => ({
-      seq: i + 1, ts: i, type: pick(3) ? 'unrelated' : 'wanted', rid: pick(4) ? `other-${i}` : rid,
-      body: { text: pick(3) ? 'plain\u96ea' : rid, nested: pick(5) ? {} : { rid }, extra: pick(4) ? '' : extraNeedle },
-    }));
-    const apply = (state: Entry[], entry: Entry) => { if (entry.type === 'wanted' && entry.rid === rid) state.push(entry); };
-    const full = (prior?: JournalFold<Entry[]>) => readJournalFold(path, prior, () => [], apply)!;
-    const filtered = (prior?: JournalFold<Entry[]>) => readJournalFold(path, prior, () => [], apply, { needles })!;
-    const check = (actual: JournalFold<Entry[]>, expected: JournalFold<Entry[]>, phase: string) => assert.deepEqual(actual, expected, `seed=${seed} phase=${phase}`);
-    const base = framed(entries), next: Entry = { seq: entries.length + 1, ts: 99, type: 'wanted', rid };
-    const tail = frameLine(JSON.stringify(next)), cut = 1 + pick(tail.length - 2);
-    await writeFile(path, base + tail.slice(0, cut));
-    let a = filtered(), b = full(); check(a, b, 'torn no newline');
+    const pick = random(seed), wanted = ids.slice(0, 1 + seed % 6), needles = wanted.map(id => JSON.stringify(id));
+    counts.add(needles.length);
+    // Every history spans several chunks; needles occur both before and after long padding in different records.
+    const entries: Entry[] = Array.from({ length: 12 + pick(16) }, (_, i) => {
+      const id = ids[pick(ids.length)]!, pad = 'p'.repeat((sizes[i % sizes.length] ?? 0) + pick(50));
+      return { seq: i + 1, ts: i, type: pick(3) ? 'unrelated' : 'wanted',
+        ...(i % 2 ? { pad, rid: id } : { rid: id, pad }), body: { falsePositive: ids[pick(ids.length)], text: '\u96ea' } };
+    });
+    type State = [number, number][];
+    const apply = (state: State, entry: Entry, offset: number) => {
+      if (entry.type === 'wanted' && wanted.includes(String(entry.rid))) state.push([entry.seq, offset]);
+    };
+    const full = (prior?: JournalFold<State>) => readJournalFold(path, prior, () => [], apply)!;
+    const filtered = (prior?: JournalFold<State>) => readJournalFold(path, prior, () => [], apply, { needles })!;
+    const check = (actual: JournalFold<State>, expected: JournalFold<State>, phase: string) => assert.deepEqual(actual, expected, `seed=${seed} phase=${phase}`);
+    const base = Buffer.from(framed(entries)); assert.ok(base.length > 64 * 1024);
+    const next: Entry = { seq: entries.length + 1, ts: 99, type: 'wanted', pad: 't'.repeat(70000), rid: wanted[0] };
+    const tail = Buffer.from(frameLine(JSON.stringify(next))), cut = 1 + pick(tail.length - 2), bytes = Buffer.concat([base, tail.subarray(0, cut)]);
+    // Split arbitrary bytes, occasionally inside a multibyte string, rather than only between framed lines.
+    const utf8 = bytes.indexOf(Buffer.from('\u96ea'));
+    const split = seed % 5 ? 1 + pick(base.length - 1) : utf8 + 1;
+    if (seed % 5 === 0) splitUtf8 = true;
+    await writeFile(path, bytes.subarray(0, split));
+    let a = filtered(), b = full(); check(a, b, 'partial initial poll');
+    await appendFile(path, bytes.subarray(split));
+    a = filtered(a); b = full(b); check(a, b, 'growth with partial long tail');
     assert.equal(a.seen, entries.length);
-    await appendFile(path, tail.slice(cut));
-    a = filtered(a); b = full(b); check(a, b, 'growth completes tail');
+    await appendFile(path, tail.subarray(cut));
+    a = filtered(a); b = full(b); check(a, b, 'growth completes long tail');
     assert.equal(a.seen, next.seq);
-    const extra: Entry = { seq: next.seq + 1, ts: 100, type: 'unrelated', body: rid };
+    const extra: Entry = { seq: next.seq + 1, ts: 100, type: 'unrelated', body: wanted[0] };
     await appendFile(path, frameLine(JSON.stringify(extra)));
     a = filtered(a); b = full(b); check(a, b, 'growth with false positive');
-    await writeFile(path, base + broken(tail));
-    a = filtered(a); b = full(b); check(a, b, 'shrink with bad CRC final newline');
-    assert.equal(a.length, Buffer.byteLength(base));
+    await writeFile(path, Buffer.concat([base, Buffer.from(broken(tail.toString()))]));
+    a = filtered(a); b = full(b); check(a, b, 'bad CRC final newline');
+    assert.equal(a.length, base.length);
     const changed = entries.map(e => ({ ...e, ts: Number(e.ts) + 10 }));
     await writeFile(replacement, framed(changed)); await rename(replacement, path);
     a = filtered(a); b = full(b); check(a, b, 'replacement');
     await writeFile(path, framed(changed.slice(0, 2)));
-    a = filtered(a); b = full(b); check(a, b, 'shrink');
-    assert.equal(a.seen, 2);
-    // CRC corruption is detected before filtering, including on a line that contains no needle.
+    a = filtered(a); b = full(b); check(a, b, 'shrink'); assert.equal(a.seen, 2);
     for (const candidate of [true, false]) {
-      const bad: Entry = { seq: 2, ts: 1, type: 'wanted', rid: candidate ? rid : 'unrelated', body: '' };
-      await writeFile(path, framed([entries[0]!]) + broken(frameLine(JSON.stringify(bad))) + framed([{ seq: 3, ts: 2, type: 'wanted', rid }]));
+      const bad: Entry = { seq: 2, ts: 1, type: 'wanted', pad: 'b'.repeat(70000), rid: candidate ? wanted[0] : 'no-needle' };
+      await writeFile(path, framed([entries[0]!]) + broken(frameLine(JSON.stringify(bad))) + framed([{ seq: 3, ts: 2, type: 'wanted', rid: wanted[0] }]));
       assert.throws(() => filtered(), /Journal corruption at byte/);
       assert.throws(() => full(), /Journal corruption at byte/);
     }
   }
+  assert.deepEqual([...counts].sort(), [1, 2, 3, 4, 5, 6]); assert.ok(splitUtf8);
 });
 
 test('filtering skips parsing/apply only, counts every framed line, and preserves first-match semantics', async t => {

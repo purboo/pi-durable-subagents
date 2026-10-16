@@ -5,13 +5,12 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { defineTool, type ExtensionAPI, type ExtensionContext, type CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { Outbox, scanInbox } from "../kernel/mailbox.ts";
-import { readJournalFold } from "../kernel/journal.ts";
 import { readerLedger } from "../orchestrator/reader-ledger.ts";
 import { OsLock } from "../platform/lock.ts";
 import { launchOrchestrator } from "../platform/launch.ts";
 import { dsaHome, orchInbox, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
-import { attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
+import { PendingOutboxReader, attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
 import { NOTIFY_SINCE, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "./main/tool.ts";
 import { parameters } from "./main/schema.ts";
@@ -56,6 +55,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   let queue: Promise<unknown> = Promise.resolve(), timer: ReturnType<typeof setInterval> | undefined;
   let reserved: AttentionItem[] = [], notes: string[] = [], stopped = true, lastStarter = 0;
   let polling = false;
+  const pendingReader = new PendingOutboxReader();
   const sink = (text: string) => { notes.push(text); };
   function serial<T>(fn: () => Promise<T>): Promise<T> {
     const result = queue.then(fn); queue = result.catch(() => {}); return result;
@@ -68,10 +68,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   }
   function pendingOutbox() { return pendingRids().size > 0; }
   function pendingRids() {
-    return readJournalFold(join(outboxRoot(home), "outbox", `${sender}.jsonl`), undefined, () => new Set<string>(), (pending, entry) => {
-      if (entry.type === "sent") pending.add((entry.request as { rid: string }).rid);
-      else if (entry.type === "resolved") pending.delete(String(entry.rid));
-    }, { needles: ['"type":"sent"', '"type":"resolved"'] })?.state ?? new Set<string>();
+    return pendingReader.read(join(outboxRoot(home), "outbox", `${sender}.jsonl`));
   }
   async function starter(submitting = false) {
     if (stopped) return;
@@ -122,7 +119,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   });
   async function close() {
     stopped = true; clearInterval(timer); timer = undefined;
-    await queue; await outbox?.close(); outbox = undefined;
+    await queue; await outbox?.close(); outbox = undefined; pendingReader.clear();
     if (noteSink === sink) noteSink = undefined;
     reserved = []; notes = []; ctx = undefined;
   }
