@@ -109,6 +109,8 @@ export class Outbox {
   }
   /** The envelope recorded as sent under `rid`, if any. */
   recorded(rid: string): Request | undefined { const req = this.sent.get(rid); return req && structuredClone(req); }
+  /** The identities still awaiting terminal resolution, without copying their envelopes. */
+  pendingRids(): Set<string> { return new Set(this.pending.keys()); }
   /** The recipients of unresolved envelopes. */
   pendingDestinations(): Set<string> { return new Set([...this.pending.values()].map(req => req.to)); }
   /** P38: Re-publish every unresolved envelope under its original identity. */
