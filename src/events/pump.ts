@@ -14,7 +14,7 @@ import { EventLog } from "./log.ts";
 import { EVENT_RETENTION_MS, EVENT_SEQ_SKIP, type EventDraft, type EventSink } from "./types.ts";
 
 /** What the pump reads of the orchestrator's store: its unpruned workflows and a hook called after their appends. */
-export interface PumpStore { workflows: ReadonlyMap<string, { journal: JournalHandle }>; appended?: (wid: string) => void }
+export interface PumpStore { workflows: ReadonlyMap<string, { journal: JournalHandle; settled?: { quiet: boolean } }>; appended?: (wid: string) => void }
 export interface PumpOptions {
   home: string;
   orch: JournalHandle;
@@ -223,7 +223,10 @@ export class EventPump implements EventSink {
       for (const wid of dirty) {
         const wf = this.options.store.workflows.get(wid);
         if (!wf) continue;
-        const entries = committed(wf.journal), start = this.marks.get(wid) ?? 0;
+        const start = this.marks.get(wid) ?? 0;
+        // A journal not decoded (a settled workflow) is decoded only when it has entries not derived yet.
+        if (wf.journal.loaded === false && (wf.journal.count?.() ?? Infinity) <= start) continue;
+        const entries = committed(wf.journal);
         if (entries.length <= start) continue;
         const id = this.identity(wid);
         for (let i = start; i < entries.length; i++) await add(wid, i, deriveEntry(wid, entries, i, orch, id));
@@ -251,7 +254,7 @@ export class EventPump implements EventSink {
       let v = verdicts.get(wid);
       if (v === undefined) {
         const wf = this.options.store.workflows.get(wid);
-        v = wf ? quiet(wid, committed(wf.journal)) : pruned.has(wid);
+        v = wf ? (wf.journal.loaded === false && wf.settled ? wf.settled.quiet : quiet(wid, committed(wf.journal))) : pruned.has(wid);
         verdicts.set(wid, v);
       }
       return v;

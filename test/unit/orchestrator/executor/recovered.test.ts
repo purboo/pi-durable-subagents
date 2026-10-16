@@ -142,3 +142,26 @@ test("completeCalls reads only entries after the earliest current receipt and fo
   await journal.append("forward-retired", { rid2: "x" });
   assert.deepEqual([...completeCalls(journal, "W")], [b], "a forward-retired of a forward to the call concerns it");
 });
+
+test("a settled journal opened lazily is recovered without decoding; the sweep still scans its tracked identities", async t => {
+  const f = await fixture(t);
+  await f.journal.append("tracked", { exec: f.exec, pid: 4242, start: "77" });
+  await f.journal.append("tracked", { exec: f.exec, pid: 4242, start: "77" });
+  await f.recover();
+  const { journalExpectation, openLazyJournal } = await import("../../../../src/kernel/journal.ts");
+  const { sweepSeed } = await import("../../../../src/orchestrator/executor/sweep.ts");
+  const seed = sweepSeed(f.journal), expect = journalExpectation(f.journal)!;
+  assert.deepEqual(seed, [{ exec: f.exec, call: f.call, tracked: ["4242 77"] }]);
+  const lazy = (await openLazyJournal(f.journal.path, expect))!;
+  const scans: ReadonlyMap<string, readonly ProcInfo[]>[] = [];
+  const watching: Containment = { ...containment, async scan(known) { scans.push(known); return new Map([...known.keys()].map(exec => [exec, []])); } };
+  const executor = createExecutor({ home: f.home, orch: f.orch, config: {} }, { effects, containment: watching, memory: async () => 1e6, sweepMs: 20 });
+  t.after(async () => { await executor.shutdown(); await lazy.close(); });
+  const before = sessionReads();
+  assert.deepEqual(await executor.recover(f.wid, lazy, { batch: true, settled: { calls: 1, sweep: seed } }), { calls: 0, skipped: 1 });
+  await executor.finishRecovery!();
+  for (let i = 0; i < 200 && !scans.length; i++) await new Promise(r => setTimeout(r, 10));
+  assert.equal(sessionReads(), before);
+  assert.deepEqual(scans[0]?.get(f.exec), [{ pid: 4242, ppid: 0, start: "77" }]);
+  assert.equal(lazy.loaded, false, "neither recovery nor the sweep decoded it");
+});

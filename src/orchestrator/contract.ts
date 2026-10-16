@@ -4,6 +4,7 @@
 import type { AgentDefinition } from "../compat/agents.ts";
 import type { PoolEntry } from "../compat/model.ts";
 import type { CallId, CallResult, CallSpec, JournalHandle, Request, Wid, WidRev } from "../types.ts";
+import type { SweepSeed } from "./executor/sweep.ts";
 
 /** User configuration: $DSA_HOME/config.json (all optional). */
 export interface OrchestratorConfig {
@@ -85,7 +86,9 @@ export interface Executor {
   retire(widRev: WidRev): Promise<void>;
   /** Startup recovery for one workflow, BEFORE the engine replays it: fence every exec without JT.fenced
    *  (using persisted tracked identities), and re-derive pool holdings. Unsealed calls are settled later via run(). */
-  recover(wid: Wid, journal: JournalHandle, options?: { batch?: boolean }): Promise<RecoveryCounts | void>;
+  /** With `settled` (the journal is a lazy handle of a settled workflow, see settled.ts): nothing is read or repaired;
+   *  the executor keeps the journal and what its sweep needs of its executions. */
+  recover(wid: Wid, journal: JournalHandle, options?: { batch?: boolean; settled?: { calls: number; sweep: SweepSeed[] } }): Promise<RecoveryCounts | void>;
   /** After batched recover() calls (`batch: true`) of every workflow: the steps that do not depend on one workflow
    *  (worktree reminders, outbox republication) and the end of each sealed call's recovery (inbox cleanup, receipt). */
   finishRecovery?(): Promise<void>;

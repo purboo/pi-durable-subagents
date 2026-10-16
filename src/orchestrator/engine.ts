@@ -38,6 +38,7 @@ import { parseModel } from '../compat/model.ts';
 import { PENDING_NOTE, generationRids, openingMessage, pendingFollowUps, pendingNotes, unsettledForward, unsettledNotify } from './notes.ts';
 import { journalAppends } from '../kernel/journal.ts';
 import { callEntries, entriesOf } from './executor/indexes.ts';
+import { lazy, writeSettled } from './settled.ts';
 import { STATS_EVERY_MS, readBytes, writeStats, type OrchestratorStats } from './stats.ts';
 
 const tail = (text: string, n: number) => text.length > n ? `…${text.slice(-(n - 1))}` : text;
@@ -132,6 +133,7 @@ export class Engine {
   }
   /** Follow-ups (generations) of the current revision that have not ended: on a finished workflow they are its only live work. */
   private openFollowUps(wf: Workflow): boolean {
+    if (lazy(wf)) return false; // settled: none open
     const log = revisionEntries(wf), ended = new Set(log.filter(e => e.type === JT.sealed || e.type === 'retired').map(e => String(e.call)));
     return log.some(e => e.type === 'generation' && !ended.has(`${wf.wid}@${wf.revision}/${e.key}@${e.gen}`));
   }
@@ -165,7 +167,22 @@ export class Engine {
   /** A workflow with nothing live rests its journal: the descriptor closes and nothing reads it periodically; the next
    *  append (a follow-up, resume, revise, stop, prune or a late executor record) reopens it. Only a descriptor is
    *  released: the entries stay in memory, so every decision reads them as before. */
-  private settle(wf: Workflow) { if (!wf.journal.closed) wf.journal.resting = this.quiescent(wf); }
+  private settle(wf: Workflow) {
+    if (wf.journal.closed) return;
+    const quiet = wf.journal.resting = this.quiescent(wf);
+    if (quiet) this.recordSettled(wf);
+  }
+  /** Journal lengths of the workflows whose settled record (settled.ts) was last written or found not due. */
+  private settledAt = new Map<string, number>();
+  /** Write the settled record of a quiescent workflow whose journal is decoded, once per journal length; a workflow
+   *  that is not settled has its record removed. Never from a poller: from settle (start, seals, ends). */
+  private recordSettled(wf: Workflow) {
+    if (wf.journal.loaded === false || !this.executor.recovered) return;
+    const length = wf.journal.count?.() ?? wf.journal.entries().length;
+    if (this.settledAt.get(wf.wid) === length) return;
+    this.settledAt.set(wf.wid, length);
+    writeSettled(this.ledgers.home, wf, call => this.executor.recovered!(wf.journal, call));
+  }
   /** Intake passes that ran (ms timestamps of the last minute) and the ledger length after the last one. */
   private passes: number[] = [];
   private consumed?: { length: number; pending: boolean };
@@ -179,7 +196,7 @@ export class Engine {
       passesPerSecond: Math.round(this.passes.length / Math.max(1, since / 1000) * 100) / 100, ...(rchar !== undefined ? { readBytes: rchar } : {}) };
   }
   private started = Date.now();
-  private terminal(wf: Workflow) { return terminalEntry(revisionEntries(wf)); }
+  private terminal(wf: Workflow) { return lazy(wf) ? wf.settled.done : terminalEntry(revisionEntries(wf)); }
   private lifecycle(): DecisionRecord[] { return this.ledgers.orch.entries().filter(e => ['admitted', 'applied', 'rejected', 'withdrawn'].includes(e.type)) as unknown as DecisionRecord[]; }
   /** A2, P10: Recover executor authority before replaying each unfinished workflow. Returns what it recovered: the
    *  workflows, the calls the executor read and repaired, and those it skipped as already recovered. */
@@ -192,8 +209,11 @@ export class Engine {
     const batch = this.executor.finishRecovery !== undefined ? { batch: true } : undefined;
     let calls = 0, skipped = 0;
     for (const wf of this.store.workflows.values()) {
-      const counts = await this.executor.recover(wf.wid, wf.journal, batch);
+      // A settled workflow not decoded (settled.ts): nothing below applies to it (its facts say so).
+      const settled = lazy(wf) ? { settled: { calls: wf.settled.calls, sweep: wf.settled.sweep } } : undefined;
+      const counts = await this.executor.recover(wf.wid, wf.journal, settled ? { ...batch, ...settled } : batch);
       if (counts) { calls += counts.calls; skipped += counts.skipped; }
+      if (settled && wf.journal.loaded === false) continue;
       // A seal may survive a crash before post-seal effects, even after workflow completion.
       let revision = 1;
       for (const entry of wf.journal.entries()) {
@@ -209,6 +229,8 @@ export class Engine {
     await this.startHost();
     for (const intent of this.ledgers.orch.entries().filter(e => e.type === 'revise-intent')) await this.revise(intent);
     for (const wf of this.store.workflows.values()) {
+      // Settled and not decoded: its finished attention is recorded, no generation is open, no follow-up pending.
+      if (lazy(wf)) continue;
       if (!this.terminal(wf)) await this.startWorkflow(wf);
       else await this.attention(wf);
       for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) if (!this.settledGeneration(wf, entry)) this.dispatchGeneration(wf, entry);
@@ -334,6 +356,8 @@ export class Engine {
   }
   private findCall(to: string, bareWid = false): { wf: Workflow; entry: Entry } | undefined {
     for (const wf of this.store.workflows.values()) {
+      // Every address of a call starts with its wid: another workflow's journal need not be decoded.
+      if (wf.journal.loaded === false && !String(to).startsWith(wf.wid)) continue;
       const calls = revisionEntries(wf).filter(e => e.type === 'call' || e.type === 'generation');
       // For sends, a bare wid addresses its call when the workflow has exactly one key (stop <wid> means the workflow).
       const keys = new Set(calls.map(e => String(e.key)));
@@ -397,7 +421,9 @@ export class Engine {
       await this.revise(await this.store.revisionIntent(req as Request<ReviseBody>, wf));
       if (!this.states.has(wf.wid) && !this.terminal(wf)) await this.startWorkflow(wf);
     } else if (req.kind === 'send') {
-      const existing = [...this.store.workflows.values()].flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && generationRids(e).includes(req.rid)).map(entry => ({ wf, entry })))[0];
+      // A generation that took this request is in the workflow it addresses (see findCall).
+      const to = String((req.body as SendBody)?.to ?? '');
+      const existing = [...this.store.workflows.values()].filter(wf => wf.journal.loaded !== false || to.startsWith(wf.wid)).flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && generationRids(e).includes(req.rid)).map(entry => ({ wf, entry })))[0];
       if (existing) { this.dispatchGeneration(existing.wf, existing.entry); return { action: 'apply' }; }
       const target = this.findCall((req.body as SendBody)?.to, true);
       if (!target) return { action: 'reject', reason: this.unknownCall((req.body as SendBody)?.to) };
@@ -455,7 +481,7 @@ export class Engine {
       // A resume releases held work in its scope (one workflow, one session's, or all) and continues parked workflows;
       // running ones need nothing and final ones are final.
       const inScope = (wf: Workflow) => wid ? wf.wid === wid : origin ? wf.origin === origin : true;
-      const took = (wf: Workflow) => wf.journal.entries().some(e => e.type === 'resumed' && e.rid === req.rid);
+      const took = (wf: Workflow) => lazy(wf) ? wf.settled.resumed.includes(req.rid) : wf.journal.entries().some(e => e.type === 'resumed' && e.rid === req.rid);
       const replayed = this.ledgers.orch.entries().some(e => e.type === 'undrain' && e.rid === req.rid);
       // Held follow-ups of a finished workflow are released too; they run again through dispatchGeneration below.
       const holding = [...this.store.workflows.values()].filter(wf => inScope(wf) && this.held(wf.wid) && (!this.terminal(wf) || this.openFollowUps(wf)));
@@ -491,7 +517,8 @@ export class Engine {
         }
         if (!this.states.has(wf.wid)) await this.startWorkflow(wf);
       }
-      for (const wf of this.store.workflows.values()) for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
+      // A settled workflow not decoded has no generation to run (each ended, its finished attention recorded).
+      for (const wf of this.store.workflows.values()) if (!lazy(wf)) for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     } else if (req.kind === 'drain') {
       const { fence, origin, wid } = (req.body as DrainBody) ?? {}, scoped = Boolean(origin || wid);
       if (!this.ledgers.orch.entries().some(e => e.type === 'drain' && e.rid === req.rid)) {
@@ -551,6 +578,11 @@ export class Engine {
   private unprunable(wf: Workflow, cutoff?: number): string | undefined {
     const done = this.terminal(wf), status = done ? String(done.status) : 'running';
     if (!['done', 'failed', 'stopped'].includes(status)) return `not-finished:${status}`;
+    if (lazy(wf)) {
+      // Settled (settled.ts): no open generation, every execution fenced, no unresolved fence failure.
+      if (this.running.has(wf.wid) || [...this.generations].some(id => id.startsWith(`${wf.wid}@`))) return 'open-generation';
+      return cutoff !== undefined && done!.ts > cutoff ? 'too-recent' : undefined;
+    }
     const log = wf.journal.entries(), has = (type: string, field: string, value: unknown) => log.some(e => e.type === type && e[field] === value);
     const openGeneration = log.some(e => e.type === 'generation' && !has(JT.sealed, 'call', `${wf.wid}@${e.revision}/${e.key}@${e.gen}`) && !has('retired', 'call', `${wf.wid}@${e.revision}/${e.key}@${e.gen}`));
     const liveExec = log.some(e => e.type === JT.exec && !has(JT.fenced, 'exec', e.exec) && !has(JT.sealed, 'call', e.call));
@@ -619,8 +651,9 @@ export class Engine {
     try { return await run; } finally { if (this.opening.get(wid) === tail) this.opening.delete(wid); }
   }
   private dispatchGeneration(wf: Workflow, entry: Entry) {
-    // A finished workflow's pinned files are verified before a generation of it runs (the ticket names its origin).
-    if (!this.store.verified(wf.wid)) {
+    // A finished workflow's pinned files are verified before a generation of it runs (the ticket names its origin); a
+    // sealed generation's run only repeats post-seal steps, which read no pinned file.
+    if (!this.store.verified(wf.wid) && !callEntries(wf.journal, `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`).some(e => e.type === JT.sealed)) {
       const revision = wf.revision;
       void this.store.ready(wf).then(() => { if (wf.revision === revision && this.store.workflows.get(wf.wid) === wf) this.dispatchGeneration(wf, entry); },
         error => this.background(async () => { throw error; }));

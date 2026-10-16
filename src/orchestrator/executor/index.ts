@@ -36,7 +36,7 @@ import { RECOVERED, RECOVERY_VERSION, completeCalls } from "./recovered.ts";
 import { observeExecution } from "./observe.ts";
 import { availableMemory } from "./memory.ts";
 import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
-import { indexSweep, recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
+import { indexSweep, seededSweep, recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
 import { gateRetired } from "./effects/gate.ts";
 import { WorktreeIndex, worktreeCalls, worktreeLabel, worktreePair, worktreeRoots, type WorktreeWrite } from "./worktree.ts";
 import { failedModel, modelFailures, MODEL_RETRY_MS, parentPinned, spillCandidates } from "./pool.ts";
@@ -96,6 +96,7 @@ export function requestedModel(journal: JournalHandle, call: string, followUp?: 
   }
   return wanted;
 }
+const callWid = (call: string) => /^(.*)@\d+\/.*@\d+$/.exec(call)?.[1];
 function address(call: string) {
   const match = /^(.*)@(\d+)\/(.*)@(\d+)$/.exec(call);
   if (!match) throw new Error(`Invalid call identity: ${call}`);
@@ -151,8 +152,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   // F1: execs whose fence failed in this process; they are retried only by the sweep.
   const failing = new Set<string>();
   // F2: a sweep error is transient: report it and retry at the next K1; it never blocks dispatch.
+  /** The sweep state of settled journals not decoded (recover with `settled`). */
+  const seeds = new WeakMap<JournalHandle, ReturnType<typeof seededSweep>>();
   const sweepTimer = setInterval(() => {
-    if (!sweeping) sweeping = sweepExecutions([...journals.values()].filter(j => !j.closed), containment, { failing: exec => failing.has(exec), fenced: swept, failed: fenceFailed })
+    if (!sweeping) sweeping = sweepExecutions([...journals.values()].filter(j => !j.closed), containment, { failing: exec => failing.has(exec), fenced: swept, failed: fenceFailed, seeded: journal => seeds.get(journal) })
       .catch(error => console.error(`durable-subagents: sweep failed, retrying in K1: ${String(error)}`)).finally(() => { sweeping = undefined; });
   }, options.sweepMs ?? 30000);
   sweepTimer.unref();
@@ -367,7 +370,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     return hit;
   }
   const roots = worktreeRoots(), writes = new WorktreeIndex();
-  const indexed = () => writes.scan(journals.values());
+  // A journal not decoded (a settled workflow) has no open reminder and only ended calls: nothing of it is indexed.
+  const indexed = () => writes.scan([...journals.values()].filter(j => j.loaded !== false));
+  const endedCall = (call: string) => writes.ended(call) || journals.get(callWid(call) ?? "")?.loaded === false;
   const origin = (w: WorktreeWrite) => writes.origin(w.journal) ?? orch.entries().find(e => e.type === JT.created && e.wid === address(w.call).wid)?.origin;
   // Serial sections only: wrote and attention are durable before another writer or seal can interleave.
   /** Remind of every pair of calls that wrote in `root` and have not ended, once per pair and journal. The index must be
@@ -400,7 +405,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   async function resolveWorktrees(call?: string) {
     for (const { id, journal, item } of indexed().open()) {
       const pair = worktreeCalls(id);
-      if (call ? pair.includes(call) : pair.some(c => writes.ended(c)))
+      if (call ? pair.includes(call) : pair.some(endedCall))
         await journal.append(JT.attentionResolved, { id, rev: item.rev, resolution: "ended" });
     }
   }
@@ -1456,6 +1461,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     },
     async recover(wid, journal, options = {}) {
       journals.set(wid, journal);
+      // A settled workflow (orchestrator/settled.ts) not decoded: every call recovered; only the sweep needs its executions.
+      if (journal.loaded === false && options.settled) {
+        seeds.set(journal, seededSweep(options.settled.sweep));
+        return { calls: 0, skipped: options.settled.calls };
+      }
       indexSweep(journal);
       // Batched (the engine recovers every workflow, then calls finishRecovery): the steps that do not depend on the
       // workflow run once, in finishRecovery.
@@ -1509,8 +1519,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await sender.republishPending();
       // E2: republication may restore envelopes of sealed calls, also of calls skipped as complete; the seal resolves them.
       const destinations = sender.pendingDestinations();
-      if (destinations.size) for (const [wid, journal] of journals) for (const call of completeCalls(journal, wid)) {
-        if (destinations.has(call) && sealed(journal, call)) await collectSealed(call).catch(error => console.error(`durable-subagents: inbox cleanup of ${call} failed: ${String(error)}`));
+      for (const call of destinations) {
+        const wid = callWid(call), journal = wid === undefined ? undefined : journals.get(wid);
+        if (wid !== undefined && journal && completeCalls(journal, wid).has(call) && sealed(journal, call)) await collectSealed(call).catch(error => console.error(`durable-subagents: inbox cleanup of ${call} failed: ${String(error)}`));
       }
       for (const { journal, calls } of batch) await finishCalls(journal, calls);
     },

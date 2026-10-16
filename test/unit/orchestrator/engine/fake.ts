@@ -7,7 +7,8 @@ import type { CallTicket, Executor, Ledgers } from '../../../../src/orchestrator
 
 /** P9, P14: Seal synthetic outcomes and model retirement without launching pi. */
 /** forwards: a follow-up is recorded as a real `forward` and, never delivered, retired at the seal as the executor does. */
-export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => number; hold?: string; forwards?: boolean } = {}): Executor {
+/** recovered: every call counts as recovered (Executor.recovered), so settled workflows get settled records. */
+export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => number; hold?: string; forwards?: boolean; recovered?: boolean } = {}): Executor {
   if (process.env.DSA_FAKE_CRASH_WINDOW === 'admitted') {
     const append = ledgers.orch.append.bind(ledgers.orch);
     ledgers.orch.append = async (type, fields) => {
@@ -55,7 +56,7 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
       return { action: 'apply' };
     },
     async stop(target) { await ledgers.orch.append('fake-stop', { target }); },
-    async recover(wid) { await ledgers.orch.append('fake-recover', { wid }); },
+    async recover(wid, _journal, options) { await ledgers.orch.append('fake-recover', { wid, ...(options?.settled ? { settled: true } : {}) }); },
     async retire(widRev) {
       await ledgers.orch.append('fake-retire', { widRev });
       if (process.env.DSA_FAKE_CRASH_WINDOW === 'retire') await new Promise(() => {});
@@ -81,6 +82,7 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
       await Promise.allSettled(runs);
     },
     async shutdown() { await this.suspend(); },
+    ...(opts.recovered ? { recovered: () => true } : {}),
   };
 }
 
