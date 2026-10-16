@@ -19,11 +19,12 @@ import { sweepSeed, type SweepSeed } from "./executor/sweep.ts";
 import { callEntries } from "./executor/indexes.ts";
 
 /** Bump whenever the record gains a field or settledFacts a condition: every record is then rebuilt once. */
-export const SETTLED_VERSION = 1;
+export const SETTLED_VERSION = 2;
 export interface SettledFacts {
   /** The current revision and, past the first, its `revised` entry (it names the pinned snapshot). */
   revision: number; revised?: Entry;
-  /** The terminal (`workflow-done`) entry of the current revision. */
+  /** The terminal (`workflow-done`) entry of the current revision, without its result or error: readers of a lazy
+   *  workflow's end (Engine.terminal: status, ts) need neither; everything else reads the journal. */
   done: Entry;
   /** Request ids of every `resumed` entry (a replayed resume asks whether it took the workflow). */
   resumed: string[];
@@ -91,7 +92,7 @@ export function settledFacts(wf: Workflow, recovered: (call: string) => boolean)
   if (!attention.has(`finished:${wf.wid}\0${log.filter(e => e.type === JT.done).length}`)) return "finished-attention";
   if (liveWaitCalls(foldWaits(wf.wid, log)).length) return "waits";
   const revised = log.findLast(e => e.type === "revised");
-  return { revision: wf.revision, ...(revised ? { revised } : {}), done, resumed: log.filter(e => e.type === "resumed" && e.rid !== undefined).map(e => String(e.rid)),
+  return { revision: wf.revision, ...(revised ? { revised } : {}), done: { seq: done.seq, ts: done.ts, type: done.type, status: done.status } as Entry, resumed: log.filter(e => e.type === "resumed" && e.rid !== undefined).map(e => String(e.rid)),
     quiet: quiet(wf.wid, log), calls: calls.size, sweep: sweepSeed(wf.journal) };
 }
 

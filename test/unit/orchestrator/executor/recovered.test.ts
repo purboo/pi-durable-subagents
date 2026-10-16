@@ -147,6 +147,9 @@ test("a settled journal opened lazily is recovered without decoding; the sweep s
   const f = await fixture(t);
   await f.journal.append("tracked", { exec: f.exec, pid: 4242, start: "77" });
   await f.journal.append("tracked", { exec: f.exec, pid: 4242, start: "77" });
+  // An old fence failure, fenced since: not a failure any more (a seeded one made the sweep decode the journal).
+  await f.journal.append("fence-failed", { exec: f.exec, call: f.call, error: "timeout" });
+  await f.journal.append(JT.fenced, { exec: f.exec });
   await f.recover();
   const { journalExpectation, openLazyJournal } = await import("../../../../src/kernel/journal.ts");
   const { sweepSeed } = await import("../../../../src/orchestrator/executor/sweep.ts");
@@ -160,8 +163,28 @@ test("a settled journal opened lazily is recovered without decoding; the sweep s
   const before = sessionReads();
   assert.deepEqual(await executor.recover(f.wid, lazy, { batch: true, settled: { calls: 1, sweep: seed } }), { calls: 0, skipped: 1 });
   await executor.finishRecovery!();
-  for (let i = 0; i < 200 && !scans.length; i++) await new Promise(r => setTimeout(r, 10));
+  for (let i = 0; i < 200 && scans.length < 3; i++) await new Promise(r => setTimeout(r, 10));
+  assert.ok(scans.length >= 3, "several sweeps ran");
   assert.equal(sessionReads(), before);
   assert.deepEqual(scans[0]?.get(f.exec), [{ pid: 4242, ppid: 0, start: "77" }]);
   assert.equal(lazy.loaded, false, "neither recovery nor the sweep decoded it");
+});
+
+test("a refused ticket is sealed failed with its reason through the unprepared path: no child, no preparation", async t => {
+  const f = await fixture(t);
+  let spawned = 0, prepared = 0;
+  const watching: Containment = { ...containment, async spawn(...args) { spawned++; return containment.spawn(...args); } };
+  const executor = createExecutor({ home: f.home, orch: f.orch, config: { k: { trackerMs: 20 } } },
+    { effects: { ...effects, prepare: async (t: CallTicket) => { prepared++; return { cwd: t.cwd }; } }, containment: watching, memory: async () => 1e6, sweepMs: 60000 });
+  t.after(() => executor.shutdown());
+  const call = `${f.wid}@1/b@1`;
+  await f.journal.append("call", { key: "b", gen: 1, pos: 1, spec: { agent: "test", task: "task" } });
+  const ticket: CallTicket = { wid: f.wid, widRev: `${f.wid}@1`, key: "b", gen: 1, callId: call, spec: { agent: "test", task: "task" }, cwd: f.home, journal: f.journal,
+    agent: { name: "test", description: "test", body: "test", sourcePath: "fixture", source: "project", systemPromptMode: "replace", inheritProjectContext: false, inheritSkills: false },
+    refusal: "pin-failed: Pinned content conflict: /x/script.js" };
+  const result = await executor.run(ticket);
+  assert.equal(result.status, "failed"); assert.equal(result.error, "pin-failed: Pinned content conflict: /x/script.js");
+  assert.equal(spawned, 0); assert.equal(prepared, 0);
+  const own = f.journal.entries().filter(e => e.call === call || e.exec === `${call}#1.1`).map(e => e.type);
+  assert.deepEqual(own.filter(t => ([JT.exec, JT.fenced, JT.sealed] as string[]).includes(t)), [JT.exec, JT.fenced, JT.sealed]);
 });

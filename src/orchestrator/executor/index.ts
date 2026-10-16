@@ -16,7 +16,7 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CT, JT, attentionEntries, isEntry, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
 import { binDir, callDir, callInbox, callSession, journalPath, outboxRoot } from "../../paths.ts";
-import { readJournalSnapshot } from "../../kernel/journal.ts";
+import { readJournalSnapshot, syncDirectory } from "../../kernel/journal.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, forwardRid } from "../../kernel/ids.ts";
 import { capacity, seal } from "../../kernel/guards.ts";
@@ -300,10 +300,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   async function collectSealed(call: string) {
     const sender = await outbox, dir = inbox(call);
+    let removed = false;
     for (const name of await readdir(dir).catch(error => { ignoreMissing(error); return []; })) {
       if (name.endsWith(".json") && !name.startsWith(".")) await sender.markResolved(name.slice(0, -5));
-      await rm(join(dir, name), { force: true });
+      await rm(join(dir, name), { force: true }); removed = true;
     }
+    // The removals are durable before anything recorded after them (a `recovered` receipt); best effort.
+    if (removed) await syncDirectory(dir).catch(error => console.error(`durable-subagents: sync of ${dir} failed: ${String(error)}`));
   }
   /** Sealed or retired calls a batched recovery read, finished by finishRecovery. */
   const unfinished: { journal: JournalHandle; calls: string[] }[] = [];
@@ -942,14 +945,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const makeResult = (status: CallResult["status"], output = "", error?: string) => buildCallResult({ key: t.key, gen: t.gen, status, output, ...(error ? { error } : {}) });
     let cwd = t.cwd, writer: string | undefined;
     if (sealed(journal, t.callId)) { const result = sealed(journal, t.callId)!; await effects.afterSeal(t, result); return result; }
-    try {
+    // A call that cannot run (CallTicket.refusal) or whose preparation failed is sealed failed without a child.
+    let unprepared = t.refusal;
+    if (unprepared === undefined) try {
       await continueSession(home, t, session);
       cwd = (await effects.prepare(t, { sessionPath: session })).cwd;
-    } catch (error) {
+    } catch (error) { unprepared = String(error); }
+    if (unprepared !== undefined) {
       const exec = current(journal, t.callId) ?? `${t.callId}#1.1`;
       if (!current(journal, t.callId)) await serial(() => journal.append(JT.exec, { call: t.callId, exec }));
       await fence(journal, exec, { park: a });
-      return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
+      return finish(journal, t.callId, exec, makeResult("failed", "", unprepared));
     }
     for (;;) {
       const old = sealed(journal, t.callId); if (old) return old;

@@ -47,6 +47,10 @@ export interface CallTicket {
   opening?: { rid: string; kind: "steer" | "follow-up"; message: string };
   /** "provider/id[:thinking]" a follow-up asked this generation to run on (replaces the continued session's model). */
   model?: string;
+  /** Seal the call `failed` with this error without launching a child or preparing anything (the engine found the
+   *  call cannot run, e.g. `pin-failed: …` when the workflow's pinned files no longer verify). Same seal path as a call
+   *  whose preparation failed: forwards, attention, inbox, release and afterSeal as for any seal. */
+  refusal?: string;
 }
 
 /** P19, P30, P32, P33: Call-scoped effects around executions, implemented in src/orchestrator/executor/effects/

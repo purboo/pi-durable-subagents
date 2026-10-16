@@ -2,7 +2,7 @@
 // are used again. The store's ledger lookups (pruned, created, intents) are indexes kept current on append.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -10,7 +10,7 @@ import { openJournal } from '../../../../src/kernel/journal.ts';
 import { publishRequest } from '../../../../src/kernel/mailbox.ts';
 import { orchInbox, orchLedger } from '../../../../src/paths.ts';
 import { Engine } from '../../../../src/orchestrator/engine.ts';
-import { JT, type Request, type RunBody, type EvalToOrch, type OrchToEval } from '../../../../src/types.ts';
+import { JT, isEntry, type Request, type RunBody, type EvalToOrch, type OrchToEval } from '../../../../src/types.ts';
 import type { Ledgers } from '../../../../src/orchestrator/contract.ts';
 import type { EvaluatorTransport } from '../../../../src/orchestrator/evaluator-client.ts';
 import type { Workflow } from '../../../../src/orchestrator/store.ts';
@@ -135,4 +135,36 @@ test('pruned and created indexes keep pruning and materialize semantics across s
     const again = await f.request(b, 'prune', { wid: gone.wid });
     assert.match(String(f.decision(b, again)?.reason), /already-pruned/);
   }
+});
+
+test('a generation open at restart whose pinned script changed is sealed failed pin-failed; the engine goes on; restoring the file lets a follow-up run', async t => {
+  const f = await home(t), first = await f.boot(), wf = await f.finished(first);
+  const spec = wf.journal.entries().find(e => e.type === 'call')!.spec;
+  await wf.journal.append('generation', { rid: 'fu', key: 'c', gen: 2, from: `${wf.wid}@1/c@1`, spec, revision: 1, opening: { rid: 'fu', kind: 'follow-up', message: 'more' } });
+  const script = await readFile(wf.scriptPath, 'utf8');
+  await writeFile(wf.scriptPath, 'return 999;');
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+  const b = await f.boot(), log = () => b.engine.store.workflows.get(wf.wid)!.journal.entries(), id = `${wf.wid}@1/c@2`;
+  for (let i = 0; i < 500 && !log().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`); i++) await delay(5);
+  const seal = log().find(e => e.type === JT.sealed && e.call === id)?.result as { status?: string; error?: string } | undefined;
+  assert.equal(seal?.status, 'failed');
+  assert.match(String(seal?.error), /^pin-failed: Pinned content conflict: .*script\.js$/);
+  assert.equal(log().some(e => e.type === 'fake-run' && e.call === id), false, 'no child ran');
+  assert.ok(log().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${id}`), 'finished attention');
+  assert.equal(errors.filter(e => e.includes('pin-failed')).length, 1, 'one log line');
+  // The engine is alive: another workflow runs its call, and prune no longer finds an open generation.
+  const other = await f.finished(b);
+  assert.ok(other.journal.entries().some(e => e.type === 'fake-run'));
+  await b.engine.intake();
+  const stop = await f.request(b, 'stop', { target: wf.wid });
+  assert.equal(f.decision(b, stop)?.reason, 'terminal:done', 'the workflow is terminal again');
+  // Restore the file: a follow-up verifies the pins again and runs.
+  await writeFile(wf.scriptPath, script);
+  const rid = await f.request(b, 'send', { to: `${wf.wid}/c`, kind: 'follow-up', message: 'again' });
+  assert.equal(f.decision(b, rid)?.type, JT.applied, String(f.decision(b, rid)?.reason));
+  const next = `${wf.wid}@1/c@3`;
+  for (let i = 0; i < 500 && !log().some(e => e.type === JT.sealed && e.call === next); i++) await delay(5);
+  assert.ok(log().some(e => e.type === 'fake-run' && e.call === next));
+  assert.equal((log().find(e => e.type === JT.sealed && e.call === next)?.result as { status: string }).status, 'ok');
 });

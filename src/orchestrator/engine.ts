@@ -221,7 +221,10 @@ export class Engine {
         if (entry.type !== 'call' && entry.type !== 'generation') continue;
         const call = `${wf.wid}@${revision}/${entry.key}@${entry.gen}`;
         if (!this.worktreeUnsettled(wf, call)) continue;
-        const original = await this.store.atRevision(wf, revision);
+        // A revision whose pinned files no longer verify skips this step (the start goes on; the next one retries).
+        let original: Workflow;
+        try { original = await this.store.atRevision(wf, revision); }
+        catch (error) { console.error(`durable-subagents: worktree step of ${call} skipped: pin-failed: ${error instanceof Error ? error.message : String(error)}`); continue; }
         await this.executor.run(this.ticket({ wf: original } as State, entry));
       }
     }
@@ -650,16 +653,22 @@ export class Engine {
     this.opening.set(wid, tail);
     try { return await run; } finally { if (this.opening.get(wid) === tail) this.opening.delete(wid); }
   }
-  private dispatchGeneration(wf: Workflow, entry: Entry) {
+  private dispatchGeneration(wf: Workflow, entry: Entry, refusal?: string) {
     // A finished workflow's pinned files are verified before a generation of it runs (the ticket names its origin); a
-    // sealed generation's run only repeats post-seal steps, which read no pinned file.
-    if (!this.store.verified(wf.wid) && !callEntries(wf.journal, `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`).some(e => e.type === JT.sealed)) {
-      const revision = wf.revision;
-      void this.store.ready(wf).then(() => { if (wf.revision === revision && this.store.workflows.get(wf.wid) === wf) this.dispatchGeneration(wf, entry); },
-        error => this.background(async () => { throw error; }));
+    // sealed generation's run only repeats post-seal steps, which read no pinned file. When they do not verify, the
+    // generation is sealed failed (`pin-failed: …`) without a child, like any call that cannot be prepared: the engine
+    // goes on, the workflow ends again, and a later follow-up verifies the files again.
+    if (refusal === undefined && !this.store.verified(wf.wid) && !callEntries(wf.journal, `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`).some(e => e.type === JT.sealed)) {
+      const revision = wf.revision, current = () => wf.revision === revision && this.store.workflows.get(wf.wid) === wf && !this.closed;
+      void this.store.ready(wf).then(() => { if (current()) this.dispatchGeneration(wf, entry); }, error => {
+        if (!current()) return;
+        const reason = `pin-failed: ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`durable-subagents: generation ${wf.wid}@${revision}/${String(entry.key)}@${String(entry.gen)} sealed failed: ${reason}`);
+        try { this.dispatchGeneration(wf, entry, reason); } catch (failure) { console.error(`durable-subagents: ${String(failure)}`); }
+      });
       return;
     }
-    const ticket = this.ticket({ wf } as State, entry), id = ticket.callId;
+    const ticket: CallTicket = { ...this.ticket({ wf } as State, entry), ...(refusal !== undefined ? { refusal } : {}) }, id = ticket.callId;
     if (this.generations.has(id) || this.held(wf.wid) || wf.journal.entries().some(e => e.type === 'retired' && e.call === id)) return;
     this.generations.add(id); wf.journal.resting = false;
     void this.executor.run(ticket).then(() => this.background(async () => {
