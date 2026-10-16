@@ -20,13 +20,23 @@ export function compileFanout(input: Fanout): CompiledFanout {
     return { key, spec: spec as CallSpec };
   });
   const prefix = `const steps = ${JSON.stringify(steps)};\n`;
-  const source = kind === "tasks"
-    ? prefix + "return await runs.all(steps.map(({key, spec}) => ({...spec, key})));\n"
-    : prefix + `const results = [];
+  const source = prefix + (kind === "tasks" ? TASKS_BODY : CHAIN_BODY);
+  return { source, steps };
+}
+
+const TASKS_BODY = "return await runs.all(steps.map(({key, spec}) => ({...spec, key})));\n";
+/** A chain step's task gets the previous step's output as {previous}; a command step (no task) runs unchanged. */
+const CHAIN_BODY = chainBody(`spec.command === undefined ? {...spec, task: spec.task.replaceAll("{previous}", () => previous)} : spec`);
+/** The chain body before command calls (1.0.43 and earlier): workflows pinned with it keep running it. */
+const LEGACY_CHAIN_BODY = chainBody(`{...spec, task: spec.task.replaceAll("{previous}", () => previous)}`);
+/** Every script body compileFanout emits or emitted after its `const steps = [...];` line (a pinned fanout is one of them). */
+export const FANOUT_BODIES: readonly string[] = [TASKS_BODY, CHAIN_BODY, LEGACY_CHAIN_BODY];
+function chainBody(stepSpec: string): string {
+  return `const results = [];
 let previous = "";
 for (let i = 0; i < steps.length; i++) {
   const {key, spec} = steps[i];
-  const result = await runs.run(key, {...spec, task: spec.task.replaceAll("{previous}", () => previous)});
+  const result = await runs.run(key, ${stepSpec});
   results.push(result);
   if (!result.ok) {
     const skipped = steps.slice(i + 1).map(({key}) => ({key, gen: 0, status: "skipped", ok: false, output: ""}));
@@ -38,5 +48,4 @@ for (let i = 0; i < steps.length; i++) {
 }
 return results;
 `;
-  return { source, steps };
 }

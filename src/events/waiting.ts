@@ -90,6 +90,9 @@ function exhaustedWait(c: WaitInput, now: number): Omit<Wait, "reason"> | undefi
 // ---------------------------------------------------------------------------------------------------------------------
 export interface CallFacts {
   call: string; key: string; gen: number; generation: boolean; agent?: string;
+  /** A command call: no model or slot. From its `command-intent` it runs (its attempt id is `exec`, always selected),
+   *  so only a lease it waits for (a `hold` inside the command) or a writer lock before it starts can hold it. */
+  command?: true;
   /** The model the call asked for (a follow-up's model, else its spec's): a model or a pool name. */
   wanted?: string;
   /** The model of its latest `selected`/`model-used` ("provider/id"). */
@@ -131,11 +134,13 @@ function applyWait(f: WaitFold, e: Entry): void {
       break;
     }
     case "call": case "generation": {
-      const key = String(e.key), gen = Number(e.gen) || 1, call = `${f.wid}@${f.rev}/${key}@${gen}`, spec = e.spec as { agent?: unknown; model?: unknown } | undefined;
+      const key = String(e.key), gen = Number(e.gen) || 1, call = `${f.wid}@${f.rev}/${key}@${gen}`, spec = e.spec as { agent?: unknown; model?: unknown; command?: unknown } | undefined;
       const wanted = typeof e.model === "string" && e.model ? e.model : typeof spec?.model === "string" && spec.model ? spec.model : undefined;
-      f.calls.set(call, { call, key, gen, generation: e.type === "generation", ...(typeof spec?.agent === "string" ? { agent: spec.agent } : {}), ...(wanted ? { wanted } : {}) });
+      f.calls.set(call, { call, key, gen, generation: e.type === "generation", ...(typeof spec?.agent === "string" ? { agent: spec.agent } : {}), ...(wanted ? { wanted } : {}),
+        ...(spec?.command !== undefined ? { command: true as const } : {}) });
       break;
     }
+    case "command-intent": { const c = f.calls.get(String(e.call)); if (c?.command) { c.exec = String(e.id); c.queued = e.ts; c.selected = true; c.fenced = false; delete c.writer; } break; }
     case JT.exec: { const c = f.calls.get(String(e.call)); if (c) { c.exec = String(e.exec); c.queued = e.ts; c.selected = false; c.fenced = false; delete c.answered; } break; }
     // D6: hibernated again after a bound answer the session had already closed: it waits for a new answer.
     case "hibernated": { const c = f.calls.get(String(e.call)); if (c && c.exec === e.exec) delete c.answered; break; }
@@ -209,6 +214,8 @@ const providerOf = (model?: string) => { if (!model) return undefined; try { ret
 export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: (agent: string) => string | undefined): WaitInput {
   // An answered asker is queued (live) although its hibernated execution is fenced, unless a drain holds its workflow.
   const answered = c.answered !== undefined && !env.held?.(f.wid);
+  // A command call queued behind a writer lock has no attempt yet: the lock is its wait (it takes no slot).
+  if (c.command && !c.exec) return c.writer ? { asking: false, exec: { id: "", since: c.writer.since, selected: false }, writerWait: c.writer } : { asking: false };
   const settings = settingsOf(env.ledger, env.config ?? {}), live = c.exec && (!c.fenced || answered), selected = c.selected && c.answered === undefined;
   const attention: { id: string; kind: string; text: string; since: number; exec?: string }[] = [];
   let asking = false;

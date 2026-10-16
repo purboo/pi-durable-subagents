@@ -69,6 +69,7 @@ the agent calls it:
 ```text
 subagents({ action: "agents" })
 subagents({ agent: "worker", task: "Fix the flaky lease test" })
+subagents({ command: ["npm", "test"], cwd: "./repo", timeoutMs: 1800000 })
 subagents({ tasks: [{ agent: "scout", task: "…" }, { agent: "reviewer", task: "…" }] })
 subagents({ chain: [{ agent: "worker", task: "…" }, { agent: "reviewer", task: "Review: {previous}" }] })
 subagents({ workflow: "./batch.js", args: { … }, usageBudget: { costUsd: 20 } })
@@ -103,10 +104,12 @@ call at once with that error instead of retrying it.
 With `tasks` or `chain`, top-level `agent`, `model`, `timeoutMs`, `budget`,
 `isolation`, `context`, `tools`, `skills`, `once` and `writer` apply to every
 step that does not set its own, e.g.
-`{ tasks: [{ task: "…" }, { task: "…" }], agent: "reviewer" }`. A top-level
-`task` beside a list is refused (agent + task is a single call); other call
-fields there, and any of them beside a workflow script, are refused rather
-than ignored.
+`{ tasks: [{ task: "…" }, { task: "…" }], agent: "reviewer" }`. A command
+step takes only `timeoutMs` and `writer` of them, plus `env` and `rerun`,
+which apply to command steps only (see [Command calls](#command-calls)). A
+top-level `task` or `command` beside a list is refused (each is a single
+call; put it in a step); other call fields there, and any of them beside a
+workflow script, are refused rather than ignored.
 When a call of a new run already waits for its worktree's writer lock as the
 run reply is written, the reply names it: `writerWait: ["<wid>/<key> held by
 <wid>/<key> (<root>)"]` with a hint that `writer: false` or
@@ -118,13 +121,13 @@ it something. Each verb means one thing, and a refusal says what would work:
 
 | Verb | Applies to | Effect |
 |---|---|---|
-| `run` | — | Start one subagent, `tasks` in parallel, a `chain`, or a workflow script. An unknown agent name is refused before anything starts, with the list of agents. |
+| `run` | — | Start one subagent, a command call, `tasks` in parallel, a `chain`, or a workflow script. An unknown agent name is refused before anything starts, with the list of agents. |
 | `send steer` | a running subagent | Reaches it at its next safe point. To a finished one: refused, use `follow-up`; To one waiting on its question: it interrupts the question, and the subagent usually asks again; `answer` answers it. |
 | `send notify` | any subagent | Tells it a decision without disturbing it. The reply's `delivery` says how: `steered` (running: it gets the note at its next safe point, like a steer), `held-until-answer` (waiting on its question: never interrupts it; it gets the note at the first safe point after the answer) or `noted` (not running: nothing starts; the note is recorded, and the call's next follow-up opens with it). |
 | `send follow-up` | any subagent | A finished one continues in the same session as a new generation (`key@2`); the reply names it (`generation`, `call`). A running one gets it after its current turn; the reply says `delivery: forwarded` and names the running generation (`call: <wid>/<key>@<gen>`). With `model` (a model or a pool's name), the generation that takes it runs on it. |
 | `send answer` | an open question | Answers it once, at the first chance: as the result of the question it waits on, or (when it no longer waits on that question, say after a steer) as a message at its next safe point. An answer to an earlier question while it waits on a later one ends the later one: that question is withdrawn (`superseded`, the subagent is told to ask again if it still needs it) and takes no answer. |
 | `send model` | any subagent | A running one switches at its next request; one asking, hibernated or waiting for a slot launches on it when it runs again. A pool's name picks its first model that is not used up (and, for a running call, has a free slot); the reply names the model picked, and a call from that pool stays in it. |
-| `stop` | a subagent or a workflow | Final: `stopped`, usage kept, edits left as they are. |
+| `stop` | a subagent or a workflow | Final: `stopped`, usage kept, edits left as they are. A command call's whole process tree ends. |
 | `drain` / `resume` | existing workflows | A reversible hold; runs started later are not held. |
 
 Notes recorded for a call that is not running are durable and pending until
@@ -195,12 +198,74 @@ single file: it cannot `import` or `require` other modules.
 - `writer` (`false`: the call does not write in its cwd's worktree, so it does
   not take that worktree's writer lock; `true`: it does, whatever its tools).
 
+A spec with `command` instead of `agent` and `task` is a
+[command call](#command-calls).
+
 The result has `ok`, `status`, the full `output` text and the structured
 `data`.
 
 A script is replayed after a crash. Finished calls are not run again, and a
 changed script is detected rather than silently mixed. Keep scripts
 deterministic: use `now()`/`random()`, not `Date`/`Math.random`.
+
+### Command calls
+
+A command call runs a command instead of an agent: no model, no provider slot,
+no tokens. It is a call like any other: it has a key and an address
+(`<wid>/<key>`), it can be a step of `tasks` or `chain` or a `runs.run` of a
+script, and when it ends it wakes the session that started it like any
+finished call. Use it for a long build, a test suite or a wait that should not
+keep an agent (and its slot) busy.
+
+```text
+subagents({ command: ["npm", "test"], cwd: "./repo" })
+subagents({ command: "make -j8 && ./bench > bench.txt", timeoutMs: 3600000, env: { CI: "1" } })
+subagents({ chain: [{ command: ["npm", "test"] }, { agent: "worker", task: "Fix what failed:\n{previous}" }] })
+```
+
+| Field | Meaning |
+|---|---|
+| `command` | An array runs as argv, without a shell; a string runs through `/bin/sh -c`. |
+| `cwd` | Its directory, resolved like an agent call's. |
+| `timeoutMs` | Wall-clock time from its start, including time the orchestrator was down. |
+| `env` | Variables added to the environment (`DSA_*` names are reserved). |
+| `rerun` | `true`: when the process vanished without an exit record (the machine restarted), start it once more instead of ending `unknown`. For idempotent commands. |
+| `writer` | `true`: take its worktree's writer lock (default `false`). |
+| `key` | Its key in `tasks`/`chain`, as for agent steps. |
+
+Other call fields (`agent`, `task`, `model`, `tools`, `schema`, `gate`, …)
+are refused in a command call, and `env`/`rerun` in an agent call. stdin is
+empty; stdout and stderr go, interleaved, to `output.log` in the attempt's
+directory. The command sees the orchestrator's environment plus `env`,
+`DSA_CALL` (its call id), `DSA_EXEC` (its attempt) and `DSA_HOME`, so a
+`pi-durable-subagents` command inside it (`hold`, `run`, `send`) addresses
+the same home; it cannot force a restart.
+
+| The command | Result |
+|---|---|
+| exits 0 | `ok` |
+| exits with another status or is killed by a signal | `failed`, error `Command exited <status>` / `Command killed by <SIG>` |
+| runs longer than `timeoutMs` | `timeout` |
+| is stopped (`stop`) | `stopped` |
+| vanished without an exit record, no `rerun` | `unknown`, error `Command ended without an exit record` |
+
+`data` is `{exitCode, signal, durationMs}` and `output` the last 16 KiB of
+`output.log`. Only `stop` controls a command call (it ends the whole process
+tree); `steer`, `follow-up`, `answer`, `model` and `notify` are refused with
+`command call: <kind> is not supported (stop it, or start a new call)`.
+
+A command outlives the orchestrator: a restart (also a forced one), an idle
+exit or a crash leaves it running, and the next orchestrator takes it over or
+records its result if it ended meanwhile. The restart busy list does not count
+it. Neither does a quit pi or `stop-all` stop it: it runs to its end and its
+result is recorded; the held workflow just starts nothing after it.
+
+In a chain, a command step gets no `{previous}` (its command is not changed);
+an agent step after a command step gets the command's output as `{previous}`.
+`status`, `describe` and the `/subagents` view show a running command call
+with `command: <command>`, its pid and how long it runs instead of a model;
+`describe` also names its `output.log`. A finished one shows its status and
+exit code.
 
 ### Watch any subagent like the main agent
 
@@ -370,7 +435,8 @@ answers, the question id and revision). Persist the exact spec bytes you
 submit and retry with those bytes: the run's `cwd` is part of the content
 (`spec.cwd`, else `--cwd`, else the current directory, made absolute), so
 retry from the same place or pass it explicitly. The `spec` file is the
-`subagents` tool's run form (`{agent, task, model?, schema?, …}` or
+`subagents` tool's run form (`{agent, task, model?, schema?, …}`,
+`{command, cwd?, timeoutMs?, env?, rerun?}` or
 `{tasks: […], name?, usageBudget?, maxCalls?}`); `context: "fork"` needs a pi
 session and is rejected.
 
@@ -412,7 +478,9 @@ full text, `qid`, `rev` and the `to` address to answer), `sealed` (finished:
 `status` plus every call's unclipped `output`, `error` and schema `data`) or
 `pruned` (`pruned: {status, endedAt}`; workflows pruned before 1.0.21 have
 only `endedAt`), with `wid`, `request` and
-`spec_digest`, and `labels` when the run has any. Live calls also show what
+`spec_digest`, and `labels` when the run has any. A command call has
+`command` (its command on one line, clipped), `attempt`, `log` (its
+`output.log`) and, while it runs, `pid` and `elapsed`. Live calls also show what
 they wait for (slot, writer lock, lease, exhausted provider; see "Labels and
 why a call does not move"). `lastFence: {at, exec, reason}` appears only
 when an execution was cut off: it had not ended its turn when it was fenced,
