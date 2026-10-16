@@ -67,7 +67,7 @@ export async function resolution(home: string, rid: string, timeoutMs: number, i
     // The compact reader retains only this rid's first terminal decision and reads appended bytes on each poll.
     journal = readJournalFold<State>(orchLedger(home), journal, () => ({}), (state, entry) => {
       if (!state.resolved && entry.rid === rid && isResolution(entry)) state.resolved = entry.type === "rejected" ? { type: "rejected", reason: String(entry.reason) } : { type: "applied" };
-    });
+    }, { needles: [JSON.stringify(rid)] });
     if (journal?.state.resolved) return journal.state.resolved;
     if (performance.now() >= deadline) return undefined;
     await delay(interval);
@@ -119,8 +119,10 @@ async function withSender<T>(home: string, fn: (outbox: Outbox, sender: string) 
     try {
       const pending = outbox.pendingRids();
       if (pending.size) {
-        const ledger = readJournalSnapshot(orchLedger(home));
-        for (const entry of ledger) if (isResolution(entry) && pending.delete(String(entry.rid))) await outbox.markResolved(String(entry.rid));
+        const resolved = readJournalFold(orchLedger(home), undefined, () => [] as string[], (rids, entry) => {
+          if (isResolution(entry) && pending.delete(String(entry.rid))) rids.push(String(entry.rid));
+        }, { needles: [...pending].map(rid => JSON.stringify(rid)) });
+        for (const rid of resolved?.state ?? []) await outbox.markResolved(rid);
       }
       await outbox.republishPending();
       return await fn(outbox, sender);

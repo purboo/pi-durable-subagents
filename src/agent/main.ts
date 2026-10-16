@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { defineTool, type ExtensionAPI, type ExtensionContext, type CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { Outbox, scanInbox } from "../kernel/mailbox.ts";
-import { readJournalSnapshot } from "../kernel/journal.ts";
+import { readJournalFold } from "../kernel/journal.ts";
 import { readerLedger } from "../orchestrator/reader-ledger.ts";
 import { OsLock } from "../platform/lock.ts";
 import { launchOrchestrator } from "../platform/launch.ts";
@@ -68,12 +68,10 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   }
   function pendingOutbox() { return pendingRids().size > 0; }
   function pendingRids() {
-    const pending = new Set<string>();
-    for (const entry of readJournalSnapshot(join(outboxRoot(home), "outbox", `${sender}.jsonl`))) {
+    return readJournalFold(join(outboxRoot(home), "outbox", `${sender}.jsonl`), undefined, () => new Set<string>(), (pending, entry) => {
       if (entry.type === "sent") pending.add((entry.request as { rid: string }).rid);
       else if (entry.type === "resolved") pending.delete(String(entry.rid));
-    }
-    return pending;
+    }, { needles: ['"type":"sent"', '"type":"resolved"'] })?.state ?? new Set<string>();
   }
   async function starter(submitting = false) {
     if (stopped) return;
