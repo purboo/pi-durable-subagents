@@ -66,30 +66,16 @@ type SweepHooks = {
   fenced?: (journal: JournalHandle, exec: string, call: string, wasFenced: boolean) => Promise<void>;
   failed?: (journal: JournalHandle, exec: string, call: string, error: unknown) => Promise<void>;
   /** The sweep state of a journal not decoded yet (seededSweep), so the sweep does not decode it. */
-  seeded?: (journal: JournalHandle) => SweepState | undefined;
+  seeded?: (journal: JournalHandle) => readonly string[] | undefined;
 };
 type SweepState = { count: number; fenced: Set<unknown>; retired: Set<unknown>; failed: Set<unknown>; gated: Set<unknown>; tracked: Map<string, ProcInfo[]>; execs: Entry[]; gates: Entry[] };
 const sweeps = new WeakMap<JournalHandle, SweepState>();
-/** What the sweep needs of a journal whose executions are all fenced and whose gates all have an outcome (a settled
- *  workflow): each execution, whether a fence of it failed once, and its tracked process identities, each once, as
- *  `pid start` (a tracked execution records only these; the sweep matches them against live processes). */
-export type SweepSeed = { exec: string; call: string; failed?: true; tracked: string[] };
+export type SweepSeed = string;
 export function sweepSeed(journal: JournalHandle): SweepSeed[] {
-  const { failed, fenced, tracked, execs } = indexSweep(journal);
-  return execs.map(e => {
-    const exec = String(e.exec);
-    const ids = [...new Set((tracked.get(exec) ?? []).map(p => `${p.pid} ${p.start}`))];
-    // Only a failure not fenced since is still a failure: a fenced one would make the sweep record (and decode) again.
-    return { exec, call: String(e.call), ...(failed.has(exec) && !fenced.has(exec) ? { failed: true as const } : {}), tracked: ids };
-  });
+  return [...indexSweep(journal).fenced] as string[];
 }
-const procOf = (id: string): ProcInfo => { const space = id.indexOf(" "); return { pid: Number(id.slice(0, space)), ppid: 0, start: id.slice(space + 1) }; };
-/** The sweep state of a journal that is not decoded, from its seed (every execution fenced, no open gate): no failed
- *  fence is open (settledFacts requires it), so none is seeded, also from an older record. */
-export function seededSweep(seed: readonly SweepSeed[]): SweepState {
-  return { count: 0, fenced: new Set(seed.map(s => s.exec)), retired: new Set(), failed: new Set(), gated: new Set(),
-    tracked: new Map(seed.map(s => [s.exec, s.tracked.map(procOf)])), execs: seed.map(s => ({ seq: 0, ts: 0, type: JT.exec, exec: s.exec, call: s.call })) as Entry[], gates: [] };
-}
+/** Settled executions are fenced: only tags can match later stragglers. Share the compact list with the store. */
+export function seededSweep(seed: readonly SweepSeed[]): readonly string[] { return seed; }
 
 /** A1: Fold old history during recovery, so the first sweep does not allocate it on the timer path. */
 export function indexSweep(journal: JournalHandle) {
@@ -100,16 +86,21 @@ export function indexSweep(journal: JournalHandle) {
     const e = entries[state.count++]!;
     if (e.type === JT.exec) execs.push(e);
     else if (e.type === "gate-intent") gates.push(e);
-    else if (e.type === JT.fenced) fenced.add(e.exec);
+    else if (e.type === JT.fenced) { fenced.add(e.exec); tracked.delete(String(e.exec)); failed.delete(e.exec); }
     else if (e.type === "retired") retired.add(e.call);
     else if (e.type === "fence-failed") failed.add(e.exec);
-    else if (e.type === "gate") gated.add(e.id);
+    else if (e.type === "gate") { gated.add(e.id); tracked.delete(String(e.id)); failed.delete(e.id); }
     else if (e.type === "tracked" || e.type === "gate-tracked") {
-      const id = String(e.type === "tracked" ? e.exec : e.id), list = tracked.get(id) ?? [];
+      const id = String(e.type === "tracked" ? e.exec : e.id);
+      if (fenced.has(id) || gated.has(id)) continue;
+      const list = tracked.get(id) ?? [];
       if (!tracked.has(id)) tracked.set(id, list);
       list.push(e.type === "tracked" ? { pid: Number(e.pid), ppid: 0, start: String(e.start) } : e.process as ProcInfo);
     }
   }
+  state.execs = execs.filter(e => !fenced.has(e.exec));
+  state.gates = gates.filter(e => !gated.has(e.id));
+  if (!state.execs.length) retired.clear();
   return state;
 }
 
@@ -118,7 +109,16 @@ export function indexSweep(journal: JournalHandle) {
 export async function sweepExecutions(journals: Iterable<JournalHandle>, containment: Pick<Containment, "scan" | "fence">, hooks: SweepHooks = {}) {
   const targets: { journal: JournalHandle; exec: string; call: string; fenced: boolean; failed: boolean; tracked: ProcInfo[] }[] = [];
   for (const journal of journals) {
-    const { fenced, retired, failed, gated, tracked, execs, gates } = (journal.loaded === false ? hooks.seeded?.(journal) : undefined) ?? indexSweep(journal);
+    const seed = journal.loaded === false ? hooks.seeded?.(journal) : undefined;
+    if (seed) {
+      for (const exec of seed) targets.push({ journal, exec, call: exec.slice(0, exec.lastIndexOf("#")), fenced: true, failed: false, tracked: [] });
+      continue;
+    }
+    const { fenced, retired, failed, gated, tracked, execs, gates } = indexSweep(journal);
+    for (const id of fenced) {
+      const exec = String(id);
+      targets.push({ journal, exec, call: exec.slice(0, exec.lastIndexOf("#")), fenced: true, failed: failed.has(id), tracked: [] });
+    }
     // A gate whose recovery fence failed has no outcome yet; it is retried here until its processes are gone.
     for (const e of gates) {
       const id = String(e.id);
