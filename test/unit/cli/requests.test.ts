@@ -367,3 +367,18 @@ test('An envelope another sender recorded but never published is published by a 
   assert.deepEqual(await f.inbox(), ['req:orphan.json']);
   assert.deepEqual(JSON.parse(await readFile(join(orchInbox(f.home), 'req:orphan.json'), 'utf8')), sent.request, 'published verbatim, from the original sender');
 });
+
+test('Run --request takes command call bodies: a single command and command steps, normalized like the tool; agent-only fields refused', async t => {
+  const f = await fixture(t);
+  const single = await f.cli(['run', '--request', 'cmd-1', '--spec', await f.spec('c.json', { command: ['npm', 'test'], cwd: 'sub', env: { CI: '1' } }), '--json']);
+  assert.equal(single.code, 75);
+  assert.deepEqual((JSON.parse(await readFile(join(orchInbox(f.home), 'req:cmd-1.json'), 'utf8')) as Request).body,
+    { cwd: join(f.cwd, 'sub'), call: { command: ['npm', 'test'], cwd: join(f.cwd, 'sub'), env: { CI: '1' } } });
+  const chain = await f.cli(['run', '--request', 'cmd-2', '--spec', await f.spec('d.json', { chain: [{ command: 'make' }, { agent: 'echo', task: '{previous}' }], model: 'p/m', rerun: true }), '--json']);
+  assert.equal(chain.code, 75);
+  assert.deepEqual((JSON.parse(await readFile(join(orchInbox(f.home), 'req:cmd-2.json'), 'utf8')) as Request).body,
+    { cwd: f.cwd, chain: [{ command: 'make', rerun: true }, { agent: 'echo', task: '{previous}', model: 'p/m' }] });
+  await assert.rejects(f.cli(['run', '--request', 'cmd-3', '--spec', await f.spec('e.json', { command: 'true', model: 'p/m' })]), /model is not allowed in a command call/);
+  await assert.rejects(f.cli(['run', '--request', 'cmd-4', '--spec', await f.spec('g.json', { tasks: [{ command: 'true' }], command: 'x' })]), /command cannot be set beside tasks: put it in a step/);
+  assert.deepEqual((await f.inbox()).sort(), ['req:cmd-1.json', 'req:cmd-2.json']);
+});
