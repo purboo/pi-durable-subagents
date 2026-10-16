@@ -237,7 +237,8 @@ recorded it, and `queued` alone when nothing is known:
 | `queued: <provider> usage window used up` | every provider it can start on is used up |
 | `queued: waiting for the writer lock of <root>` | another call writes in the same worktree |
 | `queued: waiting for a free slot (<provider> 4/4)` | every provider it can start on is full |
-| `queued (answered, waiting for a slot)` / `paused · r resumes` | an answered asker waiting to run again / a drained workflow |
+| `queued (answered)` / `queued (answered): <reason>` | an answered asker waiting to run again, with the reason when one is recorded (as above) |
+| `paused · r resumes` | a drained workflow |
 
 The CLI and the tool's status (`queued` per call) say the same.
 
