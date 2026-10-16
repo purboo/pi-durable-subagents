@@ -185,7 +185,8 @@ test("command call: a process gone without an exit record seals unknown; rerun s
   const unknown = await s.sealed(lost);
   assert.equal(unknown.status, "unknown");
   assert.equal(unknown.error, "Command ended without an exit record");
-  assert.ok(s.journal(lost).some(e => e.type === JT.attention && (e.item as { id: string }).id.startsWith("unknown:")));
+  // The unknown attention item follows the seal (same serial section; this read may come between the two).
+  await s.until(() => s.journal(lost).some(e => e.type === JT.attention && (e.item as { id: string }).id.startsWith("unknown:")), "unknown attention");
   const again = await s.sealed(rerun);
   assert.equal(again.status, "ok", JSON.stringify(again));
   assert.equal(readFileSync(marks("rerun"), "utf8"), "start\nend\nstart\nend\n", "the rerun started after the first run ended");
