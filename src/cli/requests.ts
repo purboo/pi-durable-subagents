@@ -8,7 +8,7 @@ import { findJournalEntry, readJournalFold, readJournalSnapshot, type JournalFol
 import { isResolution, lifecycleResolution } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
-import { NOTIFY_SINCE, HOLD_ENTRY_TYPES, commandLine, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, HOLD_ENTRY_TYPES, commandLine, commandSendRefusal, isCommandTarget, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
@@ -422,6 +422,8 @@ async function sendRequest(args: string[], ctx: Context, seen: Seen, batch?: str
   const rev = text(values, "rev");
   if (rev !== undefined && !/^\d+$/.test(rev)) throw new Error("--rev needs a positive integer");
   let qid = text(values, "qid"), revision = rev !== undefined ? Number(rev) : undefined;
+  // R8: a command call has no questions: an answer is refused with the pinned reason, not "no open question".
+  if (kind === "answer" && (qid === undefined || revision === undefined) && isCommandTarget(ctx.home, where.to)) throw new Error(commandSendRefusal("answer"));
   if (kind === "answer" && (qid === undefined || revision === undefined)) {
     // The open question of the target call (or, on a retry, the one the original answered) supplies qid/rev.
     const before = prior?.kind === "send" && (prior.body as { to?: string; kind?: string }).kind === "answer" && (prior.body as { to?: string }).to === where.to ? prior.cond : undefined;

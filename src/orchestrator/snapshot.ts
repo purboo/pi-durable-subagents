@@ -66,6 +66,19 @@ export function commandText(command: unknown): string {
   if (Array.isArray(command)) return command.map(a => { const s = String(a); return /^[A-Za-z0-9_./:=@%+,-]+$/.test(s) ? s : `'${s.replaceAll("'", "'\\''")}'`; }).join(" ");
   return String(command ?? "");
 }
+/** R8: The pinned refusal of a send to a command call (the engine gives the same reason). */
+export const commandSendRefusal = (kind: string) => `command call: ${kind} is not supported (stop it, or start a new call)`;
+/** R8: Whether a send address (`<wid>/<key>`, `<wid>@<rev>/<key>@<gen>`, or a bare wid of a single-call workflow)
+ *  names a command call. Read-only; false for anything it cannot resolve (the orchestrator decides those). */
+export function isCommandTarget(home: string, to: unknown): boolean {
+  if (typeof to !== "string" || !to) return false;
+  const m = /^([^@/]+)(?:@\d+)?(?:\/(.+?))?(?:@\d+)?$/.exec(to);
+  if (!m) return false;
+  let wf: WorkflowSnapshot;
+  try { wf = workflowSnapshot(home, m[1]!); } catch { return false; }
+  const keys = new Set(wf.calls.map(c => c.key)), key = m[2] ?? (keys.size === 1 ? [...keys][0] : undefined);
+  return key !== undefined && wf.calls.some(c => c.key === key && c.command !== undefined);
+}
 /** A command clipped to one display line of at most `n` characters ("command: <clipped>" in status and the UI). */
 export function commandLine(command: string, n = 80): string {
   return clip(command.replace(/\s+/g, " ").trim(), n);

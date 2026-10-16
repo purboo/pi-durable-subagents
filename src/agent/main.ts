@@ -11,7 +11,7 @@ import { launchOrchestrator } from "../platform/launch.ts";
 import { dsaHome, orchInbox, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { PendingOutboxReader, attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
-import { NOTIFY_SINCE, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, commandSendRefusal, isCommandTarget, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "./main/tool.ts";
 import { parameters } from "./main/schema.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, requestRid, sendIdentified, type Identified } from "../requests.ts";
@@ -258,6 +258,10 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
         (args.to === undefined || args.to === body.to) && (args.qid === undefined || args.qid === prior.cond.qid))
         args = { ...args, to: body.to, qid: prior.cond.qid, rev: args.rev ?? prior.cond.rev };
     }
+    // R8: a command call has no questions: an answer is refused with the pinned reason (as the orchestrator refuses one
+    // that names a qid/rev), not with the question pre-fill's "no open question".
+    if (args.action === "send" && args.kind === "answer" && (args.qid === undefined || args.rev === undefined) && isCommandTarget(home, args.to))
+      return { applied: false, reason: commandSendRefusal("answer") };
     if (args.action === "send") args = completeSend(args);
     // A session resumes its own held work (what its quit paused); the CLI `resume` remains the global one.
     if (args.action === "resume" && args.wid === undefined) args = { ...args, origin: sender };

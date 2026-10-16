@@ -134,3 +134,29 @@ test("quit pause: the start notice names this session's paused workflows; a quit
     } finally { await held?.release(); }
   } finally { await lock.release(); }
 });
+
+test("R3: a held workflow with a started, unsealed command call is pending work (starter and CLI start); sealed, it is not", async () => {
+  const { pendingWork } = await import("../../../src/cli/control.ts");
+  // The ledger attributes the held workflow (W01), and one whose journal names its origin only itself (W02).
+  for (const attributed of [true, false]) {
+    const home = fresh();
+    if (attributed) await create(home, "W01", B);
+    else { // no ledger `created`: the journal's own `created` entry names its origin
+      await append(journalPath(home, "W01"), JT.created, { rid: "rid-W01", wid: "W01", origin: B });
+      await append(journalPath(home, "W01"), "wf-created", { rid: "rid-W01", origin: B, cwd: root, revision: 1 });
+    }
+    await append(orchLedger(home), "drain", { origin: B });
+    const path = journalPath(home, "W01");
+    await append(path, "call", { pos: 0, key: "k", gen: 1, spec: { command: ["sleep", "100"] } });
+    assert.equal(unfinishedWorkflow(home), false, `held, not started: waits for resume (attributed: ${attributed})`);
+    assert.equal(await pendingWork(home), false);
+    await append(path, "command-intent", { call: "W01@1/k@1", id: "command:W01@1/k@1#1", n: 1 });
+    assert.equal(unfinishedWorkflow(home), true, `started command under a hold (attributed: ${attributed})`);
+    assert.equal(await pendingWork(home), true);
+    if (attributed) { await session(home, A); assert.ok(await launched(home), "the pi session's starter starts the orchestrator"); }
+    await append(path, "command-started", { id: "command:W01@1/k@1#1", pid: 1, start: "1", dir: "/x" });
+    await append(path, JT.sealed, { call: "W01@1/k@1", result: { key: "k", gen: 1, status: "ok", ok: true, output: "" } });
+    assert.equal(unfinishedWorkflow(home), false, "sealed: held work again");
+    assert.equal(await pendingWork(home), false);
+  }
+});
