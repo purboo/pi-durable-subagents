@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.44
+
+- Command calls: a call spec with `command` (an argv array, or a string for `/bin/sh -c`) instead of `agent`/`task`
+  runs the command without a model, a provider slot or tokens, and wakes the session that started it like any finished
+  call. Use it for a long build, a test suite or a wait that should not keep an agent busy. It works in every launch
+  form (single call, `tasks`, `chain`, `runs.run` in a script, `run --request`) and takes `cwd`, `timeoutMs`
+  (wall-clock from its start), `env` (added to the orchestrator's environment; `DSA_*` is reserved), `rerun` and
+  `writer` (default `false`). See README, "Command calls".
+- Result: exit 0 is `ok`, another status `failed`, past `timeoutMs` `timeout`, `stop` `stopped`; `data` is
+  `{exitCode, signal, durationMs}` and `output` the last 16 KiB of the interleaved stdout/stderr log. Stop and timeout
+  end the whole process tree, including detached descendants. Steer, follow-up, answer, model and notify are refused.
+- A command outlives the orchestrator: a restart (also a forced one), an idle exit, a crash, a quitting pi session or
+  `stop-all` leaves it running; the next orchestrator takes it over, or records its result if it ended meanwhile. It
+  never runs twice at once. A process gone without an exit record ends `unknown`, or with `rerun: true` starts once
+  more. Restart refusals do not count command calls as busy and say how many keep running.
+- In a chain, a command step gets no `{previous}` substitution; an agent step after it gets its output.
+- Status, describe and the subagent view show a command call's command, pid, attempt, elapsed time and log path
+  instead of a model.
+
 ## 1.0.43
 
 Steady-state cost no longer grows with history. Behaviour, file formats and recorded decisions are unchanged.
