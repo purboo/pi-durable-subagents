@@ -101,7 +101,7 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
   return `${prefix}${lines.join('')}${footer}`;
 }
 
-type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Set<number>; exposures: Entry[]; sent: number; replaying: boolean; ready: Map<number, CallResult>; running: Set<number>; outputs: Map<number, Entry>; values: Entry[]; needs: number };
+type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Set<number>; exposures: Entry[]; exposed: Set<number>; sent: number; replaying: boolean; ready: Map<number, CallResult>; running: Set<number>; outputs: Map<number, Entry>; values: Entry[]; needs: number };
 export interface EngineOptions { evaluator?: EvaluatorTransport; discovery?: DiscoveryOptions }
 
 /** A1, P2, P10, P11: Serialize decisions while executions run independently. */
@@ -369,7 +369,7 @@ export class Engine {
     const ev = Math.max(0, ...wf.journal.entries().filter(e => e.type === 'ev').map(e => e.n as number)) + 1;
     await wf.journal.append('ev', { n: ev });
     const calls = new Map(log.filter(e => ['call', 'refused', 'reused'].includes(e.type)).map(e => [e.pos as number, e]));
-    const st: State = { wf, ev, calls, proposed: new Set(), exposures: log.filter(e => e.type === 'exposed'), sent: 0, replaying: true, ready: new Map(), running: new Set(), outputs: new Map(log.filter(e => ['call', 'refused', 'reused', 'emit'].includes(e.type)).map(e => [e.pos as number, e])), values: log.filter(e => e.type === 'value'), needs: 0 };
+    const st: State = { wf, ev, calls, proposed: new Set(), exposures: log.filter(e => e.type === 'exposed'), exposed: new Set(log.filter(e => e.type === 'exposed').map(e => e.pos as number)), sent: 0, replaying: true, ready: new Map(), running: new Set(), outputs: new Map(log.filter(e => ['call', 'refused', 'reused', 'emit'].includes(e.type)).map(e => [e.pos as number, e])), values: log.filter(e => e.type === 'value'), needs: 0 };
     this.states.set(wf.wid, st);
     this.evaluator.send({ t: 'start', wid: wf.wid, ev, scriptPath: wf.scriptPath, args: wf.pins.args, inputs: wf.inputs });
   }
@@ -598,9 +598,14 @@ export class Engine {
       for (const wf of this.store.workflows.values()) if (!lazy(wf)) for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     } else if (req.kind === 'drain') {
       const { fence, origin, wid } = (req.body as DrainBody) ?? {}, scoped = Boolean(origin || wid);
-      if (!this.ledgers.orch.entries().some(e => e.type === 'drain' && e.rid === req.rid)) {
-        await this.ledgers.orch.append('drain', { rid: req.rid, fence: fence === true, ...(wid ? { wid } : origin ? { origin } : {}) });
-      }
+      // Recorded in one step of the executor's serial queue (F2): a command call's intent is either before the drain
+      // (it started; the hold never stops it) or after it (its start decision sees the hold and records none).
+      const record = async () => {
+        if (!this.ledgers.orch.entries().some(e => e.type === 'drain' && e.rid === req.rid)) {
+          await this.ledgers.orch.append('drain', { rid: req.rid, fence: fence === true, ...(wid ? { wid } : origin ? { origin } : {}) });
+        }
+      };
+      await (this.executor.exclusive ? this.executor.exclusive(record) : record());
       if (fence === true) {
         await this.executor.suspend(scoped ? w => this.held(w) : undefined);
         for (const st of this.states.values()) if (!scoped || this.held(st.wf.wid)) st.running.clear();
@@ -871,8 +876,13 @@ export class Engine {
       st.ready.delete(pos); st.sent++;
     }
     if (st.replaying) return;
+    // A position is exposed at most once per workflow state (F1): two observers of one seal (an adopted command's watch
+    // and a dispatch of the same call) may both deliver it; the first one wins, a later one is dropped.
     for (const [pos, result] of st.ready) {
-      await st.wf.journal.append('exposed', { pos });
+      if (st.exposed.has(pos)) { st.ready.delete(pos); continue; }
+      st.exposed.add(pos);
+      try { await st.wf.journal.append('exposed', { pos }); }
+      catch (error) { st.exposed.delete(pos); throw error; }
       this.evaluator.send({ t: 'expose', wid: st.wf.wid, ev: st.ev, pos, result });
       st.ready.delete(pos);
     }
