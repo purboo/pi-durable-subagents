@@ -29,6 +29,30 @@ async function fixture(t: TestContext) {
   const warnings = async (rid: string) => JSON.parse(await readFile(join(home, "staging", rid, "snapshot.json"), "utf8")).warnings as string[] | undefined;
   return { home, cwd, agents, ledgers, store, discovery, run, warnings, staging: (rid: string) => join(home, "staging", rid) };
 }
+test('an unverified pin load cannot overwrite a revision published while file verification waits', async t => {
+  const f = await fixture(t), req = f.run('verify-old', { source: 'old' });
+  await f.store.stage(req, f.discovery); const first = await f.store.create(req);
+  const change = { ...f.run('verify-new', {}), kind: 'revise' as const, body: { wid: first.wid, source: 'new' } };
+  await f.store.stage(change, f.discovery);
+  const intent = await f.store.revisionIntent(change, first);
+  await first.journal.append(JT.done, { status: 'done' }); await f.store.close();
+  const store = new Store(f.ledgers); t.after(() => store.close());
+  await store.recover(); const wf = store.workflows.get(first.wid)!;
+  assert.equal(store.verified(wf.wid), false);
+  const internal = store as unknown as { pinnedFiles(...args: unknown[]): Promise<unknown> }, pinnedFiles = internal.pinnedFiles.bind(internal);
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
+  t.mock.method(internal, 'pinnedFiles', async (...args: unknown[]) => {
+    const files = await pinnedFiles(...args);
+    if (args[1] === 1) { entered(); await gate; }
+    return files;
+  });
+  const verifying = store.ready(wf); await started;
+  try { await store.revise(intent); } finally { release(); }
+  await verifying;
+  assert.equal(wf.revision, 2); assert.equal(wf.pins.source, 'new'); assert.equal(store.verified(wf.wid), true);
+});
+
 test('a delayed pin reload cannot overwrite a concurrently published revision', async t => {
   const f = await fixture(t), req = f.run('reload-old', { source: 'old' });
   await f.store.stage(req, f.discovery); const wf = await f.store.create(req);

@@ -173,9 +173,8 @@ export class Store {
   /** Called after each append to a workflow journal (the event pump derives from it). */
   appended?: (wid: string) => void;
   private ledgers: Ledgers;
-  /** Terminal workflows materialized from their `pins.json` without verifying it: the revision and the intent to verify
-   *  it with (see ready). */
-  private unverified = new Map<string, { revision: number; intent: Entry }>();
+  /** Terminal workflows awaiting file verification; reuse their immutable revision intent instead of a wrapper. */
+  private unverified = new Map<string, Entry>();
   private verifying = new Map<string, Promise<void>>();
   /** A request can verify pins and then be refused before live work starts. Release those pins after the request. */
   private pinRest = new Map<string, ReturnType<typeof setTimeout>>();
@@ -431,9 +430,9 @@ export class Store {
       run = (async () => {
         const pending = this.unverified.get(wf.wid);
         if (!pending) return;
-        const files = pending.revision === wf.revision ? await this.pinnedFiles(wf.wid, pending.revision, pending.intent) : undefined;
-        if (this.unverified.get(wf.wid) !== pending) return; // A revision published meanwhile was verified by revise.
-        if (files && pending.revision === wf.revision) Object.assign(wf, files);
+        const revision = wf.revision, files = await this.pinnedFiles(wf.wid, revision, pending);
+        if (this.workflows.get(wf.wid) !== wf || this.unverified.get(wf.wid) !== pending) return; // A revision or owner changed meanwhile.
+        if (revision === wf.revision) Object.assign(wf, files);
         this.unverified.delete(wf.wid);
       })().finally(() => this.verifying.delete(wf.wid));
       this.verifying.set(wf.wid, run);
@@ -509,7 +508,7 @@ export class Store {
         const facts: SettledFacts = { revision: settled.revision, ...(settled.revised ? { revised: settled.revised } : {}), done: settled.done, resumed: settled.resumed, quiet: settled.quiet, calls: settled.calls, sweep: settled.sweep };
         const wf: Workflow = { wid, revision: settled.revision, origin: intent.origin as string, cwd: intent.cwd as string, journal: lazy, ...files, settled: facts };
         this.releasePins(wf);
-        this.unverified.set(wid, { revision: settled.revision, intent: current });
+        this.unverified.set(wid, current);
         lazy.onAppend = () => this.appended?.(wid);
         this.workflows.set(wid, wf);
         if (!this.index().created.has(String(intent.rid))) await this.ledgers.orch.append(JT.created, { rid: intent.rid, wid, origin: intent.origin });
@@ -528,7 +527,7 @@ export class Store {
       const ended = !first && entries.length > 0 && terminalEntry(entries) !== undefined;
       const files = first ?? (ended ? await this.pinnedFiles(wid, revision, current, false) : await this.pinnedFiles(wid, 1, intent));
       wf = { wid, revision: ended ? revision : 1, origin: intent.origin as string, cwd: intent.cwd as string, journal, ...files };
-      if (ended) { this.releasePins(wf); this.unverified.set(wid, { revision, intent: current }); }
+      if (ended) { this.releasePins(wf); this.unverified.set(wid, current); }
     } catch (error) { await journal.close(); throw error; }
     journal.onAppend = () => this.appended?.(wid);
     this.workflows.set(wid, wf);
