@@ -68,16 +68,22 @@ export function commandText(command: unknown): string {
 }
 /** R8: The pinned refusal of a send to a command call (the engine gives the same reason). */
 export const commandSendRefusal = (kind: string) => `command call: ${kind} is not supported (stop it, or start a new call)`;
-/** R8: Whether a send address (`<wid>/<key>`, `<wid>@<rev>/<key>@<gen>`, or a bare wid of a single-call workflow)
- *  names a command call. Read-only; false for anything it cannot resolve (the orchestrator decides those). */
+/** R8, F5: Whether a send address names a command call, matched whole as the engine's findCall does, among the
+ *  current revision's calls: `<wid>/<key>`, `<wid>@<rev>/<key>@<gen>`, or a bare wid of a workflow with one key. A key
+ *  may contain `@` and digits: nothing is stripped. Read-only; false for anything it cannot resolve. */
 export function isCommandTarget(home: string, to: unknown): boolean {
   if (typeof to !== "string" || !to) return false;
-  const m = /^([^@/]+)(?:@\d+)?(?:\/(.+?))?(?:@\d+)?$/.exec(to);
-  if (!m) return false;
-  let wf: WorkflowSnapshot;
-  try { wf = workflowSnapshot(home, m[1]!); } catch { return false; }
-  const keys = new Set(wf.calls.map(c => c.key)), key = m[2] ?? (keys.size === 1 ? [...keys][0] : undefined);
-  return key !== undefined && wf.calls.some(c => c.key === key && c.command !== undefined);
+  const wid = to.split(/[@/]/, 1)[0]!; // a wid has neither '@' nor '/'
+  if (!wid || !existsSync(journalPath(home, wid))) return false;
+  let entries: readonly Entry[];
+  try { entries = readJournalSnapshot(journalPath(home, wid)); } catch { return false; }
+  const rev = Math.max(1, ...entries.filter(e => e.type === "wf-created" || e.type === "revised").map(e => Number(e.revision) || 1));
+  const start = entries.findLastIndex(e => e.type === "revised");
+  const calls = (start < 0 ? entries : entries.slice(start)).filter(e => e.type === "call" || e.type === "generation");
+  const keys = new Set(calls.map(e => String(e.key)));
+  const named = calls.findLast(e => to === `${wid}/${e.key}` || to === `${wid}@${rev}/${e.key}@${e.gen}` || (to === wid && keys.size === 1));
+  if (!named) return false;
+  return (calls.findLast(e => e.key === named.key)!.spec as { command?: unknown } | undefined)?.command !== undefined;
 }
 /** A command clipped to one display line of at most `n` characters ("command: <clipped>" in status and the UI). */
 export function commandLine(command: string, n = 80): string {

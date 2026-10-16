@@ -160,3 +160,38 @@ test("R3: a held workflow with a started, unsealed command call is pending work 
     assert.equal(await pendingWork(home), false);
   }
 });
+
+test("F4: a held workflow is pending only for a live command attempt: a withdrawn intent is not", async () => {
+  const { pendingWork } = await import("../../../src/cli/control.ts");
+  // (a) Close after the intent and before the spawn: command-withdrawn; nothing runs.
+  const a = fresh();
+  await create(a, "W01", B);
+  await append(orchLedger(a), "drain", { origin: B });
+  const pa = journalPath(a, "W01"), id = "command:W01@1/k@1#1";
+  await append(pa, "call", { pos: 0, key: "k", gen: 1, spec: { command: ["sleep", "100"] } });
+  await append(pa, "command-intent", { call: "W01@1/k@1", id, n: 1 });
+  assert.equal(unfinishedWorkflow(a), true, "intent: live");
+  await append(pa, "command-withdrawn", { call: "W01@1/k@1", id });
+  assert.equal(unfinishedWorkflow(a), false, "withdrawn: no live attempt");
+  assert.equal(await pendingWork(a), false);
+  // A later start decides again: a new intent with the same id is live again.
+  await append(pa, "command-intent", { call: "W01@1/k@1", id, n: 1 });
+  assert.equal(unfinishedWorkflow(a), true, "a new intent after the withdrawal is live");
+});
+
+test("F4: a running command retired by revise, the new revision done, then a drain: not pending work", async () => {
+  const { pendingWork } = await import("../../../src/cli/control.ts");
+  const id = "command:W01@1/k@1#1";
+  const b = fresh();
+  await create(b, "W01", B);
+  const pb = journalPath(b, "W01");
+  await append(pb, "call", { pos: 0, key: "k", gen: 1, spec: { command: ["sleep", "100"] } });
+  await append(pb, "command-intent", { call: "W01@1/k@1", id, n: 1 });
+  await append(pb, "command-started", { call: "W01@1/k@1", id, pid: 1, start: "1", dir: "/x" });
+  await append(pb, "revised", { revision: 2, rid: "rev-2" });
+  await append(pb, "retired", { call: "W01@1/k@1" });
+  await append(pb, JT.done, { status: "done", result: 1 });
+  await append(orchLedger(b), "drain", { origin: B });
+  assert.equal(unfinishedWorkflow(b), false, "retired: not a reason to start an orchestrator");
+  assert.equal(await pendingWork(b), false);
+});

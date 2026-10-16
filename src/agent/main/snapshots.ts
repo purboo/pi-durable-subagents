@@ -2,6 +2,7 @@ import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { liveCommandCalls } from "../../orchestrator/executor/command.ts";
 import { forgetJournalSnapshot, journalAppends, readJournalFold, readJournalSnapshot, readJournalUncached, type JournalFold } from "../../kernel/journal.ts";
 import { journalPath } from "../../paths.ts";
 import { CT, JT, type AttentionItem, type Entry } from "../../types.ts";
@@ -92,7 +93,8 @@ function unfinishedJournal(path: string, known?: { ino: number; size: number; en
   decided.set(path, { ino: read.ino, size: read.size, unfinished });
   return unfinished;
 }
-/** R3: Whether a journal has a started command call: a `command-intent` whose call has no seal. A hold never stops
+/** R3, F4: Whether a journal has a live command attempt (liveCommandCalls: an intent not withdrawn, of a call neither
+ *  sealed nor retired). A hold never stops
  *  one, so an orchestrator must watch and seal it even while its workflow is held. Cached by file identity. */
 const commanded = new Map<string, { ino: number; size: number; running: boolean }>();
 function startedCommand(path: string, known?: { ino: number; size: number; entries: readonly Entry[] }): boolean {
@@ -105,13 +107,9 @@ function startedCommand(path: string, known?: { ino: number; size: number; entri
   let read = known;
   try { read ??= readJournalUncached(path); } catch { commanded.delete(path); return false; }
   if (!read) { commanded.delete(path); return false; }
-  const intents = new Set<string>();
-  for (const e of read.entries) {
-    if (e.type === "command-intent") intents.add(String(e.call));
-    else if (e.type === JT.sealed) intents.delete(String(e.call));
-  }
-  commanded.set(path, { ino: read.ino, size: read.size, running: intents.size > 0 });
-  return intents.size > 0;
+  const running = liveCommandCalls(read.entries).length > 0;
+  commanded.set(path, { ino: read.ino, size: read.size, running });
+  return running;
 }
 /** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation,
  *  unless a drain (stop-all) holds it: held work waits for an explicit resume, which starts the orchestrator itself.
