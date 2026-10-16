@@ -44,17 +44,20 @@ test('shared type lists cover reducer branches so a new type cannot silently byp
     ['../../../src/orchestrator/ledger.ts', 'export function applyLedger', '/** Fold the entries', LEDGER_ENTRY_TYPES],
     ['../../../src/orchestrator/providers.ts', 'export function foldExhaustion', undefined, EXHAUSTION_ENTRY_TYPES],
     ['../../../src/events/fence.ts', 'export function fenceReason', '/** The fence of', FENCE_LEDGER_TYPES],
-    ['../../../src/orchestrator/snapshot.ts', 'export function holdOf', '/** Drain: whether', HOLD_ENTRY_TYPES],
+    // holdOf/heldIn read only ledgerIndex's projections; its other branches feed projections describe does not use.
+    ['../../../src/orchestrator/snapshot.ts', 'export function ledgerIndex', 'function workflowIds', HOLD_ENTRY_TYPES],
     ['../../../src/orchestrator/reader-ledger.ts', 'export function applyReaderLedger', 'export function readerHold', READER_ENTRY_TYPES],
   ] as const;
   for (const [path, start, end, types] of cases) {
     const source = await readFile(new URL(path, import.meta.url), 'utf8');
     const body = source.slice(source.indexOf(start), end ? source.indexOf(end, source.indexOf(start)) : undefined);
-    const consumed = [...body.matchAll(/(?:\.type\s*===\s*|isEntry\(\w+,\s*)["']([^"']+)["']/g)].map(match => match[1]!);
-    for (const match of body.matchAll(/\.type\s*===\s*JT\.(\w+)/g)) consumed.push(JT[match[1] as keyof typeof JT]);
+    const consumed = [...body.matchAll(/(?:\.type\s*===\s*|isEntry\(\w+,\s*|case\s+)["']([^"']+)["']/g)].map(match => match[1]!);
+    for (const match of body.matchAll(/(?:\.type\s*===\s*|isEntry\(\w+,\s*|case\s+)JT\.(\w+)/g)) consumed.push(JT[match[1] as keyof typeof JT]);
+    assert.ok(consumed.length > 0, `${path}: no reducer branch found between the markers`);
     // applyReaderLedger also branches on hold to compact applyLedger's input; it is in the shared ledger list.
     const declared: readonly string[] = path.includes('reader-ledger') ? [...types, ...LEDGER_ENTRY_TYPES]
-      : path.includes('fence.ts') ? [...types, JT.exec] : types;
+      : path.includes('fence.ts') ? [...types, JT.exec]
+      : path.includes('snapshot.ts') ? [...types, 'create-intent', 'request', JT.rejected, 'pruned'] : types;
     for (const type of consumed) assert.ok(declared.includes(type), `${path}: reducer type ${type} needs a shared filter type`);
   }
 });
