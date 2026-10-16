@@ -1,22 +1,40 @@
 import { open, mkdir, type FileHandle } from 'node:fs/promises';
 import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { dirname } from 'node:path';
+import * as zlib from 'node:zlib';
 import type { Entry, JournalHandle } from '../types.ts';
 
 const TABLE = new Uint32Array(256).map((_, n) => { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+/** The CRC-32 (IEEE) of `bytes` as an unsigned number: node's native one when it has it (22.2+), else a table. */
+const crcValue: (bytes: Uint8Array) => number = typeof (zlib as { crc32?: unknown }).crc32 === 'function'
+  ? bytes => (zlib as unknown as { crc32(data: Uint8Array): number }).crc32(bytes)
+  : bytes => {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) crc = TABLE[(crc ^ bytes[i]!) & 0xff]! ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  };
 /** C11: the CRC-32 (IEEE) of a record, 8 lowercase hex digits: the frame of every journal line. */
 export function crc32(bytes: Uint8Array): string {
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) crc = TABLE[(crc ^ bytes[i]!) & 0xff]! ^ (crc >>> 8);
-  return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0');
+  return crcValue(bytes).toString(16).padStart(8, '0');
+}
+/** The value of the 8 lowercase hex digits at `bytes[0..8)` followed by a space, or -1 when they are not that. */
+function frameHead(bytes: Uint8Array): number {
+  if (bytes.length < 9 || bytes[8] !== 32) return -1;
+  let value = 0;
+  for (let i = 0; i < 8; i++) {
+    const c = bytes[i]!, digit = c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : -1;
+    if (digit < 0) return -1;
+    value = value * 16 + digit;
+  }
+  return value;
 }
 /** C11: One framed line `<crc32 hex 8> <json>\n` (the journal format; the event log uses it too). */
 export function frameLine(json: string): string { return `${crc32(Buffer.from(json))} ${json}\n`; }
 /** C11: The JSON text of one framed line (without its newline), or undefined when its frame or checksum is wrong. */
 export function unframeLine(line: Uint8Array): string | undefined {
-  if (line.length < 10 || line[8] !== 32) return undefined;
-  const head = Buffer.from(line.subarray(0, 8)).toString(), json = line.subarray(9);
-  return /^[0-9a-f]{8}$/.test(head) && crc32(json) === head ? Buffer.from(json).toString() : undefined;
+  if (line.length < 10) return undefined;
+  const head = frameHead(line), json = line.subarray(9);
+  return head >= 0 && crcValue(json) === head ? Buffer.from(json.buffer, json.byteOffset, json.byteLength).toString() : undefined;
 }
 /** Entries are immutable history (A1): freeze them so shared snapshots can be handed out without copying. */
 function freeze<T>(value: T): T {
@@ -30,9 +48,9 @@ function decode(bytes: Buffer, prior: readonly Entry[] = []): { entries: Entry[]
     const end = bytes.indexOf(10, offset);
     if (end < 0) break;
     try {
-      const line = bytes.subarray(offset, end), json = line.subarray(9);
-      if (!/^[0-9a-f]{8} $/.test(line.subarray(0, 9).toString()) || crc32(json) !== line.subarray(0, 8).toString()) throw new Error('CRC');
-      const entry = JSON.parse(json.toString()) as Entry;
+      const line = bytes.subarray(offset, end), json = line.subarray(9), head = frameHead(line);
+      if (head < 0 || crcValue(json) !== head) throw new Error('CRC');
+      const entry = JSON.parse(bytes.toString('utf8', offset + 9, end)) as Entry;
       if (entry.seq !== entries.length + 1 || !Number.isFinite(entry.ts) || typeof entry.type !== 'string') throw new Error('Envelope');
       entries.push(freeze(entry));
     } catch (cause) {

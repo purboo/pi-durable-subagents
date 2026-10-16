@@ -20,6 +20,7 @@ const EMPTY: SessionState = { entries: [], corrupt: [] };
 /** C5, E4, F3: Read complete native entries incrementally; an unfinished trailing line is ignored and a malformed
  *  complete line is skipped (pi's own loader does the same), reported by its 1-based line number in `corrupt`. */
 export async function readSessionState(path: string): Promise<SessionState> {
+  reads++;
   const file = await open(path, "r").catch(error => { if (error.code === "ENOENT") return undefined; throw error; });
   if (!file) { cache.delete(path); return EMPTY; }
   try {
@@ -46,6 +47,9 @@ export async function readSessionState(path: string): Promise<SessionState> {
     return state;
   } finally { await file.close(); }
 }
+let reads = 0;
+/** How many session reads (readSessionState calls) this process made: a diagnostic, e.g. of what a recovery read. */
+export function sessionReads(): number { return reads; }
 /** C5: Complete native session entries (see readSessionState). The result is shared: never mutate it. */
 export async function readSession(path: string): Promise<SessionEntry[]> {
   return (await readSessionState(path)).entries;

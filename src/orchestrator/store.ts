@@ -159,7 +159,29 @@ export class Store {
   /** Called after each append to a workflow journal (the event pump derives from it). */
   appended?: (wid: string) => void;
   private ledgers: Ledgers;
+  /** Terminal workflows materialized from their `pins.json` without verifying it: the revision and the intent to verify
+   *  it with (see ready). */
+  private unverified = new Map<string, { revision: number; intent: Entry }>();
+  private verifying = new Map<string, Promise<void>>();
+  /** What the store looks up in the orchestrator ledger, folded over appended entries only (first entry wins, as find). */
+  private ix = { seen: 0, pruned: new Set<string>(), created: new Set<string>(), createIntents: [] as Entry[], createByRid: new Map<string, Entry>(),
+    createByWid: new Map<string, Entry>(), reviseByRid: new Map<string, Entry>(), rids: new Map<string, string[]>() };
   constructor(ledgers: Ledgers) { this.ledgers = ledgers; }
+  private index() {
+    const ix = this.ix, entries = this.ledgers.orch.committed?.() ?? this.ledgers.orch.entries();
+    while (ix.seen < entries.length) {
+      const e = entries[ix.seen++]!;
+      if (e.type === 'pruned') ix.pruned.add(String(e.wid));
+      else if (e.type === JT.created) ix.created.add(String(e.rid));
+      else if (e.type === 'create-intent' || e.type === 'revise-intent') {
+        const byRid = e.type === 'create-intent' ? ix.createByRid : ix.reviseByRid, rid = String(e.rid), wid = String(e.wid);
+        if (e.type === 'create-intent') { ix.createIntents.push(e); if (!ix.createByWid.has(wid)) ix.createByWid.set(wid, e); }
+        if (!byRid.has(rid)) byRid.set(rid, e);
+        const rids = ix.rids.get(wid); if (rids) rids.push(rid); else ix.rids.set(wid, [rid]);
+      }
+    }
+    return ix;
+  }
   private stagePath(rid: string) {
     if (!rid || rid === '.' || rid === '..') throw new Error('Invalid staging identity');
     return join(this.ledgers.home, 'staging', encodeURIComponent(rid));
@@ -182,6 +204,7 @@ export class Store {
         if (req.kind === 'revise') {
           const change = req.body as ReviseBody, wf = this.workflows.get(change?.wid);
           if (!wf) throw new Error('unknown-workflow');
+          await this.ready(wf);
           body = { cwd: wf.cwd, ...(change.workflow !== undefined ? { workflow: change.workflow } : { source: change.source ?? wf.pins.source }),
             args: Object.hasOwn(change, 'args') ? change.args : wf.pins.args, inputs: wf.pins.inputSources,
             usageBudget: wf.pins.usageBudget, maxCalls: wf.pins.maxCalls };
@@ -239,20 +262,21 @@ export class Store {
   }
   /** P3, P6: Remove staging only after a durable rejection or withdrawal without a committed intent. */
   async discardStage(rid: string): Promise<void> {
-    if (this.ledgers.orch.entries().some(e => (e.type === 'create-intent' || e.type === 'revise-intent') && e.rid === rid)) return;
+    const ix = this.index();
+    if (ix.createByRid.has(rid) || ix.reviseByRid.has(rid)) return;
     await rm(this.stagePath(rid), { recursive: true, force: true });
     await syncDirectory(join(this.ledgers.home, 'staging')).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
   /** A5: Fix the workflow identity and snapshot reference before filesystem effects. */
   async create(req: Request<RunBody>): Promise<Workflow> {
-    let intent = this.ledgers.orch.entries().find(e => e.type === 'create-intent' && e.rid === req.rid);
+    let intent = this.index().createByRid.get(req.rid);
     intent ??= await this.ledgers.orch.append('create-intent', { rid: req.rid, wid: ulid(), origin: req.from, cwd: req.body.cwd,
       ...(req.body.name !== undefined ? { name: req.body.name } : {}), snapshot: await this.reference(req.rid) });
     return this.materialize(intent);
   }
   /** P14, A5: Bind the next revision before retiring any old authority. */
   async revisionIntent(req: Request<ReviseBody>, wf: Workflow): Promise<Entry> {
-    return this.ledgers.orch.entries().find(e => e.type === 'revise-intent' && e.rid === req.rid) ??
+    return this.index().reviseByRid.get(req.rid) ??
       await this.ledgers.orch.append('revise-intent', { rid: req.rid, wid: wf.wid, revision: wf.revision + 1, snapshot: await this.reference(req.rid) });
   }
   private async publishPins(wid: string, revision: number, pins: Pins) {
@@ -282,11 +306,11 @@ export class Store {
    *  workflow), and use it only when it is well formed, names this snapshot, its pins hash to its digest and every file
    *  hashes as recorded — otherwise they take the snapshot path, whose byte comparison reports a changed file as a
    *  conflict, and record it again. */
-  private async pinnedFiles(wid: string, revision: number, intent: Entry): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'>> {
+  private async pinnedFiles(wid: string, revision: number, intent: Entry, verify = true): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'>> {
     const dir = revision === 1 ? pinnedDir(this.ledgers.home, wid) : join(pinnedDir(this.ledgers.home, wid), `r${revision}`);
     const ref = intent.pins ? undefined : intent.snapshot as SnapshotRef | undefined;
     if (ref) {
-      const files = await this.recorded(dir, ref.hash).catch(() => undefined);
+      const files = await this.recorded(dir, ref.hash, verify).catch(() => undefined);
       if (files) return files;
     }
     const files = await this.publishPins(wid, revision, await this.pinned(intent));
@@ -299,15 +323,16 @@ export class Store {
     }
     return files;
   }
-  /** The files `pins.json` in `dir` records for snapshot `hash`, when the record and every file verify; else undefined. */
-  private async recorded(dir: string, hash: string): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'> | undefined> {
+  /** The files `pins.json` in `dir` records for snapshot `hash`, when the record and every file verify; else undefined.
+   *  Without `verify`, only the record's form is checked (its digest and the file hashes are left to `ready`). */
+  private async recorded(dir: string, hash: string, verify = true): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'> | undefined> {
     const { digest, ...body } = JSON.parse(await readFile(join(dir, 'pins.json'), 'utf8')) as PinRecord;
     // The digest covers everything the record decides (pins, input names → files, origin, file hashes).
-    if (body.snapshot !== hash || typeof digest !== 'string' || contentHash(body) !== digest) return undefined;
+    if (body.snapshot !== hash || typeof digest !== 'string' || (verify && contentHash(body) !== digest)) return undefined;
     if (!body.pins || typeof body.pins !== 'object' || !body.inputs || typeof body.inputs !== 'object' || !body.files || typeof body.files !== 'object') return undefined;
     const names = publishedFiles(Object.values(body.inputs).map(String), body.origin === true);
     if (names.length !== Object.keys(body.files).length || names.some(name => !Object.hasOwn(body.files, name))) return undefined;
-    for (const name of names) if (body.files[name] !== await fileHash(join(dir, name))) return undefined;
+    if (verify) for (const name of names) if (body.files[name] !== await fileHash(join(dir, name))) return undefined;
     return { pins: body.pins, scriptPath: join(dir, 'script.js'), inputs: Object.fromEntries(Object.entries(body.inputs).map(([name, file]) => [name, join(dir, String(file))])),
       originPath: body.origin === true ? join(dir, 'origin.jsonl') : undefined };
   }
@@ -318,18 +343,41 @@ export class Store {
     const revision = Number(intent.revision), files = await this.pinnedFiles(wf.wid, revision, intent);
     await wf.journal.append('revised', { rid: intent.rid, revision, snapshot: intent.snapshot });
     Object.assign(wf, files, { revision });
+    this.unverified.delete(wf.wid);
   }
+  /** A1: Verify the pinned files of a workflow materialized unverified (a terminal one) before its script, inputs, origin
+   *  or pins are used again: the record's digest and every file's hash, else the snapshot path (which republishes a
+   *  missing file and refuses a changed one). Nothing evaluates from a file that does not hash as recorded. Idempotent;
+   *  a refusal is raised again by every later call. */
+  async ready(wf: Workflow): Promise<void> {
+    if (!this.unverified.has(wf.wid)) return;
+    let run = this.verifying.get(wf.wid);
+    if (!run) {
+      run = (async () => {
+        const pending = this.unverified.get(wf.wid);
+        if (!pending) return;
+        const files = pending.revision === wf.revision ? await this.pinnedFiles(wf.wid, pending.revision, pending.intent) : undefined;
+        if (this.unverified.get(wf.wid) !== pending) return; // A revision published meanwhile was verified by revise.
+        if (files && pending.revision === wf.revision) Object.assign(wf, files);
+        this.unverified.delete(wf.wid);
+      })().finally(() => this.verifying.delete(wf.wid));
+      this.verifying.set(wf.wid, run);
+    }
+    await run;
+  }
+  /** Whether a workflow's pinned files were verified in this process (see ready). */
+  verified(wid: string): boolean { return !this.unverified.has(wid); }
   /** P32: Rebuild a historical ticket from that revision's immutable snapshot. */
   async atRevision(wf: Workflow, revision: number): Promise<Workflow> {
-    if (revision === wf.revision) return wf;
+    if (revision === wf.revision) { await this.ready(wf); return wf; }
     const intent = revision === 1
-      ? this.ledgers.orch.entries().find(e => e.type === 'create-intent' && e.wid === wf.wid)
+      ? this.index().createByWid.get(wf.wid)
       : wf.journal.entries().find(e => e.type === 'revised' && e.revision === revision);
     if (!intent) throw new Error(`Missing pinned revision: ${wf.wid}@${revision}`);
     return { ...wf, revision, ...await this.pinnedFiles(wf.wid, revision, intent) };
   }
   /** A1, housekeeping: Wids with a committed pruned entry; they are gone and never materialize again. */
-  pruned(): Set<string> { return new Set(this.ledgers.orch.entries().filter(e => e.type === 'pruned').map(e => String(e.wid))); }
+  pruned(): ReadonlySet<string> { return this.index().pruned; }
   /** Housekeeping: Bytes a prune of `wid` frees: its workflow directory and the staging dirs of its requests. */
   async footprint(wid: string): Promise<number> {
     let total = await diskUsage(workflowDir(this.ledgers.home, wid));
@@ -337,7 +385,7 @@ export class Store {
     return total;
   }
   private stagedRids(wid: string): string[] {
-    return this.ledgers.orch.entries().filter(e => (e.type === 'create-intent' || e.type === 'revise-intent') && e.wid === wid).map(e => String(e.rid));
+    return [...this.index().rids.get(wid) ?? []];
   }
   /** A1, A2: Retire a pruned workflow's handle after its pruned entry is committed; nothing appends to it again. */
   async drop(wid: string): Promise<void> {
@@ -365,22 +413,36 @@ export class Store {
       try { await this.remove(wid); }
       catch (error) { console.error(`durable-subagents: removal of pruned workflow ${wid} failed, retrying at next start: ${String(error)}`); }
     }
-    for (const intent of this.ledgers.orch.entries().filter(e => e.type === 'create-intent')) if (!pruned.has(String(intent.wid))) await this.materialize(intent);
+    for (const intent of [...this.index().createIntents]) if (!pruned.has(String(intent.wid))) await this.materialize(intent);
   }
+  /** A1: A workflow that already ended (its journal's current revision is terminal) is materialized from its pinned
+   *  files' record without verifying them (see ready): a start does not hash the pinned files of finished history. */
   private async materialize(intent: Entry): Promise<Workflow> {
     const wid = intent.wid as string, existing = this.workflows.get(wid);
     if (existing) return existing;
     if (this.pruned().has(wid)) throw new Error(`Workflow ${wid} was pruned`);
-    const files = await this.pinnedFiles(wid, 1, intent);
-    const journal = await openJournal(journalPath(this.ledgers.home, wid));
+    const path = journalPath(this.ledgers.home, wid);
+    // A new workflow publishes its pins before its journal exists (a failed publication leaves no journal).
+    const fresh = await stat(path).then(() => false, error => { if (error.code === 'ENOENT') return true; throw error; });
+    const first = fresh ? await this.pinnedFiles(wid, 1, intent) : undefined;
+    const journal = await openJournal(path);
+    let wf: Workflow;
+    try {
+      const entries = journal.entries(), revised = entries.findLast(e => e.type === 'revised');
+      const revision = revised ? Number(revised.revision) : 1, current = revised ?? intent;
+      // terminalEntry over the whole journal: a `revised` after the last done supersedes it, as in the revision's view.
+      const ended = !first && entries.length > 0 && terminalEntry(entries) !== undefined;
+      const files = first ?? (ended ? await this.pinnedFiles(wid, revision, current, false) : await this.pinnedFiles(wid, 1, intent));
+      wf = { wid, revision: ended ? revision : 1, origin: intent.origin as string, cwd: intent.cwd as string, journal, ...files };
+      if (ended) this.unverified.set(wid, { revision, intent: current });
+    } catch (error) { await journal.close(); throw error; }
     journal.onAppend = () => this.appended?.(wid);
-    const wf: Workflow = { wid, revision: 1, origin: intent.origin as string, cwd: intent.cwd as string, journal, ...files };
     this.workflows.set(wid, wf);
     if (!journal.entries().length) await journal.append('wf-created', { rid: intent.rid, origin: intent.origin, cwd: intent.cwd, revision: 1,
       ...(intent.name !== undefined ? { name: intent.name } : {}) });
     const revised = journal.entries().findLast(e => e.type === 'revised');
-    if (revised) Object.assign(wf, await this.pinnedFiles(wid, Number(revised.revision), revised), { revision: Number(revised.revision) });
-    if (!this.ledgers.orch.entries().some(e => e.type === JT.created && e.rid === intent.rid)) await this.ledgers.orch.append(JT.created, { rid: intent.rid, wid, origin: intent.origin });
+    if (revised && wf.revision !== Number(revised.revision)) Object.assign(wf, await this.pinnedFiles(wid, Number(revised.revision), revised), { revision: Number(revised.revision) });
+    if (!this.index().created.has(String(intent.rid))) await this.ledgers.orch.append(JT.created, { rid: intent.rid, wid, origin: intent.origin });
     return wf;
   }
   /** A1: Close shared journals only after engine and executor activity retires. */

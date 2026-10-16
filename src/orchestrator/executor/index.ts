@@ -31,7 +31,8 @@ import { SessionFold, answerKey, digestOpenQuestion, supersededBy } from "./dige
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
-import { entriesOf, trackedState, usageIds } from "./indexes.ts";
+import { callEntries, entriesOf, forwardsTo, trackedState, usageIds } from "./indexes.ts";
+import { RECOVERED, RECOVERY_VERSION, completeCalls } from "./recovered.ts";
 import { observeExecution } from "./observe.ts";
 import { availableMemory } from "./memory.ts";
 import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
@@ -55,9 +56,10 @@ const ignoreMissing = (error: NodeJS.ErrnoException) => { if (error.code !== "EN
 const callOf = (exec: string) => exec.slice(0, exec.lastIndexOf("#"));
 const shutdownError = () => Object.assign(new Error("executor shutdown; call resumes on recovery"), { name: "ExecutorShutdown" });
 const extension = fileURLToPath(new URL(`../../agent/extension.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url));
-const entriesFor = (journal: JournalHandle, call: string) => journal.entries().filter(e => e.call === call);
+const entriesFor = callEntries;
 const current = (journal: JournalHandle, call: string) => entriesFor(journal, call).findLast(e => e.type === JT.exec)?.exec as string | undefined;
 const sealed = (journal: JournalHandle, call: string) => entriesFor(journal, call).find(e => e.type === JT.sealed)?.result as CallResult | undefined;
+const retiredCall = (journal: JournalHandle, call: string) => entriesFor(journal, call).some(e => e.type === "retired");
 const has = (journal: JournalHandle, type: string, exec: string) => entriesOf(journal, type, exec).length > 0;
 /** The run of executions of `call` whose launches failed for a reason of the environment, ending at `exec`: its first
  *  execution and the one before it (absent for the call's first). Undefined when `exec` did not fail so. */
@@ -300,6 +302,21 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await rm(join(dir, name), { force: true });
     }
   }
+  /** Sealed or retired calls a batched recovery read, finished by finishRecovery. */
+  const unfinished: { journal: JournalHandle; calls: string[] }[] = [];
+  /** The end of the recovery of sealed or retired calls, after republication: the inbox cleanup of the sealed ones (E2),
+   *  then each call's `recovered` receipt (recovered.ts), once. A failed cleanup records none: the next start recovers
+   *  the call again. */
+  async function finishCalls(journal: JournalHandle, calls: readonly string[]) {
+    for (const call of calls) {
+      // F1: an execution whose fence failed is fenced again by every start (and the sweep) until it is: no receipt yet.
+      let clean = entriesFor(journal, call).every(e => e.type !== JT.exec || has(journal, JT.fenced, String(e.exec)));
+      if (clean && sealed(journal, call)) await collectSealed(call).catch(error => { clean = false; console.error(`durable-subagents: inbox cleanup of ${call} failed: ${String(error)}`); });
+      if (clean) await serial(async () => {
+        if (!journal.closed && !completeCalls(journal, address(call).wid).has(call)) await journal.append(RECOVERED, { call, v: RECOVERY_VERSION });
+      });
+    }
+  }
   /** P7, P27: Record forward-delivered once when a forward's child receipt is first observed; serial sections only. */
   /** The reply to a model send says which model and when it applies (orchestrator ledger `send-note`, once per rid). */
   async function note(rid: string, model: string, effect: string, pool?: string) {
@@ -321,13 +338,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const entries = await readCall(journal, call);
     await forwardsDelivered(journal, call, entries);
     const receipts = new Set(entries.map(receiptId).filter(rid => rid !== undefined));
-    for (const e of journal.entries().filter(e => e.type === "forward" && e.dest === call)) {
-      if (!receipts.has(String(e.rid2)) && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2)) {
+    for (const e of [...forwardsTo(journal, call)]) {
+      if (!receipts.has(String(e.rid2)) && !entriesOf(journal, "forward-retired").some(r => r.rid2 === e.rid2)) {
         // A notify the call never received is not lost: it becomes a pending note (before its forward is retired, so a
         // crash in between finds the forward open again and the note is written once). A withdrawn one is not.
-        const envelope = e.envelope as Envelope, all = journal.entries();
-        const withdrawn = all.some(r => r.type === "forward" && r.dest === call && (r.envelope as Envelope).kind === "withdraw" && ((r.envelope as Envelope).body as { rids?: string[] }).rids?.includes(String(e.rid2)));
-        if (envelope.kind === "notify" && !withdrawn && !all.some(r => r.type === PENDING_NOTE && r.rid === e.rid))
+        const envelope = e.envelope as Envelope;
+        const withdrawn = forwardsTo(journal, call).some(r => (r.envelope as Envelope).kind === "withdraw" && ((r.envelope as Envelope).body as { rids?: string[] }).rids?.includes(String(e.rid2)));
+        if (envelope.kind === "notify" && !withdrawn && !entriesOf(journal, PENDING_NOTE).some(r => r.rid === e.rid))
           await journal.append(PENDING_NOTE, { rid: e.rid, call, key: address(call).key, message: String((envelope.body as { message?: unknown } | undefined)?.message ?? "") });
         // A follow-up the call never took is not lost either: the orchestrator opens the next generation with it (or a
         // later follow-up takes it along). A stop is final and drops it; a withdrawn one is gone.
@@ -1437,30 +1454,36 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         }
       }
     },
-    async recover(wid, journal) {
+    async recover(wid, journal, options = {}) {
       journals.set(wid, journal);
       indexSweep(journal);
-      await serial(() => resolveWorktrees());
+      // Batched (the engine recovers every workflow, then calls finishRecovery): the steps that do not depend on the
+      // workflow run once, in finishRecovery.
+      if (!options.batch) await serial(() => resolveWorktrees());
       await effects.recover(journal);
-      for (const e of journal.entries().filter(e => e.type === JT.exec)) {
+      // A call whose recovery ran to its end before (and that nothing concerned since) is not read again: all its
+      // executions were fenced and released, its session read, its forwards, attention and inbox settled.
+      const complete = completeCalls(journal, wid), execs = entriesOf(journal, JT.exec).filter(e => !complete.has(String(e.call)));
+      for (const e of execs) {
         // F1: an exec whose fence fails stays unfenced and holding; its call parks until a sweep retires it.
         const exec = String(e.exec); if (await fence(journal, exec)) await release(exec);
       }
       // Writers that waited before the restart keep their order while their calls come back.
-      for (const e of journal.entries()) {
+      const waits = entriesOf(journal, "writer-wait");
+      if (waits.length) for (const e of [...waits, ...entriesOf(journal, "writer-acquired"), ...entriesOf(journal, JT.sealed), ...entriesOf(journal, "retired")].sort((x, y) => x.seq - y.seq)) {
         const call = String(e.call);
         if (e.type === "writer-wait" && !writerWaits.has(call)) writerWaits.set(call, { root: String(e.root), since: e.ts, recovered: Date.now() });
         else if (e.type === "writer-acquired" || e.type === JT.sealed || e.type === "retired") { const w = writerWaits.get(call); if (w?.recovered !== undefined) writerWaits.delete(call); }
       }
-      const calls = new Set(journal.entries().filter(e => e.type === JT.exec).map(e => String(e.call)));
+      const calls = new Set(execs.map(e => String(e.call)));
       for (const call of calls) {
         const session = await readCall(journal, call), values = sessionUsage(session, call);
         await serial(async () => {
           await repairConsumedAnswers(journal, call, session);
           await forwardsDelivered(journal, call, session);
-          const recorded = new Set(journal.entries().filter(e => e.type === "usage" && e.call === call).map(e => e.id));
+          const recorded = new Set(entriesFor(journal, call).filter(e => e.type === "usage").map(e => e.id));
           for (const u of values) if (!recorded.has(u.id)) await journal.append("usage", { call, ...u });
-          if (sealed(journal, call) || journal.entries().some(e => e.type === "retired" && e.call === call)) {
+          if (sealed(journal, call) || retiredCall(journal, call)) {
             await retireForwards(journal, call); await retireAttention(journal, call); await unknownAttention(journal, call);
           } else {
             await resolveSuperseded(journal, call);
@@ -1469,10 +1492,31 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         });
         if (!active.has(call)) forgetCall(call);
       }
-      for (const e of journal.entries().filter(e => e.type === "forward" && !journal.entries().some(r => r.type === "forward-retired" && r.rid2 === e.rid2))) await replayForward(e);
-      await (await outbox).republishPending();
-      // E2: republication may restore envelopes of sealed calls; those are resolved by the seal.
-      for (const call of calls) if (sealed(journal, call)) await collectSealed(call).catch(error => console.error(`durable-subagents: inbox cleanup of ${call} failed: ${String(error)}`));
+      const retiredForwards = new Set(entriesOf(journal, "forward-retired").map(r => r.rid2));
+      for (const e of entriesOf(journal, "forward").filter(e => !retiredForwards.has(e.rid2))) await replayForward(e);
+      const ended = [...calls].filter(call => sealed(journal, call) || retiredCall(journal, call));
+      if (options.batch) unfinished.push({ journal, calls: ended });
+      else {
+        await (await outbox).republishPending();
+        await finishCalls(journal, ended);
+      }
+      return { calls: calls.size, skipped: new Set(entriesOf(journal, JT.exec).map(e => String(e.call))).size - calls.size };
+    },
+    async finishRecovery() {
+      const batch = unfinished.splice(0);
+      await serial(() => resolveWorktrees());
+      const sender = await outbox;
+      await sender.republishPending();
+      // E2: republication may restore envelopes of sealed calls, also of calls skipped as complete; the seal resolves them.
+      const destinations = sender.pendingDestinations();
+      if (destinations.size) for (const [wid, journal] of journals) for (const call of completeCalls(journal, wid)) {
+        if (destinations.has(call) && sealed(journal, call)) await collectSealed(call).catch(error => console.error(`durable-subagents: inbox cleanup of ${call} failed: ${String(error)}`));
+      }
+      for (const { journal, calls } of batch) await finishCalls(journal, calls);
+    },
+    recovered(journal, call) {
+      const wid = address(call).wid;
+      return completeCalls(journal, wid).has(call) && ![...folded().writers.values()].some(w => w.call === call);
     },
     async retire(widRev) {
       const journal = journals.get(widRev.slice(0, widRev.lastIndexOf("@"))); if (!journal) return;

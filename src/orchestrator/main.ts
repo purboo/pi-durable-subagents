@@ -60,7 +60,9 @@ export async function main(options: MainOptions = {}): Promise<{ restart?: true 
     // PATH; null when there is none (each launch then runs a bare `pi`, and fails as an environment error until it works).
     const pi = resolvePi(process.env).path ?? resolvePi({ PATH: process.env.PATH }).path;
     if (!pi) console.error('durable-subagents: pi not found (DSA_PI_BIN unset or not executable, not on PATH); subagents launch `pi` from PATH');
-    await ledgers.orch.append('orchestrator', { version: packageVersion(), pid: process.pid, ...(start ? { start } : {}), restart: true, pi: pi ?? null });
+    // `recovery: true` announces the `recovered` entry this pid appends once its recovery ends (none if it fails first).
+    await ledgers.orch.append('orchestrator', { version: packageVersion(), pid: process.pid, ...(start ? { start } : {}), restart: true, pi: pi ?? null, recovery: true });
+    const recoveryStarted = performance.now();
     const factory = options.executor ?? (await import(new URL(import.meta.url.endsWith('.ts') ? './executor/index.ts' : './executor/index.js', import.meta.url).href)).default as NonNullable<MainOptions['executor']>;
     const executor = factory(ledgers, pi ? { pi } : {});
     engine = new Engine(ledgers, executor, options);
@@ -71,7 +73,8 @@ export async function main(options: MainOptions = {}): Promise<{ restart?: true 
       watcher = watchConfig({ path: configPath(home), stamp, config, orch: ledgers.orch, intervalMs: Math.min(1000, config.k?.trackerMs ?? 1000),
         apply: change => executor.reconfigure ? executor.reconfigure(change) : change() });
     }
-    await engine.recover();
+    const recovered = await engine.recover();
+    await ledgers.orch.append('recovered', { pid: process.pid, ms: Math.round(performance.now() - recoveryStarted), ...recovered });
     await engine.loop(options.signal);
     const reason = options.signal?.reason;
     exit = engine.restartRequested ? { reason: 'restart' }
