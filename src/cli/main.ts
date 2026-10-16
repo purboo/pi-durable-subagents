@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { dsaHome } from "../paths.ts";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger } from "../paths.ts";
-import { answerForwardedNote, modelStatusText, allWorkflows, eventsFromEntries, heldWorkflows, isLive, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, type AnswerForwarded, compactWorkflow, labelsText, outputSelect, statusCompactDetail, type StatusCompactDetail } from "../orchestrator/snapshot.ts";
+import { answerForwardedNote, modelStatusText, queuedText, type QueueWait, allWorkflows, eventsFromEntries, heldWorkflows, isLive, formatUsage, renderEvent, statusDetail, statusView, workflowSnapshot, type StatusView, type WorkflowSnapshot, type AnswerForwarded, compactWorkflow, labelsText, outputSelect, statusCompactDetail, type StatusCompactDetail } from "../orchestrator/snapshot.ts";
 import { statsLine } from "../orchestrator/stats.ts";
 import { resolution, start, startOrchestrator, submit, type Control } from "./control.ts";
 import { doctor, renderDoctor, size } from "./doctor.ts";
@@ -75,10 +75,16 @@ export function parseArgs(args: string[]): Arguments {
 const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
 /** Notes recorded for a call that is not running (send kind "notify"); its next follow-up carries them. */
 const notesLine = (n?: number) => n ? ` · ${n} note${n > 1 ? "s" : ""} pending` : "";
-/** An answered asker waiting for a slot; nothing while a drain holds its workflow (it waits for resume, as the UI says). */
-const answeredNote = (c: { phase?: string; answered?: string; answerForwarded?: AnswerForwarded }, paused?: boolean) => {
+/** Why a queued call does not start, when the orchestrator ledger says so (an answered asker: its own note); nothing
+ *  while a drain holds its workflow (it waits for resume, as the UI says). A writer-lock wait has its own suffix. */
+const answeredNote = (c: { phase?: string; answered?: string; answerForwarded?: AnswerForwarded; writerWait?: { root: string }; queuedFor?: QueueWait; queued?: string }, paused?: boolean) => {
   const forwarded = answerForwardedNote(c);
-  return forwarded ? `: ${forwarded}` : c.phase === "queued" && c.answered && !paused ? " (answered, waiting for a slot)" : "";
+  if (forwarded) return `: ${forwarded}`;
+  if (c.phase !== "queued" || paused) return "";
+  const why = c.queued ?? (c.queuedFor ? queuedText(c.queuedFor) : undefined);
+  if (c.writerWait && why === `waiting for the writer lock of ${c.writerWait.root}`) return c.answered ? " (answered)" : ""; // its own suffix says it
+  if (c.answered) return why && !why.startsWith("waiting for a free slot") ? ` (answered): ${why}` : " (answered, waiting for a slot)";
+  return why ? `: ${why}` : "";
 };
 /** P25, T10: Render journal-derived status (one line per call, last output line only) without live orchestrator memory. */
 export function renderStatus(wf: WorkflowSnapshot & { scriptLog?: string }): string {

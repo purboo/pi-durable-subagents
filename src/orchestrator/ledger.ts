@@ -5,8 +5,9 @@
 //   provider-*: used-up usage windows (providers.ts).
 //   config{hash,config}: the orchestrator settings in effect from here; config-rejected{error,hash?}: a change of
 //     config.json refused, while the earlier settings stay (cleared by the next config record).
-//   orchestrator{version,pid,pi?} / orchestrator-exit{pid,reason?,signal?,error?}: the orchestrator running (its package
-//     version, the pi it launches) and its exit (why: idle, restart, signal, error).
+//   orchestrator{version,pid,pi?,recovery?} / orchestrator-exit{pid,reason?,signal?,error?}: the orchestrator running (its
+//     package version, the pi it launches) and its exit (why: idle, restart, signal, error). `recovery`: it recovers the
+//     home's workflows before it dispatches anything, until its recovered{pid,ms,workflows,calls,skipped}.
 //   restart{rid,force,reason?,initiator?,from?,live}: accepted restart; the next start consumes its status provenance.
 //     Old records lack reason/initiator/from and remain readable (A1).
 //   writer-hold/writer-release{root,call}: the writer lock of a worktree root, held by one call until it ends.
@@ -29,7 +30,9 @@ export interface LedgerState {
   rejected?: { error: string; ts: number };
   /** `restart`: it decides restart requests (1.0.18+); an older one is checked and ended by the client instead. */
   pendingRestart?: RestartAudit;
-  orchestrator?: { version: string; pid: number; start?: string; ts: number; exited?: true; restart?: true; forceRestart?: RestartAudit; pi?: string | null };
+  orchestrator?: { version: string; pid: number; start?: string; ts: number; exited?: true; restart?: true; forceRestart?: RestartAudit; pi?: string | null;
+    /** It recovers workflows before dispatching (its start entry says so); `recovered`: when that ended. */
+    recovery?: true; recovered?: { ts: number; ms: number } };
   /** The last recorded exit of an orchestrator, and why (absent in ledgers older than exit reasons). */
   lastExit?: { pid: number; ts: number; reason: string; signal?: string; error?: string };
 }
@@ -48,9 +51,10 @@ export function applyLedger(state: LedgerState, e: Entry): void {
   else if (isEntry(e, "config-rejected")) state.rejected = { error: String(e.error), ts: e.ts };
   else if (e.type === "restart") state.pendingRestart = e.force === true ? { ts: e.ts, reason: e.reason as string | undefined, initiator: e.initiator as RestartInitiator | undefined, from: e.from as string | undefined } : undefined;
   else if (isEntry(e, "orchestrator")) {
-    state.orchestrator = { version: String(e.version), pid: Number(e.pid), ...(e.start ? { start: String(e.start) } : {}), ts: e.ts, ...(e.pi !== undefined ? { pi: e.pi } : {}), ...(e.restart === true ? { restart: true as const } : {}), ...(state.pendingRestart ? { forceRestart: state.pendingRestart } : {}) };
+    state.orchestrator = { version: String(e.version), pid: Number(e.pid), ...(e.start ? { start: String(e.start) } : {}), ts: e.ts, ...(e.pi !== undefined ? { pi: e.pi } : {}), ...(e.restart === true ? { restart: true as const } : {}), ...(e.recovery === true ? { recovery: true as const } : {}), ...(state.pendingRestart ? { forceRestart: state.pendingRestart } : {}) };
     delete state.pendingRestart;
   }
+  else if (isEntry(e, "recovered")) { if (state.orchestrator && state.orchestrator.pid === Number(e.pid)) state.orchestrator.recovered = { ts: e.ts, ms: Number(e.ms) }; }
   else if (e.type === "writer-hold") { if (!state.writers.has(String(e.root))) state.writers.set(String(e.root), { call: String(e.call), ts: e.ts }); }
   else if (e.type === "writer-release") { if (state.writers.get(String(e.root))?.call === e.call) state.writers.delete(String(e.root)); }
   else if (isEntry(e, "orchestrator-exit")) {
