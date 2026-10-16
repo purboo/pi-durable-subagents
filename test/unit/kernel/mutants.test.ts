@@ -26,7 +26,8 @@ test('actual V1–V8 removed-predicate source mutants each fail the guard suite'
       const lifecycleSuite = await readFile(new URL('./lifecycle.test.ts', import.meta.url), 'utf8');
       const lifecyclePath = join(dir, 'lifecycle.ts'), lifecycleTestPath = join(dir, 'lifecycle.test.ts');
       const idsPath = fileURLToPath(new URL('../../../src/kernel/ids.ts', import.meta.url));
-      await writeFile(lifecyclePath, lifecycle.replace('./guards.ts', mutant).replace('./ids.ts', idsPath));
+      const overlayPath = fileURLToPath(new URL('../../../src/kernel/overlay.ts', import.meta.url));
+      await writeFile(lifecyclePath, lifecycle.replace('./guards.ts', mutant).replace('./ids.ts', idsPath).replace('./overlay.ts', overlayPath));
       await writeFile(lifecycleTestPath, lifecycleSuite.replaceAll('../../../src/kernel/lifecycle.ts', lifecyclePath));
       const integration = spawnSync(process.execPath, ['--test', '--test-name-pattern=V5 withdrawal', lifecycleTestPath], { env, encoding: 'utf8', timeout: 10000 });
       assert.equal(integration.status, 1, `V5 lifecycle mutant must fail: ${integration.stderr}`);
