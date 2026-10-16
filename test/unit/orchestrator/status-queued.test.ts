@@ -35,13 +35,13 @@ test("answered but queued: snapshots, brief, CLI and UI stop asking before resum
   const brief = statusBrief(home).active[0]!;
   assert.equal(brief.calls[0]!.phase, "queued"); assert.equal(brief.calls[0]!.answered, "q1"); assert.equal(brief.calls[0]!.hibernated, true);
   assert.equal(brief.asking, undefined);
-  assert.equal(statusPhrase(c, snap, undefined, 2000), "queued (answered, waiting for a slot)");
+  assert.equal(statusPhrase(c, snap, undefined, 2000), "queued (answered)", "no slot evidence: no slot claim");
   assert.equal(summary([snap]).asking, 0); assert.equal(summary([snap]).queued, 1);
-  assert.match(dockLines([snap], new Map(), () => "M", 120, 2000).join("\n"), /queued \(answered, waiting for a slot\)/);
-  assert.match(resultLines({ wid, ...c })[0]!, /queued \(answered, waiting for a slot\)/);
+  assert.match(dockLines([snap], new Map(), () => "M", 120, 2000).join("\n"), /queued \(answered\)/);
+  assert.equal(resultLines({ wid, ...c })[0]!, "a · queued (answered) · p/m");
   const lines: string[] = [];
   assert.equal(await main(["status", wid], { env: { DSA_HOME: home }, write: line => lines.push(line) }), 0);
-  assert.match(lines.join("\n"), /queued \(answered, waiting for a slot\)/);
+  assert.match(lines.join("\n"), /a@1 queued \(answered\) p\/m/);
   await journal.append("exec", { call, exec: `${call}#1.2` });
   const queued = workflowSnapshot(home, wid).calls[0]!;
   assert.equal(queued.phase, "queued"); assert.equal(queued.answered, "q1"); assert.equal(queued.hibernated, true);
@@ -113,6 +113,9 @@ test("a drained (paused) answered call is not shown or counted as waiting for a 
   const journal = await openJournal(journalPath(home, wid)), orch = await openJournal(orchLedger(home));
   t.after(async () => { await journal.close(); await orch.close(); });
   await orch.append("created", { wid, rid: "run", origin: "main:test" });
+  // Slot evidence: p's only slot is held by another call.
+  await orch.append("config", { hash: "h", config: { providers: { p: { slots: 1 } } } });
+  await orch.append("hold", { pool: "p", slot: 0, exec: "other#1.1" });
   for (const { seq: _s, ts: _t, type, ...fields } of bound) await journal.append(type, fields);
   const status = async (...args: string[]) => {
     const lines: string[] = [];
@@ -122,12 +125,12 @@ test("a drained (paused) answered call is not shown or counted as waiting for a 
   const ledger = foldLedger(emptyLedger(), [entry(1, "config", { hash: "h", config: { providers: { p: { slots: 1 } } } }), entry(2, "hold", { pool: "p", exec: "other#1.1", slot: 0 })]);
   const waits = (held?: (w: string) => boolean) => waitsOf(foldWaits(wid, bound), { now: 9000, ledger, ...(held ? { held } : {}) }).get(call)?.reason;
   // Not drained: the note and the slot wait.
-  for (const args of [[wid], [], [wid, "--tail", "1"]]) assert.match(await status(...args), /queued \(answered, waiting for a slot\)/, args.join(" "));
+  for (const args of [[wid], [], [wid, "--tail", "1"]]) assert.match(await status(...args), /queued \(answered\): waiting for a free slot \(p 1\/1\)/, args.join(" "));
   assert.equal(waits(), "slot");
   await orch.append("drain", {});
   for (const args of [[wid], [], [wid, "--tail", "1"]]) {
     const text = await status(...args);
-    assert.match(text, /a@1 queued/, args.join(" ")); assert.doesNotMatch(text, /answered, waiting for a slot/, args.join(" "));
+    assert.match(text, /a@1 queued/, args.join(" ")); assert.doesNotMatch(text, /\(answered|free slot/, args.join(" "));
   }
   assert.equal(waits(() => true), undefined, "a drained answered call waits for resume, not for a slot");
 });

@@ -59,10 +59,10 @@ test("answered calls render as queued in list and watch without an answer action
   ] as const;
   data.workflows = [snapshotFromEntries("w", rows.map(([type, fields], i) => ({ seq: i + 1, ts: now + i, type, ...fields })) as never)];
   data.sessions.clear(); data.facts.clear();
-  assert.match(plain(screen, 120), /queued \(answered, waiting for a slot\)/);
+  assert.match(plain(screen, 120), /queued \(answered\)/);
   assert.doesNotMatch(plain(screen, 120), /asking|a answer|Choose\?/);
   screen.handleInput("\r");
-  assert.match(plain(screen, 120), /queued \(answered, waiting for a slot\)/);
+  assert.match(plain(screen, 120), /queued \(answered\)/);
   assert.doesNotMatch(plain(screen, 120), /a answer|Choose\?/);
 });
 

@@ -81,7 +81,8 @@ test("view phrases: starting, recorded reasons, answered, paused and plain queue
   assert.equal(phrase({ queuedFor: { reason: "slot", detail: "waiting for a free slot (p 2/2)" } }), "queued: waiting for a free slot (p 2/2)");
   assert.equal(phrase({ queuedFor: { reason: "provider-exhausted", detail: "p usage window used up" } }), "queued: p usage window used up");
   assert.equal(phrase({}), "queued");
-  assert.equal(phrase({ answered: "q1" }), "queued (answered, waiting for a slot)");
+  assert.equal(phrase({ answered: "q1" }), "queued (answered)", "no slot claim without evidence");
+  assert.equal(phrase({ answered: "q1", queuedFor: { reason: "slot", detail: "waiting for a free slot (p 2/2)" } }), "queued (answered): waiting for a free slot (p 2/2)");
   assert.equal(queuedPhrase({ answered: "q1", queuedFor: { reason: "writer-lock", detail: "waiting for the writer lock of /repo" } }, NOW), "queued (answered): waiting for the writer lock of /repo");
   // The summary line (dock and footer) says it once.
   const a = queued({ queuedFor: starting }), b = queued({ key: "b", callId: "w@1/b@1", queuedFor: starting }), w = wf(a, { calls: [a, b], counts: { queued: 2, running: 0, asking: 0, sealed: 0 } });
