@@ -78,6 +78,9 @@ async function home(t: test.TestContext) {
 test('a settled workflow is written a record and opens lazily at the next start; status reads it from disk as before', async t => {
   const f = await home(t), a = await f.boot(), w = await f.finished(a);
   assert.ok(existsSync(settledPath(f.dir, w.wid)), 'recorded when the workflow settled');
+  const done = readCache(settledPath(f.dir, w.wid))!.done as Record<string, unknown>;
+  assert.deepEqual(Object.keys(done).sort(), ['seq', 'status', 'ts', 'type'], 'the end without its result');
+  assert.ok(w.journal.entries().find(e => e.type === JT.done)!.result !== undefined);
   const before = workflowSnapshot(f.dir, w.wid);
   const b = await f.boot(), lazy = f.wf(b, w.wid);
   assert.equal(lazy.journal.loaded, false);
