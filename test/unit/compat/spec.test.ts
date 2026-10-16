@@ -42,3 +42,21 @@ test("T2: every rule reports its exact message", () => {
   assert.deepEqual(check({ key: "" }, true), ["key must be a non-empty string"]);
   assert.deepEqual(check({ key: 3 }, true), ["key must be a non-empty string"]);
 });
+
+test("command call: argv or sh string with cwd, timeoutMs, env, rerun, writer and key only", () => {
+  assert.deepEqual(validateCallSpec({ command: ["sleep", "1"] }), []);
+  assert.deepEqual(validateCallSpec({ command: "sleep 1; exit 3", cwd: "/tmp", timeoutMs: 5, env: { A_B: "x" }, rerun: true, writer: false }), []);
+  assert.deepEqual(validateCallSpec({ command: "true", key: "w" }, { fanout: true }), []);
+  assert.deepEqual(validateCallSpec({ command: "true", agent: "a", task: "t", model: "m", once: true }), [
+    "agent is not allowed in a command call", "task is not allowed in a command call", "model is not allowed in a command call", "once is not allowed in a command call"]);
+  assert.match(validateCallSpec({ command: [] })[0]!, /^command must be a non-empty string or an array of strings/);
+  assert.match(validateCallSpec({ command: ["", "x"] })[0]!, /^command must be/);
+  assert.match(validateCallSpec({ command: "  " })[0]!, /^command must be/);
+  assert.deepEqual(validateCallSpec({ command: "true", env: { DSA_EXEC: "x", "1x": "y", OK: 2 } }), [
+    "env name DSA_EXEC is reserved (DSA_*)", 'env name "1x" is not a valid variable name', "env.OK must be a string (got 2)"]);
+  assert.deepEqual(validateCallSpec({ command: "true", rerun: "yes", timeoutMs: 0 }), [
+    "timeoutMs must be a positive number (milliseconds) (got 0)", 'rerun must be a boolean (got "yes")']);
+  assert.deepEqual(validateCallSpec({ command: "true", bogus: 1 }), ['unknown field "bogus"']);
+  assert.deepEqual(validateCallSpec({ agent: "a", task: "t", env: { A: "b" }, rerun: true }), [
+    "env is only allowed in a command call", "rerun is only allowed in a command call"]);
+});

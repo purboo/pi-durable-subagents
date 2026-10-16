@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { readJournalFold } from "../../kernel/journal.ts";
 import { generationRids } from "../../orchestrator/notes.ts";
 import { journalPath } from "../../paths.ts";
-import type { CallSpec, Conditions, Entry, RequestKind, RunBody } from "../../types.ts";
+import { isCommandCall, type CallSpec, type Conditions, type Entry, type RequestKind, type RunBody } from "../../types.ts";
 import { validateCallSpec } from "../../compat/spec.ts";
 import { compileFanout } from "../../compat/fanout.ts";
 import { checkLabels } from "../../events/labels.ts";
@@ -28,7 +28,8 @@ function call(value: unknown, cwd: string, where: string): CallSpec {
 /** v12 §2: Reject unknown explicit call agents before starter or outbox publication; scripts remain call-local. Shared by
  *  the tool and the CLI `run --request`. */
 export function checkAgents(body: RunBody, available: () => string[]): void {
-  const names = [...(body.call ? [body.call] : []), ...(body.tasks ?? []), ...(body.chain ?? [])].map(call => call.agent);
+  // A command call names no agent.
+  const names = [...(body.call ? [body.call] : []), ...(body.tasks ?? []), ...(body.chain ?? [])].filter(call => !isCommandCall(call)).map(call => call.agent);
   if (!names.length) return;
   const known = available(), unknown = [...new Set(names.filter(name => !known.includes(name)))];
   if (unknown.length) throw new Error(`Unknown agent${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. Available agents: ${known.join(", ") || "(none)"}`);

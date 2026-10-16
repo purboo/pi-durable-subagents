@@ -291,8 +291,19 @@ export interface AttentionItem {
 // ---------------------------------------------------------------------------
 
 export interface CallSpec {
+  /** Agent calls only; absent in a command call (see isCommandCall). */
   agent: string;
+  /** Agent calls only; absent in a command call (see isCommandCall). */
   task: string;
+  /** Command call: run this instead of an agent, without a model. An argv array is executed directly; a string runs
+   *  through `/bin/sh -c`. A command call has no agent, task, model, tools, skills, schema, gate, output, isolation,
+   *  context, budget or once; it takes cwd, timeoutMs (wall-clock from the start of the command), env, rerun, writer. */
+  command?: string | string[];
+  /** Command calls only: variables added to the orchestrator's environment (names starting with DSA_ are reserved). */
+  env?: Record<string, string>;
+  /** Command calls only: when the process is gone without an exit record (a machine restart), start it once more
+   *  instead of sealing `unknown`. For idempotent commands such as waits. */
+  rerun?: boolean;
   /** "provider/id[:thinking]" or a pool name. */
   model?: string;
   cwd?: string;
@@ -314,6 +325,9 @@ export interface CallSpec {
    *  tools do). One writer per worktree runs at a time; false opts out (e.g. a reviewer writing its report elsewhere). */
   writer?: boolean;
 }
+
+/** A command call (CallSpec.command): no agent, task or model at runtime even though the type declares them. */
+export const isCommandCall = (spec: Pick<CallSpec, "command"> | undefined): boolean => spec?.command !== undefined;
 
 export type CallStatus =
   | "ok" | "failed" | "stopped" | "timeout" | "budget" | "unknown" | "gate-failed" | "skipped" | "parked";
