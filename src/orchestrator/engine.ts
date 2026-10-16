@@ -485,6 +485,8 @@ export class Engine {
       const target = this.findCall((req.body as SendBody)?.to, true);
       if (!target) return { action: 'reject', reason: this.unknownCall((req.body as SendBody)?.to) };
       const { wf, entry } = target, send = req.body as SendBody;
+      // A command call runs a process, not an agent: nothing receives a message or switches a model (stop ends it).
+      if (isCommandCall(entry.spec as CallSpec | undefined)) return { action: 'reject', reason: `command call: ${String(send.kind)} is not supported (stop it, or start a new call)` };
       const from = `${wf.wid}@${wf.revision}/${entry.key}@${entry.gen}`;
       const seal = wf.journal.entries().find(e => e.type === JT.sealed && e.call === from);
       if (seal && send.kind === 'steer') return { action: 'reject', reason: `finished:${(seal.result as CallResult).status} — use kind "follow-up" to continue it` };
