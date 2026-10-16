@@ -8,17 +8,17 @@ import { findJournalEntry, readJournalFold, readJournalSnapshot, type JournalFol
 import { isResolution, lifecycleResolution } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
-import { NOTIFY_SINCE, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, HOLD_ENTRY_TYPES, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { JT, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
 import { startOrchestrator, submitIdentified } from "./control.ts";
-import { endedExecs, fenceReason } from "../events/fence.ts";
+import { FENCE_LEDGER_TYPES, endedExecs, fenceReason } from "../events/fence.ts";
 import { parseLabels } from "../events/labels.ts";
 import { foldWaits, leaseWaits, waitsOf } from "../events/waiting.ts";
 import type { WaitReason } from "../events/types.ts";
-import { emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
+import { LEDGER_ENTRY_TYPES, emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
 
 export const EXIT = { ok: 0, rejected: 1, conflict: 3, pending: 75 } as const;
 export interface Context { home: string; env: NodeJS.ProcessEnv; write: (line: string) => void; starter?: typeof startOrchestrator; waitMs?: number; cwd?: string; stdin?: () => Promise<string> }
@@ -52,9 +52,8 @@ function ledger(home: string, needles: readonly string[]): Entry[] {
   return readJournalFold(orchLedger(home), undefined, () => [] as Entry[], (entries, entry) => { entries.push(entry); }, { needles })?.state ?? [];
 }
 // Shared state consulted by describe's waits/holds/fence readers; workflow/request facts also match their identity.
-const descriptionNeedles = ['created', 'pruned', 'drain', 'undrain', 'hold', 'release', 'switch-observed', 'skip', 'writer-hold',
-  'writer-release', 'config', 'config-rejected', 'restart', 'orchestrator', 'orchestrator-exit', 'recovered',
-  'provider-exhausted', 'provider-available', 'provider-probe'].map(type => `"type":${JSON.stringify(type)}`);
+export const descriptionNeedles = [...new Set(['pruned', ...HOLD_ENTRY_TYPES, ...LEDGER_ENTRY_TYPES, ...FENCE_LEDGER_TYPES])]
+  .map(type => `"type":${JSON.stringify(type)}`);
 function decision(entries: readonly Entry[], rid: string) {
   return lifecycleResolution(entries, rid);
 }
