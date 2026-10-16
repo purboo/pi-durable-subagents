@@ -263,3 +263,41 @@ test("command call: a revision retires it and ends its process tree", { timeout:
   assert.ok(s.journal(wid).some(e => e.type === "retired" && e.call === first.call));
   assert.ok(!s.journal(wid).some(e => e.type === JT.sealed && e.call === first.call));
 });
+
+test("command call integration: a tool-built chain runs command steps, status and describe show the real records, sends are refused, an agent step gets {previous}", { timeout: 60_000 }, async t => {
+  const { request } = await import("../../../src/agent/main/tool.ts");
+  const { statusView } = await import("../../../src/orchestrator/snapshot.ts");
+  const { describe, renderDescription } = await import("../../../src/cli/requests.ts");
+  const s = await stack(t);
+  const gate = join(s.root, "go");
+  const { body } = request({ chain: [
+    { key: "wait", command: `while [ ! -e ${gate} ]; do sleep 0.1; done; echo first-{previous}` },
+    { key: "second", command: ["sh", "-c", "echo second-{previous}"] },
+    { key: "agent", agent: "worker", task: "summarize: {previous}" },
+  ], timeoutMs: 30_000 }, s.cwd);
+  const wid = await s.run(body as Record<string, unknown>);
+  const first = await s.started(wid);
+  // status and describe of the running command call, from the records the executor wrote.
+  const running = await s.until(() => statusView(s.home).workflows?.find(w => w.wid === wid)?.calls?.find(c => c.key === "wait" && c.pid !== undefined), "status pid");
+  assert.equal(running.pid, Number(first.pid));
+  assert.match(String(running.command), /^while \[ ! -e /);
+  assert.equal(running.model, undefined);
+  const text = renderDescription(await describe(s.home, { wid }));
+  assert.match(text, new RegExp(`pid ${String(first.pid)}`));
+  assert.match(text, /output\.log/);
+  // Controls other than stop are refused for a command call, with the pinned reason.
+  for (const kind of ["steer", "follow-up"] as const) {
+    const req = await s.send("send", { to: `${wid}/wait`, kind, message: "x" });
+    const decided = await s.until(() => s.ledger().find(e => (e.type === "rejected" || e.type === "applied" || e.type === "decision") && e.rid === req.rid), `decision ${kind}`);
+    assert.match(JSON.stringify(decided), new RegExp(`command call: ${kind} is not supported \\(stop it, or start a new call\\)`), JSON.stringify(decided));
+  }
+  await import("node:fs/promises").then(fs => fs.writeFile(gate, ""));
+  const one = await s.sealed(wid, "wait"), two = await s.sealed(wid, "second");
+  assert.equal(one.status, "ok"); assert.match(one.output, /^first-\{previous\}\n?$/, "no substitution in a command");
+  assert.equal(two.status, "ok"); assert.match(two.output, /^second-\{previous\}\n?$/);
+  // The agent step was planned with the command's output in its task (pi is /bin/false, so the step itself fails).
+  const agentCall = await s.until(() => s.journal(wid).find(e => e.type === "call" && e.key === "agent"), "agent step planned");
+  assert.match(String((agentCall.spec as { task: string }).task), /^summarize: second-\{previous\}/);
+  const done = statusView(s.home).workflows?.find(w => w.wid === wid)?.calls?.find(c => c.key === "second");
+  assert.equal(done?.pid, undefined, "no pid after the seal");
+});
