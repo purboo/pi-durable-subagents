@@ -1,6 +1,14 @@
 // Command calls: the workflow journal records the executor writes for them (documented in index.ts) and the questions
 // the engine and recovery ask of them. Pure functions of the journal's entries.
+import { delimiter } from "node:path";
+import { binDir } from "../../paths.ts";
 import { JT, type Entry } from "../../types.ts";
+
+/** EX3: Custom/inherited tools win; the orchestrator's shim is the last PATH entry, never an empty entry. */
+export function commandEnvironment(home: string, id: string, call: string, env?: Record<string, string>): NodeJS.ProcessEnv {
+  const bin = binDir(home), PATH = [...(env?.PATH ?? process.env.PATH ?? "").split(delimiter).filter(p => p && p !== bin), bin].join(delimiter);
+  return { ...process.env, ...env, PATH, DSA_EXEC: id, DSA_CALL: call, DSA_HOME: home };
+}
 
 export const COMMAND_INTENT = "command-intent";
 export const COMMAND_STARTED = "command-started";

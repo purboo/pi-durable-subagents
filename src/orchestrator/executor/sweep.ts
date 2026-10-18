@@ -5,6 +5,7 @@ import { JT, attentionEntries, isEntry } from "../../types.ts";
 import { Containment as PlatformContainment } from "../../platform/containment.ts";
 import { ProcessTable } from "../../platform/proctable.ts";
 import type { Model } from "../../compat/model.ts";
+import { fenceAgent } from "./ended.ts";
 
 /** C2, F4: Real observers share snapshots; injected tables retain serialized access. */
 export function serialContainment(table?: Pick<ProcessTable, "list">): PlatformContainment {
@@ -141,7 +142,10 @@ export async function sweepExecutions(journals: Iterable<JournalHandle>, contain
   const live = await containment.scan(new Map(targets.map(t => [t.exec, t.tracked])));
   for (const t of targets) {
     if (t.fenced && !live.get(t.exec)?.length) { if (t.failed) await hooks.fenced?.(t.journal, t.exec, t.call, true); continue; }
-    try { await containment.fence(t.exec, t.tracked); }
+    try {
+      if (t.exec.startsWith("gate:")) await containment.fence(t.exec, t.tracked);
+      else await fenceAgent(containment, t.journal, t.exec, t.tracked);
+    }
     catch (error) { await hooks.failed?.(t.journal, t.exec, t.call, error); continue; }
     await hooks.fenced?.(t.journal, t.exec, t.call, t.fenced);
   }
