@@ -53,7 +53,7 @@ export const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
  *  nor is body.session (which pi session shows the run): a retry from another session is the same request. */
 export function specDigest(req: Pick<Request, 'kind' | 'body' | 'cond'>): string {
   let body = req.body;
-  if (req.kind === 'run' && body && typeof body === 'object' && !Array.isArray(body)) { const { origin: _, session: _s, ...rest } = body as Record<string, unknown>; body = rest; }
+  if (req.kind === 'run' && body && typeof body === 'object' && !Array.isArray(body)) { const { origin: _, session: _s, caller: _c, ...rest } = body as Record<string, unknown>; body = rest; }
   if (req.kind === 'send' && body && typeof body === 'object' && !Array.isArray(body)) { const { caller: _, ...rest } = body as Record<string, unknown>; body = rest; }
   return contentHash({ kind: req.kind, body, cond: req.cond });
 }

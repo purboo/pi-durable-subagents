@@ -1,7 +1,7 @@
 // Pi-side ledger state: only projections used by readers, never decoded ledger history or run bodies.
 import { forgetJournalSnapshot, readJournalFold, type JournalFold } from "../kernel/journal.ts";
-import { orchLedger } from "../paths.ts";
-import { JT, type Entry } from "../types.ts";
+import { orchLedger, journalPath } from "../paths.ts";
+import { JT, type Entry, type Request, type RunBody } from "../types.ts";
 import { LEDGER_ENTRY_TYPES, applyLedger, emptyLedger, type LedgerState } from "./ledger.ts";
 import { labelsOf } from "../events/derive.ts";
 
@@ -23,14 +23,17 @@ export interface ReaderLedger {
   /** UI controls consume the first resolution, including an identity-conflict refusal. */
   resolutions: Map<string, { seq: number; type: "applied" | "rejected"; reason?: string }>;
   sendNotes: Map<unknown, Entry>;
+  /** Admission-ordered wake runs, indexed by caller address; no unrelated workflow journal is read. */
+  wakeRuns: Map<string, { rid: string; to: string; caller: string; admitted?: true }>;
+  wakeByTo: Map<string, string[]>;
 }
 export function emptyReaderLedger(): ReaderLedger {
   return { created: new Map(), origins: new Map(), intents: new Map(), revisions: new Map(), pruned: new Set(), labels: new Map(), runLabels: new Map(), sessions: new Map(), runSessions: new Map(),
-    byWid: new Map(), byOrigin: new Map(), state: emptyLedger(), createdRids: new Map(), decisions: new Map(), resolutions: new Map(), sendNotes: new Map() };
+    byWid: new Map(), byOrigin: new Map(), state: emptyLedger(), createdRids: new Map(), decisions: new Map(), resolutions: new Map(), sendNotes: new Map(), wakeRuns: new Map(), wakeByTo: new Map() };
 }
 /** Reader-only projections, combined with applyLedger's type list by the byte filter. */
 export const READER_ENTRY_TYPES = [JT.created, 'create-intent', 'revise-intent', 'request', 'pruned', 'drain', 'undrain',
-  JT.applied, JT.rejected, 'send-note'] as const;
+  JT.admitted, JT.applied, JT.rejected, 'send-note'] as const;
 const discardedLedgerTypes: readonly string[] = ['switch-observed', 'skip', 'writer-hold', 'writer-release'];
 export function applyReaderLedger(ix: ReaderLedger, e: Entry): void {
   if (e.type === JT.created) {
@@ -47,10 +50,20 @@ export function applyReaderLedger(ix: ReaderLedger, e: Entry): void {
     if (Number.isFinite(revision)) ix.revisions.set(wid, Math.max(revision, ix.revisions.get(wid) ?? 0));
   } else if (e.type === "request") {
     const r = e.request as { rid?: unknown; kind?: unknown; body?: unknown } | undefined;
+    const body = r?.kind === 'run' ? r.body as RunBody | undefined : undefined;
+    if (body?.wake && typeof body.wake.to === 'string' && typeof body.caller === 'string' && typeof r?.rid === 'string' && !ix.wakeRuns.has(r.rid)) {
+      ix.wakeRuns.set(r.rid, { rid: r.rid, to: body.wake.to, caller: body.caller });
+    }
     const labels = r?.kind === "run" ? labelsOf(r.body) : undefined;
     if (labels && typeof r?.rid === "string") ix.runLabels.set(r.rid, labels);
     const session = r?.kind === "run" ? (r.body as { session?: unknown } | null)?.session : undefined;
     if (typeof session === "string" && session && typeof r?.rid === "string") ix.runSessions.set(r.rid, session);
+  } else if (e.type === JT.admitted && e.kind === 'run') {
+    const run = ix.wakeRuns.get(String(e.rid));
+    if (run && !run.admitted) {
+      run.admitted = true;
+      const list = ix.wakeByTo.get(run.to) ?? []; list.push(run.rid); ix.wakeByTo.set(run.to, list);
+    }
   } else if (e.type === "pruned") {
     ix.pruned.add(String(e.wid)); ix.labels.delete(String(e.wid)); ix.sessions.delete(String(e.wid));
   } else if (e.type === "drain" || e.type === "undrain") {
@@ -81,9 +94,9 @@ export function readerHold(ix: ReaderLedger, wid: string, origin?: string): Drai
 }
 const readers = new Map<string, JournalFold<ReaderLedger>>();
 // Canonical writer JSON: these are exactly the types that affect reader projections or applyLedger below.
-const needles = [...new Set([...READER_ENTRY_TYPES.filter(type => type !== 'request'),
+const needles = [...new Set([...READER_ENTRY_TYPES.filter(type => type !== 'request' && type !== JT.admitted),
   ...LEDGER_ENTRY_TYPES.filter(type => !discardedLedgerTypes.includes(type))])].map(type => `"type":${JSON.stringify(type)}`);
-// Request records only affect labels/session for runs; the other request kinds have no reader projection.
+// Run requests and run admissions affect labels/session and caller wake routing; other request kinds have no projection.
 needles.push('"kind":"run"');
 export function readerLedger(home: string): JournalFold<ReaderLedger> {
   const path = orchLedger(home);
@@ -95,5 +108,41 @@ export function readerLedger(home: string): JournalFold<ReaderLedger> {
     readers.delete(path);
     return { dev: 0, ino: 0, size: 0, length: 0, seen: 0, state: emptyReaderLedger() };
   } catch (error) { readers.delete(path); throw error; } // a partial fold is never retried as an accepted prefix
+}
+export interface WakeStatus { to: string; state: 'pending' | 'applied' | 'skipped' | 'rejected'; rev?: number; generation?: number; reason?: string }
+export interface AwaitingRun { request: string; wid?: string; state: 'pending' | 'running' | 'finished' }
+type WakeFold = { rev: number; outcome?: Omit<WakeStatus, 'to'> };
+const wakeReaders = new Map<string, JournalFold<WakeFold>>();
+/** Only matching wake runs are read, incrementally, with a byte filter for completion and wake receipts. */
+function wakeFacts(home: string, wid: string): WakeFold {
+  const path = journalPath(home, wid);
+  try {
+    const record = readJournalFold<WakeFold>(path, wakeReaders.get(path), () => ({ rev: 0 }), (state, e) => {
+      if (e.type === JT.done) state.rev++;
+      if (e.type === 'wake-outcome') state.outcome = { state: e.state as WakeStatus['state'], rev: Number(e.rev),
+        ...(typeof e.generation === 'number' ? { generation: e.generation } : {}), ...(typeof e.reason === 'string' ? { reason: e.reason } : {}) };
+    }, { needles: ['"type":"workflow-done"', '"type":"wake-outcome"'] });
+    if (record) { wakeReaders.set(path, record); return record.state; }
+    wakeReaders.delete(path); return { rev: 0 };
+  } catch (error) { wakeReaders.delete(path); throw error; }
+}
+export function wakeStatus(home: string, request: Request | undefined, wid?: string): WakeStatus | undefined {
+  const body = request?.kind === 'run' ? request.body as RunBody : undefined;
+  if (!body?.wake) return undefined;
+  const facts = wid ? wakeFacts(home, wid) : { rev: 0 } as WakeFold;
+  return { to: body.wake.to, ...(facts.outcome && facts.outcome.rev === facts.rev ? facts.outcome : { state: 'pending' as const }) };
+}
+export function awaitingRuns(home: string, wid: string, key: string, revision: number): AwaitingRun[] | undefined {
+  const ix = readerLedger(home).state, out: AwaitingRun[] = [];
+  for (const rid of ix.wakeByTo.get(`${wid}/${key}`) ?? []) {
+    const run = ix.wakeRuns.get(rid)!;
+    if (run.caller.slice(0, run.caller.indexOf('/')) !== `${wid}@${revision}` || ix.decisions.get(rid)?.type === 'rejected') continue;
+    const created = ix.createdRids.get(rid), child = created ? String(created.wid) : undefined;
+    if (child && ix.pruned.has(child)) continue;
+    const facts = child ? wakeFacts(home, child) : undefined;
+    if (facts?.rev && facts.outcome?.rev === facts.rev) continue;
+    out.push({ request: rid.startsWith('req:') ? rid.slice(4) : rid, ...(child ? { wid: child } : {}), state: !child ? 'pending' : facts?.rev ? 'finished' : 'running' });
+  }
+  return out.length ? out : undefined;
 }
 export const readerLedgerIdentity = (record: Pick<JournalFold<ReaderLedger>, "dev" | "ino" | "size">): string => `${record.dev}:${record.ino}:${record.size}`;
