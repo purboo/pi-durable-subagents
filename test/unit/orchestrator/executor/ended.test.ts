@@ -78,7 +78,7 @@ test("EX1 produces one ended entry for each nonempty fence round", async t => {
   const f = await simulated(t, []);
   let scan = 0;
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ < 2 ? [row(900_001 + scan, f.exec)] : []]]));
-  await fenceAgent(f.containment, f.journal, f.exec, []);
+  await fenceAgent(f.containment, f.journal, f.exec, [], { pid: 900_000, start: "direct" });
   assert.equal(f.journal.entries().filter(e => e.type === "ended").length, 2);
 });
 
@@ -97,7 +97,7 @@ for (const failure of ["reject", "hang"] as const) test(`EX1 ${failure} recordin
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? [row(900_001, f.exec)] : []]]));
   const journal: JournalHandle = { ...f.journal, append: async () => { recorded++; if (failure === "reject") throw new Error("disk failure"); return new Promise(() => {}); } };
   const before = performance.now();
-  await fenceAgent(f.containment, journal, f.exec, []);
+  await fenceAgent(f.containment, journal, f.exec, [], { pid: 900_000, start: "direct" });
   assert.equal(recorded, 1); assert.deepEqual(f.killed, [900_001]);
   assert.ok(performance.now() - before < 800, "500 ms budget plus scan/scheduling overhead");
 });
@@ -112,7 +112,7 @@ test("EX1 aborting slow argv reads prevents a stale append after fencing", { tim
   syncBuiltinESMExports();
   try {
     t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? [row(900_001, f.exec)] : []]]));
-    await fenceAgent(f.containment, f.journal, f.exec, []);
+    await fenceAgent(f.containment, f.journal, f.exec, [], { pid: 900_000, start: "direct" });
     assert.equal(typeof finish, "function", "the diagnostic read was started");
     finish("late argv"); await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(f.journal.entries(), []); assert.deepEqual(f.killed, [900_001]);
@@ -138,6 +138,48 @@ test("EX1 recovery prefers the explicit direct-child token even when a tracker e
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? [row(900_001, f.exec), row(900_002, f.exec)] : []]]));
   await fenceAgent(f.containment, f.journal, f.exec, []);
   assert.deepEqual(f.journal.entries().find(e => e.type === "ended")?.procs, [{ pid: 900_002, command: "" }]);
+});
+
+for (const descendant of [false, true]) test(`EX1 R-11-3 crash before tracked: ${descendant ? "only the tagged grandchild is listed" : "a lone direct child is never listed"}`, async t => {
+  const f = await simulated(t, []);
+  await f.journal.append("exec", { exec: f.exec, call: f.exec.split("#")[0] });
+  // Direct pi belongs to the orchestrator; orphaned descendants belong to init/a subreaper. Both are roots.
+  const direct = { ...row(900_001, f.exec), ppid: process.pid };
+  const grandchild = { ...row(900_002, f.exec), ppid: direct.pid };
+  const orphan = { ...row(900_003, f.exec), ppid: 1 };
+  const targets = descendant ? [direct, grandchild, orphan] : [direct];
+  let scan = 0;
+  t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? targets : []]]));
+  await fenceAgent(f.containment, f.journal, f.exec, []);
+  assert.ok(!f.journal.entries().some(e => e.type === "tracked"), "exec committed without a persisted child identity");
+  const ended = f.journal.entries().filter(e => e.type === "ended");
+  if (descendant) {
+    assert.equal(ended.length, 1);
+    assert.deepEqual(ended[0]!.procs, [{ pid: grandchild.pid, command: "" }]);
+    assert.equal(ended[0]!.more, undefined, "omitted roots do not count as additional listed processes");
+  } else assert.deepEqual(ended, []);
+  assert.deepEqual(f.killed, targets.map(p => p.pid), "diagnostic under-reporting does not change containment");
+});
+
+// Reproduce the reviewer's real-process probe: only exec is durable, then a fresh containment recovers the tag.
+for (const descendant of [false, true]) test(`EX1 R-11-3 real-process crash cut with ${descendant ? "a tagged sleep grandchild" : "only the direct child"}`, { timeout: 15_000 }, async t => {
+  const f = await fixture(t);
+  await f.journal.append("exec", { exec: f.exec, call: f.exec.split("#")[0] });
+  const source = descendant
+    ? 'const c=require("child_process").spawn("sleep",["300"],{stdio:"ignore"}); console.log(c.pid); setInterval(()=>{},1000)'
+    : 'console.log(0); setInterval(()=>{},1000)';
+  const child = await f.containment.spawn({ exec: f.exec, command: process.execPath, args: ["-e", source], cwd: f.root, env: {} });
+  const pid = await new Promise<number>(resolve => child.stdout.once("data", data => resolve(Number(String(data).trim()))));
+  const recovered = new Containment();
+  await fenceAgent(recovered, f.journal, f.exec, []);
+  await child.exited;
+  assert.ok(!f.journal.entries().some(e => e.type === "tracked"));
+  const ended = f.journal.entries().filter(e => e.type === "ended");
+  const procs = ended.flatMap(e => e.procs as { pid: number; command: string }[]);
+  assert.ok(!procs.some(p => p.pid === child.pid), "the unpersisted direct child is never listed");
+  if (descendant) assert.deepEqual(procs, [{ pid, command: "sleep 300" }]);
+  else assert.deepEqual(ended, []);
+  assert.equal((await recovered.scan(new Map([[f.exec, []]]), { fresh: true })).get(f.exec)?.length ?? 0, 0);
 });
 
 test("EX1 command and gate fences have no ended recording hook", async t => {

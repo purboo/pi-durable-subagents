@@ -39,6 +39,15 @@ its pid and start token, including during recovery. Newly launched children have
 an optional `child:true` marker on their existing `tracked` journal entry; older
 journals retain their original first-tracked-child interpretation.
 
+If dsa crashes after spawn but before any child identity is persisted, recovery
+has no identity to exclude by pid and start. In this window it lists only fence
+targets whose parent is also a target. The direct pi child is a root of this
+forest (its parent is the orchestrator, init or a subreaper, not a tagged target),
+so it is never listed. An orphaned descendant is a root too and is also omitted;
+this diagnostic under-reporting is intentional (R-11-3). All targets are still
+fenced, including omitted roots. A lone unpersisted direct child produces no
+`ended` entry.
+
 `ended` records **dsa sending SIGKILL to these processes**, not proof that dsa
 caused their death. A process can exit or a pid can be reused between recording
 and signalling; the identity recheck avoids signalling a reused pid, so an entry
@@ -74,4 +83,7 @@ orchestrator's node directory and inherited PATH.
 `test/unit/orchestrator/executor/lifecycle.test.ts`: added EX2/EX3 regression tests
 and their imports; all four existing P18/P31 tests remain unchanged. No existing
 test expectation was changed. All other new tests are in the two requested
-`ended.test.ts` files.
+`ended.test.ts` files. R-11-3 updates the multi-round/failure/abort fixture calls
+to provide a known direct identity, keeping their original expectations, and
+adds crash-before-tracked coverage with fake and real process tables. This
+separates known-identity diagnostics from the newly approved root-omission rule.
