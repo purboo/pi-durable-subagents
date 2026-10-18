@@ -10,7 +10,7 @@ import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
 import { parseModel, resolveModel } from "../compat/model.ts";
 import { type LedgerState } from "./ledger.ts";
-import { readerHold, readerLedger, readerLedgerIdentity, type ReaderLedger } from "./reader-ledger.ts";
+import { awaitingRuns, readerHold, readerLedger, readerLedgerIdentity, type AwaitingRun, type ReaderLedger } from "./reader-ledger.ts";
 import type { Exhaustion } from "./providers.ts";
 import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
@@ -137,6 +137,9 @@ export interface CallSnapshot extends ModelStatus {
   notesPending?: number;
   /** Why a queued call does not start, when the orchestrator ledger says so (see queueWait); readers add it. */
   queuedFor?: QueueWait;
+  awaiting?: AwaitingRun[];
+  endedAtSeal?: { pid: number; command: string }[];
+  endedAtSealMore?: number;
 }
 /** Why a queued call waits, most specific first: the orchestrator is still recovering (`since` its start), the call's
  *  every provider is used up, it waits for its worktree's writer lock, or every provider it can start on is full. */
@@ -242,6 +245,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
   // P31: usage per call id, deduplicated by message id; a seal carries the authoritative total.
   const live = new Map<string, Usage>(), sealedUsage = new Map<string, Usage>(), seen = new Set<string>();
   const tools = new Map<string, number>();
+  const endedAtSeal = new Map<string, { procs: { pid: number; command: string }[]; more: number }>();
   // P7, P27: forward / forward-delivered / forward-retired, by destination call; retirements carry only rid2.
   const sends = new Map<string, CallSend[]>(), byRid2 = new Map<string, CallSend>();
   // Pending notes of the current revision by key (notes.ts): recorded rids, and those a generation carried.
@@ -355,6 +359,9 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         seen.add(id);
         const total = live.get(String(e.call)) ?? zero();
         total.input += u.input; total.output += u.output; total.costUsd += u.costUsd; live.set(String(e.call), total);
+      } else if (isEntry(e, 'ended')) {
+        const prior = endedAtSeal.get(e.call), procs = [...(prior?.procs ?? []), ...e.procs];
+        endedAtSeal.set(e.call, { procs: procs.slice(0, 20), more: (prior?.more ?? 0) + Math.max(0, procs.length - 20) + (e.more ?? 0) });
       } else if (e.type === JT.sealed) {
         const usage = (e.result as CallResult | undefined)?.usage;
         if (usage) sealedUsage.set(String(e.call), usage);
@@ -404,6 +411,9 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
     for (const c of list) {
       if (c.phase !== "sealed" && c.phase !== "queued") delete c.poolWait;
       counts[c.phase]++;
+      const ended = endedAtSeal.get(c.callId);
+      if (ended?.procs.length) c.endedAtSeal = structuredClone(ended.procs);
+      if (ended?.more) c.endedAtSealMore = ended.more;
       const usage = usageOf(c.callId); if (usage) c.usage = { ...usage };
       const n = tools.get(c.callId); if (n) c.tools = n;
       const forwarded = sends.get(c.callId);
@@ -510,6 +520,8 @@ const digests = new Map<string, { dev: number; ino: number; size: number; digest
 const FINAL_STATUS = new Set(["done", "failed", "stopped"]);
 /** Post-seal/recovery work that can append without a new request must not enter a polling trust window. */
 export function pendingRecovery(wid: string, entries: readonly Entry[]): boolean {
+  const rev = entries.filter(e => e.type === JT.done).length;
+  if (entries.some(e => e.type === 'wf-created' && e.wake) && !entries.some(e => e.type === 'wake-outcome' && e.rev === rev)) return true;
   const start = entries.findLastIndex(e => e.type === "revised"), current = start < 0 ? entries : entries.slice(start);
   const consumed = new Set(current.filter(e => e.type === "generation").flatMap(generationRids));
   const retiredForwards = new Map(entries.filter(e => e.type === "forward-retired").map(e => [String(e.rid2), e]));
@@ -1234,6 +1246,8 @@ export function versionNote(running: string, loaded: string): string {
 
 /** The first version whose orchestrator and child know send kind "notify". */
 export const NOTIFY_SINCE = "1.0.28";
+/** The first orchestrator version that delivers run --wake caller. */
+export const WAKE_SINCE = "1.1.0";
 /** A refusal when the orchestrator running now predates `since` and is older than the version this process loaded (an
  *  older orchestrator would accept the request and its child would drop it); none when none runs (the next one starts
  *  on the installed version) or it is current. */
@@ -1431,7 +1445,8 @@ export function statusDetail(home: string, wid: string): StatusDetail {
   const origin = origins(home);
   if (!origin.has(wid)) throw new Error(prunedIds(home).has(wid) ? `Workflow ${wid} was pruned` : `Unknown workflow: ${wid}`);
   const held = heldWorkflows(home), wf = labelled(workflowSnapshot(home, wid), held.labels(wid), held.session(wid)), log = scriptLogPath(home, wid);
-  return { ...wf, ...(wf.origin === undefined && origin.get(wid) !== undefined ? { origin: origin.get(wid) } : {}), ...(existsSync(log) ? { scriptLog: log } : {}),
+  const calls = wf.calls.map(c => { const awaiting = awaitingRuns(home, wid, c.key, wf.rev); return awaiting ? { ...c, awaiting } : c; });
+  return { ...wf, calls, ...(wf.origin === undefined && origin.get(wid) !== undefined ? { origin: origin.get(wid) } : {}), ...(existsSync(log) ? { scriptLog: log } : {}),
     ...(isLive(wf) && held.held(wid) ? { paused: true } : {}) };
 }
 

@@ -46,6 +46,7 @@ export const settledPath = (home: string, wid: string) => join(cacheDir(home), "
 export function settledFacts(wf: Workflow, recovered: (call: string) => boolean): SettledFacts | string {
   const log = wf.journal.entries(), rev = revisionEntries(wf), done = terminalEntry(rev);
   if (!done) return "running";
+  if (wf.wake && !log.some(e => e.type === "wake-outcome" && e.rev === log.filter(e => e.type === JT.done).length)) return "wake pending";
   const has = (type: string, field: string, value: unknown) => log.some(e => e.type === type && e[field] === value);
   const sealedCalls = new Set(log.filter(e => e.type === JT.sealed).map(e => String(e.call)));
   const ended = new Set([...sealedCalls, ...log.filter(e => e.type === "retired").map(e => String(e.call))]);
