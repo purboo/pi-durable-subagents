@@ -58,7 +58,7 @@ the npx cache, so `install-service` refuses to run from there.
 | A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded, a daily quota at 0) | Found at the second refusal in a row, while pi is still retrying. A call in a pool continues **in the same session** on the pool's next model (within pi's next retry or two); new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
 | Two subagents would write in the same worktree | Only one runs there at a time. A call that can write (its tools include `edit` or `write`, which pi's default tools do) holds its git worktree's writer lock from its launch until it ends, also while it waits for an answer. Another writer for that worktree waits in order, and status shows `waiting for writer lock: <root> held by <wid>/<key>`. `writer: false` (a call that does not write there), `isolation: "worktree"` and `"writerLock": "off"` opt out. |
 | A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. A forwarded answer prevents planned hibernation. If an execution was stopped after consuming the answer, recovery continues the same session without another answer. The question survives orchestrator restarts (also forced ones) and crashes, including one that hits before the subagent released its slot. |
-| A subagent's work ends (finished, stopped, or cut off) | Every process its tools started ends with that execution, also ones started with `nohup`, `setsid` or `&`: they carry the execution's tag (see the limit below). Anything that must outlive the subagent has to be started by you or the parent session. A command run under `hold` is no exception: a forced restart stops it and its lease is released. |
+| A subagent's work ends (finished, stopped, or cut off) | Every process its tools started ends with that execution, also ones started with `nohup`, `setsid` or `&`: they carry the execution's tag (see the limit below). For work that must outlive its turn, the subagent can start a durable command call with `run --wake caller -- …` (below). A `hold` run directly by its tools is no exception: a forced restart stops it and its lease is released. |
 | A subagent runs in a worktree you made (`isolation: "none"`, the default, with `cwd`) | Durable Subagents never creates, cleans, moves or deletes that directory or its branch, also not on `prune`; `prune` deletes only its own state and the worktrees it created for `isolation: "worktree"`. |
 
 ## Use it
@@ -239,7 +239,13 @@ empty; stdout and stderr go, interleaved, to `output.log` in the attempt's
 directory. The command sees the orchestrator's environment plus `env`,
 `DSA_CALL` (its call id), `DSA_EXEC` (its attempt) and `DSA_HOME`, so a
 `pi-durable-subagents` command inside it (`hold`, `run`, `send`) addresses
-the same home; it cannot force a restart.
+the same home; it cannot force a restart. After merging `env`, the command's
+`PATH` is `env.PATH`, else the orchestrator's `PATH`, with `$DSA_HOME/bin`
+appended once as the last entry. Custom and inherited tools keep precedence,
+and the CLI shim is still found. Empty entries and earlier copies of the
+shim directory are removed; an explicitly empty PATH searches only that
+directory, not the current directory or system tools. Agent PATH is unchanged
+(the shim stays first).
 
 | The command | Result |
 |---|---|
@@ -263,6 +269,28 @@ A command outlives the orchestrator: a restart (also a forced one), an idle
 exit or a crash leaves it running, and the next orchestrator takes it over or
 records its result if it ended meanwhile. The restart busy list does not count
 it.
+
+A subagent can start a command that must outlive its own turn, then end the
+turn instead of waiting in a tool:
+
+```sh
+pi-durable-subagents run --request build-42 --wake caller -- npm test
+```
+
+When the workflow ends, the caller gets a follow-up with its status, each
+call's status and duration, command exit code or signal when known, and an
+output tail. Its first line is:
+
+```text
+Durable run build-42 (<wid>) that you started with --wake caller finished: done.
+```
+
+A sealed caller continues as a new generation; a running one gets the usual
+forwarded follow-up, reopened after its turn if it did not take it.
+Each workflow completion has one durable wake decision, reused
+after retries and crashes. The ordinary finished notice to the CLI origin
+is unchanged. Every derived agent system prompt includes this lifecycle
+reminder; the pinned agent definition is not changed.
 
 A hold (`drain`, `stop-all`, a quit pi) prevents starting, never stops what
 started. A command call that has not started yet (also one waiting for its
@@ -395,6 +423,7 @@ unchanged, with zero edited lines.
 ## Command line
 
 ```text
+pi-durable-subagents version            print pi-durable-subagents <package version> (also --version)
 pi-durable-subagents smoke              check this machine and this pi (offline, < 60 s)
 pi-durable-subagents chaos              run the fault suite (offline, about 2 minutes)
 pi-durable-subagents drill failover [--keep] [--json]
@@ -410,7 +439,8 @@ pi-durable-subagents start              start the orchestrator if work is pendin
 pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)
 pi-durable-subagents drain              hold existing workflows: running calls finish, nothing new starts in them
 pi-durable-subagents stop <wid|call>
-pi-durable-subagents run --request <id> --spec <file|-> [--labels <json>] [--session <id>] [--cwd <dir>] [--json] [--wait-ms <n>]
+pi-durable-subagents run --request <id> [--wake caller] --spec <file|-> [--labels <json>] [--session <id>] [--cwd <dir>] [--json] [--wait-ms <n>]
+pi-durable-subagents run --request <id> [--wake caller] [--cwd <dir>] [--timeout-ms <n>] [--name <text>] [--labels <json>] [--session <id>] [--json] [--wait-ms <n>] -- <program> [args…]
                                         start a run under a caller-chosen id; safe to retry (see below)
 pi-durable-subagents send --request <id> --to <run-id|wid/key> [--to ...] --kind follow-up|answer|steer|notify|model
                          [--call <key>] [--qid <qid> --rev <n>] --message <text|@file> [--model <m>] [--json]
@@ -422,7 +452,7 @@ pi-durable-subagents stop-all           pause every existing workflow now; journ
 pi-durable-subagents prune [wid] [--older-than <days>]
                                         delete finished workflows (done, failed, stopped); prints count and bytes freed
 pi-durable-subagents restart [--force <token> --reason <text>]  switch to the installed version (see "Updating Durable Subagents")
-pi-durable-subagents hold <resource> [--shared | --slots <n>] [--max-wait <s> | --no-wait] [--note <text>] -- <command…>
+pi-durable-subagents hold <resource> [--shared | --slots <n>] [--priority <n>] [--yield] [--expect <duration>] [--max-wait <s> | --no-wait] [--note <text>] -- <command…>
                                         run one command while holding a resource lease (see below)
 pi-durable-subagents leases [--json]    who holds and who waits for each resource
 pi-durable-subagents doctor [--json]    read-only health check; exits 1 when something needs you
@@ -453,6 +483,32 @@ retry from the same place or pass it explicitly. The `spec` file is the
 `{command, cwd?, timeoutMs?, env?, rerun?}` or
 `{tasks: […], name?, usageBudget?, maxCalls?}`); `context: "fork"` needs a pi
 session and is rejected.
+
+The `run -- …` shorthand submits `{command: [program, ...args], timeoutMs?,
+name?}` through the same normalizer. Arguments after `--` are literal; use
+`-- sh -c 'make && make test'` for shell syntax. `--spec` and `--` are mutually
+exclusive. `--timeout-ms` (positive integer milliseconds) and `--name` require
+the argv form; `--cwd`, labels, session display and request-id exit codes
+work as before.
+
+`--wake` takes only `caller` and needs a valid `DSA_CALL`, supplied inside a
+subagent call. Without it, the CLI refuses before submitting anything:
+`--wake caller needs DSA_CALL: run it from inside a subagent call`.
+The caller must be an agent call in an existing, unpruned workflow's current
+revision; invalid callers are rejected with `wake caller: …`, with no new
+workflow. A command call cannot receive a wake; the main-session `subagents`
+tool has no wake option. The stored `RunBody.wake: {to: "<wid>/<key>"}` is
+part of the digest; `RunBody.caller` (the full `DSA_CALL`) is provenance, not
+part of it. Retrying from another generation of the same caller therefore
+keeps the request identity. Requests without wake keep their digests.
+
+Caller wakes need a 1.1.0 orchestrator. After upgrading the CLI, restart a
+still-running 1.0.45 orchestrator: a new wake request exits 1 before recording
+anything, with `the running orchestrator 1.0.45 predates run --wake (new in 1.1.0)`
+and restart guidance, not a silently ignored flag. This gate applies
+when the running version predates both 1.1.0 and the loaded CLI; an already
+recorded request retains its first outcome. With no running orchestrator,
+the next one starts on the installed version.
 
 | exit | meaning | `--json` reply |
 | --- | --- | --- |
@@ -505,6 +561,33 @@ reported; a `once` call sealed `unknown` or a call sealed after repeated losses
 is. The reason is a best-effort reading of the journals: `restart-force` when a forced restart listed the execution,
 `orchestrator-crash` when the orchestrator died uncleanly while it ran, else
 `process-died`.
+
+A wake run's `describe` adds `wake: {to, state, rev?, generation?, reason?}`:
+`state` is `pending`, `applied`, `skipped` or `rejected`; `rev` counts workflow
+completions and `generation` names the delivery generation when known. A
+stopped caller is skipped (`caller stopped`); a pruned or retired caller or
+broken pins can reject delivery. Skips and rejections are final. A pending
+wake prevents prune (`wake pending`) and lazy settlement; pruning after
+delivery keeps its receipt.
+
+Each described caller call, and each call in `status <wid> --json`, can have
+`awaiting: [{request, wid?, state}]`: `pending` means admitted but no workflow
+yet, `running` means not completed, `finished` means completed with the wake
+still undecided. Entries are ordered by admission, limited to the caller's
+current revision and removed once the latest wake is decided; absent when
+empty. Reading this indexes caller addresses in the ledger and reads only
+matching run journals, not every workflow.
+A sealed described call also has `sealedAt`, its latest generation's seal
+timestamp in milliseconds; an unsealed generation omits it.
+
+For an agent call, `describe` can show `endedAtSeal: [{pid, command}]`, the
+SIGKILL targets recorded by fences of its latest generation, in journal
+order, at most 20, and `endedAtSealMore` for the rest. Each `ended` journal
+entry lists at most 20 targets plus optional `more`; command lines are
+clipped to 200 characters, empty when unreadable (Linux `/proc`, macOS `ps`).
+The direct pi child is excluded; command calls and gates have no such
+records. These fields are absent when nothing was recorded. They diagnose
+signal targets, not proof of death (see the limits below).
 
 ```sh
 pi-durable-subagents run --request build-42 --spec build-42.json --json
@@ -763,18 +846,24 @@ pi-durable-subagents hold machine -- make bench          # exclusive
 pi-durable-subagents hold machine --shared -- npm test   # with other shared holders, never with an exclusive one
 pi-durable-subagents hold machine --max-wait 600 --note "profile" -- ./measure.sh
 pi-durable-subagents hold build --slots 4 -- cargo test   # at most 4 at a time
+pi-durable-subagents hold machine --priority 50 --expect 25m -- ./measure.sh
+pi-durable-subagents hold machine --shared --yield -- ./advisory-check.sh
 ```
 
 - The lease covers one command, not a whole call: a subagent that thinks
   or waits for an answer holds nothing.
-- Requests are served strictly in order. An exclusive request waits for
-  everything before it, and keeps later shared requests out (no starvation).
-  A waiting `hold` prints who holds the resource; `--max-wait` gives up with
-  exit 75 without running the command.
+- Waiters rank by `--priority N` (integer -100..100, default 0), higher
+  first, then sequence. Incompatible granted holders always block. An
+  exclusive request waits behind every ranked-ahead waiter; a shared one
+  behind exclusive waiters. Higher priorities can overtake lower waiters,
+  never incompatible holders; equal priorities keep the existing FIFO
+  rules. Low priorities can starve. Every final grant is checked under the
+  resource lock. A waiting `hold` prints who holds the resource; `--max-wait`
+  gives up with exit 75 without running the command.
 - `--slots N` (an integer of at least 1; not with `--shared`) makes the
   resource a counting semaphore: a request runs once fewer than N holders
-  (slot or shared) hold it, no exclusive request is ahead of it, and no
-  earlier request of any kind still waits, so it never overtakes a waiter.
+  (slot or shared) hold it, no exclusive holder blocks it, and no
+  ranked-ahead request of any kind still waits.
   Shared requests are not limited by slots but occupy them, and they do not
   queue behind a slot waiter, so a stream of shared requests can keep it
   waiting; use one mode and one N per resource name. `leases` shows
@@ -786,17 +875,35 @@ pi-durable-subagents hold build --slots 4 -- cargo test   # at most 4 at a time
   written already granted. Otherwise nothing is written, and it exits 75
   naming who holds or waits, without running the command. It is never
   listed as a waiter, even for a moment, so it can probe a resource whose
-  owner treats any queued request as interference. It also leaves the
+  owner treats any queued request as interference. It can pass lower-priority
+  waiters; equal- or higher-priority waiters block it by the same mode rules
+  (a counted request waits behind every such waiter). It also leaves the
   resource alone: unlike a queued waiter, it does not end processes left
   by a holder whose `hold` was killed, and is refused while they remain.
+- `--yield` makes a holder stop its command and descendants when a live
+  waiter is blocked by it, even a lower-priority one. Compatible waiters
+  and no-wait probes do not trigger it. Detection is within the poll
+  interval plus one second; cleanup runs before release, then `hold` exits
+  75. The command is not resumed or retried.
+- `--expect` records an estimate, not a timeout or reservation: whole
+  seconds, optionally `s`, `m` or `h` (`90`, `90s`, `25m`, `2h`), from one
+  second through seven days (`604800s` or `168h`). Holder text shows
+  `3m of ~25m`, waiter text `expects 25m` (the first waiter for counted
+  listings). `leases --json` includes optional ticket fields `priority`,
+  `yield: true` and `expectMs`; unused fields stay absent, old priority is 0.
 - The command runs without a shell (write `-- sh -c '…'` for one) in its
-  own process group; signals to `hold` go to it and its exit status is
-  returned. When it exits, whatever it left in its process group is ended
-  before the lease passes on.
+  own process group, with `DSA_HOLD=<resource>:<seq>`; `DSA_EXEC` and
+  `DSA_CALL` are unchanged. Signals to `hold` go to its group, and the exit
+  status passes through unless it yields. Before release on command exit,
+  yield, a forwarded signal followed by exit, or wrapper cleanup, the group
+  and exact-tagged descendants are ended: TERM, grace, KILL and rescans,
+  bounded to five seconds. If tags survive, it releases anyway and prints
+  `hold: <n> processes tagged <tag> survived; releasing`.
 - The lease lives as long as the `hold` process or its command lives, so a
   killed `hold` does not hand the machine over while the command still
   runs. If `hold` is killed and its command has exited, processes the
-  command left in its group still hold the lease; the next waiter ends them
+  command left in its group or with its tag still hold the lease; the next
+  queued waiter ends them before proceeding, with the same cleanup bound
   (on macOS, a process that took over the command's pid is waited for, not
   ended). State is one small file per request under
   `$DSA_HOME/leases/<resource>/`; no orchestrator is needed, and the user's
@@ -811,8 +918,27 @@ pi-durable-subagents hold build --slots 4 -- cargo test   # at most 4 at a time
   `(holds lease machine)` / `(waiting for lease machine 3m)` on call lines.
   Tell a subagent in its task to run measurements under
   `pi-durable-subagents hold machine -- …`.
-- Leases are cooperative: processes started without `hold` are not held
-  back, and a daemon that leaves the process group is not covered.
+- Linux finds tags in `/proc/<pid>/environ`, including descendants in new
+  groups or sessions. macOS uses `ps` when it exposes the tag, otherwise
+  falls back to group-only cleanup. Clearing the tag and leaving the group
+  can escape. Tags are not a security boundary; separate DSA homes should
+  use distinct resource names to avoid identical tags.
+- Priorities and yield take effect once every hold wrapper for the resource
+  runs 1.1.0; upgrading the orchestrator alone does not update wrappers.
+  Leases remain cooperative: processes started without `hold` are not held
+  back.
+
+Programs may treat exit 75 with any of these stable line forms as no check
+verdict (identity and duration text in the middle varies):
+
+```text
+hold: <resource> is not free now (…); not running the command (exit 75)
+hold: <resource> still held by … after …; not running the command (exit 75)
+hold: yielded <resource> to <who> after <age>; the command was stopped (exit 75)
+```
+
+The first two never started the command; the yield line stopped it, so its
+partial output is not a completed result.
 
 ## Configuration
 
@@ -991,8 +1117,9 @@ subagent is a pi process the orchestrator drives over its stdin and stdout, and
 those pipes end with the old process. A crash is no different: the successor
 fences every execution that still runs (an execution that had already ended is
 not counted as interrupted). Work that must survive a forced restart, such as a
-long measurement, belongs outside the subagent's processes (for example
-`systemd-run --user … pi-durable-subagents hold machine -- …`), with the
+long measurement, belongs outside the subagent's processes: use a durable
+command call (`run --wake caller -- …`) or an external launcher such as
+`systemd-run --user … pi-durable-subagents hold machine -- …`, with the
 subagent only watching it.
 The restart ledger records the reason and initiator; after the next start,
 `status` shows who forced it and why for 24 hours.
@@ -1051,7 +1178,25 @@ loads the old extension; start a new one.
 - After a crash, the model call that was in flight is paid for again.
 - Process containment uses process tags plus a 1-second tracker. A process
   that clears its tag and leaves the process tree within its first second
-  cannot be found.
+  cannot be found. Lease tag discovery on macOS depends on `ps` exposing
+  environments; otherwise only the command's group is covered. Even on
+  Linux, lease cleanup releases after five seconds with a warning if tagged
+  processes survive.
+- Caller wakes use ordinary follow-up delivery, not a stronger guarantee:
+  durable storage and an available orchestrator are needed, a held caller
+  waits for resume, and stop, retired revisions or broken pins can prevent
+  delivery. A wake lists at most 20 calls (then `… N more`), with at most
+  4000 characters total, dropping earlier output to fit; agent results never get invented exit
+  codes. `describe` and `status` retain the command result's last 16 KiB,
+  not its whole output; read the command's log for the full interleaved text.
+- Ended-process diagnostics are best effort, with a total 500 ms budget per
+  fence; failed or timed-out recording does not prevent cleanup. A record
+  lists SIGKILL targets, not proof of death: a process may exit or its pid
+  may be reused before signalling, and identity rechecks can skip it.
+  An append already in progress can finish after the budget expires.
+  Recovery without a persisted direct-child identity omits roots (including
+  orphaned descendants) from diagnostics but still fences them. Command
+  lines can contain sensitive arguments, like other workflow diagnostics.
 - Model and tool behaviour belong to the models and tools you use.
 
 ## License

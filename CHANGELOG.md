@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.1.0
+
+- Caller wakes: a subagent can run `run --request <id> --wake caller -- <program> [args…]`, then end its turn. The
+  durable command keeps running; each workflow completion sends the caller a follow-up with workflow and call
+  statuses, durations, command exit codes or signals, and an output tail (at most 20 call lines and 4000 characters
+  total). A sealed caller opens a new generation; a running one gets the existing forwarded-follow-up behaviour,
+  including reopening after an undelivered turn. Retries and recovery reuse each completion's first wake decision.
+- Wake admission and limits: `--wake` accepts only `caller` and needs a valid `DSA_CALL`; without it the CLI refuses
+  before submitting anything. The caller must be an agent call in an existing, unpruned workflow's current revision;
+  invalid callers are rejected with `wake caller: …` and no workflow is created. The main-session tool has no wake
+  option. A stopped caller is skipped (`caller stopped`); a pruned or retired caller or broken pins can reject
+  delivery. These outcomes are durable and final; holds and the ordinary follow-up rules still apply.
+- Command shorthand and version: `run --request <id> -- <program> [args…]` submits an argv command call without a spec
+  file; `--timeout-ms` (positive integer milliseconds) and `--name` apply only to that form. `--spec` and `--` are
+  mutually exclusive; both forms accept `--wake caller`, `--cwd`, labels and the existing request-id options. Arguments
+  after `--` are literal; use `-- sh -c '…'` for shell syntax. `version` and `--version` print the package version.
+- Read-only fields: `describe` adds top-level `wake: {to, state, rev?, generation?, reason?}` (`pending`, `applied`,
+  `skipped`, `rejected`). Each caller's `awaiting: [{request, wid?, state}]` is admission-ordered, limited to its current
+  revision and absent when empty; states are `pending` (admitted, no workflow), `running`, and `finished` (wake
+  undecided). `status <wid> --json` carries it too. A described sealed call has `sealedAt`, its latest generation's seal
+  timestamp in milliseconds; an unsealed one omits it. Pending wakes prevent prune and lazy settlement; prune after
+  delivery keeps the wake receipt. `wake` participates in the request digest; `caller` is provenance, excluded, so
+  retries from another generation of the same caller keep their identity. Requests without wake keep their digests.
+- Agent process lifecycle and diagnostics: every derived agent system prompt ends with a reminder to use a durable
+  command call for work that must outlive the turn. Agent fences record best-effort `ended` entries before signalling
+  SIGKILL to targets other than the direct pi child: at most 20 pid/command pairs per entry, `more` for the rest,
+  command lines clipped to 200 characters (empty when unreadable). Linux reads `/proc`, macOS uses `ps`. `describe`
+  projects these as `endedAtSeal` (at most 20 across the latest generation) and `endedAtSealMore`, absent when empty.
+  This records signal targets, not proof of death; identity rechecks can prevent a signal after recording. Recording
+  has a total 500 ms budget per fence and never prevents cleanup. Crash recovery without a persisted child identity
+  omits roots, including orphaned descendants, from diagnostics but still fences them. Command calls and gates are
+  not recorded. Command arguments may be sensitive; processes that clear their tag and escape the tree before
+  tracking can still evade containment.
+- Command PATH: after merging `env`, command calls append `$DSA_HOME/bin` once as the last PATH entry, so they can find
+  the CLI shim while custom and inherited tools keep precedence. Empty entries and earlier copies of that directory
+  are removed; an explicitly empty PATH contains only the shim directory. Agent PATH is unchanged.
+- Lease priorities: `hold --priority <n>` accepts integers -100..100 (default 0). Waiters rank by higher priority, then
+  sequence; incompatible granted holders always block. Exclusive requests wait behind every ranked-ahead waiter,
+  shared behind exclusive waiters, counted behind every ranked-ahead waiter and until its slot limit permits a grant.
+  Every final grant is checked under the resource lock. Equal priorities keep the existing rules; lower priorities
+  can starve. `--no-wait` can pass lower-priority waiters, never incompatible holders or blockers of equal or higher priority,
+  and creates no waiting ticket.
+- Yield and expected duration: `hold --yield` stops its command and descendants for a live waiter it blocks, even one
+  with lower priority, releases the lease and exits 75; detection is within the poll interval plus one second.
+  Compatible waiters and no-wait probes do not trigger it; the command is not resumed or retried. `--expect` accepts
+  whole seconds, optionally `s`, `m` or `h` (`90`, `90s`, `25m`, `2h`), from one second through seven days; it is only an
+  estimate, not a timeout or reservation. Holder text shows `3m of ~25m`, waiters `expects 25m`; `leases --json` includes
+  optional ticket fields `priority`, `yield: true` and `expectMs`. Exit 75 with
+  `hold: <resource> is not free now (…); not running the command (exit 75)`,
+  `hold: <resource> still held by … after …; not running the command (exit 75)` or
+  `hold: yielded <resource> to <who> after <age>; the command was stopped (exit 75)` is a stable program interface:
+  the first two never ran the command, the third stopped it, and none is a completed check verdict.
+- Lease process cleanup: held commands inherit `DSA_HOLD=<resource>:<seq>` without changing `DSA_EXEC` or `DSA_CALL`.
+  Before release on exit, yield or wrapper cleanup, hold ends the command group and exact-tagged descendants with
+  TERM, grace, KILL and rescans, bounded to five seconds; surviving tags produce a warning and the lease is released
+  anyway. After a killed wrapper's command ends, group or tagged leftovers keep the ticket live until a queued waiter
+  reclaims and ends them (with the same bound). Linux finds tags in `/proc/<pid>/environ`, including detached sessions;
+  macOS uses `ps` when it exposes tags, otherwise falls back to group-only cleanup. Clearing the tag and leaving the
+  group can escape; tags are cooperative, not a security boundary. Separate homes should use distinct resource names
+  to avoid identical tags.
+- Upgrade: caller wakes need a 1.1.0 orchestrator. With the 1.1.0 CLI, a new wake request to a live 1.0.45 orchestrator
+  exits 1 before recording anything, with `the running orchestrator 1.0.45 predates run --wake (new in 1.1.0)` and
+  restart guidance, not a silently ignored flag. The gate applies only when the running version predates both 1.1.0
+  and the loaded CLI; already recorded requests retain their first outcome. Lease priorities and yield take effect
+  once every hold wrapper for the resource runs 1.1.0; upgrading the orchestrator alone does not update wrappers.
+
 ## 1.0.45
 
 - 1.0.44 was tagged but never published: its release checks failed on macOS. 1.0.45 is the first release with
