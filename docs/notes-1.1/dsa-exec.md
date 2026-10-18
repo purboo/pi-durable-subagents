@@ -107,7 +107,7 @@ second execution marker. Output `continued`, one loss, one session header, two
 execution markers, exactly-once request receipts and inbox cleanup are unchanged.
 No source code or other assertion in that file changed.
 
-### R-11-7 validation and current blocker
+### R-11-7 validation
 
 All commands ran in the foreground through `/tmp/dsa-110/run-dsa.sh` on ipc.
 The tested source tree was `81f8be3fea60ef402904481cfe1c14cccc6f4652` (rebased
@@ -135,7 +135,37 @@ notes update follows those checks; it does not change the tested code.
   Log: `/tmp/dsa-110/logs/dsa-dsa-exec-1-105839-194140.log`.
   Runtime evidence: `/home/purboo/dsa-ci/tmp/dsa-chaos-qT4Tsi/5` on ipc.
 
-The requested C1 criterion passes, but the full-suite criterion remains unmet.
-The V1, P28 and chaos failures have not been proven baseline or waived; their
-fixes are outside this test-only ruling. Preserve this candidate for parent
-review; do not submit it as passing or rerun full suites without a new reason.
+### R-11-8 parent disposition of non-C1 failures
+
+R-11-8 (#107, clarified by #109) accepts `ec8f8c1` as satisfying R-11-7:
+zero C1 failures in ten whole-file runs and a full-pi C1 pass. The parent
+attributes the three non-C1 failures to trunk test/harness races, not dsa-exec.
+The recorded exits and counts above remain failures, not passing checks.
+
+- Chaos AC2/AC4 scenario 5, `main send receipt`:
+  `/tmp/dsa-110/logs/dsa-dsa-exec-1-105839-194140.log`.
+  The parent inspected ipc evidence
+  `/home/purboo/dsa-ci/tmp/dsa-chaos-qT4Tsi/5/rpc.jsonl`:
+  `src/cli/chaos/stack.ts:94-96` captures `from` before sending the prompt and
+  accepts any subsequent `agent_settled`. The CHAOS-QUESTION attention wake's
+  `Acknowledged.` turn settled after that capture but before prompt `chaos-3`
+  started. The send tool had started but had no end, so the check read the
+  previous run's `{wid}` result. `src/cli/chaos` is unchanged from trunk
+  `0c82a88`; the same executor source passed chaos in inv:pi #85 and #102.
+- P28 `executor.test.ts:758`, `Unexpected end of JSON input`:
+  `/tmp/dsa-110/r117-evidence/r117-executor-5-ap8Hk3.tap` (summary:
+  `/tmp/dsa-110/logs/dsa-dsa-exec-1-80918-192025.log`). The test's `rows()`
+  parses the session while pi is writing it; a partial tail line can throw.
+- V1 `executor.test.ts:889`, durable-evidence wait timeout:
+  `/tmp/dsa-110/r117-evidence/r117-executor-1-23ZCCi.tap` (same summary log).
+  The parent identified overlapping o-probe merge full suites on ipc
+  (19:27-19:49) during this writer's 19:20-19:41 loop. P28 and V1 both passed
+  ten whole-file runs of the same source in the parent's comparative evidence
+  (`dsa-c1-merge-4086120-182510.log`) and in inv:pi #85/#102.
+
+No source or test changes address these races. Chaos waits tied to its own
+`agent_start` or response, and P28 reads tolerant of a partial tail line, go to
+the dsa backlog outside this node. If merge inv:pi encounters these failures,
+the parent remeasures; the writer does not rerun suites or enlarge this fix.
+This documentation-only follow-up leaves `src/` and `test/` byte-identical to
+`ec8f8c134d5026d69d2a0d519b9f30b4e7278dde`; no checks are rerun.
