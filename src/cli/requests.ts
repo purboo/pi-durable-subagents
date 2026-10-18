@@ -8,7 +8,7 @@ import { findJournalEntry, readJournalFold, readJournalSnapshot, type JournalFol
 import { isResolution, lifecycleResolution } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
-import { NOTIFY_SINCE, HOLD_ENTRY_TYPES, commandLine, commandSendRefusal, isCommandTarget, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, WAKE_SINCE, HOLD_ENTRY_TYPES, commandLine, commandSendRefusal, isCommandTarget, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState, callAddress } from "../platform/lease.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
@@ -67,6 +67,7 @@ async function stdin(): Promise<string> { const chunks: Buffer[] = []; for await
 export type DescribeState = "absent" | "pending" | "rejected" | "running" | "asking" | "sealed" | "pruned" | "applied";
 export interface DescribedCall {
   key: string; gen: number; phase: CallSnapshot["phase"]; agent: string; model?: string;
+  sealedAt?: number;
   /** A command call (no agent or model): its command on one line (clipped), its attempt (1, or 2 for the rerun), the
    *  pid and time since its start while it runs, and its log (`<attempt dir>/output.log`). */
   command?: string; attempt?: number; pid?: number; elapsed?: string; log?: string;
@@ -154,7 +155,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
       ...(c.hibernated ? { hibernated: true as const } : {}), ...waits.get(c.callId) };
     const run = c.command !== undefined ? c.commandRun : undefined, live = !r && run !== undefined;
     const awaiting = awaitingRuns(home, wid, c.key, wf.rev);
-    return { key: c.key, gen: c.gen, phase: c.phase, agent: c.agent, ...(awaiting ? { awaiting } : {}),
+    return { key: c.key, gen: c.gen, phase: c.phase, agent: c.agent, ...(c.phase === 'sealed' && c.endedAt !== undefined ? { sealedAt: c.endedAt } : {}), ...(awaiting ? { awaiting } : {}),
       ...(c.endedAtSeal ? { endedAtSeal: c.endedAtSeal } : {}), ...(c.endedAtSealMore ? { endedAtSealMore: c.endedAtSealMore } : {}), ...(c.model ? { model: c.model } : {}),
       ...(c.command !== undefined ? { command: commandLine(c.command, 200) } : {}), ...(run?.attempt !== undefined ? { attempt: run.attempt } : {}),
       ...(live && run.pid !== undefined ? { pid: run.pid } : {}), ...(live && c.startedAt !== undefined ? { elapsed: commandAge(now - c.startedAt) } : {}),
@@ -343,6 +344,8 @@ async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<num
   // An id already recorded is decided by that record: the same content gets its first outcome (the agents it named may
   // have changed since), other content is a request-conflict. Only a new id is checked here.
   const prior = (await findRequest(ctx.home, requestRid(id)))?.request;
+  const old = wake && !prior ? orchestratorTooOld(ctx.home, 'run --wake', WAKE_SINCE) : undefined;
+  if (old) throw new Error(old);
   if (!prior) checkAgents(body, () => discoverAgents(dir, { home: ctx.env.HOME || undefined, agentDir: ctx.env.PI_CODING_AGENT_DIR || undefined }).agents.map(a => a.name));
   const done = await submitAndWait(ctx, seen, id, "run", body, undefined, wait, json);
   if ("code" in done) return done.code;
