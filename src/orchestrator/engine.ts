@@ -58,7 +58,7 @@ export function unknownAgent(name: unknown, agents: readonly { name: string }[])
   return `unknown agent ${JSON.stringify(name)}; available agents: ${agents.map(a => a.name).sort().join(", ") || "none"}`;
 }
 /** v12 §3: Wake with bounded latest-per-key results, preferring structured reports and preserving clipped tails. */
-export function finishedText(wid: string, entries: readonly Entry[], call?: string): string {
+export function finishedText(wid: string, entries: readonly Entry[], call?: string, commandOutput = false): string {
   const snap = snapshotFromEntries(wid, entries), label = snap.name ?? wid;
   const latest = new Map(snap.calls.map(c => [c.key, c]));
   const calls = call ? snap.calls.filter(c => c.callId === call) : [...latest.values()];
@@ -75,7 +75,7 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
   // Share the space fairly: short results take what they need and the rest goes to longer ones (one agent may use it
   // all), so a notice is cut only when the results really exceed it; usage and the full-output hint are never lost.
   const want = calls.map(c => {
-    const message = c.result && Object.hasOwn(c.result, 'data') ? JSON.stringify(c.result.data) : c.result?.output;
+    const message = commandOutput && c.command !== undefined ? c.result?.output : c.result && Object.hasOwn(c.result, 'data') ? JSON.stringify(c.result.data) : c.result?.output;
     return 120 + (message?.length ?? 0) + Math.min(320, c.result?.error?.length ?? 0);
   });
   const shares = new Array<number>(calls.length).fill(0);
@@ -94,11 +94,24 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
     const title = `\n${tail(name, allowance - 1)}`;
     const error = result?.error && allowance - title.length > 10 ? `\n  Error: ${tail(result.error, Math.min(300, allowance - title.length - 9))}` : '';
     const space = allowance - title.length - error.length;
-    const message = result && Object.hasOwn(result, 'data') ? JSON.stringify(result.data) : result?.output;
+    const message = commandOutput && c.command !== undefined ? result?.output : result && Object.hasOwn(result, 'data') ? JSON.stringify(result.data) : result?.output;
     const line = title + (message && space > 4 ? `\n  ${tail(message.trimEnd(), space - 3)}` : '') + error;
     lines.push(line);
   }
   return `${prefix}${lines.join('')}${footer}`;
+}
+
+export function wakeText(rid: string, wid: string, done: Entry, entries: readonly Entry[]): string {
+  const calls = [...new Map(snapshotFromEntries(wid, entries).calls.map(c => [c.key, c])).values()];
+  const lines = calls.slice(0, 20).map(c => {
+    const data = c.command !== undefined ? c.result?.data as { exitCode?: number | null; signal?: string | null; durationMs?: number } | undefined : undefined;
+    const ms = data?.durationMs ?? (c.endedAt !== undefined && c.startedAt !== undefined ? c.endedAt - c.startedAt : 0);
+    return `${c.key}: ${callStatus(c)}${data?.exitCode != null ? ` exit ${data.exitCode}` : ''}${data?.signal ? ` signal ${data.signal}` : ''} (${Math.max(0, Math.round(ms))}ms)`;
+  });
+  if (calls.length > 20) lines.push(`… ${calls.length - 20} more`);
+  const head = `Durable run ${rid} (${wid}) that you started with --wake caller finished: ${done.status}.\n${lines.join('\n')}\n`;
+  const prefix = head.slice(0, 4000), space = 4000 - prefix.length;
+  return prefix + (space > 0 ? tail(finishedText(wid, entries, undefined, true), space) : '');
 }
 
 type State = { wf: Workflow; ev: number; calls: Map<number, Entry>; proposed: Set<number>; exposures: Entry[]; exposed: Set<number>; sent: number; replaying: boolean; ready: Map<number, CallResult>; running: Set<number>; outputs: Map<number, Entry>; values: Entry[]; needs: number };
@@ -161,7 +174,7 @@ export class Engine {
   }
   /** Nothing of the workflow is live: it ended (or parked), no script runs, no executor run or follow-up is open. */
   private quiescent(wf: Workflow): boolean {
-    if (!this.terminal(wf) || this.states.has(wf.wid) || this.running.has(wf.wid) || this.openFollowUps(wf)) return false;
+    if (!this.terminal(wf) || this.wakePending(wf) || this.states.has(wf.wid) || this.running.has(wf.wid) || this.openFollowUps(wf)) return false;
     for (const id of this.generations) if (id.startsWith(`${wf.wid}@`)) return false;
     return true;
   }
@@ -427,7 +440,8 @@ export class Engine {
         await unlink(join(orchInbox(this.ledgers.home), `${req.rid}.json`)).catch(error => { if (error.code !== 'ENOENT') throw error; });
       }
     }
-    this.consumed = { length: this.intakeSeen, pending: view.open.size > 0 };
+    await this.deliverWakes();
+    this.consumed = { length: this.intakeSeen, pending: this.lifecycle().open.size > 0 };
   }
   private findCall(to: string, bareWid = false): { wf: Workflow; entry: Entry } | undefined {
     for (const wf of this.store.workflows.values()) {
@@ -475,6 +489,18 @@ export class Engine {
     }
     if (req.kind === 'run') {
       const created = this.ledgers.orch.entries().find(e => e.type === JT.created && e.rid === req.rid);
+      if (!created && (req.body as RunBody | null)?.wake !== undefined) {
+        const { wake, caller } = req.body as RunBody;
+        const match = typeof caller === 'string' && /^([^@/]+)@(\d+)\/(.+)@(\d+)$/.exec(caller);
+        const parent = match ? this.store.workflows.get(match[1]!) : undefined;
+        const refuse = (reason: string): Decision => ({ action: 'reject', reason: `wake caller: ${reason}` });
+        if (!match || !wake || wake.to !== `${match[1]}/${match[3]}`) return refuse('invalid caller');
+        if (!parent || this.store.pruned().has(parent.wid)) return refuse('workflow missing or pruned');
+        if (parent.revision !== Number(match[2])) return refuse('stale-revision');
+        const entry = latestCall(parent, match[3]!);
+        if (!entry) return refuse('unknown key');
+        if (isCommandCall(entry.spec as CallSpec)) return refuse('command call');
+      }
       // Senders validate labels; a hand-written request must not bypass that.
       const labels = (req.body as RunBody | null)?.labels, invalid = !created && labels !== undefined ? labelsProblem(labels) : undefined;
       if (invalid) return { action: 'reject', reason: `invalid-labels: ${invalid}` };
@@ -658,6 +684,7 @@ export class Engine {
   /** Housekeeping: Why a workflow cannot be pruned: not final (parked or running), open executor work, an unresolved
    *  fence failure, or ended after the cutoff. */
   private unprunable(wf: Workflow, cutoff?: number): string | undefined {
+    if (this.wakePending(wf)) return 'wake pending';
     const done = this.terminal(wf), status = done ? String(done.status) : 'running';
     if (!['done', 'failed', 'stopped'].includes(status)) return `not-finished:${status}`;
     if (lazy(wf)) {
@@ -687,7 +714,9 @@ export class Engine {
     // when they cannot be, the prune is rejected and the caller retries later.
     try { await this.events.flush(); }
     catch (error) { return `event-log: ${error instanceof Error ? error.message : String(error)}`; }
-    await this.ledgers.orch.append('pruned', { rid, wid: wf.wid, endedAt: done.ts, bytes, status: String(done.status), ...identity });
+    const wake = wf.wake && wf.journal.entries().findLast(e => e.type === 'wake-outcome');
+    const wakeReceipt = wake ? { wake: { to: wf.wake!.to, state: wake.state, rev: wake.rev, ...(wake.generation !== undefined ? { generation: wake.generation } : {}), ...(wake.reason !== undefined ? { reason: wake.reason } : {}) } } : {};
+    await this.ledgers.orch.append('pruned', { rid, wid: wf.wid, endedAt: done.ts, bytes, status: String(done.status), ...identity, ...wakeReceipt });
     this.states.delete(wf.wid);
     await this.store.drop(wf.wid);
     try { await this.store.remove(wf.wid); }
@@ -950,6 +979,63 @@ export class Engine {
     const rev = wf.journal.entries().filter(e => e.type === JT.done).length;
     if (done && !wf.journal.entries().some(e => isEntry(e, JT.attention) && e.item.id === `finished:${wf.wid}` && e.item.rev === rev)) {
       await wf.journal.append(JT.attention, { item: { id: `finished:${wf.wid}`, rev, kind: 'finished', wid: wf.wid, text: finishedText(wf.wid, wf.journal.entries()) } });
+    }
+    await this.deliverWake(wf);
+  }
+  /** A pending wake keeps the journal decoded and unprunable until its durable outcome is recorded. */
+  private wakePending(wf: Workflow): boolean {
+    if (!wf.wake || lazy(wf)) return false;
+    const log = wf.journal.entries(), rev = log.filter(e => e.type === JT.done).length;
+    return !rev || !log.some(e => e.type === 'wake-outcome' && e.rev === rev);
+  }
+  private async deliverWakes() {
+    for (const wf of this.store.workflows.values()) if (wf.wake && !lazy(wf)) { await this.deliverWake(wf); this.settle(wf); }
+  }
+  /** The intent pins the message before admission. Lifecycle resolution and send's existing generation/forward
+   *  receipts make every crash cut replayable, including a crash between the send effect and its decision. */
+  private waking = new Map<string, Promise<void>>();
+  private deliverWake(wf: Workflow): Promise<void> {
+    const pending = this.waking.get(wf.wid);
+    if (pending) return pending;
+    const run = this.deliverWakeNow(wf).finally(() => { if (this.waking.get(wf.wid) === run) this.waking.delete(wf.wid); });
+    this.waking.set(wf.wid, run); return run;
+  }
+  private async deliverWakeNow(wf: Workflow) {
+    if (!wf.wake || lazy(wf)) return;
+    const { rid, to, caller } = wf.wake;
+    const dones = wf.journal.entries().filter(e => e.type === JT.done);
+    for (const [n, done] of dones.entries()) {
+      const rev = n + 1;
+      if (wf.journal.entries().some(e => e.type === 'wake-outcome' && e.rev === rev)) continue;
+      let intent = wf.journal.entries().find(e => e.type === 'wake-request' && e.rev === rev);
+      if (!intent) {
+        const target = this.findCall(to), id = target && `${target.wf.wid}@${target.wf.revision}/${target.entry.key}@${target.entry.gen}`;
+        const seal = target?.wf.journal.entries().find(e => e.type === JT.sealed && e.call === id);
+        if (target && `${target.wf.wid}@${target.wf.revision}` === caller.slice(0, caller.indexOf('/')) && (seal?.result as CallResult | undefined)?.status === 'stopped') {
+          await wf.journal.append('wake-outcome', { rev, state: 'skipped', reason: 'caller stopped' }); continue;
+        }
+        const request: Request<SendBody> = { rid: `wake-${contentHash([rid, rev]).slice(0, 32)}`, from: `wake:${rid}:${rev}`, to: 'orch', sseq: 1,
+          kind: 'send', cond: { epoch: caller.slice(0, caller.indexOf('/')) }, body: { to, kind: 'follow-up', message: wakeText(requestId(rid) ?? rid, wf.wid, done, wf.journal.entries().filter(e => e.seq <= done.seq)) } };
+        intent = await wf.journal.append('wake-request', { rev, request });
+      }
+      const request = intent.request as Request<SendBody>;
+      for (const { type, ...fields } of planDecisions(this.lifecycle(), [request], () => ({ action: 'defer' }))) {
+        if (type === 'admitted') await this.ledgers.orch.append('request', { request });
+        await this.ledgers.orch.append(type, fields);
+      }
+      let resolution = this.lifecycle().resolved.get(request.rid);
+      if (!resolution) {
+        const decision = await this.decide(request);
+        if (decision.action === 'defer') return;
+        for (const { type, ...fields } of planDecisions(this.lifecycle(), [request], () => decision)) await this.ledgers.orch.append(type, fields);
+        resolution = this.lifecycle().resolved.get(request.rid);
+      }
+      if (!resolution) continue;
+      const target = this.findCall(to), opened = target && revisionEntries(target.wf).find(e => e.type === 'generation' && generationRids(e).includes(request.rid));
+      const forward = target && target.wf.journal.entries().find(e => e.type === 'forward' && e.rid === request.rid);
+      const generation = opened ? Number(opened.gen) : forward ? Number(String(forward.dest).match(/@(\d+)$/)?.[1]) : undefined;
+      await wf.journal.append('wake-outcome', { rev, state: resolution.type === 'applied' ? 'applied' : 'rejected',
+        ...(resolution.type === 'rejected' ? { reason: resolution.reason } : {}), ...(generation !== undefined ? { generation } : {}) });
     }
   }
   private async resolveFinished(wf: Workflow) {

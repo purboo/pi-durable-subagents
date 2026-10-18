@@ -44,6 +44,7 @@ export interface EntryFields {
   fenced: { exec: string };
   "fence-failed": { exec: string; error: string };
   sealed: { call: string; exec?: string; result: CallResult };
+  ended: { exec: string; call: string; procs: { pid: number; command: string }[]; more?: number };
   // orchestrator.jsonl
   /** A slot of a provider (pool = provider name) or of memory; `reserved` holds the target of a pending model switch. */
   hold: { pool: string; slot: number; exec: string; reserved?: true; rid?: string };
@@ -220,6 +221,10 @@ export interface RunBody {
    *  which a pi session exports to the processes it starts. Display only: notices, questions' routing, pause on quit and
    *  restart grouping keep following the sender. Not part of the spec digest. */
   session?: string;
+  /** Deliver a follow-up to this caller address each time the workflow ends (CLI --wake caller). */
+  wake?: { to: string };
+  /** Full DSA_CALL at submission; provenance only, excluded from spec_digest. */
+  caller?: CallId;
 }
 /** kind "send": forwarded to a child (P7). cond.qid/rev required for answers. */
 export interface SendBody {
