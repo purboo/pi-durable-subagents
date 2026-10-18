@@ -1246,6 +1246,8 @@ export function versionNote(running: string, loaded: string): string {
 
 /** The first version whose orchestrator and child know send kind "notify". */
 export const NOTIFY_SINCE = "1.0.28";
+/** The first orchestrator version that delivers run --wake caller. */
+export const WAKE_SINCE = "1.1.0";
 /** A refusal when the orchestrator running now predates `since` and is older than the version this process loaded (an
  *  older orchestrator would accept the request and its child would drop it); none when none runs (the next one starts
  *  on the installed version) or it is current. */

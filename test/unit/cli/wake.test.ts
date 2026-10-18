@@ -9,7 +9,7 @@ import { openJournal } from '../../../src/kernel/journal.ts';
 import { orchInbox, orchLedger, journalPath } from '../../../src/paths.ts';
 import { findRequest, specDigest } from '../../../src/requests.ts';
 import { packageVersion } from '../../../src/version.ts';
-import { snapshotFromEntries, workflowSnapshot } from '../../../src/orchestrator/snapshot.ts';
+import { snapshotFromEntries, workflowSnapshot, orchestratorTooOld, WAKE_SINCE } from '../../../src/orchestrator/snapshot.ts';
 
 async function fixture(t: test.TestContext) {
   const root = await mkdtemp(join(tmpdir(), 'dsa-cli-wake-')), home = join(root, 'dsa'), cwd = join(root, 'work');
@@ -61,6 +61,39 @@ test('run --spec still accepts wake caller; malformed caller is refused; help do
   assert.equal(invalid.code, 1); assert.match(invalid.out, /valid DSA_CALL/);
   assert.match(HELP, /--wake caller/); assert.match(HELP, /--timeout-ms <n>/);
   for (const flag of ['priority', 'yield', 'expect']) assert.ok(HELP.includes(`--${flag}`));
+});
+
+test('wake version gate refuses before recording, preserves retries, and allows the same loaded version or no live orchestrator (R-11-1)', async t => {
+  const f = await fixture(t), args = (id: string) => ['run', '--request', id, '--wake', 'caller', '--json', '--', 'true'];
+  const caller = { DSA_CALL: 'W@1/key@1' };
+  assert.equal((await f.cli(args('recorded'), caller)).code, 75, 'no running orchestrator passes');
+  const original = (await findRequest(f.home, 'req:recorded'))!.request;
+  const orch = await openJournal(orchLedger(f.home)); t.after(() => orch.close());
+  await orch.append('orchestrator', { pid: process.pid, version: '1.0.45' });
+  const refusal = `the running orchestrator 1.0.45 predates run --wake (new in 1.1.0); restart it to the installed version 1.1.0 first (\`pi-durable-subagents restart\` or the subagents tool's restart action), then send again`;
+  assert.equal(orchestratorTooOld(f.home, 'run --wake', WAKE_SINCE, '1.1.0'), refusal);
+  assert.equal(orchestratorTooOld(f.home, 'run --wake', WAKE_SINCE, '1.0.45'), undefined, 'the unreleased leaf engine is the same loaded version');
+  await orch.append('orchestrator', { pid: process.pid, version: '0.0.1' });
+  const before = orch.entries().length;
+  const refused = await f.cli(args('refused'), caller);
+  assert.equal(refused.code, 1);
+  assert.equal(JSON.parse(refused.out).reason, `the running orchestrator 0.0.1 predates run --wake (new in 1.1.0); restart it to the installed version ${packageVersion()} first (\`pi-durable-subagents restart\` or the subagents tool's restart action), then send again`);
+  assert.equal(orch.entries().length, before); assert.equal(await findRequest(f.home, 'req:refused'), undefined);
+  assert.deepEqual(await f.inbox(), ['req:recorded.json']);
+  assert.deepEqual(await readdir(join(f.home, 'w')).catch(() => []), [], 'the refusal creates no workflow');
+  assert.equal((await f.cli(args('recorded'), caller)).code, 75, 'a recorded pending request bypasses the gate');
+  await orch.append('request', { request: original });
+  await orch.append('created', { rid: original.rid, wid: 'W', origin: original.from });
+  await orch.append('applied', { rid: original.rid });
+  const retry = await f.cli(args('recorded'), { DSA_CALL: 'W@1/key@9' });
+  assert.equal(retry.code, 0); assert.deepEqual(JSON.parse(retry.out), { request: 'recorded', wid: 'W', created: false, spec_digest: specDigest(original) });
+  await orch.append('orchestrator', { pid: process.pid, version: packageVersion() });
+  assert.equal((await f.cli(args('same-version'), caller)).code, 75);
+  await orch.append('orchestrator', { pid: process.pid, version: '1.1.0' });
+  assert.equal(orchestratorTooOld(f.home, 'run --wake', WAKE_SINCE, '1.1.0'), undefined);
+  await orch.append('orchestrator-exit', { pid: process.pid });
+  assert.equal(orchestratorTooOld(f.home, 'run --wake', WAKE_SINCE, '1.1.0'), undefined);
+  assert.equal((await f.cli(args('no-live'), caller)).code, 75);
 });
 
 test('version and --version print the package version and exit 0 without starting anything', async t => {

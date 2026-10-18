@@ -213,6 +213,25 @@ test('awaiting indexes matching runs in admission order without touching unrelat
   assert.deepEqual((await describe(f.home, { wid: caller })).calls![0]!.awaiting, [...expected, { request: 'later-envelope', state: 'pending' }, { request: 'early-envelope', state: 'pending' }]);
 });
 
+test('describe sealedAt follows the latest generation seal and is absent while it runs (R-11-2)', async t => {
+  const f = await fixture(t), wid = await f.caller('slow', false);
+  await f.wf(wid).journal.append(JT.exec, { call: `${wid}@1/slow@1`, exec: `${wid}@1/slow@1#1.1` });
+  await f.wf(wid).journal.append('selected', { exec: `${wid}@1/slow@1#1.1`, model: { provider: 'test', id: 'fake' } });
+  const initial = (await describe(f.home, { wid })).calls![0]!;
+  assert.equal(initial.phase, 'running'); assert.equal(initial.sealedAt, undefined);
+  const first = await until(() => f.log(wid).find(e => e.type === JT.sealed && e.call === `${wid}@1/slow@1`));
+  await f.finish(wid);
+  assert.equal((await describe(f.home, { wid })).calls![0]!.sealedAt, first.ts);
+  await f.send('send', { to: `${wid}/slow`, kind: 'follow-up', message: 'again' });
+  await f.wf(wid).journal.append(JT.exec, { call: `${wid}@1/slow@2`, exec: `${wid}@1/slow@2#1.1` });
+  await f.wf(wid).journal.append('selected', { exec: `${wid}@1/slow@2#1.1`, model: { provider: 'test', id: 'fake' } });
+  const running = (await describe(f.home, { wid })).calls![0]!;
+  assert.equal(running.gen, 2); assert.equal(running.phase, 'running'); assert.equal(running.sealedAt, undefined);
+  const second = await until(() => f.log(wid).find(e => e.type === JT.sealed && e.call === `${wid}@1/slow@2`));
+  assert.equal((await describe(f.home, { wid })).calls![0]!.sealedAt, second.ts);
+  assert.ok(second.ts > first.ts);
+});
+
 test('request digest retains old bytes, ignores caller generations and hashes wake routing', () => {
   const body = { cwd: '/w', call: { command: ['true'] } }, old = contentHash({ kind: 'run', body, cond: undefined });
   assert.equal(specDigest({ kind: 'run', body }), old);
