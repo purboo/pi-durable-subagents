@@ -9,7 +9,7 @@ import { isResolution, lifecycleResolution } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
 import { NOTIFY_SINCE, HOLD_ENTRY_TYPES, commandLine, commandSendRefusal, isCommandTarget, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
-import { leaseCalls, leaseState } from "../platform/lease.ts";
+import { leaseCalls, leaseState, callAddress } from "../platform/lease.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
 import { JT, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
@@ -18,6 +18,7 @@ import { FENCE_LEDGER_TYPES, endedExecs, fenceReason } from "../events/fence.ts"
 import { parseLabels } from "../events/labels.ts";
 import { foldWaits, leaseWaits, waitsOf } from "../events/waiting.ts";
 import type { WaitReason } from "../events/types.ts";
+import { awaitingRuns, wakeStatus, type AwaitingRun, type WakeStatus } from "../orchestrator/reader-ledger.ts";
 import { LEDGER_ENTRY_TYPES, emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
 
 export const EXIT = { ok: 0, rejected: 1, conflict: 3, pending: 75 } as const;
@@ -69,6 +70,9 @@ export interface DescribedCall {
   /** A command call (no agent or model): its command on one line (clipped), its attempt (1, or 2 for the rerun), the
    *  pid and time since its start while it runs, and its log (`<attempt dir>/output.log`). */
   command?: string; attempt?: number; pid?: number; elapsed?: string; log?: string;
+  awaiting?: AwaitingRun[];
+  endedAtSeal?: { pid: number; command: string }[];
+  endedAtSealMore?: number;
   status?: CallResult["status"]; ok?: boolean; error?: string; output?: string; data?: unknown;
   /** Unsealed calls: why they wait — writer lock, resource lease, the provider's slot use and exhaustion (as `status`);
    *  `reason` (WAIT_REASONS precedence), its status line `detail` and `since` (ms) when the call does not move. */
@@ -79,6 +83,7 @@ export interface Description {
   /** The run's labels. */
   labels?: Record<string, string>;
   status?: string; error?: string; pruned?: { status?: string; endedAt?: number };
+  wake?: WakeStatus;
   calls?: DescribedCall[];
   questions?: { qid?: string; rev: number; to: string; call?: string; text: string }[];
   attention?: { id: string; rev: number; kind: string; call?: string; text: string }[];
@@ -101,7 +106,7 @@ export async function describe(home: string, key: { request: string } | { wid: s
   if (decided?.type === "rejected") return { state: "rejected", ...head, reason: String(decided.reason) };
   // A send or stop has no workflow of its own: its decision is the outcome.
   if (decided && found.request.kind !== "run") return { state: "applied", ...head };
-  return { state: "pending", ...head };
+  return { state: "pending", ...head, ...(wakeStatus(home, found.request) ? { wake: wakeStatus(home, found.request) } : {}) };
 }
 /** `{labels}` of a run request that has any. */
 function labelsOf(request: Request | undefined): { labels?: Record<string, string> } {
@@ -127,7 +132,7 @@ function pinnedAgentModel(home: string, wid: string, rev: number): (agent: strin
 function describeWorkflow(home: string, wid: string, entries: readonly Entry[], now: number): Description {
   const pruned = entries.find(e => e.type === "pruned" && e.wid === wid);
   if (pruned) return { state: "pruned", wid, pruned: { ...(pruned.status !== undefined ? { status: String(pruned.status) } : {}), endedAt: Number(pruned.endedAt) },
-    ...(typeof pruned.request === "string" ? { request: pruned.request } : {}), ...(typeof pruned.spec_digest === "string" ? { spec_digest: pruned.spec_digest } : {}), ...labelsOf(runOf(home, entries, wid).run) };
+    ...(typeof pruned.request === "string" ? { request: pruned.request } : {}), ...(typeof pruned.spec_digest === "string" ? { spec_digest: pruned.spec_digest } : {}), ...labelsOf(runOf(home, entries, wid).run), ...(pruned.wake ? { wake: pruned.wake as WakeStatus } : {}) };
   if (!/^[^/\\\0]+$/.test(wid) || wid === "." || wid === ".." || !existsSync(journalPath(home, wid))) return { state: "absent", wid };
   // The snapshot and the journal the wait fold reads must be the same bytes (a writer-wait appended between the two reads
   // would give a reason without its writerWait): read again until the journal did not move around the snapshot.
@@ -148,7 +153,9 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
       ...(line(slots.slots, c.model) ? { slot: line(slots.slots, c.model) } : {}), ...(line(slots.exhausted, c.model) ? { exhausted: line(slots.exhausted, c.model) } : {}),
       ...(c.hibernated ? { hibernated: true as const } : {}), ...waits.get(c.callId) };
     const run = c.command !== undefined ? c.commandRun : undefined, live = !r && run !== undefined;
-    return { key: c.key, gen: c.gen, phase: c.phase, agent: c.agent, ...(c.model ? { model: c.model } : {}),
+    const awaiting = awaitingRuns(home, wid, c.key, wf.rev);
+    return { key: c.key, gen: c.gen, phase: c.phase, agent: c.agent, ...(awaiting ? { awaiting } : {}),
+      ...(c.endedAtSeal ? { endedAtSeal: c.endedAtSeal } : {}), ...(c.endedAtSealMore ? { endedAtSealMore: c.endedAtSealMore } : {}), ...(c.model ? { model: c.model } : {}),
       ...(c.command !== undefined ? { command: commandLine(c.command, 200) } : {}), ...(run?.attempt !== undefined ? { attempt: run.attempt } : {}),
       ...(live && run.pid !== undefined ? { pid: run.pid } : {}), ...(live && c.startedAt !== undefined ? { elapsed: commandAge(now - c.startedAt) } : {}),
       ...(run?.log ? { log: run.log } : {}),
@@ -161,7 +168,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
   const state: DescribeState = questions.length ? "asking" : isLive(wf) || wf.status === "parked" ? "running" : "sealed";
   const fence = lastFence(journal, entries);
   return { state, wid, ...(id ? { request: id } : {}), ...(admitted ? { spec_digest: specDigest(admitted) } : {}), ...labelsOf(run), status: wf.status, ...(wf.error ? { error: wf.error } : {}),
-    calls, ...(questions.length ? { questions } : {}), ...(attention.length ? { attention } : {}), ...(fence ? { lastFence: fence } : {}) };
+    ...(wakeStatus(home, run, wid) ? { wake: wakeStatus(home, run, wid) } : {}), calls, ...(questions.length ? { questions } : {}), ...(attention.length ? { attention } : {}), ...(fence ? { lastFence: fence } : {}) };
 }
 /** Best effort: why the latest fence that interrupted work happened. The per-execution classification and the
  *  reason are shared with the event log's `fenced` events (src/events/fence.ts). */
@@ -179,6 +186,7 @@ export function renderDescription(d: Description): string {
   const lines = [`${d.request ?? d.wid}: ${d.state}${d.reason ? ` (${d.reason})` : ""}${d.wid && d.request ? ` — ${d.wid}` : ""}${d.status && d.state !== d.status ? ` · ${d.status}` : ""}`];
   if (d.labels) lines.push(`  labels: ${Object.entries(d.labels).map(([k, v]) => `${k}=${v}`).join(" ")}`);
   if (d.pruned) lines.push(`  pruned: ${d.pruned.status ?? "?"} at ${new Date(d.pruned.endedAt ?? 0).toISOString()}`);
+  if (d.wake) lines.push(`  wake: ${d.wake.to} ${d.wake.state}${d.wake.rev ? ` rev ${d.wake.rev}` : ''}${d.wake.generation ? ` generation ${d.wake.generation}` : ''}${d.wake.reason ? ` (${d.wake.reason})` : ''}`);
   if (d.error) lines.push(`  error: ${d.error}`);
   for (const c of d.calls ?? []) {
     const facts = [c.pid !== undefined ? `pid ${c.pid}` : "", c.attempt !== undefined ? `attempt ${c.attempt}` : "", c.elapsed ?? ""].filter(Boolean).join(", ");
@@ -186,6 +194,8 @@ export function renderDescription(d: Description): string {
       ? `  ${c.key}@${c.gen} command ${c.phase}${c.status ? ` ${c.status}` : ""}${facts ? ` (${facts})` : ""}${c.error ? ` — ${c.error}` : ""}`
       : `  ${c.key}@${c.gen} ${c.agent} ${c.phase}${c.status ? ` ${c.status}` : ""}${c.model ? ` (${c.model})` : ""}${c.error ? ` — ${c.error}` : ""}`);
     if (c.command !== undefined) lines.push(`    command: ${c.command}`, ...(c.log ? [`    log: ${c.log}`] : []));
+    if (c.awaiting) for (const run of c.awaiting) lines.push(`    awaiting: ${run.request}${run.wid ? ` (${run.wid})` : ''} ${run.state}`);
+    if (c.endedAtSeal) lines.push(`    ended at seal: ${JSON.stringify(c.endedAtSeal)}${c.endedAtSealMore ? ` (${c.endedAtSealMore} more)` : ''}`);
     if (c.waiting) lines.push(`    waiting: ${JSON.stringify(c.waiting)}`);
     if (c.data !== undefined) lines.push(`    data: ${JSON.stringify(c.data)}`);
     if (c.output) lines.push(...c.output.split("\n").map(l => `    | ${l}`));
@@ -296,15 +306,27 @@ export function runSession(flag: string | undefined, env: NodeJS.ProcessEnv): st
  *  form ({agent,task,…}, {command,…} or {tasks|chain:[…],…}); it is validated by the tool's own normalizer and agent check. */
 export const runCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, runRequest);
 async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
-  const { values, positionals } = flags(args, { request: "value", spec: "value", cwd: "value", labels: "value", session: "value", json: "flag", "wait-ms": "value" });
+  const dash = args.indexOf("--"), argv = dash < 0 ? undefined : args.slice(dash + 1);
+  const { values, positionals } = flags(dash < 0 ? args : args.slice(0, dash), { request: "value", spec: "value", wake: "value", "timeout-ms": "value", name: "value", cwd: "value", labels: "value", session: "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), file = text(values, "spec"), json = values.json === true, wait = waitMs(values, ctx);
   seen.id = id; seen.json = json;
-  if (!id || !file || positionals.length) throw new Error("usage: run --request <id> --spec <file|-> [--labels <json>] [--session <pi session id>] [--cwd <dir>] [--json] [--wait-ms <n>]");
+  if (file !== undefined && argv !== undefined) throw new Error("--spec and -- are mutually exclusive");
+  if (argv === undefined && (values["timeout-ms"] !== undefined || values.name !== undefined)) throw new Error("--timeout-ms and --name require -- <program> [args…]");
+  if (!id || (file === undefined && argv === undefined) || positionals.length || (argv !== undefined && !argv[0])) throw new Error("usage: run --request <id> [--wake caller] (--spec <file|-> | -- <program> [args…])");
+  const wake = text(values, "wake");
+  if (wake !== undefined && wake !== "caller") throw new Error("--wake takes exactly caller");
+  if (wake && !ctx.env.DSA_CALL) throw new Error("--wake caller needs DSA_CALL: run it from inside a subagent call");
+  if (wake && callAddress(ctx.env.DSA_CALL!) === ctx.env.DSA_CALL) throw new Error("--wake caller needs a valid DSA_CALL");
+  const timeout = text(values, "timeout-ms");
+  if (timeout !== undefined && (!/^[1-9]\d*$/.test(timeout) || !Number.isSafeInteger(Number(timeout)))) throw new Error("--timeout-ms needs a positive integer");
   requestRid(id);
   const raw = text(values, "labels"), labels = raw !== undefined ? parseLabels(raw) : undefined;
-  const bytes = file === "-" ? await (ctx.stdin ?? stdin)() : readFileSync(resolve(ctx.cwd ?? process.cwd(), file), "utf8");
   let spec: Record<string, unknown>;
-  try { spec = JSON.parse(bytes); } catch (error) { throw new Error(`--spec is not JSON: ${(error as Error).message}`); }
+  if (argv !== undefined) spec = { command: argv, ...(timeout !== undefined ? { timeoutMs: Number(timeout) } : {}), ...(values.name !== undefined ? { name: text(values, "name") } : {}) };
+  else {
+    const bytes = file === "-" ? await (ctx.stdin ?? stdin)() : readFileSync(resolve(ctx.cwd ?? process.cwd(), file!), "utf8");
+    try { spec = JSON.parse(bytes); } catch (error) { throw new Error(`--spec is not JSON: ${(error as Error).message}`); }
+  }
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("--spec must be a JSON object");
   if (spec.action !== undefined && spec.action !== "run") throw new Error("--spec describes a run; action must be absent or \"run\"");
   if (spec.request !== undefined) throw new Error("the request id is --request, not a spec field");
@@ -316,6 +338,7 @@ async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<num
   const body = normalized.body as RunBody;
   const session = runSession(text(values, "session"), ctx.env);
   if (session) body.session = session;
+  if (wake) { body.wake = { to: callAddress(ctx.env.DSA_CALL!) }; body.caller = ctx.env.DSA_CALL; }
   seen.digest = specDigest({ kind: "run", body });
   // An id already recorded is decided by that record: the same content gets its first outcome (the agents it named may
   // have changed since), other content is a request-conflict. Only a new id is checked here.

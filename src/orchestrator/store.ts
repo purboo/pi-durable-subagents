@@ -28,7 +28,9 @@ export interface Pins {
  *  from the published files: `originPath` (pinned origin.jsonl, when the run has an origin) and `inputs`. */
 export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string>; originPath?: string;
   /** The settled record it was opened from (settled.ts): consult it only while its journal is not loaded. */
-  settled?: SettledFacts }
+  settled?: SettledFacts;
+  /** Pinned wake routing, copied only for runs that explicitly request it. */
+  wake?: { rid: string; to: string; caller: string } }
 type SnapshotRef = { path: string; hash: string };
 /** pinned/<rN>/pins.json: the in-memory pins of a published revision, valid for the snapshot hash it names. */
 type PinRecord = { snapshot: string; digest: string; pins: Pins; inputs: Record<string, string>; origin: boolean; files: Record<string, string> };
@@ -303,7 +305,7 @@ export class Store {
   async create(req: Request<RunBody>): Promise<Workflow> {
     let intent = this.index().createByRid.get(req.rid);
     intent ??= await this.ledgers.orch.append('create-intent', { rid: req.rid, wid: ulid(), origin: req.from, cwd: req.body.cwd,
-      ...(req.body.name !== undefined ? { name: req.body.name } : {}), snapshot: await this.reference(req.rid) });
+      ...(req.body.name !== undefined ? { name: req.body.name } : {}), ...(req.body.wake ? { wake: { rid: req.rid, to: req.body.wake.to, caller: req.body.caller } } : {}), snapshot: await this.reference(req.rid) });
     return this.materialize(intent);
   }
   /** P14, A5: Bind the next revision before retiring any old authority. */
@@ -507,7 +509,7 @@ export class Store {
       try {
         const current = settled.revised ?? intent, files = await this.pinnedFiles(wid, settled.revision, current, false);
         const facts: SettledFacts = { revision: settled.revision, ...(settled.revised ? { revised: settled.revised } : {}), done: settled.done, resumed: settled.resumed, quiet: settled.quiet, calls: settled.calls, sweep: settled.sweep };
-        const wf: Workflow = { wid, revision: settled.revision, origin: intent.origin as string, cwd: intent.cwd as string, journal: lazy, ...files, settled: facts };
+        const wf: Workflow = { wid, revision: settled.revision, origin: intent.origin as string, cwd: intent.cwd as string, journal: lazy, ...files, settled: facts, ...(intent.wake ? { wake: intent.wake as Workflow['wake'] } : {}) };
         this.releasePins(wf);
         this.unverified.set(wid, current);
         lazy.onAppend = () => this.appended?.(wid);
@@ -527,13 +529,13 @@ export class Store {
       // terminalEntry over the whole journal: a `revised` after the last done supersedes it, as in the revision's view.
       const ended = !first && entries.length > 0 && terminalEntry(entries) !== undefined;
       const files = first ?? (ended ? await this.pinnedFiles(wid, revision, current, false) : await this.pinnedFiles(wid, 1, intent));
-      wf = { wid, revision: ended ? revision : 1, origin: intent.origin as string, cwd: intent.cwd as string, journal, ...files };
+      wf = { wid, revision: ended ? revision : 1, origin: intent.origin as string, cwd: intent.cwd as string, journal, ...files, ...(intent.wake ? { wake: intent.wake as Workflow['wake'] } : {}) };
       if (ended) { this.releasePins(wf); this.unverified.set(wid, current); }
     } catch (error) { await journal.close(); throw error; }
     journal.onAppend = () => this.appended?.(wid);
     this.workflows.set(wid, wf);
     if (!journal.entries().length) await journal.append('wf-created', { rid: intent.rid, origin: intent.origin, cwd: intent.cwd, revision: 1,
-      ...(intent.name !== undefined ? { name: intent.name } : {}) });
+      ...(intent.name !== undefined ? { name: intent.name } : {}), ...(intent.wake ? { wake: intent.wake } : {}) });
     const revised = journal.entries().findLast(e => e.type === 'revised');
     if (revised && wf.revision !== Number(revised.revision)) Object.assign(wf, await this.pinnedFiles(wid, Number(revised.revision), revised), { revision: Number(revised.revision) });
     if (!this.index().created.has(String(intent.rid))) await this.ledgers.orch.append(JT.created, { rid: intent.rid, wid, origin: intent.origin });
