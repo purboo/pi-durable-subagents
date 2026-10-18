@@ -77,11 +77,12 @@ for (const pool of [true, false]) test(`model-unavailable: real pi restore with 
   ].map(e => JSON.stringify(e)).join("\n") + "\n");
   const result = await f.executor.run(ticket);
   assert.equal(result.status, pool ? "ok" : "failed");
+  // pi 1.0.x findInitialModel may fall back from settings qa/m to router/auto while startup refresh replaces configuredProviders.
   if (pool) assert.equal(result.output, "answered by qb");
-  else assert.match(result.error!, /model-unavailable: selected missing-auth\/m, pi would use qa\/m:.*auth/);
+  else assert.match(result.error!, /model-unavailable: selected missing-auth\/m, pi would use (?:qa\/m|router\/auto):.*auth/);
   assert.deepEqual(await f.requests(), pool ? ["qb"] : [], "neither the unauthenticated selection nor pi's default makes a request");
   const failure = f.journal.entries().find(e => e.type === "model-unavailable")!;
-  assert.ok(failure); assert.match(String(failure.reason), /selected missing-auth\/m, pi would use qa\/m:.*auth/);
+  assert.ok(failure); assert.match(String(failure.reason), /selected missing-auth\/m, pi would use (?:qa\/m|router\/auto):.*auth/);
   assert.deepEqual(providersOf(f, "a"), pool ? ["missing-auth", "qb"] : ["missing-auth"]);
 });
 
