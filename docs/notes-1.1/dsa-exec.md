@@ -82,8 +82,60 @@ orchestrator's node directory and inherited PATH.
 
 `test/unit/orchestrator/executor/lifecycle.test.ts`: added EX2/EX3 regression tests
 and their imports; all four existing P18/P31 tests remain unchanged. No existing
-test expectation was changed. All other new tests are in the two requested
+expectation in that unit file was changed. All other new tests are in the two requested
 `ended.test.ts` files. R-11-3 updates the multi-round/failure/abort fixture calls
 to provide a known direct identity, keeping their original expectations, and
 adds crash-before-tracked coverage with fake and real process tables. This
 separates known-identity diagnostics from the newly approved root-omission rule.
+
+R-11-4 changes only the two model-unavailable regexes in
+`test/pi/executor/failover.test.ts`: pi can select either settings `qa/m` or
+startup fallback `router/auto`. The selected missing-auth model and auth-error
+checks, status, output, provider history and forbidden-request counts remain
+unchanged.
+
+R-11-7 changes only the model-change assertion in the C1 empty-reply test in
+`test/pi/executor/executor.test.ts`. Pi startup can miss an extension provider
+that registers late; `src/agent/child.ts`'s existing `ensureModel()` C8 correction
+then reselects the held model via `pi.setModel()`. Pi's `AgentSession.setModel()`
+appends a `model_change` even when restoring the same selected model. This does
+not create a session: candidate and clean-trunk failure artifacts each have one
+session header, two execution markers and two changes to `probe/scripted`.
+The assertion now requires every model change to name the ticket's selected
+model, with either one change or exactly two, the second immediately after the
+second execution marker. Output `continued`, one loss, one session header, two
+execution markers, exactly-once request receipts and inbox cleanup are unchanged.
+No source code or other assertion in that file changed.
+
+### R-11-7 validation and current blocker
+
+All commands ran in the foreground through `/tmp/dsa-110/run-dsa.sh` on ipc.
+The tested source tree was `81f8be3fea60ef402904481cfe1c14cccc6f4652` (rebased
+HEAD `930702ba646d3cf20230e5347c116a70a0232105` plus the C1 test hunk). Only this
+notes update follows those checks; it does not change the tested code.
+
+- `npm run typecheck`: exit 0.
+  Log: `/tmp/dsa-110/logs/dsa-dsa-exec-1-80528-191953.log`.
+- Ten sequential invocations of `node --test --test-reporter=tap
+  --test-concurrency=1 --test-force-exit test/pi/executor/executor.test.ts`:
+  C1 10/10 pass, zero C1 failures. Each invocation had 90 tests; overall
+  898/900 pass, eight invocations exit 0 and two exit 1 (wrapper exit 1).
+  Run 1 failed V1 provider-slot serialization while waiting for durable evidence
+  (`executor.test.ts:889`); run 5 failed P28 receipt-before-crash while parsing
+  a session (`executor.test.ts:758`, `Unexpected end of JSON input`).
+  Summary log: `/tmp/dsa-110/logs/dsa-dsa-exec-1-80918-192025.log`.
+  Complete failing TAP logs are preserved locally in
+  `/tmp/dsa-110/r117-evidence/r117-executor-1-23ZCCi.tap` and
+  `/tmp/dsa-110/r117-evidence/r117-executor-5-ap8Hk3.tap`; all ten remote TAP
+  paths are recorded in the summary log.
+- Full pi suite once: `node --test --test-reporter=tap --test-timeout=120000
+  --test-concurrency=1 --test-force-exit 'test/pi/**/*.test.ts'`:
+  224/225 pass, exit 1, no skips; C1 passed. The sole failure was the AC2/AC4
+  chaos test, scenario 5, invariant `main send receipt`.
+  Log: `/tmp/dsa-110/logs/dsa-dsa-exec-1-105839-194140.log`.
+  Runtime evidence: `/home/purboo/dsa-ci/tmp/dsa-chaos-qT4Tsi/5` on ipc.
+
+The requested C1 criterion passes, but the full-suite criterion remains unmet.
+The V1, P28 and chaos failures have not been proven baseline or waived; their
+fixes are outside this test-only ruling. Preserve this candidate for parent
+review; do not submit it as passing or rerun full suites without a new reason.
