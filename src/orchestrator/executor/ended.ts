@@ -8,7 +8,11 @@ export async function fenceAgent(containment: Pick<Containment, "fence">, journa
   const options: FenceOptions = { beforeKill: async (targets, signal) => {
     const identities = journal.entries().filter(e => e.type === "tracked" && e.exec === exec);
     const direct = child ?? identities.find(e => e.child === true) ?? identities[0];
-    const others = targets.filter(p => !direct || p.pid !== direct.pid || p.start !== direct.start);
+    // R-11-3: a crash after spawn but before tracked leaves no provable direct identity. Roots of the target
+    // forest may be pi or orphaned descendants: omit all roots rather than ever reporting the direct child.
+    const pids = new Set(targets.map(p => p.pid));
+    const others = direct ? targets.filter(p => p.pid !== direct.pid || p.start !== direct.start)
+      : targets.filter(p => pids.has(p.ppid));
     if (!others.length || signal.aborted) return;
     const commands = await Promise.all(others.map(async p => ({ pid: p.pid, command: await commandLine(p.pid, signal) })));
     const procs = commands.slice(0, 20);
