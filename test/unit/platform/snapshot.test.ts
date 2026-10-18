@@ -51,3 +51,17 @@ test("C2 failed scans are shared but not cached; macOS known ids cannot contamin
   assert.equal((await table.list(new Set(["other"]), { maxAgeMs: 10000 }))[0]?.tag, undefined);
   assert.equal(calls, 2, "different macOS known-id sets reuse raw ps output, not filtered tags");
 });
+
+test("lease tags: macOS environment listing selects the configured tag name and exact known value", async () => {
+  const stdout = row.replace("DSA_EXEC=real", "DSA_EXEC=real DSA_HOLD=machine:1 DSA_HOLD=machine:10");
+  const table = new ProcessTable({ platform: "darwin", tagName: "DSA_HOLD", ps: async () => stdout });
+  assert.equal((await table.list(new Set(["machine:1"])))[0]?.tag, "machine:1");
+  assert.equal((await table.list(new Set(["machine:10"])))[0]?.tag, "machine:10");
+  assert.equal((await table.list(new Set(["machine:2"])))[0]?.tag, undefined);
+  assert.equal((await new ProcessTable({ platform: "darwin", ps: async () => stdout }).list(new Set(["real"])))[0]?.tag, "real");
+});
+
+test("lease tags: macOS listing without visible environments leaves tags absent for group-only cleanup", async () => {
+  const table = new ProcessTable({ platform: "darwin", tagName: "DSA_HOLD", ps: async () => row.replace(" DSA_EXEC=real", "") });
+  assert.equal((await table.list(new Set(["machine:1"])))[0]?.tag, undefined);
+});
