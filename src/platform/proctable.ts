@@ -2,8 +2,8 @@
 // Known-id filtering assumes argv/other values do not impersonate the sole known
 // execution id. Multiple known ids are ambiguous; macOS verification awaits CI.
 import { readFile, readdir } from "node:fs/promises";
-import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync } from "node:fs";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import type { ProcInfo, ProcessTable as Table } from "../types.ts";
 
@@ -63,13 +63,40 @@ export class ProcessTable implements Table {
   private ticks?: Promise<number>;
   private platform: NodeJS.Platform;
   private ps: () => Promise<string>;
+  private tagName: string;
 
-  constructor(options: { platform?: NodeJS.Platform; ps?: () => Promise<string> } = {}) {
+  constructor(options: { platform?: NodeJS.Platform; ps?: () => Promise<string>; tagName?: string } = {}) {
+    this.tagName = options.tagName ?? "DSA_EXEC";
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(this.tagName)) throw new Error("Invalid process tag name");
     this.platform = options.platform ?? process.platform;
     this.ps = options.ps ?? (async () => (await exec(PS,
       ["-axEww", "-o", "pid=,ppid=,lstart=,time=,stat=,command="],
       // The whole table with environments is large; 2 s proved too short on loaded macOS machines.
       { env: { ...process.env, LC_ALL: "C" }, timeout: 10_000, maxBuffer: 32 * 1024 * 1024 })).stdout);
+  }
+
+  /** Synchronous liveness for lease readers. Unlike execution tracking, hold tags are reread after each exec. */
+  tagged(tag: string): Pick<ProcInfo, "pid" | "start">[] {
+    if (this.platform === "darwin") {
+      try {
+        return this.mac(execFileSync(PS, ["-axEww", "-o", "pid=,ppid=,lstart=,time=,stat=,command="],
+          { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 1000, maxBuffer: 32 * 1024 * 1024 }), new Set([tag]))
+          .filter(p => p.tag === tag);
+      } catch { return []; /* ps may not expose environments: group-only fallback */ }
+    }
+    if (this.platform !== "linux") return [];
+    const out: Pick<ProcInfo, "pid" | "start">[] = [];
+    for (const name of readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        const stat = readStat(name), fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        if (fields[0] === "Z" || fields[0] === "X") continue;
+        if (!readFileSync(`/proc/${name}/environ`, "utf8").split("\0").includes(`${this.tagName}=${tag}`)) continue;
+        const check = readStat(name), current = check.slice(check.lastIndexOf(")") + 2).split(" ");
+        if (current[19] === fields[19] && current[0] !== "Z" && current[0] !== "X") out.push({ pid: Number(name), start: fields[19]! });
+      } catch (error) { if (!vanished(error)) throw error; }
+    }
+    return out;
   }
 
   /** C2, F1: Concurrent observations share a scan; fences wait out all pre-request work. */
@@ -109,10 +136,10 @@ export class ProcessTable implements Table {
         const start = fields[19]!;
         const key = `${name}:${start}`;
         let tag = this.tags.get(key);
-        if (!this.tags.has(key)) {
+        if (this.tagName !== "DSA_EXEC" || !this.tags.has(key)) {
           try {
             const env = await readFile(`/proc/${name}/environ`, "utf8");
-            tag = env.split("\0").find(value => value.startsWith("DSA_EXEC="))?.slice(9);
+            tag = env.split("\0").find(value => value.startsWith(`${this.tagName}=`))?.slice(this.tagName.length + 1);
           } catch (error) { if (!vanished(error)) throw error; }
           // Do not attach an old environment to a reused pid; cached identities already include the start token.
           const check = readStat(name);
@@ -134,7 +161,7 @@ export class ProcessTable implements Table {
       if (!match || match[5]!.startsWith("Z")) continue;
       const parts = match[4]!.split(":").map(Number);
       const seconds = parts.reduce((total, part) => total * 60 + part, 0);
-      const tags = new Set([...match[6]!.matchAll(/(?:^|\s)DSA_EXEC=([^\s]*)/g)]
+      const tags = new Set([...match[6]!.matchAll(new RegExp(`(?:^|\\s)${this.tagName}=([^\\s]*)`, "g"))]
         .map(token => token[1]!).filter(tag => knownExecs.has(tag)));
       result.push({ pid: Number(match[1]), ppid: Number(match[2]), start: match[3]!.replace(/\s+/g, " "),
         tag: tags.size === 1 ? tags.values().next().value : undefined, cpuMs: seconds * 1000,
