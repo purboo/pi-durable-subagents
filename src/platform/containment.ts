@@ -12,6 +12,12 @@ type KnownTable = { list(knownExecs?: ReadonlySet<string>, options?: { maxAgeMs?
 
 const identity = (p: Pick<ProcInfo, "pid" | "start">) => `${p.pid}:${p.start}`;
 
+export type FenceOptions = {
+  timeoutMs?: number;
+  /** EX1: Best-effort diagnostics before each SIGKILL round; aborted after 500 ms, never a retirement guard. */
+  beforeKill?: (targets: readonly ProcInfo[], signal: AbortSignal) => Promise<void>;
+};
+
 /** P22, P23, C1, C3: Direct launch and identity-based retirement of executions. */
 export class Containment implements Contract {
   private table: KnownTable;
@@ -82,10 +88,11 @@ export class Containment implements Contract {
   }
 
   /** P22, P23: Kill tagged and tracked identities until a rescan proves retirement. */
-  async fence(exec: ExecId, tracked: readonly ProcInfo[], opts: { timeoutMs?: number } = {}): Promise<void> {
+  async fence(exec: ExecId, tracked: readonly ProcInfo[], opts: FenceOptions = {}): Promise<void> {
     const timeout = opts.timeoutMs ?? 5000;
     if (!Number.isFinite(timeout) || timeout < 0) throw new Error("Invalid fence timeout");
     const deadline = performance.now() + timeout;
+    let recordingMs = 500;
     const known = new Map(tracked.filter(p => p.start !== "").map(p => [identity(p), p]));
     for (;;) {
       const remaining = deadline - performance.now();
@@ -97,10 +104,30 @@ export class Containment implements Contract {
       const targets = live.get(exec) ?? [];
       if (!targets.length) { this.launched.delete(exec); return; }
       if (performance.now() >= deadline) throw new Error(`Fence timeout: ${exec}`);
+      const killing: ProcInfo[] = [];
       for (const p of targets) {
         known.set(identity(p), p);
         // C3: the pid may have exited and been reused since the scan; kill only if it still has the scanned start.
         if (p.start !== "" && await captureStart(p.pid) !== p.start) continue;
+        if (!opts.beforeKill) {
+          try { process.kill(p.pid, "SIGKILL"); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+        } else killing.push(p);
+      }
+      if (killing.length && opts.beforeKill && recordingMs > 0) {
+        const recordingStarted = performance.now(), controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            Promise.resolve().then(() => opts.beforeKill!(killing, controller.signal)),
+            new Promise<void>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(); }, recordingMs); }),
+          ]);
+        } catch { /* A recording failure must never prevent SIGKILL. */ }
+        finally { clearTimeout(timer); controller.abort(); recordingMs = Math.max(0, recordingMs - (performance.now() - recordingStarted)); }
+      }
+      for (const p of killing) {
+        // Diagnostic I/O was asynchronous: revalidate identity again before signalling.
+        if (opts.beforeKill && p.start !== "" && await captureStart(p.pid) !== p.start) continue;
         try { process.kill(p.pid, "SIGKILL"); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       }

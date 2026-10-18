@@ -1,10 +1,12 @@
-// Private journal entries (A1): tracked{exec,pid,start}; loss{exec}; settled{exec};
+// Private journal entries (A1): tracked{exec,pid,start,child?} (child:true identifies the direct pi process);
+// loss{exec}; settled{exec};
 // stop-intent{call}; forward{rid,rid2,dest,hash,envelope:{to,kind,body,cond?}};
 // forward-delivered{rid,rid2,call,reason?}: the first observed child receipt of a forward (once per forward; reason when
 // the child resolved it as rejected, e.g. withdrawn); forward-retired{rid,rid2,reason}: sealed/retired without a receipt (P27);
 // an undelivered notify becomes a pending-note{rid,call,key,message} first (../notes.ts).
 // observation{exec,event}; selected{exec,model}; switch-observed{exec,rid,pool}.
 // P28 entries are documented in hibernate.ts; generation session publication in generation.ts.
+// ended{exec,call,procs:[{pid,command}],more?}: agent fence SIGKILL targets other than its direct child (EX1/WK8).
 // session-corrupt{call,line}: a malformed native session line was skipped (once per line, E4).
 // spawn-env-failed{exec,call,command,error}: launching the child failed for a reason of the environment (ENOENT, EACCES:
 // pi or its interpreter missing or not executable); the call stays queued and launches again after a backoff.
@@ -36,6 +38,7 @@ import { buildCallResult } from "../../compat/result.ts";
 import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts";
 import createEffects from "./effects/index.ts";
 import { continueSession } from "./generation.ts";
+import { fenceAgent } from "./ended.ts";
 import { answerInFlight, boundAnswer, hibernation, openAsked, openQuestion, supersededByBinding } from "./hibernate.ts";
 import { SessionFold, answerKey, digestOpenQuestion, supersededBy } from "./digest.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
@@ -54,7 +57,7 @@ import { PENDING_NOTE, UNDELIVERED_FOLLOW_UP } from "../notes.ts";
 import { COMMAND_LOG, exitMeaning, readExitRecord, readTail, spawnCommand, type SpawnedCommand } from "../../platform/command.ts";
 import { captureStart } from "../../platform/proctable.ts";
 import { heldIn } from "../snapshot.ts";
-import { COMMAND_INTENT, COMMAND_SPAWN_FAILED, COMMAND_STARTED, COMMAND_TIMEOUT, COMMAND_WITHDRAWN, commandDirName, commandId, retiredCommandAttempts } from "./command.ts";
+import { COMMAND_INTENT, COMMAND_SPAWN_FAILED, COMMAND_STARTED, COMMAND_TIMEOUT, COMMAND_WITHDRAWN, commandDirName, commandEnvironment, commandId, retiredCommandAttempts } from "./command.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
 type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean; commandStarting?: boolean;
@@ -138,6 +141,11 @@ export function continueMessage(dangling: readonly string[]): string {
     "(background ones included) were stopped with it: do not wait for them or their output; check what they left " +
     "and start again what is still needed. Tool calls whose outcomes are unknown: " + (dangling.join(", ") || "none") + ".";
 }
+/** EX2: Appended to every derived agent prompt, never to the pinned agent definition. */
+export const CHILD_LIFECYCLE_NOTE = "Processes you start end when your turn ends: dsa stops every process of this call when it seals.\n" +
+  "To run something that must outlive your turn (a long build, test suite or measurement), start it as a durable command call and end your turn:\n" +
+  "  pi-durable-subagents run --request <unique id> --wake caller -- <program> [args…]\n" +
+  "It keeps running after your turn; when it finishes you get a follow-up with its exit status and output tail.";
 /** An asker hibernates while it waits (its execution is stopped to free the provider slot), so the answer says so. */
 export const HIBERNATED_NOTE = "While you waited for the answer below your execution was stopped; processes your tools had " +
   "started (background ones included) were stopped with it. Check them before relying on them.";
@@ -229,7 +237,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     if (has(journal, JT.fenced, exec)) return true;
     if (!failing.has(exec)) {
       let retired = false;
-      try { await containment.fence(exec, tracked(journal, exec)); retired = true; }
+      try { await fenceAgent(containment, journal, exec, tracked(journal, exec), opts.child); retired = true; }
       catch (error) { await fenceFailed(journal, exec, callOf(exec), error); }
       if (retired) { await fenceSucceeded(journal, exec); return true; }
     }
@@ -1078,7 +1086,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         return refused === undefined;
       };
       const result = await spawnCommand({ command: t.spec.command!, cwd: t.cwd, dir, proceed,
-        env: { ...process.env, ...t.spec.env, DSA_EXEC: id, DSA_CALL: t.callId, DSA_HOME: home } });
+        env: commandEnvironment(home, id, t.callId, t.spec.env) });
       if (!result) {
         if (refused === "withdrawn") await serial(() => t.journal.append(COMMAND_WITHDRAWN, { call: t.callId, id }));
         return undefined;
@@ -1340,7 +1348,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await mkdir(dir, { recursive: true });
       const prompt = join(dir, "system.txt"), schema = join(dir, "schema.json");
       // These are derived launch inputs, reconstructed from the pinned ticket after a crash.
-      await writeFile(prompt, t.agent.body);
+      await writeFile(prompt, `${t.agent.body}\n\n${CHILD_LIFECYCLE_NOTE}`);
       if (t.spec.schema !== undefined) await writeFile(schema, JSON.stringify(t.spec.schema));
       const sender = await outbox;
       if (bound) await serial(async () => {
@@ -1392,6 +1400,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       }
       await serial(() => spawnEnvResolved(t));
       try {
+        // EX1: retain the direct identity even if pi exited before start capture; otherwise a surviving grandchild
+        // could become the first tracked process and be mistaken for pi on a recovery fence.
+        if (child.pid > 0) await serial(async () => {
+          await journal.append("tracked", { exec, pid: child.pid, start: child.start, child: true });
+        });
         await track(journal, exec, [{ pid: child.pid, start: child.start, ppid: process.pid }]);
         await observeExecution({ home, config, ticket: t, exec, child, serial, read: () => readCall(journal, t.callId),
           setWake: fn => { a.wake = fn; }, interrupted: () => !!interrupted(a),

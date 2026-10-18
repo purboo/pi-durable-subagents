@@ -1054,7 +1054,15 @@ test("C1 empty reply loses once, then continues in the same native session", { t
   const entries = readFileSync(callSession(f.home, f.wid, "a", 1), "utf8").trim().split("\n").map(line => JSON.parse(line));
   assert.equal(entries.filter(e => e.type === "session").length, 1);
   assert.equal(entries.filter(e => e.customType === CT.exec).length, 2);
-  assert.equal(entries.filter(e => e.type === "model_change").length, 1);
+  // R-11-7: late provider registration can make ensureModel's C8 correction reselect the restored model after exec #2.
+  const changes = entries.filter(e => e.type === "model_change");
+  const selected = f.journal.entries().find(e => e.type === "selected" && e.exec === `${ticket.callId}#1.1`)!.model as { provider: string; id: string };
+  assert.ok(changes.length === 1 || changes.length === 2);
+  for (const change of changes) {
+    assert.equal(change.provider, selected.provider);
+    assert.equal(change.modelId, selected.id);
+  }
+  if (changes.length === 2) assert.equal(entries.indexOf(changes[1]), entries.findIndex(e => e.customType === CT.exec && e.data?.exec === `${ticket.callId}#1.2`) + 1);
   const requests = sent(f.home).filter(r => r.to === ticket.callId);
   assert.deepEqual(requests.map(r => r.kind), ["task", "continue"]);
   for (const r of requests) assert.equal(entries.filter(e => e.type === "custom_message" && e.details?.rid === r.rid).length, 1, "each request is applied exactly once");
