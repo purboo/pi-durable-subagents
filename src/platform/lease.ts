@@ -1,18 +1,15 @@
-// Command-scoped resource leases: `pi-durable-subagents hold <resource> -- <command>` (README "Resource leases").
-// One ticket file per request under $DSA_HOME/leases/<resource>/, numbered under a kernel lock so the numbers are
-// strictly increasing and never reused. Grants are strict FIFO by number: an exclusive request needs no earlier live
-// ticket, a shared one no earlier live exclusive ticket. A counted request (`--slots N`) needs no earlier live waiter of
-// any mode, no earlier live exclusive ticket, and fewer than N live granted tickets. Whether an exclusive or shared
-// request is grantable depends only on earlier tickets, which can only disappear. A counted request also counts later
-// granted tickets, but only shared ones can be granted past it (shared requests ignore slots by design), and earlier
-// counted tickets are all granted before it is (FIFO), so counted grants happen one at a time in number order and none
-// can be missed: a grant needs no lock once the ticket exists. A ticket is live while its wrapper or its
-// command (pid + start token) lives, or processes the command left in its group remain; a waiter next in line ends such
-// leftovers of a killed wrapper. Anyone may delete a dead ticket. No orchestrator is involved.
+// Command-scoped resource leases: `pi-durable-subagents hold <resource> -- <command>`.
+// Tickets are numbered under a kernel lock and waiters rank by descending priority, then ascending sequence.
+// Granted incompatible tickets always block; waiting incompatible tickets block only requests behind them in rank.
+// Enqueue and every final check-and-grant share the resource lock: a later higher-priority waiter can now block an
+// earlier request, so the old FIFO lock-free grant argument no longer applies. No lock is held while commands run or
+// their processes are ended. A ticket stays live while its wrapper, command, group or exact DSA_HOLD tag lives;
+// waiters reclaim orphaned command trees before granting the next request. No orchestrator is involved.
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { OsLock } from "./lock.ts";
+import { ProcessTable } from "./proctable.ts";
 
 export type LeaseMode = "exclusive" | "shared" | "counted";
 export interface LeaseProcess { pid: number; start?: string }
@@ -20,6 +17,7 @@ export interface LeaseTicket {
   seq: number; resource: string; mode: LeaseMode;
   /** Mode "counted": at most this many live granted tickets (counted or shared) when it is granted. */
   slots?: number;
+  priority?: number; yield?: true; expectMs?: number;
   wrapper: LeaseProcess; command?: LeaseProcess;
   /** The command as given (clipped), its working directory and an optional note. */
   argv: string[]; cwd: string; note?: string;
@@ -70,9 +68,9 @@ export function groupAlive(pgid: number): boolean {
  * the original group emptied and the pid was reused. macOS has no start token here: a reused pid that is alive there
  * counts as the command (the lease waits for it), never as leftovers to end.
  */
-export function orphaned(t: LeaseTicket): boolean {
+function leftoverGroup(t: LeaseTicket): boolean {
   const c = t.command;
-  if (!c || alive(t.wrapper) || alive(c)) return false;
+  if (!c) return false;
   if (process.platform === "linux") {
     try {
       const fields = readFileSync(`/proc/${c.pid}/stat`, "utf8");
@@ -89,8 +87,32 @@ export function orphaned(t: LeaseTicket): boolean {
   try { process.kill(-c.pid, "SIGKILL"); } catch { /* the group is gone */ }
   return false;
 }
-/** A ticket is live while its wrapper, its command, or processes the command left in its group run. */
+const holdTable = new ProcessTable({ tagName: "DSA_HOLD" });
+export const holdTag = (t: Pick<LeaseTicket, "resource" | "seq">) => `${t.resource}:${t.seq}`;
+export const tagged = (t: Pick<LeaseTicket, "resource" | "seq">): LeaseProcess[] => holdTable.tagged(holdTag(t));
+/** An orphan may retain its tag even after its leader and entire original process group have gone. */
+export const orphaned = (t: LeaseTicket) => !alive(t.wrapper) && !alive(t.command) && (leftoverGroup(t) || tagged(t).length > 0);
+/** A ticket is live while its wrapper, command, process group or exact inherited tag can still act. */
 export const live = (t: LeaseTicket) => alive(t.wrapper) || alive(t.command) || orphaned(t);
+
+/** End the group and escaped tagged descendants, rescanning for forks. Release is bounded even for unkillable tasks. */
+export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (line: string) => void): Promise<void> {
+  const started = Date.now(), until = started + 5000;
+  for (;;) {
+    const members = tagged(t), group = t.command && (alive(t.command) || leftoverGroup(t));
+    const signal = Date.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
+    if (group) { try { process.kill(-t.command!.pid, signal); } catch { /* gone */ } }
+    for (const p of members) if (alive(p)) { try { process.kill(p.pid, signal); } catch { /* gone */ } }
+    if (!group && !members.length) break;
+    if (Date.now() >= until) {
+      if (members.length) say(`hold: ${members.length} processes tagged ${holdTag(t)} survived; releasing`);
+      break;
+    }
+    await new Promise(r => setTimeout(r, 25));
+  }
+  // /proc listings are not atomic. A final group signal also reaches a newborn missed by the last scan.
+  if (t.command && (alive(t.command) || leftoverGroup(t))) { try { process.kill(-t.command.pid, "SIGKILL"); } catch { /* gone */ } }
+}
 
 /** The tickets of one resource in request order (unreadable or half-written files are skipped). */
 export function readTickets(home: string, resource: string): LeaseTicket[] {
@@ -112,17 +134,18 @@ export function liveTickets(home: string, resource: string): LeaseTicket[] {
   });
 }
 
-/** The live tickets that keep `t` waiting (empty when it may run). For an exclusive or shared request these are earlier
- *  tickets; a counted one is kept by earlier waiters and exclusive tickets, else, when all its slots are taken, by every
- *  granted ticket (a granted shared one may be later). `tickets` is the resource's live list, `t` itself ignored. A
- *  granted ticket is never blocked again: later grants (shared, or counted with a larger N) must not take it back. */
-export function blockers(t: Pick<LeaseTicket, "seq" | "mode" | "slots" | "grantedAt">, tickets: LeaseTicket[]): LeaseTicket[] {
+/** Priority is optional for persisted 1.0 tickets. Ties retain the original sequence order. */
+export const rank = (a: Pick<LeaseTicket, "seq" | "priority">, b: Pick<LeaseTicket, "seq" | "priority">) =>
+  (b.priority ?? 0) - (a.priority ?? 0) || a.seq - b.seq;
+
+/** All incompatible holders, plus incompatible waiters ranked ahead. A grant is never taken back by later grants. */
+export function blockers(t: Pick<LeaseTicket, "seq" | "mode" | "slots" | "grantedAt" | "priority">, tickets: LeaseTicket[]): LeaseTicket[] {
   if (t.grantedAt !== undefined) return [];
-  if (t.mode !== "counted") return tickets.filter(o => o.seq < t.seq && (t.mode === "exclusive" || o.mode === "exclusive"));
-  const ahead = tickets.filter(o => o.seq < t.seq && (o.grantedAt === undefined || o.mode === "exclusive"));
-  if (ahead.length) return ahead;
-  const granted = tickets.filter(o => o.seq !== t.seq && o.grantedAt !== undefined);
-  return granted.length >= (t.slots ?? 1) ? granted : [];
+  const others = tickets.filter(o => o.seq !== t.seq);
+  const full = t.mode === "counted" && others.filter(o => o.grantedAt !== undefined).length >= (t.slots ?? 1);
+  return others.filter(o => o.grantedAt !== undefined
+    ? t.mode === "exclusive" || o.mode === "exclusive" || full
+    : rank(o, t) < 0 && (t.mode !== "shared" || o.mode === "exclusive"));
 }
 
 /** Write `file` through a temporary file renamed over it; a failed write or rename removes the temporary file (a full
@@ -160,28 +183,35 @@ export function removeTicket(home: string, t: LeaseTicket) {
   try { unlinkSync(path.join(leaseDir(home, t.resource), ticketName(t.seq))); } catch { /* already gone */ }
 }
 
-/** Queue a request: number it under the resource's kernel lock and write its ticket before the lock is released, so a
- *  later request always sees it. */
+/** Queue a request under the same lock used by queued and no-wait grants. */
 export async function enqueue(home: string, ticket: Omit<LeaseTicket, "seq">, lock = new OsLock()): Promise<LeaseTicket> {
   return (await numbered(home, ticket, false, lock)) as LeaseTicket;
 }
-/** Take the lease now or not at all (`hold --max-wait 0`): under the resource's kernel lock, either no live ticket
- *  blocks it and its ticket is written already granted, or nothing is written and the blockers are returned. A refused
- *  request is never visible as a waiter, and a granted one never was one. Granting needs no more than the lock: a later
- *  request gets a higher number and waits behind this ticket, and earlier tickets can only disappear. */
+/** Take the lease now or not at all. Refusal never creates a waiter; the synthetic sequence ranks after equal priority. */
 export async function tryGrant(home: string, ticket: Omit<LeaseTicket, "seq" | "grantedAt">, lock = new OsLock()): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
   return numbered(home, ticket, true, lock);
 }
-async function numbered(home: string, ticket: Omit<LeaseTicket, "seq">, now: boolean, lock: OsLock): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
-  const dir = leaseDir(home, ticket.resource);
+async function locked<T>(home: string, resource: string, lock: OsLock, action: () => Promise<T> | T): Promise<T> {
+  const dir = leaseDir(home, resource);
   mkdirSync(dir, { recursive: true });
   let handle = await lock.tryAcquire(path.join(dir, ".lock"));
   for (let delay = 5; !handle; delay = Math.min(delay * 2, 100)) {
     await new Promise(r => setTimeout(r, delay));
     handle = await lock.tryAcquire(path.join(dir, ".lock"));
   }
-  try {
-    const counter = path.join(dir, ".seq");
+  try { return await action(); } finally { await handle.release(); }
+}
+/** Recheck and commit a queued grant under the resource lock. No awaits separate the final read and ticket write. */
+export async function grantQueued(home: string, t: LeaseTicket, lock = new OsLock()): Promise<LeaseTicket[]> {
+  return locked(home, t.resource, lock, () => {
+    const busy = blockers(t, liveTickets(home, t.resource));
+    if (!busy.length) { t.grantedAt = Date.now(); writeTicketSync(home, t); }
+    return busy;
+  });
+}
+async function numbered(home: string, ticket: Omit<LeaseTicket, "seq">, now: boolean, lock: OsLock): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
+  return locked(home, ticket.resource, lock, async () => {
+    const dir = leaseDir(home, ticket.resource), counter = path.join(dir, ".seq");
     const last = Number.parseInt(await readFile(counter, "utf8").catch(() => "0"), 10) || 0;
     const highest = readTickets(home, ticket.resource).reduce((m, t) => Math.max(m, t.seq), last);
     const t: LeaseTicket = { ...ticket, seq: highest + 1 };
@@ -193,7 +223,7 @@ async function numbered(home: string, ticket: Omit<LeaseTicket, "seq">, now: boo
     await replaceFile(counter, String(t.seq));
     writeTicketSync(home, t);
     return t;
-  } finally { await handle.release(); }
+  });
 }
 
 /** Every resource with live tickets: holders (granted) and waiters, in request order. Cheap: a directory listing,
@@ -208,15 +238,15 @@ export function leaseState(home: string): LeaseResource[] {
   let resources: string[];
   try { resources = readdirSync(leasesRoot(home)).filter(r => RESOURCE.test(r)).sort(); } catch { return []; }
   return resources.map(resource => {
-    const tickets = liveTickets(home, resource), holders = tickets.filter(t => t.grantedAt !== undefined), waiters = tickets.filter(t => t.grantedAt === undefined);
+    const tickets = liveTickets(home, resource), holders = tickets.filter(t => t.grantedAt !== undefined), waiters = tickets.filter(t => t.grantedAt === undefined).sort(rank);
     const slots = slotCount(tickets);
     return { resource, holders, waiters, ...(slots !== undefined ? { slots, held: holders.length } : {}) };
   }).filter(r => r.holders.length || r.waiters.length);
 }
-/** The slot count shown for a resource: its first counted waiter's, else its latest counted ticket's (one N per name). */
+/** The slot count shown for a resource: its first ranked counted waiter's, else its latest counted ticket's. */
 export function slotCount(tickets: LeaseTicket[]): number | undefined {
   const counted = tickets.filter(t => t.mode === "counted");
-  return (counted.find(t => t.grantedAt === undefined) ?? counted.at(-1))?.slots;
+  return (counted.filter(t => t.grantedAt === undefined).sort(rank)[0] ?? counted.at(-1))?.slots;
 }
 
 const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`;
@@ -231,7 +261,7 @@ export const modeLabel = (t: Pick<LeaseTicket, "mode">) => t.mode === "counted" 
 /** A granted ticket's mode, how long it has been held, the command (unless `who` already names it) and the note:
  *  "exclusive, 12m, `make bench`, nightly". */
 export const holdDetail = (t: LeaseTicket, now = Date.now(), command = !!t.call) =>
-  `${modeLabel(t)}, ${age(now - (t.grantedAt ?? t.since))}${command ? `, \`${clip(t.argv.join(" "), 60)}\`` : ""}${t.note ? `, ${clip(t.note, 80)}` : ""}`;
+  `${modeLabel(t)}, ${age(now - (t.grantedAt ?? t.since))}${t.expectMs !== undefined ? ` of ~${age(t.expectMs)}` : ""}${command ? `, \`${clip(t.argv.join(" "), 60)}\`` : ""}${t.note ? `, ${clip(t.note, 80)}` : ""}`;
 
 /** One status line per resource: "machine held by <who> (exclusive, 12m, `make bench`); waiting: <who> 3m, …". A resource
  *  with counted tickets: "build 3/5 held: <who> (slot, 2m, ...), ...; waiting: 2 (first: <who>, 30s)". */
@@ -239,10 +269,10 @@ export function leaseLines(state: LeaseResource[], now = Date.now()): string[] {
   return state.map(({ resource, holders, waiters, slots }) => {
     if (slots !== undefined) {
       const by = holders.map(t => `${who(t)} (${holdDetail(t, now)})`).join(", ");
-      return `${resource} ${holders.length}/${slots} held${by ? `: ${by}` : ""}${waiters.length ? `; waiting: ${waiters.length} (first: ${who(waiters[0]!)}, ${age(now - waiters[0]!.since)})` : ""}`;
+      return `${resource} ${holders.length}/${slots} held${by ? `: ${by}` : ""}${waiters.length ? `; waiting: ${waiters.length} (first: ${who(waiters[0]!)}, ${age(now - waiters[0]!.since)}${waiters[0]!.expectMs !== undefined ? `, expects ${age(waiters[0]!.expectMs)}` : ""})` : ""}`;
     }
     const held = holders.length ? `held by ${holders.map(t => `${who(t)} (${holdDetail(t, now)})`).join(", ")}` : "free";
-    return `${resource} ${held}${waiters.length ? `; waiting: ${waiters.map(t => `${who(t)} ${t.mode === "shared" ? "shared " : ""}${age(now - t.since)}`).join(", ")}` : ""}`;
+    return `${resource} ${held}${waiters.length ? `; waiting: ${waiters.map(t => `${who(t)} ${t.mode === "shared" ? "shared " : ""}${age(now - t.since)}${t.expectMs !== undefined ? ` expects ${age(t.expectMs)}` : ""}`).join(", ")}` : ""}`;
   });
 }
 
