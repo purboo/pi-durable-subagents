@@ -9,6 +9,8 @@ import type { SweepSeed } from "./executor/sweep.ts";
 /** User configuration: $DSA_HOME/config.json (all optional). */
 export interface OrchestratorConfig {
   /** Default model when neither the call nor the agent names one (before pi's own settings default). */
+  /** Require a decision_needed on every ask; snapshotted when each execution starts. Default false. */
+  askRequireDecision?: boolean;
   defaultModel?: string;
   /** Model pools: name -> ordered "provider/id[:thinking]" candidates (P12, D10); an entry `{ model, afterMs }` is
    *  taken only by a call that has waited `afterMs` for a slot. */

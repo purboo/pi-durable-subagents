@@ -11,7 +11,7 @@ import { launchOrchestrator } from "../platform/launch.ts";
 import { dsaHome, orchInbox, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { PendingOutboxReader, attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
-import { NOTIFY_SINCE, commandSendRefusal, isCommandTarget, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusCallDetail, statusCompactDetail, statusDetail, statusView, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, commandSendRefusal, isCommandTarget, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusText, statusCallDetail, statusCompactDetail, statusDetail, statusView, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "./main/tool.ts";
 import { parameters } from "./main/schema.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, requestRid, sendIdentified, type Identified } from "../requests.ts";
@@ -358,7 +358,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     ].join("\n"), parameters,
     async execute(_id, args, signal, _update, context) {
       const value = await submit(args as Record<string, unknown>, context.cwd, signal);
-      return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value };
+      return { content: [{ type: "text" as const, text: args.action === 'status' ? statusText(home, value) : JSON.stringify(value) }], details: value };
     },
   }));
 }

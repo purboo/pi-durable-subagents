@@ -3,14 +3,14 @@ import { readFile } from 'node:fs/promises';
 import { Type } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from '@earendil-works/pi-coding-agent';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
-import { ASK_CUT, CT, ENV, JT, type MessageBody, type ModelBody, type Request } from '../types.ts';
+import { ASK_CUT, CT, ENV, JT, askFields, type AskArgs, type MessageBody, type ModelBody, type Request } from '../types.ts';
 import { readJournalSnapshot } from '../kernel/journal.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { contentHash } from '../kernel/ids.ts';
 import { planDecisions, type DecisionRecord } from '../kernel/lifecycle.ts';
 import { openness } from '../kernel/guards.ts';
 import { recover, type Question } from './child/history.ts';
-import { validate } from './child/schema.ts';
+import { askProblem, validate } from './child/schema.ts';
 import { catalogModel, parseModel, sameModel } from '../compat/model.ts';
 import { registerLive } from './child/live.ts';
 
@@ -49,6 +49,7 @@ export function usage(entries: readonly SessionLike[], call?: string): { tokens:
 type Delivery = { content: { type: 'text'; text: string }[]; details: Record<string, unknown> };
 /** P4, P8, P23, P24: Consume the child mailbox at serialized pi boundaries, retaining native session receipts. */
 export function registerChild(pi: ExtensionAPI): void {
+  const requireDecision = process.env[ENV.askRequireDecision] === 'true';
   let target = process.env[ENV.model];
   const exec = process.env[ENV.exec]!, call = process.env[ENV.call]!, inbox = process.env[ENV.inbox]!, journal = process.env[ENV.journal]!;
   let active = false, watcher: FSWatcher | undefined, queue: Promise<unknown> = Promise.resolve();
@@ -292,9 +293,23 @@ export function registerChild(pi: ExtensionAPI): void {
     active = false; watcher?.close(); blocked?.reject(new Error(ASK_CUT.shutdown)); blocked = undefined; await queue;
   });
   pi.registerTool({
-    name: 'ask', label: 'Ask supervisor', description: 'Ask a question and wait for an answer or steering message.',
-    parameters: Type.Object({ question: Type.String() }), executionMode: 'sequential', exposure: 'model-only',
-    async execute(_id, { question }, signal, _update, ctx) {
+    name: 'ask', label: 'Ask supervisor', description: 'Ask a question and wait for an answer or steering message. State the decision you need (one sentence) in decision_needed, list numbered options with scope/cost/risk and at most one preferred option. Give facts (commit, run id, log sha), what you tried, and candidate explanations with evidence and what is unproven. Every string is at most 2000 characters; options and classification_candidates at most 9, facts and tried at most 20.',
+    parameters: Type.Object({
+      question: Type.String(), decision_needed: Type.Optional(Type.String()),
+      options: Type.Optional(Type.Array(Type.Object({ label: Type.String(), scope: Type.Optional(Type.String()), cost: Type.Optional(Type.String()), risk: Type.Optional(Type.String()), preferred: Type.Optional(Type.Boolean()) }))),
+      facts: Type.Optional(Type.Array(Type.String())), tried: Type.Optional(Type.Array(Type.String())),
+      classification_candidates: Type.Optional(Type.Array(Type.Object({ label: Type.String(), evidence: Type.Optional(Type.Array(Type.String())), unproven: Type.Optional(Type.Array(Type.String())) }))),
+    }), executionMode: 'sequential', exposure: 'model-only',
+    // pi validates the schema before execute; reject raw malformed arguments here without coercion as well.
+    prepareArguments(args) {
+      const problem = askProblem(args, requireDecision);
+      if (problem) throw new Error(problem);
+      return args as AskArgs;
+    },
+    async execute(_id, args, signal, _update, ctx) {
+      const problem = askProblem(args, requireDecision);
+      if (problem) throw new Error(problem);
+      const { question } = args;
       let resolve!: (value: Delivery) => void, reject!: (error: Error) => void;
       const result = new Promise<Delivery>((yes, no) => { resolve = yes; reject = no; });
       // Attach immediately so abort during the queued intake never produces an unhandled rejection.
@@ -306,7 +321,7 @@ export function registerChild(pi: ExtensionAPI): void {
           if (!active || signal?.aborted) throw new Error(ASK_CUT.aborted);
           if (blocked) throw new Error('Another question is already blocked');
           const qid = contentHash({ exec, question }), rev = (state.questions.get(qid)?.rev ?? 0) + 1;
-          const q = { qid, rev, question }; state.questions.set(qid, q); pi.appendEntry(CT.question, q);
+          const q = { qid, rev, question, ...askFields(args) }; state.questions.set(qid, q); pi.appendEntry(CT.question, q);
           blocked = { ...q, resolve, reject }; await consume(ctx, 'ask');
         });
         return await result;
