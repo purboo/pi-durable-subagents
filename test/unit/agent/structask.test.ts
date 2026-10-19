@@ -100,6 +100,15 @@ test('AK2: configured strict mode rejects plain ask; default plain asks keep the
   });
 });
 
+test('R-12-AK-2: default plain asks accept long questions unchanged but still refuse non-string questions', async t => {
+  const c = await child(t), question = 'x'.repeat(2001);
+  assert.throws(() => c.tool.prepareArguments({ question: 7 }), /^Error: ask refused: question must be a string$/);
+  await assert.rejects(c.invoke({ question: 7 }), /^Error: ask refused: question must be a string$/);
+  assert.deepEqual(c.tool.prepareArguments({ question }), { question });
+  const q = await c.answered({ question });
+  assert.deepEqual(q, { qid: contentHash({ exec: 'call#1.1', question }), rev: 1, question });
+});
+
 test('AK1: exact collection and string limits are accepted, optional option/candidate members stay absent', async t => {
   const c = await child(t);
   const args = { question: 'x'.repeat(2000), decision_needed: 'd'.repeat(2000), options: Array.from({ length: 9 }, () => ({ label: 'o'.repeat(2000) })), facts: Array(20).fill('f'.repeat(2000)), tried: Array(20).fill('t'.repeat(2000)), classification_candidates: Array.from({ length: 9 }, () => ({ label: 'c'.repeat(2000) })) };
