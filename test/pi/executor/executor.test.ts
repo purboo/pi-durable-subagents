@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { FAUX, PI_BIN, REPO, script, settled, startPi, tempRoot, detachedSleep } from "../../harness/pi.ts";
+import { sessionRows } from "../../harness/session-lines.ts";
 import { parseAgent } from "../../../src/compat/agents.ts";
 import { binDir, callDir, callInbox, callSession, journalPath, orchLedger, outboxRoot } from "../../../src/paths.ts";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
@@ -547,7 +548,7 @@ async function reaskedBeforeFence(t: TestContext, crash: boolean) {
   const f = await setup(t, { k: { hibernateMs: 40, trackerMs: 20 } });
   const ticket = f.ticket("a", script([{ tool: "ask", args: { question: "Choose?" } }, { tool: "ask", args: { question: "Choose?" } }, { text: "not resumed with the answer" }]));
   const path = callSession(f.home, f.wid, "a", 1);
-  const revisions = async () => (await readFile(path, "utf8").catch(() => "")).split("\n").filter(Boolean).map(line => JSON.parse(line))
+  const revisions = async () => sessionRows(await readFile(path, "utf8").catch(() => ""))
     .filter(e => e.type === "custom" && e.customType === CT.question).map(e => e.data.rev as number);
   const append = f.journal.append.bind(f.journal);
   let raced = false;
@@ -755,7 +756,7 @@ test("P28 receipt-before-crash does not redeliver the answer", { timeout: 30000 
   const req: Request = { rid: "answer-before-crash", from: "main:test", to: "orch", sseq: 1, kind: "send", cond: { qid: String(h.qid), rev: Number(h.rev) }, body: { to: ticket.callId, kind: "answer", message: script([{ delayMs: 1000, text: "after receipt" }]) } };
   await f.executor.forward(req, { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 });
   const bound = f.journal.entries().find(e => e.type === "answer-bound")!;
-  const rows = async () => (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const rows = async () => sessionRows(await readFile(callSession(f.home, f.wid, "a", 1), "utf8"));
   await until(async () => (await rows()).some(e => e.type === "custom_message" && e.details?.rid === bound.rid2));
   await f.executor.shutdown(); await assert.rejects(pending, { name: "ExecutorShutdown" });
   const fresh = createExecutor({ home: f.home, orch: f.orch, config });
@@ -1178,7 +1179,7 @@ test("P7 a receipt observed before a crash but not yet recorded is recorded once
   const req: Request = { rid: "crash-steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "keep going" } };
   await f.executor.forward(req, { journal: lossy, widRev: ticket.widRev, key: "a", gen: 1 });
   const rid2 = real.entries().find(e => e.type === "forward")!.rid2;
-  const receipts = async () => (await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).trim().split("\n").map(line => JSON.parse(line)).filter(e => e.type === "custom_message" && e.details?.rid === rid2).length;
+  const receipts = async () => sessionRows(await readFile(callSession(f.home, f.wid, "a", 1), "utf8")).filter(e => e.type === "custom_message" && e.details?.rid === rid2).length;
   await until(async () => started() >= 2 && await receipts() === 1);
   const rejected = assert.rejects(pending, { name: "ExecutorShutdown" });
   await f.executor.shutdown(); await rejected;
