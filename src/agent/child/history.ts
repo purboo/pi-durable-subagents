@@ -1,8 +1,8 @@
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
-import { CT } from '../../types.ts';
+import { CT, type StructuredAskFields } from '../../types.ts';
 import type { DecisionRecord } from '../../kernel/lifecycle.ts';
 
-export interface Question { qid: string; rev: number; question: string }
+export interface Question extends StructuredAskFields { qid: string; rev: number; question: string }
 /** A1, P4, P8, P37: Recover receipts and question revisions for this call generation. A generation continues the
  *  session of the previous one (P37), but request sequences are per recipient (P5): records addressed to an earlier
  *  generation stay in history and are skipped here: segments opened by another call's execution marker are foreign. */
