@@ -34,7 +34,8 @@ import { labelsProblem } from '../events/labels.ts';
 import { WaitTracker, waitCollector, startWaiting, type WaitSeed } from '../events/waiting.ts';
 import { readPage } from '../events/log.ts';
 import { eventsLog } from '../paths.ts';
-import { parseModel } from '../compat/model.ts';
+import { parseModel, resolveModel } from '../compat/model.ts';
+import { generationModel } from './model-choice.ts';
 import { PENDING_NOTE, generationRids, openingMessage, pendingFollowUps, pendingNotes, unsettledForward, unsettledNotify } from './notes.ts';
 import { journalAppends } from '../kernel/journal.ts';
 import { callEntries, entriesOf } from './executor/indexes.ts';
@@ -526,6 +527,22 @@ export class Engine {
       const to = String((req.body as SendBody)?.to ?? '');
       const existing = [...this.store.workflows.values()].filter(wf => wf.journal.loaded !== false || to.startsWith(wf.wid)).flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && generationRids(e).includes(req.rid)).map(entry => ({ wf, entry })))[0];
       if (existing) { this.dispatchGeneration(existing.wf, existing.entry); return { action: 'apply' }; }
+      // A sealed choice was committed before its reply. Replay it even if another request has since opened a generation.
+      const chosen = [...this.store.workflows.values()].filter(wf => wf.journal.loaded !== false || to.startsWith(wf.wid))
+        .flatMap(wf => revisionEntries(wf).filter(e => e.type === 'model-choice' && e.rid === req.rid))[0];
+      if (chosen) { await this.note(req.rid, String(chosen.model), 'next-generation'); return { action: 'apply' }; }
+      if ((req.body as SendBody)?.kind === 'model') {
+        // A live forward may have committed just before a crash, then been refused or superseded before replay.
+        // Keep its original outcome; never turn it into a fresh sealed choice or send it to a newer generation.
+        for (const wf of this.store.workflows.values()) {
+          if (wf.journal.loaded === false && !to.startsWith(wf.wid)) continue;
+          const log = revisionEntries(wf), prior = log.find(e => e.type === 'forward' && e.rid === req.rid && (e.envelope as { kind?: string } | undefined)?.kind === 'model');
+          if (!prior) continue;
+          const entry = log.find(e => (e.type === 'call' || e.type === 'generation') && `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` === prior.dest);
+          if (entry && !log.some(e => (e.type === JT.sealed || e.type === 'retired') && e.call === prior.dest)) return this.executor.forward(req, this.context(wf, entry));
+          return { action: 'apply' };
+        }
+      }
       const target = this.findCall((req.body as SendBody)?.to, true);
       if (!target) return { action: 'reject', reason: this.unknownCall((req.body as SendBody)?.to) };
       const { wf, entry } = target, send = req.body as SendBody;
@@ -537,11 +554,11 @@ export class Engine {
       if (send.kind === 'notify') return this.notify(req, wf, entry, from, seal !== undefined);
       // A pool's name is a model too: the call keeps the pool, and its order and failover apply to the new generation.
       const pools = this.ledgers.config.pools, pool = send.model !== undefined && pools && Object.hasOwn(pools, send.model);
-      if (send.kind === 'follow-up' && send.model !== undefined && !pool) {
+      if ((send.kind === 'follow-up' || send.kind === 'model') && send.model !== undefined && !pool) {
         try { if (!parseModel(send.model).provider) throw new Error('missing provider'); }
         catch { return { action: 'reject', reason: 'unknown-model' }; }
       }
-      if (seal && send.kind === 'follow-up') return this.serialOpen(wf.wid, async () => {
+      if (seal && (send.kind === 'follow-up' || send.kind === 'model')) return this.serialOpen(wf.wid, async () => {
         // A generation opened meanwhile (undelivered follow-ups after a seal) is the call this follow-up now reaches.
         if (latestCall(wf, String(entry.key))?.gen !== entry.gen) return { action: 'defer' } as const;
         // Pending notes and undelivered follow-ups ride on the opening message, recorded in the same entry (consumed
@@ -549,12 +566,22 @@ export class Engine {
         if (unsettledForward(revisionEntries(wf), from)) return { action: 'defer' } as const;
         // A1: the generation runs from the workflow's pinned files: verify them (once per process) before opening it.
         try { await this.store.ready(wf); } catch (error) { return { action: 'reject', reason: `pin-failed: ${String(error)}` } as const; }
+        if (send.kind === 'model') {
+          if (!send.model) return { action: 'reject', reason: 'unknown-model' } as const;
+          // Record only intent. No execution, generation, mailbox delivery or provider reservation is created here.
+          try { resolveModel(send.model, pools); } catch { return { action: 'reject', reason: 'unknown-model' } as const; }
+          await wf.journal.append('model-choice', { rid: req.rid, call: from, model: send.model });
+          await this.note(req.rid, send.model, 'next-generation');
+          return { action: 'apply' } as const;
+        }
         if (send.model !== undefined) await this.note(req.rid, send.model, 'next-generation');
         const opened = await this.openGeneration(wf, entry, from, { rid: req.rid, message: send.message ?? '', ...(send.model !== undefined ? { model: send.model } : {}) });
         this.dispatchGeneration(wf, opened); return { action: 'apply' } as const;
       });
       // A follow-up naming a model, queued on unfinished work: the executor records its model request with the message.
-      return this.executor.forward(req, this.context(wf, entry));
+      const forwarded = await this.executor.forward(req, this.context(wf, entry));
+      // The executor's serial queue may have sealed the call after our lookup; retry through the same sealed branch.
+      return send.kind === 'model' && forwarded.action === 'reject' && forwarded.reason === 'call-sealed' ? { action: 'defer' } : forwarded;
     } else if (req.kind === 'stop') {
       const target = (req.body as { target: string })?.target;
       const call = this.findCall(target), wf = call?.wf ?? this.store.workflows.get(target);
@@ -728,15 +755,16 @@ export class Engine {
   private async openGeneration(wf: Workflow, entry: Entry, from: string, own?: { rid: string; message: string; model?: string }): Promise<Entry> {
     const log = revisionEntries(wf), key = String(entry.key), notes = pendingNotes(log, key), carried = pendingFollowUps(log, key);
     const asked = (rid: string) => ((this.ledgers.orch.entries().findLast(e => e.type === 'request' && (e.request as Request | undefined)?.rid === rid)?.request as Request | undefined)?.body as SendBody | undefined)?.model;
-    const model = [...carried.map(c => asked(c.rid)), own?.model].filter((m): m is string => typeof m === 'string').at(-1);
+    const model = own?.model ?? generationModel(log, from) ?? carried.map(c => asked(c.rid)).filter((m): m is string => typeof m === 'string').at(-1) ??
+      (typeof entry.choice === 'string' ? entry.choice : undefined);
     const pools = this.ledgers.config.pools, pool = model !== undefined && pools && Object.hasOwn(pools, model);
     const rid = own?.rid ?? carried[0]!.rid, follows = carried.map(c => c.rid).filter(r => r !== rid);
     const gen = Math.max(0, ...wf.journal.entries().filter(e => ['call', 'generation'].includes(e.type) && e.key === entry.key).map(e => Number(e.gen))) + 1;
-    // A follow-up's model replaces the continued session's for this generation and those continuing it.
+    // A follow-up's explicit model or a new manual choice persists in the spec of every later generation.
     const spec = model !== undefined ? { ...(entry.spec as CallSpec), model } : entry.spec;
     const message = openingMessage(notes.map(n => String(n.message)), [...carried.map(c => c.message), own?.message ?? '']);
     return wf.journal.append('generation', { rid, key: entry.key, gen, from, spec, revision: wf.revision, opening: { rid, kind: 'follow-up', message },
-      ...(notes.length ? { notes: notes.map(n => String(n.rid)) } : {}), ...(follows.length ? { follows } : {}), ...(model !== undefined && !pool ? { model } : {}) });
+      ...(notes.length ? { notes: notes.map(n => String(n.rid)) } : {}), ...(follows.length ? { follows } : {}), ...(model !== undefined ? { choice: model } : {}), ...(model !== undefined && !pool ? { model } : {}) });
   }
   /** Follow-ups forwarded into running work whose call sealed before taking them (`undelivered-follow-up`) open the
    *  key's next generation, as a follow-up sent after the seal would: once its latest generation has sealed, unless a
