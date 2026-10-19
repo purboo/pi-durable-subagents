@@ -126,7 +126,7 @@ it something. Each verb means one thing, and a refusal says what would work:
 | `send notify` | any subagent | Tells it a decision without disturbing it. The reply's `delivery` says how: `steered` (running: it gets the note at its next safe point, like a steer), `held-until-answer` (waiting on its question: never interrupts it; it gets the note at the first safe point after the answer) or `noted` (not running: nothing starts; the note is recorded, and the call's next follow-up opens with it). |
 | `send follow-up` | any subagent | A finished one continues in the same session as a new generation (`key@2`); the reply names it (`generation`, `call`). A running one gets it after its current turn; the reply says `delivery: forwarded` and names the running generation (`call: <wid>/<key>@<gen>`). With `model` (a model or a pool's name), the generation that takes it runs on it. |
 | `send answer` | an open question | Answers it once, at the first chance: as the result of the question it waits on, or (when it no longer waits on that question, say after a steer) as a message at its next safe point. An answer to an earlier question while it waits on a later one ends the later one: that question is withdrawn (`superseded`, the subagent is told to ask again if it still needs it) and takes no answer. |
-| `send model` | any subagent | A running one switches at its next request; one asking, hibernated or waiting for a slot launches on it when it runs again. A pool's name picks its first model that is not used up (and, for a running call, has a free slot); the reply names the model picked, and a call from that pool stays in it. |
+| `send model` | any subagent | A running one switches at its next request; one asking, hibernated or waiting for a slot launches on it when it runs again. A sealed one records a choice for its next follow-up, without starting anything or reserving a slot. An accepted manual choice persists across later generations until another manual choice replaces it (see [Model switching](#model-switching)). |
 | `stop` | a subagent or a workflow | Final: `stopped`, usage kept, edits left as they are. A command call's whole process tree ends. |
 | `drain` / `resume` | existing workflows | A reversible hold; runs started later are not held. |
 
@@ -171,6 +171,96 @@ or the retry is a conflict too.
 (`pi-durable-subagents restart` or the tool's restart action) before using it.
 While an older orchestrator runs, a notify is refused with that advice and
 nothing is sent (an older orchestrator would accept it and drop it).
+
+### Asking the parent
+
+A child uses `ask` to ask its parent a question and wait for an answer or
+steering message. `{question: string}` still works by default. For a decision
+that the parent can act on, name the decision, options and evidence:
+
+```json
+{
+  "question": "The local repair is verified; should I keep this scope?",
+  "decision_needed": "Choose the repair scope.",
+  "options": [
+    {"label": "Local fix", "scope": "ask projection", "cost": "one verification run", "risk": "low", "preferred": true},
+    {"label": "Defer the repair"}
+  ],
+  "facts": ["commit 5ad9ee3", "run AK", "log sha abc"],
+  "tried": ["reproduced the projection loss"],
+  "classification_candidates": [
+    {"label": "projection loss", "evidence": ["digest drops fields"], "unproven": ["restart path"]}
+  ]
+}
+```
+
+`question` is always required and must be a string. The optional fields are:
+
+- `decision_needed`: one sentence naming the decision you need; required and
+  nonblank whenever any structured field is present.
+- `options`: at most 9 objects with required `label` and optional `scope`,
+  `cost`, `risk` (strings) and `preferred` (boolean). At most one may be
+  preferred; the parent sees numbered labels, with `(preferred)` on that one.
+- `facts` and `tried`: at most 20 strings each; give durable evidence (commit,
+  run id, log sha) and what you have already tried.
+- `classification_candidates`: at most 9 objects with required `label` and
+  optional `evidence` and `unproven` arrays of strings, separating evidence
+  from explanations not yet proved. These nested arrays have no additional
+  item-count limit.
+
+Every string in a structured ask, including `question`, is at most 2000
+characters. An ask is structured when any optional field above is present,
+or when `askRequireDecision` is true (see [Configuration](#configuration)).
+Default question-only asks keep the 1.1.0 behaviour, including no new
+question-length limit. Empty arrays are allowed; omitted fields stay absent,
+and text is preserved, not trimmed or coerced.
+
+Wrong types, exceeded limits, multiple preferred options or a missing decision
+produce a tool error starting `ask refused:` before any question entry,
+attention item, waiter or revision is created. A missing decision says exactly:
+
+```text
+ask refused: decision_needed is required (one sentence naming the decision you need), then options
+```
+
+The child can correct it and ask again. Parent-facing asking notices, the
+agent tool's status text, and CLI status/describe text show the decision first,
+then numbered option labels, then the original question. Plain questions still
+display as before. The supplied fields survive sessions, digests, attention
+and orchestrator restarts; question identity (`qid`, based on execution and
+question text), answer, steer and hibernation semantics are unchanged. JSON
+fields are described under [Driving dsa from a program](#driving-dsa-from-a-program).
+
+### Model switching
+
+In 1.2.0, an accepted manual `send kind:model` becomes the logical call's
+choice for every later follow-up generation (g+1, g+2, …), including calls
+initially launched from a pool. Another accepted manual model switch, or a
+follow-up specifying `model`, replaces it. Refused, withdrawn or replaced
+requests never become choices; automatic failover never becomes a choice.
+
+A concrete `provider/id[:thinking]` remains concrete. A pool name remains a
+pool choice, resolved again at each generation's launch using the current pool
+configuration. Pool availability, slot, skip and failover rules still apply.
+A concrete choice follows the existing 1.1 explicit-model launch path: it has
+no pool to widen into, so an exhausted provider waits for availability/probing
+and provider slots, not an invented fallback pool. Live-switch capacity
+admission and reservations are unchanged.
+
+To a sealed call, `send kind:model` records the choice and replies with
+`model` and `effect: "next-generation"`; it creates no generation, starts no
+child and reserves no slot. Send a follow-up to continue. Until then, `status`
+retains the last actual `model` and shows the pending choice as `switching`.
+Opening the next generation consumes the pending indicator, not the choice.
+Sealed model requests use the existing sealed follow-up acceptance path,
+including done and stopped workflows; address, stale-revision, command-call
+and pin-validation refusals still apply. This does not resume a stopped
+workflow by itself.
+
+The choice is persisted before the applied reply and survives orchestrator
+restarts; a retry with the same request id returns the first outcome. Legacy
+model forwards without the new optional `choice` retain their 1.1
+execution-only semantics; upgrading does not make an old switch sticky.
 
 ### Workflow scripts
 
@@ -562,6 +652,17 @@ is. The reason is a best-effort reading of the journals: `restart-force` when a 
 `orchestrator-crash` when the orchestrator died uncleanly while it ran, else
 `process-died`.
 
+For structured asks, each `describe` `questions[]` item adds the supplied
+`decision_needed`, `options`, `facts`, `tried` and `classification_candidates`
+alongside `qid`, `rev`, `to`, `call` and `text`; `text` remains the original
+question, not a rendered summary. This applies to both CLI describe forms
+and the program `describe()` API. Full `status <wid> --json` attention items
+retain the metadata; compact status clips `decision_needed` like question
+text. The agent tool's brief `asking[]` adds clipped `decision_needed` and
+`rev` only for structured questions, even in a mixed list. Plain-question JSON
+keeps its 1.1.0 shape and serialization, without inserted defaults. Machine
+JSON stays separate from the decision-first text rendering.
+
 A wake run's `describe` adds `wake: {to, state, rev?, generation?, reason?}`:
 `state` is `pending`, `applied`, `skipped` or `rejected`; `rev` counts workflow
 completions and `generation` names the delivery generation when known. A
@@ -952,7 +1053,8 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   "pools": { "fast": ["anthropic/claude-haiku-4-5", "openai/gpt-5-mini"] },
   "providers": { "anthropic": { "slots": 4 } },
   "memory": { "reserveMb": 2048, "perChildMb": 300 },
-  "writerLock": "queue"
+  "writerLock": "queue",
+  "askRequireDecision": false
 }
 ```
 
@@ -993,8 +1095,11 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   after it last refused (`"k": { "probeMs": 900000 }`). Then one call at a
   time goes to it, so finding out costs no extra request. A call that moved to
   another provider stays there for the rest of its generation (switching back
-  mid-task would lose the prompt cache); a follow-up starts on the first
-  candidate again. `status` lists each used-up provider with its next try,
+  mid-task would lose the prompt cache). Automatic failover is not a sticky
+  choice: a follow-up starts from pool order again unless a manual choice
+  stands. A manual pool choice resolves that pool again; a concrete choice
+  has no fallback pool and waits for its provider. `status` lists each used-up
+  provider with its next try,
   and `events <wid>` shows the move as a model `forward` naming the target
   (`model=<provider>/<id>`) and the provider it left (`failover=<provider>`);
   a model you send shows only its target.
@@ -1032,11 +1137,19 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   `"off"` lets them run together and only reminds you of edits seen in the same
   worktree. Writes that do not go through a writing call (your own, or a
   `writer: false` call's bash) are not constrained.
+- **Required ask decisions:** `"askRequireDecision": true` requires a nonblank
+  `decision_needed` on every child ask and applies the structured-ask string
+  limits, even when no other metadata is given. This boolean key defaults to
+  false, is validated and participates in the orchestrator config hash.
+  It is snapshotted when each child execution starts: changing it affects
+  executions started afterwards, not a child already running; a resumed
+  execution receives the current setting. False keeps question-only asks valid.
 - **onQuit:** `"pause"` (default) pauses a session's running workflows when
   you quit that pi; `"continue"` lets them run on in the background.
 - **Changes apply without a restart:** the orchestrator re-reads the file
-  when it changes. A new slot limit, pool or default model applies to the next
-  slot acquisition; slots already held are kept when a limit drops. An
+  when it changes (`askRequireDecision` reaches a child at execution start,
+  not mid-execution). A new slot limit, pool or default model applies to the
+  next slot acquisition; slots already held are kept when a limit drops. An
   invalid change is not applied, and `status` reports it next to the settings
   still in effect (`config: <hash> since …`) and the slots held per provider.
 
@@ -1152,6 +1265,19 @@ journals itself with the same token, reason and subagent checks and ends it with
 SIGTERM, which is not atomic: a call launched in between is fenced and resumes.
 The old orchestrator cannot record the new audit fields. A pi session started before the update still
 loads the old extension; start a new one.
+
+### Upgrading to 1.2.0
+
+Restart the orchestrator on 1.2.0 and start a new pi session to load the new
+extension before relying on structured asks or sticky model choices; an
+already running child keeps its execution-start ask setting. Existing
+journals, request digests and decisions keep their meaning. Plain asks keep
+their JSON unchanged, and old model forwards remain execution-only. New live
+manual model forwards carry optional `choice` (the original model or pool
+name); sealed choices use `model-choice {rid, call, model}` entries. New
+generation records carry optional `choice` and put it in `spec.model` (a
+concrete choice also uses the existing generation `model` override). These
+records are scoped to the call and revision, not another key or revision.
 
 ## What we do not promise
 
