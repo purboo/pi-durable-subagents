@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.2.0
+
+- Structured asks: the child `ask` tool keeps required `question: string` and adds optional `decision_needed` (one
+  sentence naming the decision), `options: [{label, scope?, cost?, risk?, preferred?}]`, `facts: string[]`,
+  `tried: string[]` and `classification_candidates: [{label, evidence?: string[], unproven?: string[]}]`.
+  Option scope/cost/risk and candidate evidence/unproven distinguish costs, evidence and explanations not yet proved.
+  Parent-facing asking notices, agent-tool status and CLI status/describe text show the decision first, numbered
+  option labels second (preferred marked), then the original question. Plain questions display as before.
+- Ask limits and refusal: any supplied structured field requires a nonblank `decision_needed`. Structured asks limit
+  every string, including `question`, to 2000 characters; options and classification candidates to 9 items each;
+  facts and tried to 20 each. At most one option may be preferred. Nested evidence/unproven arrays have no additional
+  item-count limit. Empty arrays are allowed; text is preserved, not trimmed or coerced; omitted fields stay absent.
+  Wrong types, exceeded limits, multiple preferred options or a missing decision produce `ask refused:` before any
+  question entry, attention item, waiter or revision is created, and the child can correct it and ask again. The
+  missing-decision text is `ask refused: decision_needed is required (one sentence naming the decision you need), then options`.
+  Under default settings, question-only asks keep their 1.1.0 behaviour, including no new question-length limit.
+- Ask configuration: `askRequireDecision` is a boolean `config.json` key, default false, validated and included in the
+  orchestrator config hash. True requires a decision on every ask and applies structured-ask string limits. The
+  setting reaches a child when its execution starts: a live config change affects executions started afterwards,
+  not a child already running; a resumed execution receives the current setting.
+- Ask storage and JSON: supplied fields survive session entries, digests, attention and orchestrator restarts.
+  `describe --key <request> --json`, `describe <wid> --json` and the program `describe()` API add them to each
+  `questions[]` item alongside `qid`, `rev`, `to`, `call` and `text`; text stays the original question. Full status
+  JSON attention retains metadata; compact status clips the decision like question text. Agent-tool brief `asking[]`
+  adds clipped `decision_needed` and `rev` only for structured entries, including mixed lists. Plain-question JSON
+  keeps its previous shape and serialization, without defaults. The qid formula, answer, steer and hibernation
+  semantics are unchanged; machine JSON stays separate from rendered text.
+- Sticky model switches: an accepted manual `send kind:model` becomes the logical call's choice for later follow-up
+  generations (g+1, g+2, …), including calls initially launched from a pool. Another accepted manual switch or a
+  follow-up specifying `model` replaces it. Refused, withdrawn or replaced requests never become choices; automatic
+  failover never becomes one. A concrete `provider/id[:thinking]` remains concrete; a pool choice remains a pool,
+  resolved again at each generation launch using current configuration and existing availability, slot, skip and
+  failover rules. Concrete choices keep the 1.1 explicit-model path: an exhausted provider waits for availability,
+  probing and slots, with no fallback pool invented. Live-switch admission and reservations are unchanged.
+- Sealed model switches: `send kind:model` records a sealed call's choice with `effect: "next-generation"`, creating
+  no generation, starting no child and reserving no slot. A follow-up continues it. Status keeps the last actual
+  `model` and shows the unused choice as `switching`; opening the next generation consumes the indicator, not the
+  persistent choice. The existing sealed follow-up acceptance path applies, including done and stopped workflows;
+  address, stale-revision, command-call and pin-validation refusals remain. A model send alone does not resume work.
+- Model durability and upgrade: choices persist before the applied reply and survive restarts; retried request ids
+  return their first outcome. New live manual `forward` records have optional `choice` retaining the original model
+  or pool; sealed choices use `model-choice {rid, call, model}`; new `generation` records carry optional `choice` and
+  write it into `spec.model` (concrete choices also use the existing generation model override). Call/revision scope
+  prevents leakage. Existing forwards without `choice` retain their 1.1 execution-only semantics; old journals,
+  request digests and decisions keep their meaning. Restart the orchestrator on 1.2.0 and start a new pi session to
+  load the new extension before relying on the new behaviour; an already running child's ask setting is unchanged.
+- Test-tail repair: the three live-session helpers in `test/pi/executor/executor.test.ts` parse only complete JSONL
+  lines (`revisions()` in reaskedBeforeFence, `rows()` in P28, `receipts()` in P7). An incomplete final write waits for
+  its newline; a malformed complete line still throws. Settled-session assertions are unchanged.
+
 ## 1.1.0
 
 - Caller wakes: a subagent can run `run --request <id> --wake caller -- <program> [args…]`, then end its turn. The
