@@ -26,7 +26,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CT, JT, attentionEntries, isCommandCall, isEntry, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
+import { CT, JT, askFields, attentionEntries, isCommandCall, isEntry, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
 import { binDir, callDir, callInbox, callSession, journalPath, outboxRoot } from "../../paths.ts";
 import { readJournalSnapshot, syncDirectory } from "../../kernel/journal.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
@@ -762,10 +762,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     await serial(async () => {
       await forwardsDelivered(t.journal, t.callId, entries);
       const digest = digestOf(t.callId, entries);
-      for (const { qid, rev, question } of digest.questions) {
+      for (const q of digest.questions) {
+        const { qid, rev, question } = q;
         const id = `q:${t.callId}:${qid}`;
         if (!entriesOf(t.journal, JT.attention).some(r => isEntry(r, JT.attention) && r.item.id === id && r.item.rev === rev))
-          await t.journal.append(JT.attention, { item: { id, rev, kind: "question", text: String(question), wid: t.wid, call: t.callId, qid, session: callSession(home, t.wid, t.key, t.gen) } });
+          await t.journal.append(JT.attention, { item: { id, rev, kind: "question", text: String(question), wid: t.wid, call: t.callId, qid, session: callSession(home, t.wid, t.key, t.gen), ...askFields(q) } });
         if (digest.answered.has(answerKey(qid, rev)) || t.journal.entries().some(e => e.type === "answer-bound" && e.call === t.callId && e.qid === qid && e.rev === rev))
           await resolveBoundAnswer(t.journal, t.callId, qid, rev);
         else if (digest.superseded.has(answerKey(qid, rev)) || supersededByBinding(t.journal.entries(), t.callId, qid, rev))
@@ -1387,7 +1388,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       try {
         child = await containment.spawn({ exec, command: piCommand, args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
           // The orchestrator's node follows binDir: a `#!/usr/bin/env node` pi runs under a PATH without node (a service's).
-          env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
+          env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
       } catch (error) {
         const environment = environmentSpawnError(error);
         if (environment) await serial(() => spawnEnvRecord(t, exec!, error));

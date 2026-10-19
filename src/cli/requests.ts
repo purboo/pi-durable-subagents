@@ -12,7 +12,7 @@ import { NOTIFY_SINCE, WAKE_SINCE, HOLD_ENTRY_TYPES, commandLine, commandSendRef
 import { leaseCalls, leaseState, callAddress } from "../platform/lease.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
-import { JT, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
+import { JT, askFields, askText, type StructuredAskFields, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
 import { startOrchestrator, submitIdentified } from "./control.ts";
 import { FENCE_LEDGER_TYPES, endedExecs, fenceReason } from "../events/fence.ts";
 import { parseLabels } from "../events/labels.ts";
@@ -86,7 +86,7 @@ export interface Description {
   status?: string; error?: string; pruned?: { status?: string; endedAt?: number };
   wake?: WakeStatus;
   calls?: DescribedCall[];
-  questions?: { qid?: string; rev: number; to: string; call?: string; text: string }[];
+  questions?: (StructuredAskFields & { qid?: string; rev: number; to: string; call?: string; text: string })[];
   attention?: { id: string; rev: number; kind: string; call?: string; text: string }[];
   lastFence?: { at: number; exec: string; reason: "restart-force" | "orchestrator-crash" | "process-died" };
 }
@@ -164,7 +164,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
       ...(waiting && Object.keys(waiting).length ? { waiting } : {}) };
   });
   const keyOf = (call?: string) => call?.replace(/^[^/]*\//, "").replace(/@\d+$/, "");
-  const questions = wf.attention.filter(a => a.kind === "question").map(a => ({ ...(a.qid ? { qid: a.qid } : {}), rev: a.rev, to: `${wid}/${keyOf(a.call)}`, ...(a.call ? { call: a.call } : {}), text: a.text }));
+  const questions = wf.attention.filter(a => a.kind === "question").map(a => ({ ...(a.qid ? { qid: a.qid } : {}), rev: a.rev, to: `${wid}/${keyOf(a.call)}`, ...(a.call ? { call: a.call } : {}), text: a.text, ...askFields(a) }));
   const attention = wf.attention.filter(a => a.kind !== "question").map(a => ({ id: a.id, rev: a.rev, kind: a.kind, ...(a.call ? { call: a.call } : {}), text: a.text }));
   const state: DescribeState = questions.length ? "asking" : isLive(wf) || wf.status === "parked" ? "running" : "sealed";
   const fence = lastFence(journal, entries);
@@ -201,7 +201,7 @@ export function renderDescription(d: Description): string {
     if (c.data !== undefined) lines.push(`    data: ${JSON.stringify(c.data)}`);
     if (c.output) lines.push(...c.output.split("\n").map(l => `    | ${l}`));
   }
-  for (const q of d.questions ?? []) lines.push(`  question ${q.to} qid=${q.qid} rev=${q.rev}:`, ...q.text.split("\n").map(l => `    ${l}`));
+  for (const q of d.questions ?? []) lines.push(`  question ${q.to} qid=${q.qid} rev=${q.rev}:`, ...askText(q, q.text).split("\n").map(l => `    ${l}`));
   for (const a of d.attention ?? []) lines.push(`  ${a.kind}${a.call ? ` ${a.call}` : ""}: ${a.text}`);
   if (d.lastFence) lines.push(`  last fence: ${d.lastFence.exec} ${d.lastFence.reason} at ${new Date(d.lastFence.at).toISOString()}`);
   return lines.join("\n");

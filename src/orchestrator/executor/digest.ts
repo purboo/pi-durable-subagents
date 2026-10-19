@@ -2,11 +2,11 @@
 // extends its entries array with the same entry objects when the file grew, so a fold over a prefix is reused and
 // only appended entries are visited. A session read from scratch (rewritten, replaced) restarts the fold. Each fold
 // equals what the whole-array function it replaces computes over the same entries (see the tests).
-import { CT } from "../../types.ts";
+import { CT, askFields, type StructuredAskFields } from "../../types.ts";
 import { askOf, cutAskResult, receiptId, type SessionEntry } from "./session.ts";
 import { messageUsage, type Usage } from "./usage.ts";
 
-export type Question = { qid: string; rev: number; question: unknown };
+export type Question = StructuredAskFields & { qid: string; rev: number; question: unknown };
 export interface SessionDigest {
   /** Usage of every assistant message in segments opened by this call (sessionUsage), in session order. */
   usage: { id: string; usage: Usage }[];
@@ -70,7 +70,7 @@ export class SessionFold {
         s.questionAt.set(e.data?.qid, i);
         if (e.type === "custom") {
           s.lastQuestion = i;
-          if (this.own && e.data && typeof e.data.qid === "string" && typeof e.data.rev === "number") s.questions.push({ qid: e.data.qid, rev: e.data.rev, question: e.data.question });
+          if (this.own && e.data && typeof e.data.qid === "string" && typeof e.data.rev === "number") s.questions.push({ qid: e.data.qid, rev: e.data.rev, question: e.data.question, ...askFields(e.data) });
         }
       }
       const details = e.message?.details ?? e.details;
@@ -92,5 +92,5 @@ export function digestOpenQuestion(entries: readonly SessionEntry[], s: SessionD
   const ask = askOf(entries, at);
   const result = ask === undefined ? undefined : s.results.get(ask);
   if (ask === undefined || result && !cutAskResult(result.message)) return;
-  return { qid: q.qid, rev: q.rev, question: String(q.question) };
+  return { qid: q.qid, rev: q.rev, question: String(q.question), ...askFields(q) };
 }

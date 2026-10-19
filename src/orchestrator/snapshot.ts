@@ -7,7 +7,7 @@ import { FANOUT_BODIES } from "../compat/fanout.ts";
 import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends, readJournalRecord, readJournalSnapshot, readJournalUncached, type JournalRecord } from "../kernel/journal.ts";
 import { readCache, writeCache } from "../kernel/cache.ts";
 import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
-import { JT, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
+import { JT, askText, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
 import { parseModel, resolveModel } from "../compat/model.ts";
 import { type LedgerState } from "./ledger.ts";
 import { awaitingRuns, readerHold, readerLedger, readerLedgerIdentity, type AwaitingRun, type ReaderLedger } from "./reader-ledger.ts";
@@ -1044,7 +1044,7 @@ export interface StatusWorkflow {
   planned?: number;
   /** v12 §4: keys of the current revision whose latest generation is sealed (the `done` of done/total). */
   done: number;
-  calls: StatusCall[]; attention: Pick<AttentionItem, "id" | "rev" | "kind" | "text" | "call" | "qid">[];
+  calls: StatusCall[]; attention: Pick<AttentionItem, "id" | "rev" | "kind" | "text" | "call" | "qid" | "decision_needed" | "options">[];
   /** Drain: held by stop-all/drain or a quit pi; `resume` continues it. */
   paused?: boolean;
   /** Follow-ups still open on this finished workflow. */
@@ -1088,7 +1088,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
         ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
         ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(c.queuedFor && !r && !wf.paused ? { queued: queuedText(c.queuedFor) } : {}) };
     }),
-    attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
+    attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}), ...(a.decision_needed !== undefined ? { decision_needed: clip(a.decision_needed, 300), ...(a.options !== undefined ? { options: a.options } : {}) } : {}) })),
     ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}), ...(wf.labels ? { labels: wf.labels } : {}),
   };
 }
@@ -1179,7 +1179,7 @@ export interface BriefWorkflow {
   /** Only the calls that need a look: not finished, or finished not ok. */
   calls: BriefCall[];
   /** Open questions (answer with kind "answer" to "<wid>/<key>") and alerts (stall, unknown outcome, budget). */
-  asking?: { to: string; qid?: string; hibernated?: true; question: string }[];
+  asking?: { to: string; qid?: string; rev?: number; decision_needed?: string; hibernated?: true; question: string }[];
   alerts?: string[];
 }
 export interface StatusBrief {
@@ -1335,7 +1335,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(live && c.queuedFor && !w.paused ? { queued: queuedText(c.queuedFor, now) } : {}) };
     });
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
-      ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300) }));
+      ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300), ...(a.decision_needed !== undefined ? { rev: a.rev, decision_needed: clip(a.decision_needed, 300) } : {}) }));
     const alerts = open.filter(a => a.kind !== "question").map(a => `${a.kind}${a.call ? ` ${w.wid}/${callKey(a.call)}` : ""}: ${clip(a.text, 200)}`);
     return { wid: w.wid, ...(w.labels ? { labels: labelsText(w.labels) } : {}), ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.active ? { active: true as const } : {}), ...(w.paused ? { paused: true as const } : {}), ...(w.followUps ? { followUps: w.followUps } : {}),
       progress: `${p.done}/${p.total}${p.plus ? "+" : ""}`, tokens: tokens(w.usage), calls,
@@ -1353,6 +1353,15 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
     ...(paused ? { paused } : {}), ...slotsView(home, now), ...(leases.length ? { leases: leaseLines(leases, now) } : {}),
     hint: "status wid=<wid> shows one workflow (outputs clipped); add key=<key> for one call's full result, or full:true for everything",
   };
+}
+
+/** AK4: tool status content renders full decision/options/question; details retain the pinned JSON projection. */
+export function statusText(home: string, value: unknown): string {
+  const questions = new Map(snapshots(home).all.flatMap(w => w.attention.filter(a => a.kind === 'question' && a.qid).map(a => [a.qid!, a] as const)));
+  return JSON.stringify(value, function (this: { qid?: string }, key, v) {
+    const q = this.qid ? questions.get(this.qid) : undefined;
+    return (key === 'question' || key === 'text') && q?.decision_needed !== undefined ? askText(q, q.text) : v;
+  });
 }
 
 /** Running workflows of other sessions that a pause holds, as "wid" or "wid (name)": a session's own resume skips them. */
