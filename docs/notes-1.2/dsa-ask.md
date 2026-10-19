@@ -21,7 +21,10 @@ what you `tried`, and `classification_candidates`, each with a label and optiona
 }
 ```
 
-Every string is limited to 2000 characters, including `question`, decision, option members and candidate strings.
+Every string in a structured ask is limited to 2000 characters, including `question`, decision, option members and
+candidate strings. **Parent ruling R-12-AK-2:** an ask is structured when any structured field is present or
+`askRequireDecision` is true. Under the default configuration, question-only asks have no question-length limit,
+just as in 1.1.0. The `question` must still be a string for every ask; non-string values produce `ask refused:`.
 `options` and `classification_candidates` accept at most 9 items; `facts` and `tried` at most 20. Nested `evidence`
 and `unproven` are arrays of strings (no additional item-count limit). Optional members and arrays remain absent
 when not supplied; empty arrays are allowed. Text is preserved, not trimmed or coerced.

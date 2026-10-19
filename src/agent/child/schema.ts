@@ -17,7 +17,7 @@ export function askProblem(value: unknown, requireDecision = false): string | un
     if (v.length > max) return `${at} exceeds ${max} items`;
     for (const [i, entry] of v.entries()) { const problem = item(entry, `${at}[${i}]`); if (problem) return problem; }
   };
-  let problem = string(value.question, 'question');
+  let problem = typeof value.question !== 'string' || structured || requireDecision ? string(value.question, 'question') : undefined;
   if (!problem && Object.hasOwn(value, 'decision_needed')) problem = string(value.decision_needed, 'decision_needed');
   for (const key of ['facts', 'tried'] as const) if (!problem && Object.hasOwn(value, key)) problem = list(value[key], key, 20, string);
   if (!problem && Object.hasOwn(value, 'options')) {
