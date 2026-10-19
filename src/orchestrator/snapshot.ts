@@ -1355,13 +1355,30 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
   };
 }
 
-/** AK4: tool status content renders full decision/options/question; details retain the pinned JSON projection. */
+/** AK4/R-12-AK-3: render only the projection's own question entries, never business result/data/output. */
 export function statusText(home: string, value: unknown): string {
-  const questions = new Map(snapshots(home).all.flatMap(w => w.attention.filter(a => a.kind === 'question' && a.qid).map(a => [a.qid!, a] as const)));
-  return JSON.stringify(value, function (this: { qid?: string }, key, v) {
-    const q = this.qid ? questions.get(this.qid) : undefined;
-    return (key === 'question' || key === 'text') && q?.decision_needed !== undefined ? askText(q, q.text) : v;
-  });
+  const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const workflow = (v: unknown): unknown => {
+    if (!object(v) || typeof v.wid !== 'string') return v;
+    const wid = v.wid;
+    let questions: AttentionItem[] | undefined;
+    const items = (list: unknown, brief: boolean): unknown => !Array.isArray(list) ? list : list.map(item => {
+      if (!object(item) || item.decision_needed === undefined || (!brief && item.kind !== 'question')) return item;
+      // Brief drops the attention id/call; its address, qid and revision still identify the original question.
+      const q = (questions ??= workflowSnapshot(home, wid).attention).find(q => q.kind === 'question' && q.decision_needed !== undefined &&
+        q.qid === item.qid && q.rev === item.rev && (brief
+          ? q.call !== undefined && item.to === `${wid}/${callKey(q.call)}`
+          : q.id === item.id && q.call === item.call));
+      return q ? { ...item, [brief ? 'question' : 'text']: askText(q, q.text) } : item;
+    });
+    return { ...v, ...(Array.isArray(v.attention) ? { attention: items(v.attention, false) } : {}),
+      ...(Array.isArray(v.asking) ? { asking: items(v.asking, true) } : {}) };
+  };
+  if (!object(value)) return JSON.stringify(value);
+  // These are the only workflow containers produced by status. Do not walk calls, result or arbitrary nesting.
+  return JSON.stringify({ ...workflow(value) as Record<string, unknown>,
+    ...(Array.isArray(value.active) ? { active: value.active.map(workflow) } : {}),
+    ...(Array.isArray(value.workflows) ? { workflows: value.workflows.map(workflow) } : {}) });
 }
 
 /** Running workflows of other sessions that a pause holds, as "wid" or "wid (name)": a session's own resume skips them. */

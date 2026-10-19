@@ -125,6 +125,61 @@ test('AK2: askRequireDecision validation, settings and hash; old config hash is 
   assert.equal(configHash({}), contentHash({}).slice(0, 12));
 });
 
+test('R-12-AK-3: status renders only its own question entries, never colliding business results or non-question attention', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsa-ask-status-scope-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const data = {
+    qid: 'shared-qid', text: 'verbatim business result', question: 'business question',
+    wid: 'Q', kind: 'question', rev: 1, call: 'Q@1/worker@1',
+    attention: [{ id: 'shared', qid: 'shared-qid', rev: 1, kind: 'question', call: 'Q@1/worker@1', text: 'nested business attention' }],
+    active: [{ wid: 'Q', asking: [{ to: 'Q/worker', qid: 'shared-qid', rev: 1, question: 'nested business ask' }] }],
+  };
+  const ledger = await openJournal(orchLedger(home));
+  for (const wid of ['Q', 'R', 'Q2']) {
+    await ledger.append(JT.created, { rid: wid, wid });
+    const j = await openJournal(journalPath(home, wid));
+    await j.append('wf-created', { revision: 1 });
+    await j.append('call', { key: 'worker', gen: 1, spec: { agent: 'echo' } });
+    await j.append(JT.sealed, { call: `${wid}@1/worker@1`, result: { status: 'ok', ok: true, key: 'worker', gen: 1, data, output: 'verbatim output\nnot a question' } });
+    if (wid !== 'R') await j.append(JT.attention, { item: {
+      id: `question-${wid}`, rev: 1, kind: 'question', wid, call: `${wid}@1/worker@1`, qid: 'shared-qid',
+      text: `Should we repair ${wid}? ${'Full question. '.repeat(35)}`, ...fields, decision_needed: `Choose ${wid}.`,
+    } });
+    await j.append(JT.attention, { item: { id: `alert-${wid}`, rev: 1, kind: 'stall', wid, call: `${wid}@1/worker@1`, qid: 'shared-qid', text: 'verbatim non-question alert' } });
+    await j.close();
+  }
+  await ledger.close();
+  const oldHome = process.env.DSA_HOME; let tool: any;
+  try {
+    process.env.DSA_HOME = home;
+    registerMain({ on() {}, registerTool(v: unknown) { tool = v; } } as any);
+    for (const selection of [{ key: 'worker' }, { full: true }, {}]) {
+      const result = await tool.execute('status', { action: 'status', wid: 'R', ...selection }, undefined, undefined, { cwd: home });
+      assert.equal(result.content[0].text, JSON.stringify(result.details), `business-only status must be byte-identical: ${JSON.stringify(selection)}`);
+    }
+    for (const wid of ['Q', 'Q2']) {
+      const detail = statusDetail(home, wid), q = detail.attention.find(a => a.kind === 'question')!;
+      const text = `${q.decision_needed}\n1. Local fix (preferred)\n2. Defer\n${q.text}`;
+      for (const selection of [{ full: true }, {}]) {
+        const result = await tool.execute('status', { action: 'status', wid, ...selection }, undefined, undefined, { cwd: home });
+        const seen = JSON.parse(result.content[0].text);
+        assert.equal(seen.attention.find((a: any) => a.kind === 'question').text, text);
+        assert.deepEqual(seen.attention.find((a: any) => a.kind !== 'question'), result.details.attention.find((a: any) => a.kind !== 'question'));
+        assert.equal(JSON.stringify(seen.result), JSON.stringify(result.details.result));
+        assert.equal(JSON.stringify(seen.calls), JSON.stringify(result.details.calls));
+      }
+      const brief = statusBrief(home), before = JSON.stringify(brief);
+      const rendered = JSON.parse(snapshots.statusText(home, brief));
+      assert.equal(rendered.active.find((w: any) => w.wid === wid).asking[0].question, text, 'qid collision must not select a different workflow');
+      assert.equal(JSON.stringify(brief), before, 'text rendering must not mutate details');
+      for (const changes of [{ rev: 2 }, { call: 'Q@1/other@1' }, { id: 'different-item' }, { kind: 'stall' }]) {
+        const value = { wid, attention: [{ ...q, ...changes }] };
+        assert.equal(snapshots.statusText(home, value), JSON.stringify(value), 'only the matching question identity may be rendered');
+      }
+    }
+  } finally { if (oldHome === undefined) delete process.env.DSA_HOME; else process.env.DSA_HOME = oldHome; }
+});
+
 test('AK3/AK4/R-12-AK-1: mixed plain/structured describe and status JSON; decision-first parent text', async t => {
   const home = await mkdtemp(join(tmpdir(), 'dsa-ask-projection-'));
   t.after(() => rm(home, { recursive: true, force: true }));
