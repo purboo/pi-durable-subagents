@@ -5,7 +5,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { liveCommandCalls } from "../../orchestrator/executor/command.ts";
 import { forgetJournalSnapshot, journalAppends, readJournalFold, readJournalSnapshot, readJournalUncached, type JournalFold } from "../../kernel/journal.ts";
 import { journalPath } from "../../paths.ts";
-import { CT, JT, type AttentionItem, type Entry } from "../../types.ts";
+import { CT, JT, askText, type AttentionItem, type Entry } from "../../types.ts";
 import { openGeneration, readerWorkflowListing, releaseLoadedSettledJournals, releaseSettledJournals, SETTLED_RECHECK_MS, unresolvedAttention, workflowDigest, workflowDigestChecked, type WorkflowDigest } from "../../orchestrator/snapshot.ts";
 import { readerHold, readerLedgerIdentity } from "../../orchestrator/reader-ledger.ts";
 
@@ -167,7 +167,7 @@ export function attention(home: string, sender: string, seen: { id: string; rev:
  *  call nor how to answer it, so answers went out as steers or to the wrong id. */
 export function presentText(item: AttentionItem): string {
   const call = item.call ? item.call.replace(/@\d+\/([^@/]+)@\d+$/, "/$1") : undefined, where = call ?? item.wid;
-  if (item.kind === "question" && call) return `Question from ${call}${item.qid ? ` (qid ${item.qid})` : ""}; reply with send kind:"answer" to:"${call}": ${item.text}`;
+  if (item.kind === "question" && call) return `Question from ${call}${item.qid ? ` (qid ${item.qid})` : ""}; reply with send kind:"answer" to:"${call}": ${askText(item, item.text)}`;
   return item.text.includes(item.wid) ? item.text : `${where}: ${item.text}`;
 }
 

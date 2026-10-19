@@ -278,7 +278,27 @@ export interface ModelBody { provider: string; model: string; thinking?: string;
 /** Arguments of the child `report` tool (P24); `data` is validated against DSA_SCHEMA. */
 export interface ReportArgs { outcome: "ok" | "failed"; summary?: string; data?: unknown }
 
-export interface AttentionItem {
+/** AK1: optional metadata of a child ask; absent fields remain absent through every projection. */
+export interface StructuredAskFields {
+  decision_needed?: string;
+  options?: { label: string; scope?: string; cost?: string; risk?: string; preferred?: boolean }[];
+  facts?: string[];
+  tried?: string[];
+  classification_candidates?: { label: string; evidence?: string[]; unproven?: string[] }[];
+}
+export interface AskArgs extends StructuredAskFields { question: string }
+export const ASK_FIELDS = ['decision_needed', 'options', 'facts', 'tried', 'classification_candidates'] as const;
+/** Copy only present metadata, never inserting defaults into old records. */
+export function askFields(value: StructuredAskFields): StructuredAskFields {
+  return Object.fromEntries(ASK_FIELDS.filter(key => Object.hasOwn(value, key)).map(key => [key, value[key]]));
+}
+/** Parent-facing text; the stored question and machine-facing text remain unchanged. */
+export function askText(value: StructuredAskFields, question: string): string {
+  if (value.decision_needed === undefined) return question;
+  return [value.decision_needed, ...(value.options ?? []).map((o, i) => `${i + 1}. ${o.label}${o.preferred ? ' (preferred)' : ''}`), question].join('\n');
+}
+
+export interface AttentionItem extends StructuredAskFields {
   id: string;
   rev: number;
   kind: "question" | "finished" | "stall" | "unknown" | "budget" | "conflict" | "environment";
@@ -440,6 +460,7 @@ export const ENV = {
   inbox: "DSA_INBOX",     // absolute path of this call's inbox dir
   journal: "DSA_JOURNAL", // absolute path of the workflow journal (read-only snapshot for the launch gate)
   schema: "DSA_SCHEMA",   // absolute path of report JSON schema, if any
+  askRequireDecision: "DSA_ASK_REQUIRE_DECISION", // execution-start snapshot of config.askRequireDecision (default false)
   budget: "DSA_BUDGET",   // JSON {tokens?, costUsd?}: per-call budget; the child refuses the next provider request once reached (P31b)
   model: "DSA_MODEL",     // "provider/id" the executor holds a slot for; the child re-applies it if pi started without it (C8)
 } as const;

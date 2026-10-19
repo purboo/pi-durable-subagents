@@ -7,7 +7,7 @@ import { FANOUT_BODIES } from "../compat/fanout.ts";
 import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends, readJournalRecord, readJournalSnapshot, readJournalUncached, type JournalRecord } from "../kernel/journal.ts";
 import { readCache, writeCache } from "../kernel/cache.ts";
 import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
-import { JT, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
+import { JT, askText, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
 import { parseModel, resolveModel } from "../compat/model.ts";
 import { type LedgerState } from "./ledger.ts";
 import { awaitingRuns, readerHold, readerLedger, readerLedgerIdentity, type AwaitingRun, type ReaderLedger } from "./reader-ledger.ts";
@@ -1044,7 +1044,7 @@ export interface StatusWorkflow {
   planned?: number;
   /** v12 §4: keys of the current revision whose latest generation is sealed (the `done` of done/total). */
   done: number;
-  calls: StatusCall[]; attention: Pick<AttentionItem, "id" | "rev" | "kind" | "text" | "call" | "qid">[];
+  calls: StatusCall[]; attention: Pick<AttentionItem, "id" | "rev" | "kind" | "text" | "call" | "qid" | "decision_needed" | "options">[];
   /** Drain: held by stop-all/drain or a quit pi; `resume` continues it. */
   paused?: boolean;
   /** Follow-ups still open on this finished workflow. */
@@ -1088,7 +1088,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
         ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
         ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(c.queuedFor && !r && !wf.paused ? { queued: queuedText(c.queuedFor) } : {}) };
     }),
-    attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}) })),
+    attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}), ...(a.decision_needed !== undefined ? { decision_needed: clip(a.decision_needed, 300), ...(a.options !== undefined ? { options: a.options } : {}) } : {}) })),
     ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}), ...(wf.labels ? { labels: wf.labels } : {}),
   };
 }
@@ -1179,7 +1179,7 @@ export interface BriefWorkflow {
   /** Only the calls that need a look: not finished, or finished not ok. */
   calls: BriefCall[];
   /** Open questions (answer with kind "answer" to "<wid>/<key>") and alerts (stall, unknown outcome, budget). */
-  asking?: { to: string; qid?: string; hibernated?: true; question: string }[];
+  asking?: { to: string; qid?: string; rev?: number; decision_needed?: string; hibernated?: true; question: string }[];
   alerts?: string[];
 }
 export interface StatusBrief {
@@ -1335,7 +1335,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(live && c.queuedFor && !w.paused ? { queued: queuedText(c.queuedFor, now) } : {}) };
     });
     const asking = open.filter(a => a.kind === "question" && a.call).map(a => ({ to: `${w.wid}/${callKey(a.call)}`, ...(a.qid ? { qid: a.qid } : {}),
-      ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300) }));
+      ...(w.calls.some(c => c.callId === a.call && c.hibernated) ? { hibernated: true as const } : {}), question: clip(a.text, 300), ...(a.decision_needed !== undefined ? { rev: a.rev, decision_needed: clip(a.decision_needed, 300) } : {}) }));
     const alerts = open.filter(a => a.kind !== "question").map(a => `${a.kind}${a.call ? ` ${w.wid}/${callKey(a.call)}` : ""}: ${clip(a.text, 200)}`);
     return { wid: w.wid, ...(w.labels ? { labels: labelsText(w.labels) } : {}), ...(w.name ? { name: w.name } : {}), status: w.status, ...(w.active ? { active: true as const } : {}), ...(w.paused ? { paused: true as const } : {}), ...(w.followUps ? { followUps: w.followUps } : {}),
       progress: `${p.done}/${p.total}${p.plus ? "+" : ""}`, tokens: tokens(w.usage), calls,
@@ -1353,6 +1353,32 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
     ...(paused ? { paused } : {}), ...slotsView(home, now), ...(leases.length ? { leases: leaseLines(leases, now) } : {}),
     hint: "status wid=<wid> shows one workflow (outputs clipped); add key=<key> for one call's full result, or full:true for everything",
   };
+}
+
+/** AK4/R-12-AK-3: render only the projection's own question entries, never business result/data/output. */
+export function statusText(home: string, value: unknown): string {
+  const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const workflow = (v: unknown): unknown => {
+    if (!object(v) || typeof v.wid !== 'string') return v;
+    const wid = v.wid;
+    let questions: AttentionItem[] | undefined;
+    const items = (list: unknown, brief: boolean): unknown => !Array.isArray(list) ? list : list.map(item => {
+      if (!object(item) || item.decision_needed === undefined || (!brief && item.kind !== 'question')) return item;
+      // Brief drops the attention id/call; its address, qid and revision still identify the original question.
+      const q = (questions ??= workflowSnapshot(home, wid).attention).find(q => q.kind === 'question' && q.decision_needed !== undefined &&
+        q.qid === item.qid && q.rev === item.rev && (brief
+          ? q.call !== undefined && item.to === `${wid}/${callKey(q.call)}`
+          : q.id === item.id && q.call === item.call));
+      return q ? { ...item, [brief ? 'question' : 'text']: askText(q, q.text) } : item;
+    });
+    return { ...v, ...(Array.isArray(v.attention) ? { attention: items(v.attention, false) } : {}),
+      ...(Array.isArray(v.asking) ? { asking: items(v.asking, true) } : {}) };
+  };
+  if (!object(value)) return JSON.stringify(value);
+  // These are the only workflow containers produced by status. Do not walk calls, result or arbitrary nesting.
+  return JSON.stringify({ ...workflow(value) as Record<string, unknown>,
+    ...(Array.isArray(value.active) ? { active: value.active.map(workflow) } : {}),
+    ...(Array.isArray(value.workflows) ? { workflows: value.workflows.map(workflow) } : {}) });
 }
 
 /** Running workflows of other sessions that a pause holds, as "wid" or "wid (name)": a session's own resume skips them. */
