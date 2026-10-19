@@ -250,6 +250,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
   const sends = new Map<string, CallSend[]>(), byRid2 = new Map<string, CallSend>();
   // Pending notes of the current revision by key (notes.ts): recorded rids, and those a generation carried.
   const notes = new Map<string, Set<string>>(), carried = new Set<string>();
+  const choices = new Map<string, string>();
   function apply(batch: readonly Entry[], from = 0) {
     for (let i = from; i < batch.length; i++) {
       const e = batch[i]!;
@@ -259,7 +260,7 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
         const key = String(e.key), gen = Number(e.gen) || (e.type === "refused" ? 0 : 1);
         const callId = e.type === "reused" ? String(e.from) : `${wid}@${rev}/${key}@${gen}`;
-        if (e.type === "generation") { generations.add(callId); for (const rid of Array.isArray(e.notes) ? e.notes : []) carried.add(String(rid)); }
+        if (e.type === "generation") { generations.add(callId); choices.delete(String(e.from)); for (const rid of Array.isArray(e.notes) ? e.notes : []) carried.add(String(rid)); }
         const result = e.type === "refused" ? refusedResult(key, e.reason) :
           e.type === "reused" ? entries.find(s => s.type === JT.sealed && s.call === e.from)?.result as CallResult | undefined : undefined;
         const wanted = (e.spec as { model?: unknown } | undefined)?.model;
@@ -270,6 +271,8 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
           ...(typeof wanted === "string" && wanted ? { model: wanted } : {}),
           phase: result ? "sealed" : "queued", ...(result ? { result, endedAt: e.ts } : {}),
           ...(e.type === "refused" ? { refused: String(e.reason) } : {}), ...(e.type === "reused" ? { reused: String(e.from) } : {}) });
+      } else if (e.type === "model-choice") {
+        if (typeof e.model === "string" && calls.has(String(e.call))) choices.set(String(e.call), e.model);
       } else if (e.type === PENDING_NOTE) {
         if (boundary >= 0 && e.seq < entries[boundary]!.seq) continue;
         const set = notes.get(String(e.key)) ?? new Set<string>(); set.add(String(e.rid)); notes.set(String(e.key), set);
@@ -426,7 +429,9 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
         if (last?.reason !== undefined) c.switchFailed = `${last.model} (${last.reason})`;
         else if (last && last.state !== "retired" && last.model !== (c.virtualModel ? c.selectedModel : c.model)?.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")) c.switching = last.model;
       }
-      const selected = c.switching ?? c.selectedModel;
+      // A sealed choice has not been used yet; retain the last actual model and expose the intent separately.
+      if (choices.has(c.callId) && !retired.has(c.callId)) c.switching = choices.get(c.callId);
+      const selected = c.phase === "sealed" ? c.selectedModel : c.switching ?? c.selectedModel;
       if (c.usedModel && c.virtualModel) c.routedModel = c.usedModel;
       else if (c.usedModel && selected && c.usedModel.toLowerCase() !== selected.toLowerCase())
         c.modelMismatch = { used: c.usedModel, selected };
@@ -1500,6 +1505,7 @@ export function eventsFromEntries(entries: readonly Entry[]): TimelineEvent[] {
       case "stop-intent": add(e, "stop", { call: e.call }); break;
       case "timeout-intent": add(e, "timeout", { call: e.call, exec: e.exec }); break;
       case "hibernated": add(e, "hibernated", { call: e.call, qid: e.qid }); break;
+      case "model-choice": add(e, "model-choice", { rid: e.rid, call: e.call, model: e.model, effect: "next-generation" }); break;
       case "forward": {
         forwards.set(String(e.rid2), e);
         // A model switch names its target, and a failover (the executor moved the call off a used-up provider) its source.

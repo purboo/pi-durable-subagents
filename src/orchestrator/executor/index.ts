@@ -1630,7 +1630,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           }
         }
         /** P12: a model request to this call, recorded with the rid given; a reject has no effect. */
-        const requestModel = async (rid: string, model: string, hash: string, cond?: Envelope["cond"]) => {
+        const requestModel = async (rid: string, choice: string, hash: string, cond?: Envelope["cond"]) => {
+          let model = choice;
           let body: ModelBody;
           const exec = current(ctx.journal, dest);
           // P28: with no live execution (not started yet, between executions, hibernated while asking) the model is
@@ -1657,7 +1658,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           if (!idle && pendingSwitch(exec!)) return { action: "reject", reason: "switch-pending" } as const;
           if (!idle && !await reserveSwitch(exec!, body.provider, rid)) return { action: "reject", reason: "provider-full" } as const;
           await note(req.rid, model, idle ? "next-execution" : "next-request", pool);
-          const entry = await ctx.journal.append("forward", { rid, rid2, dest, hash, envelope });
+          const entry = await ctx.journal.append("forward", { rid, rid2, dest, hash, envelope, choice });
           await replayForward(entry);
           if (idle) { active.get(dest)?.wake(); wake(); }
           return undefined;
