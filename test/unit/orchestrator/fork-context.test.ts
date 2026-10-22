@@ -34,7 +34,6 @@ const compacted = (): Row[] => [header, ...chain([
   { type: "context_edit", id: "ce", timestamp: ts, targetId: "k", replacement: { content: "KEPT-EDITED" } },
   { type: "model_change", id: "m", timestamp: ts, provider: "probe", modelId: "scripted2" },
 ])];
-
 /** The 1.2 pin rule, verbatim (src/orchestrator/store.ts at 2a01184). */
 function pin12(rows: Row[], leafId?: string): string {
   const head = rows.find(e => e.type === "session")!;
@@ -44,14 +43,31 @@ function pin12(rows: Row[], leafId?: string): string {
   while (id) { const entry = byId.get(id)!; branch.unshift(entry); id = entry.parentId ?? undefined; }
   return [head, ...branch.filter(e => ["message", "model_change"].includes(e.type) && !e.message?.customType?.startsWith("dsa-"))].map(e => JSON.stringify(e)).join("\n") + "\n";
 }
-/** The origin as pi would see it without dsa receipts (they stay excluded, FC1): receipts removed and their children relinked. */
-function withoutReceipts(rows: Row[]): Row[] {
-  const dropped = new Map(rows.filter(e => String(e.customType ?? e.message?.customType ?? "").startsWith("dsa-")).map(e => [e.id!, e.parentId ?? null]));
-  const lift = (id: string | null | undefined): string | null => id && dropped.has(id) ? lift(dropped.get(id)) : id ?? null;
-  return rows.filter(e => !dropped.has(e.id!)).map(e => e.type === "session" ? e : { ...e, parentId: lift(e.parentId) });
-}
 async function write(path: string, rows: Row[]) { await writeFile(path, rows.map(e => JSON.stringify(e)).join("\n") + "\n"); }
 const parse = (text: string) => text.trim().split("\n").map(line => JSON.parse(line) as Row);
+const isReceipt = (e: any) => String(e?.customType ?? e?.message?.customType ?? "").startsWith("dsa-");
+const text = (m: any): string => typeof m.content === "string" ? m.content : (m.content ?? []).map((b: any) => b?.text ?? "").join("");
+
+/** What pi sends for the origin itself: its projection without dsa's receipts (FC1 keeps them out of the fork). */
+function parentMessages(rows: Row[]): any[] {
+  const entries = rows.filter(e => e.type !== "session") as any[];
+  const projection = pi!.buildSessionProjection(entries, entries.at(-1)!.id);
+  return projection.entries.filter(e => !isReceipt(e.sourceEntry)).flatMap(e => e.messages);
+}
+/** Pin an origin and publish the fork session the executor would publish. */
+async function fork(f: { root: string; t: any; effects: () => any }, rows: Row[], name: string) {
+  const file = join(f.root, `${name}-origin.jsonl`), pinnedPath = join(f.root, `${name}-pinned.jsonl`), session = join(f.root, `${name}-child.jsonl`);
+  await write(file, rows);
+  const bytes = await pinOrigin({ sessionFile: file });
+  await writeFile(pinnedPath, bytes);
+  const t = { ...f.t, callId: `${f.t.callId}#${name}`, spec: { ...f.t.spec, context: "fork" as const }, originSession: pinnedPath };
+  await f.effects().prepare(t, { sessionPath: session });
+  return { file, pinnedPath, session, bytes, pinned: parse(bytes) };
+}
+/** The messages the fork child sends, as pi's builder computes them from the published session. */
+function childMessages(session: string, root: string, cwd: string): any[] {
+  return pi!.SessionManager.open(session, join(root, "sessions"), cwd).buildSessionContext().messages;
+}
 
 test("FC1 compacted origin pins kept + latest compaction + later entries, not earlier raw messages or receipts", async ctx => {
   const f = await fixture(ctx), file = join(f.root, "origin.jsonl");
@@ -90,25 +106,60 @@ test("FC1 uncompacted origins pin exactly the 1.2 bytes (branch summaries and cu
   assert.deepEqual(parse(await pinOrigin({ sessionFile: file, leafId: "b" })).map(e => e.id), [header.id, "a", "model", "b"]);
 });
 
-test("FC1 the fork child's context equals pi's buildSessionContext of the origin (receipts excluded)", { skip: noPi }, async ctx => {
-  const f = await fixture(ctx), file = join(f.root, "origin.jsonl"), rows = compacted();
+test("FC1 the fork child's context equals pi's projection of the origin (receipts excluded)", { skip: noPi }, async ctx => {
+  const f = await fixture(ctx), rows = compacted();
   for (const [name, origin] of [["nested compactions", rows], ["kept marker off the branch", rows.map(e => e.id === "c" ? { ...e, firstKeptEntryId: "elsewhere" } : e)],
     ["no kept entries", rows.map(e => e.id === "c" ? { ...e, firstKeptEntryId: "c" } : e)]] as const) {
-    await write(file, origin);
-    const pinnedPath = join(f.root, `pinned-${name.replaceAll(" ", "-")}.jsonl`), session = join(f.root, `child-${name.replaceAll(" ", "-")}.jsonl`);
-    await writeFile(pinnedPath, await pinOrigin({ sessionFile: file }));
-    const t = { ...f.t, callId: `${f.t.callId}-${name.length}`, spec: { ...f.t.spec, context: "fork" as const }, originSession: pinnedPath };
-    await f.effects().prepare(t, { sessionPath: session });
-    const child = pi!.SessionManager.open(session, join(f.root, "sessions"), f.cwd).buildSessionContext();
-    const reference = withoutReceipts(origin).filter(e => e.type !== "session") as Parameters<NonNullable<typeof pi>["buildSessionContext"]>[0];
-    const expected = pi!.buildSessionContext(reference, reference.at(-1)!.id);
-    assert.deepEqual(child.messages, expected.messages, name);
-    assert.deepEqual(child.model, expected.model, name);
-    assert.ok(JSON.stringify(child.messages).includes("LATEST-SUMMARY"), name);
-    assert.ok(!JSON.stringify(child.messages).includes("EARLY-RAW"), name);
+    const forked = await fork(f, origin, name.replaceAll(" ", "-"));
+    const child = childMessages(forked.session, f.root, f.cwd);
+    assert.deepEqual(child, parentMessages(origin), name);
+    assert.ok(child.map(text).join(" ").includes("LATEST-SUMMARY"), name);
+    assert.ok(!child.map(text).join(" ").includes("EARLY-RAW"), name);
   }
   // The uncompacted fork session itself is unchanged from 1.2 (only message/model_change entries in the pin).
   const plain = [header, user("a", null, "q"), { type: "model_change", id: "m", parentId: "a", timestamp: ts, provider: "probe", modelId: "scripted" }, user("b", "m", "f")];
-  await write(file, plain);
-  assert.equal(await pinOrigin({ sessionFile: file }), pin12(plain));
+  const forked = await fork(f, plain, "plain");
+  assert.equal(forked.bytes, pin12(plain));
+});
+
+test("FC1 a kept marker that names a receipt keeps the range that follows it", { skip: noPi }, async ctx => {
+  const f = await fixture(ctx);
+  // The marker names a dsa receipt; the first kept entry is an edit of an entry that is not pinned and is dropped.
+  const rows: Row[] = [header, ...chain([
+    user("e0", null, "EARLY"),
+    { type: "custom_message", id: "e1", timestamp: ts, customType: "dsa-exec", content: "RECEIPT", display: true },
+    { type: "context_edit", id: "e2", timestamp: ts, targetId: "e0", replacement: { content: "EDITED" } },
+    user("e3", null, "U3"),
+    { type: "compaction", id: "e4", timestamp: ts, summary: "SUM4", firstKeptEntryId: "e1", tokensBefore: 400 },
+  ])];
+  const forked = await fork(f, rows, "receipt-at-the-cut");
+  assert.deepEqual(forked.pinned.map(e => e.id), [header.id, "e3", "e4"]);
+  assert.equal(forked.pinned.find(e => e.id === "e4")!.firstKeptEntryId, "e3", "the marker names an entry the child carries");
+  const child = childMessages(forked.session, f.root, f.cwd);
+  const texts = child.map(text);
+  assert.equal(texts.length, 2, "the summary and the kept message");
+  assert.ok(texts[0]!.includes("SUM4"), texts[0]);
+  assert.ok(texts[1]!.includes("U3"), texts[1]);
+  assert.deepEqual(child, parentMessages(rows));
+});
+
+test("FC1 a kept marker that names an older compaction keeps the range that follows it", { skip: noPi }, async ctx => {
+  const f = await fixture(ctx);
+  // The marker names an older compaction; the first kept entry is an edit of an entry that is not pinned and is dropped.
+  const rows: Row[] = [header, ...chain([
+    user("e0", null, "EARLY"),
+    { type: "compaction", id: "c0", timestamp: ts, summary: "SUM0", firstKeptEntryId: "e0", tokensBefore: 100 },
+    { type: "context_edit", id: "e1", timestamp: ts, targetId: "e0", replacement: { content: "EDITED" } },
+    user("e2", null, "U2"),
+    { type: "compaction", id: "e3", timestamp: ts, summary: "SUM3", firstKeptEntryId: "c0", tokensBefore: 300 },
+  ])];
+  const forked = await fork(f, rows, "older-compaction-at-the-cut");
+  assert.deepEqual(forked.pinned.map(e => e.id), [header.id, "e2", "e3"]);
+  assert.equal(forked.pinned.find(e => e.id === "e3")!.firstKeptEntryId, "e2", "the marker names an entry the child carries");
+  const child = childMessages(forked.session, f.root, f.cwd);
+  const texts = child.map(text);
+  assert.equal(texts.length, 2, "the summary and the kept message");
+  assert.ok(texts[0]!.includes("SUM3"), texts[0]);
+  assert.ok(texts[1]!.includes("U2"), texts[1]);
+  assert.deepEqual(child, parentMessages(rows));
 });

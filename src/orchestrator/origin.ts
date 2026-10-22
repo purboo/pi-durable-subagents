@@ -35,8 +35,10 @@ export function effectiveBranch(branch: OriginEntry[]): OriginEntry[] {
   const later = branch.slice(latest + 1).filter(contextual);
   const ids = new Set([...kept, ...later].map(e => e.id));
   const keep = (e: OriginEntry) => e.type !== 'context_edit' || ids.has(e.targetId);
-  // The child session is linear: its kept entries come first, so the marker names the first one that survived.
-  return [...kept.filter(keep), { ...compaction, firstKeptEntryId: kept[0]?.id ?? compaction.id }, ...later.filter(keep)];
+  const keptKept = kept.filter(keep), laterKept = later.filter(keep);
+  // The marker names an entry the child really carries: pi reads the kept range from it, so a marker that names a
+  // dropped entry (a receipt, an edit of an entry that is not pinned, an older compaction) would drop the whole range.
+  return [...keptKept, { ...compaction, firstKeptEntryId: keptKept[0]?.id ?? compaction.id }, ...laterKept];
 }
 
 /** P33, FC1: Capture the selected branch's effective context before admission and exclude extension receipts. */
