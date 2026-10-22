@@ -4,6 +4,24 @@
 //   provider-probe{provider, exec}: after nextTry, the one call admitted to find out whether it accepts requests again.
 //   provider-available{provider, exec}: it answered; a release of the probe's slot without an outcome frees the probe.
 import type { Entry } from "../types.ts";
+import type { OrchestratorConfig } from "./contract.ts";
+
+/** XP1: compile only validated, configured patterns; no implicit quota-text matching. */
+export function exhaustedPatterns(providers: OrchestratorConfig["providers"]): Record<string, string[]> {
+  return Object.fromEntries(Object.entries(providers ?? {}).filter(([, p]) => p.exhaustedPatterns?.length)
+    .map(([name, p]) => [name, p.exhaustedPatterns!]));
+}
+
+/** XP1: only an assistant answer without tool calls can be a quota notice. */
+export function exhaustedText(message: { role?: string; content?: unknown }, patterns: readonly RegExp[]): string | undefined {
+  if (message.role !== "assistant" || !patterns.length) return;
+  const content = message.content;
+  if (Array.isArray(content) && content.some(b => b?.type === "toolCall")) return;
+  const text = typeof content === "string" ? content : Array.isArray(content)
+    ? content.filter(b => b?.type === "text" && typeof b.text === "string").map(b => b.text).join("") : "";
+  if (patterns.some(pattern => pattern.test(text))) return text;
+}
+
 
 /** Entry types consumed by foldExhaustion, shared with filtered ledger readers. */
 export const EXHAUSTION_ENTRY_TYPES = ['provider-exhausted', 'provider-available', 'provider-probe', 'release'] as const;
