@@ -100,7 +100,7 @@ test("FC1 the fork child's context equals pi's buildSessionContext of the origin
     const t = { ...f.t, callId: `${f.t.callId}-${name.length}`, spec: { ...f.t.spec, context: "fork" as const }, originSession: pinnedPath };
     await f.effects().prepare(t, { sessionPath: session });
     const child = pi!.SessionManager.open(session, join(f.root, "sessions"), f.cwd).buildSessionContext();
-    const reference = withoutReceipts(origin).filter(e => e.type !== "session") as Parameters<typeof pi.buildSessionContext>[0];
+    const reference = withoutReceipts(origin).filter(e => e.type !== "session") as Parameters<NonNullable<typeof pi>["buildSessionContext"]>[0];
     const expected = pi!.buildSessionContext(reference, reference.at(-1)!.id);
     assert.deepEqual(child.messages, expected.messages, name);
     assert.deepEqual(child.model, expected.model, name);
