@@ -32,7 +32,7 @@ import { readJournalSnapshot, syncDirectory } from "../../kernel/journal.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, forwardRid } from "../../kernel/ids.ts";
 import { capacity, seal } from "../../kernel/guards.ts";
-import { buildPiArgs } from "../../compat/pi-args.ts";
+import { buildPiArgs, DEFAULT_TOOLS } from "../../compat/pi-args.ts";
 import { parseModel, plainModel, resolveModel, sameModel, type Model } from "../../compat/model.ts";
 import { buildCallResult } from "../../compat/result.ts";
 import type { CallEffects, CallTicket, Executor, Ledgers } from "../contract.ts";
@@ -42,6 +42,7 @@ import { fenceAgent } from "./ended.ts";
 import { answerInFlight, boundAnswer, hibernation, openAsked, openQuestion, supersededByBinding } from "./hibernate.ts";
 import { SessionFold, answerKey, digestOpenQuestion, supersededBy } from "./digest.ts";
 import { exhaustedPatterns } from "../providers.ts";
+import { exactDecision, modelConfigured, readPinnedCapture, type ExactReason } from "../exact.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
@@ -721,8 +722,30 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       try { await changed; } finally { clearTimeout(timer); waiters.delete(signal); }
     }
   }
+  /**
+   * EX5: the exactness of a call, decided once and recorded in the journal: "exact" (the child splices the pinned
+   * capture) or "rebuilt" (the call runs as a fork, with the reason it could not be exact). A rebuilt call never
+   * retries exact later: the recorded decision is the one every execution of the call uses.
+   */
+  async function exactMode(t: CallTicket): Promise<{ mode: "exact" | "rebuilt"; reason?: ExactReason } | undefined> {
+    if (t.spec.context !== "exact") return undefined;
+    const recorded = t.journal.entries().findLast(e => e.type === "exact-mode" && e.call === t.callId);
+    if (recorded) return { mode: String(recorded.mode) as "exact" | "rebuilt", ...(recorded.reason ? { reason: String(recorded.reason) as ExactReason } : {}) };
+    const capture = await readPinnedCapture(t.exactCapture?.path);
+    const decision = exactDecision({ capture, configured: capture ? modelConfigured(settings(), capture.provider, capture.model) : false });
+    const facts = t.exactCapture?.facts;
+    await serial(() => t.journal.append("exact-mode", { call: t.callId, mode: decision.mode, ...(decision.reason ? { reason: decision.reason } : {}),
+      ...(facts ? { capture: { sha256: facts.sha256, bytes: facts.bytes, at: facts.at, provider: facts.provider, model: facts.model, api: facts.api } } : {}) }));
+    return decision;
+  }
+
   /** P13, C5, C8: Decide holdings and CLI model restoration from the same fenced session. */
   async function launchModel(t: CallTicket, entries: SessionEntry[], previous?: string): Promise<{ candidates: Model[]; continuation: boolean; pool?: string; spill?: Model[] }> {
+    // EX3: an exact call runs on the captured provider/model and thinking: no pool, no failover.
+    if (t.exactMode?.mode === "exact" && t.exactCapture) {
+      const capture = await readPinnedCapture(t.exactCapture.path);
+      if (capture) return { candidates: [{ provider: capture.provider, id: capture.model, ...(capture.thinking ? { thinking: capture.thinking as Model["thinking"] } : {}) }], continuation: false };
+    }
     const recorded = sessionModel(entries);
     const ownSegment = entries.some(e => e.type === "custom" && e.customType === CT.exec && typeof e.data?.exec === "string" && e.data.exec.startsWith(`${t.callId}#`));
     const freshFork = t.spec.context === "fork" && !t.continueFrom && !ownSegment;
@@ -1200,6 +1223,20 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const makeResult = (status: CallResult["status"], output = "", error?: string) => buildCallResult({ key: t.key, gen: t.gen, status, output, ...(error ? { error } : {}) });
     let cwd = t.cwd, writer: string | undefined;
     if (sealed(journal, t.callId)) { const result = sealed(journal, t.callId)!; await effects.afterSeal(t, result); return result; }
+    // EX2: an exact call runs on the origin's model. The admission refuses the fanout forms; a script that names a
+    // model in an exact call is refused here (before the call is rebuilt as a fork).
+    if (t.spec.context === "exact" && t.spec.model !== undefined) {
+      const exec = current(journal, t.callId) ?? `${t.callId}#1.1`;
+      if (!current(journal, t.callId)) await serial(() => journal.append(JT.exec, { call: t.callId, exec }));
+      await fence(journal, exec, { park: a });
+      return finish(journal, t.callId, exec, makeResult("failed", "", 'context "exact" runs on the origin model; remove model'));
+    }
+    // EX2, EX5: the exactness of the call is decided once and recorded: a rebuilt call never retries exact later.
+    const exact = await exactMode(t);
+    if (exact) {
+      t.exactMode = exact;
+      if (exact.mode === "rebuilt") t.spec = { ...t.spec, context: "fork" };
+    }
     // A call that cannot run (CallTicket.refusal) or whose preparation failed is sealed failed without a child.
     let unprepared = t.refusal;
     if (unprepared === undefined) try {
@@ -1283,6 +1320,22 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         }
         await recordUsage(t, sessionUsage(entries, t.callId));
         const ev = evidence(entries, exec); dangling = ev.dangling;
+        // EX4: the request was not sent (another provider/model/api): the call fails with the mismatch.
+        const mismatch = entries.findLast(e => e.type === "custom" && e.customType === CT.exactMismatch && e.data?.exec === exec)?.data;
+        if (mismatch) return finish(journal, t.callId, exec, makeResult("failed", "", String(mismatch.error ?? "exact-mismatch")));
+        // EX5: the transport never offered the payload hook: the call is rebuilt as a fork and runs again.
+        const rebuilt = entries.findLast(e => e.type === "custom" && e.customType === CT.exactRebuilt && e.data?.exec === exec)?.data;
+        if (rebuilt && t.exactMode?.mode === "exact") {
+          const reason = String(rebuilt.reason ?? "no-payload-hook") as ExactReason;
+          await serial(() => journal.append("exact-mode", { call: t.callId, mode: "rebuilt", reason }));
+          t.exactMode = { mode: "rebuilt", reason };
+          t.spec = { ...t.spec, context: "fork" };
+          // The fork branch is published for the rebuilt call; a session the exact child already wrote keeps its own
+          // context (the publication would conflict with it).
+          await serial(async () => { await effects.prepare(t, { sessionPath: session }).catch(() => undefined); });
+          await fence(journal, exec, { park: a });
+          continue;
+        }
         if (closed || a.suspended || a.retired) throw shutdownError();
         if (stopped(a)) return finish(journal, t.callId, exec, makeResult("stopped"));
         if (has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs)
@@ -1398,11 +1451,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await launchGate(a, exec, "child");
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       const patterns = exhaustedPatterns(settings().providers);
+      // EX3: an exact child splices the pinned capture; its tools are the call's allow-list (EX4).
+      const exactTools = t.exactMode?.mode === "exact" ? [...new Set([...(t.spec.tools ?? t.agent.tools ?? DEFAULT_TOOLS),
+        ...(t.spec.schema === undefined ? ["ask"] : ["ask", "report"])])] : undefined;
       let child: Spawned;
       try {
-        child = await containment.spawn({ exec, command: piCommand, args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
+        child = await containment.spawn({ exec, command: piCommand, args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}), ...(t.exactMode?.mode === "exact" ? { thinking: (await readPinnedCapture(t.exactCapture?.path))?.thinking ?? false } : {}) }), "-e", extension], cwd,
           // The orchestrator's node follows binDir: a `#!/usr/bin/env node` pi runs under a PATH without node (a service's).
-          env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(Object.keys(patterns).length ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
+          env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(Object.keys(patterns).length ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}), ...(exactTools && t.exactCapture ? { DSA_EXACT_CAPTURE: t.exactCapture.path, DSA_EXACT_TOOLS: JSON.stringify(exactTools) } : {}) } });
       } catch (error) {
         const environment = environmentSpawnError(error);
         if (environment) await serial(() => spawnEnvRecord(t, exec!, error));
@@ -1414,6 +1470,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         continue;
       }
       await serial(() => spawnEnvResolved(t));
+      // EX6: the age of the pinned capture at the launch of this execution.
+      if (t.exactMode && t.exactCapture) await serial(() => journal.append("exact-launch", { call: t.callId, exec, ageMs: Math.max(0, Date.now() - t.exactCapture!.facts.at) }));
       try {
         // EX1: retain the direct identity even if pi exited before start capture; otherwise a surviving grandchild
         // could become the first tracked process and be mistaken for pi on a recovery fence.
@@ -1442,6 +1500,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           }, recordUsage: values => recordUsage(t, values), usage: entries => digestOf(t.callId, entries).usage,
           wrote: path => wrote(t, exec!, cwd, path),
           modelControl: event => modelControl(journal, exec!, event),
+          exactUsage: async event => {
+            // EX6: the usage of every provider request of an exact call (and of a rebuilt one: it shows the cost).
+            if (!t.exactMode) return;
+            const usage = (event.message as { usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } } } | undefined)?.usage;
+            if (!usage) return;
+            await serial(() => journal.append("exact-usage", { call: t.callId, exec, input: usage.input ?? 0, cacheRead: usage.cacheRead ?? 0,
+              cacheWrite: usage.cacheWrite ?? 0, output: usage.output ?? 0, costUsd: usage.cost?.total ?? 0 }));
+          },
           switched: event => switched(exec!, journal, event), answered: event => answered(t, exec!, event), pendingSwitch: () => pendingSwitch(exec!),
         });
       } finally { await fence(journal, exec, { child, park: a }); a.live = undefined; }

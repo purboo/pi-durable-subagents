@@ -11,6 +11,7 @@ import { captureStart } from '../platform/proctable.ts';
 import type { Executor, Ledgers, OrchestratorConfig } from './contract.ts';
 import { Engine, type EngineOptions } from './engine.ts';
 import { configPath, configProblem, configStamp, recordConfig, stampedConfig, watchConfig } from './config.ts';
+import { CAPTURE_RETENTION_MS, pruneCaptures } from '../agent/exact/capture.ts';
 import { packageVersion } from '../version.ts';
 
 export interface MainOptions extends EngineOptions {
@@ -69,6 +70,8 @@ export async function main(options: MainOptions = {}): Promise<{ restart?: true 
     engine = new Engine(ledgers, executor, options);
     // A4: admission reads the settings recorded last, so the ones this run starts with are recorded (given ones too).
     await recordConfig(ledgers.orch, config);
+    // EX1: the captures of the top-level pi sessions are kept for 7 days; the old ones go when the orchestrator starts.
+    await pruneCaptures(home, CAPTURE_RETENTION_MS).catch(() => 0);
     if (stamp !== undefined) {
       // A change applies between slot admissions, so one admission never mixes two versions of the limits.
       watcher = watchConfig({ path: configPath(home), stamp, config, orch: ledgers.orch, intervalMs: Math.min(1000, config.k?.trackerMs ?? 1000),

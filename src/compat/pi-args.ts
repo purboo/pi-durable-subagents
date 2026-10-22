@@ -2,12 +2,17 @@ import type { CallSpec } from "../types.ts";
 import type { AgentDefinition } from "./agents.ts";
 import { parseModel, thinkingLevels, type Model } from "./model.ts";
 
+/** The tools pi declares to the model when neither the spec nor the agent names any (pi's own default). */
+export const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
+
 export interface PiArgsOptions {
   sessionPath: string;
   systemPromptPath: string;
   continuation?: boolean;
   /** A candidate selected and recorded by the orchestrator when using pools. */
   model?: Model;
+  /** EX3: the thinking level of the request (the captured one for an exact call); false means: no thinking flag. */
+  thinking?: string | false;
   /** Protocol tools registered by the child agent (ask; report when DSA_SCHEMA is set). They are part of the
    *  durable protocol, not agent capabilities, so they are added to any explicit allowlist (incl. an empty one). */
   controlTools?: readonly string[];
@@ -29,7 +34,7 @@ export function buildPiArgs(agent: AgentDefinition, spec: CallSpec, options: PiA
     const raw = spec.model ?? agent.model;
     const model = options.model ?? (raw ? parseModel(raw) : undefined);
     if (model) args.push("--model", model.provider ? `${model.provider}/${model.id}` : model.id);
-    const thinking = model?.thinking ?? agent.thinking;
+    const thinking = options.thinking ?? model?.thinking ?? agent.thinking;
     if (thinking !== undefined && thinking !== false) {
       if (!thinkingLevels.includes(thinking as typeof thinkingLevels[number])) throw new Error(`Invalid thinking level: ${thinking}`);
       args.push("--thinking", thinking);

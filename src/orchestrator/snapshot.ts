@@ -98,6 +98,41 @@ export interface CommandFacts {
   /** `<attempt dir>/output.log`: stdout and stderr, interleaved. */
   log?: string;
 }
+/** EX6: what an exact (or rebuilt) call did: the pinned capture it used and the usage of every provider request. */
+export interface ExactReport {
+  /** "exact": the call spliced the pinned capture. "rebuilt": it ran as a fork, with the reason it could not be exact. */
+  mode: "exact" | "rebuilt";
+  /** Why the call was rebuilt ("no-capture", "api:<name>", "model-unknown", "no-payload-hook"). */
+  reason?: string;
+  /** The pinned capture's identity (absent when there was none). */
+  captureSha256?: string; captureBytes?: number; capturedAt?: number;
+  /** The provider and model of the capture. */
+  provider?: string; model?: string;
+  /** The age of the capture when the call launched (ms). */
+  ageMsAtLaunch?: number;
+  /** The usage of every provider request of the call, in order. */
+  requests: { input: number; cacheRead: number; cacheWrite: number; output: number; costUsd: number }[];
+  /** The totals of the requests. */
+  input: number; cacheRead: number; cacheWrite: number; output: number; costUsd: number;
+  /** The cache share of the first request (cacheRead / (input + cacheRead)). */
+  firstCacheRatio?: number;
+}
+/** A token count as "148.2K" (the report's sizes). */
+export const shortTokens = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(Math.round(n));
+/**
+ * EX6: the one line that shows the exactness of a call: the cache share of its first request, the cost and the age
+ * of the pinned capture. A rebuilt call shows why it could not be exact.
+ */
+export function exactLine(exact: ExactReport | undefined): string {
+  if (!exact) return "";
+  // EX6: a rebuilt call shows its reason and what it cost.
+  if (exact.mode === "rebuilt") return `exact: rebuilt${exact.reason ? ` (${exact.reason})` : ""}${exact.requests.length ? ` · $${exact.costUsd.toFixed(3)}` : ""}`;
+  const first = exact.requests[0];
+  const ratio = exact.firstCacheRatio ?? 0;
+  const cached = first?.cacheRead ?? 0, total = (first?.input ?? 0) + cached;
+  const age = exact.ageMsAtLaunch !== undefined ? ` · age ${Math.max(0, Math.round(exact.ageMsAtLaunch / 1000))}s` : "";
+  return `exact: cache ${Math.round(ratio * 100)}% (${shortTokens(cached)}/${shortTokens(total)}) · $${exact.costUsd.toFixed(3)}${age}`;
+}
 export interface CallSnapshot extends ModelStatus {
   key: string; gen: number; callId: string; agent: string; phase: CallPhase;
   /** A command call (no agent or model): its command as one line (commandText), and its process facts. A running command
@@ -114,6 +149,8 @@ export interface CallSnapshot extends ModelStatus {
   lastActivity?: number; startedAt?: number; endedAt?: number;
   /** P31: the sealed result's usage, else the committed usage entries so far. */
   usage?: Usage;
+  /** EX6: the exactness of the call and the usage of its provider requests. */
+  exact?: ExactReport;
   /** Tool executions observed across the call's executions. */
   tools?: number;
   /** Forwarded requests in forward order; `pending` counts pending messages (steer, follow-up, answer). */
@@ -310,6 +347,28 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
       } else if (e.type === "model-ready") {
         const call = byExec.get(String(e.exec));
         if (call && call.exec === e.exec) { call.selectedModel = modelName(e.model); call.virtualModel = e.virtual === true; }
+      } else if (e.type === "exact-mode") {
+        // EX5, EX6: the exactness of the call (the last decision wins: a rebuilt call never retries exact).
+        const call = calls.get(String(e.call)); if (!call) continue;
+        const capture = e.capture as { sha256?: string; bytes?: number; at?: number; provider?: string; model?: string } | undefined;
+        const prior = call.exact;
+        call.exact = { ...(prior ?? { requests: [], input: 0, cacheRead: 0, cacheWrite: 0, output: 0, costUsd: 0 }),
+          mode: String(e.mode) === "rebuilt" ? "rebuilt" : "exact", ...(e.reason ? { reason: String(e.reason) } : {}),
+          ...(capture?.sha256 ? { captureSha256: capture.sha256, captureBytes: capture.bytes, capturedAt: capture.at,
+            provider: capture.provider, model: capture.model } : {}) };
+      } else if (e.type === "exact-launch") {
+        const call = calls.get(String(e.call)); if (!call) continue;
+        call.exact = { ...(call.exact ?? { mode: "exact", requests: [], input: 0, cacheRead: 0, cacheWrite: 0, output: 0, costUsd: 0 }), ageMsAtLaunch: Number(e.ageMs) || 0 };
+      } else if (e.type === "exact-usage") {
+        // EX6: the usage of one provider request of an exact call.
+        const call = calls.get(String(e.call)); if (!call) continue;
+        const request = { input: Number(e.input) || 0, cacheRead: Number(e.cacheRead) || 0, cacheWrite: Number(e.cacheWrite) || 0,
+          output: Number(e.output) || 0, costUsd: Number(e.costUsd) || 0 };
+        const exact = call.exact ?? { mode: "exact" as const, requests: [], input: 0, cacheRead: 0, cacheWrite: 0, output: 0, costUsd: 0 };
+        const requests = [...exact.requests, request];
+        call.exact = { ...exact, requests, input: exact.input + request.input, cacheRead: exact.cacheRead + request.cacheRead,
+          cacheWrite: exact.cacheWrite + request.cacheWrite, output: exact.output + request.output, costUsd: exact.costUsd + request.costUsd,
+          ...(requests.length === 1 ? { firstCacheRatio: request.input + request.cacheRead > 0 ? request.cacheRead / (request.input + request.cacheRead) : 0 } : {}) };
       } else if (e.type === "writer-wait" || e.type === "writer-acquired") {
         const call = calls.get(String(e.call)), holder = String(e.holder ?? "");
         if (call && e.type === "writer-wait") call.writerWait = { root: String(e.root), holder: holder.includes("/") ? `${holder.split("@")[0]}/${holder.split("/")[1]!.split("@")[0]}` : holder };
@@ -1013,6 +1072,8 @@ export interface StatusCall extends ModelStatus, CommandStatus {
   key: string; gen: number; callId: string; phase: CallPhase;
   sharedWorktree?: string[];
   status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage;
+  /** EX6: the exactness of the call and the usage of its provider requests. */
+  exact?: ExactReport;
   /** Messages forwarded to the call whose child receipt has not been observed yet (P7). */
   pending?: number;
   /** The latest model requested while the call does not answer with it yet (running: at its next provider request;
@@ -1091,7 +1152,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
         ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
         ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
-        ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(c.queuedFor && !r && !wf.paused ? { queued: queuedText(c.queuedFor) } : {}) };
+        ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(c.queuedFor && !r && !wf.paused ? { queued: queuedText(c.queuedFor) } : {}), ...(c.exact ? { exact: c.exact } : {}) };
     }),
     attention: wf.attention.map(a => ({ id: a.id, rev: a.rev, kind: a.kind, text: clip(a.text, 300), ...(a.call ? { call: a.call } : {}), ...(a.qid ? { qid: a.qid } : {}), ...(a.decision_needed !== undefined ? { decision_needed: clip(a.decision_needed, 300), ...(a.options !== undefined ? { options: a.options } : {}) } : {}) })),
     ...(wf.paused ? { paused: true } : {}), ...(wf.followUps ? { followUps: wf.followUps } : {}), ...(wf.labels ? { labels: wf.labels } : {}),

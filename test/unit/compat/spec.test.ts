@@ -23,7 +23,7 @@ test("T2: every rule reports its exact message", () => {
     [{ ...base, model: 1, cwd: [], output: {} }, ["model must be a string (got 1)", "cwd must be a string (got [])", "output must be a string (got {})"]],
     ...([[0, "0"], [-1, "-1"], [Infinity, "Infinity"], [NaN, "NaN"], ["5", '"5"']] as const).map(([timeoutMs, shown]) => [{ ...base, timeoutMs }, [`timeoutMs must be a positive number (milliseconds) (got ${shown})`]] as [unknown, string[]]),
     [{ ...base, isolation: "docker" }, ['isolation must be "none" or "worktree" (got "docker")']],
-    [{ ...base, context: "inherit" }, ['context must be "fresh" or "fork" (got "inherit")']],
+    [{ ...base, context: "inherit" }, ['context must be "fresh", "fork" or "exact" (got "inherit")']],
     [{ ...base, once: "yes" }, ['once must be a boolean (got "yes")']],
     [{ ...base, writer: "no" }, ['writer must be a boolean (got "no")']],
     [{ ...base, tools: "read", skills: [1] }, ['tools must be an array of strings (got "read")', "skills must be an array of strings (got [1])"]],
