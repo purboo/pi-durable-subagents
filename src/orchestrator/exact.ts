@@ -48,16 +48,17 @@ export function modelConfigured(config: { providers?: Record<string, unknown>; p
   provider: string, model: string): boolean {
   if (!provider || !model) return false;
   const providers = config.providers ?? {}, pools = config.pools ?? {};
-  if (Object.keys(providers).length) return Object.hasOwn(providers, provider);
-  if (Object.keys(pools).length) {
-    const named = Object.values(pools).flatMap(list => Array.isArray(list) ? list : []).some(entry => {
+  // Every provider the configuration names: its slots, its pools and its default model.
+  const named = new Set<string>(Object.keys(providers));
+  for (const list of Object.values(pools)) {
+    for (const entry of (Array.isArray(list) ? list : []) as unknown[]) {
       const name = typeof entry === "string" ? entry : entry && typeof entry === "object" ? String((entry as { model?: unknown }).model ?? "") : "";
-      return name.split("/")[0] === provider;
-    });
-    if (named) return true;
+      if (name) named.add(name.split("/")[0]!);
+    }
   }
-  if (config.defaultModel) return config.defaultModel.split("/")[0] === provider;
-  return !Object.keys(pools).length && !config.defaultModel;
+  if (config.defaultModel) named.add(config.defaultModel.split("/")[0]!);
+  // A configuration that names no provider at all configures every provider.
+  return named.size ? named.has(provider) : true;
 }
 
 /** The decision of an exact call at launch (EX5): it is exact, or it is rebuilt as a fork with a reason. */

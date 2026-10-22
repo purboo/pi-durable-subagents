@@ -11,6 +11,7 @@
 // - the child transport never offers the payload hook: the call is rebuilt as a fork (`no-payload-hook`);
 // - the model calls a tool the exact child may not run: the call is refused at `tool_call` and the child continues.
 import { readFile } from "node:fs/promises";
+import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CT, ENV } from "../../types.ts";
 import type { Capture } from "./capture.ts";
@@ -67,37 +68,47 @@ export function mismatch(capture: Capture, model: { provider?: string; id?: stri
  */
 export function registerExactChild(pi: ExtensionAPI, exact: ExactChild): void {
   const { allow } = exact, allowed = new Set(allow);
-  let spliced = false, reported = false;
+  const exec = process.env[ENV.exec];
+  let spliced = false, refused = false, rebuilt = false;
   const captureOf = async (): Promise<Capture | undefined> => { try { return await exact.capture; } catch { return undefined; } };
-  const report = (type: string, data: Record<string, unknown>) => {
-    pi.appendEntry(type, data);
+  /** The receipt of the child, in the shape every other child receipt has (the executor matches its exec). */
+  const receipt = (type: string, data: Record<string, unknown>) => {
+    const payload = { exec, ...data };
+    pi.appendEntry(type, payload);
     // The orchestrator reads the receipt from the session; the line wakes it at once.
-    try { process.stdout.write(JSON.stringify({ type, ...data }) + "\n"); } catch { /* the session receipt is the record */ }
+    try { fs.writeSync(process.stdout.fd, JSON.stringify({ type, ...payload }) + "\n"); } catch { /* the session receipt is the record */ }
+  };
+  /**
+   * EX4: the request is not sent on another provider, model or api. The turn is aborted before the request (pi's
+   * runner swallows a handler's error and would send the request unchanged), so nothing cold reaches the provider.
+   */
+  const refuse = (error: string, ctx: ExtensionContext) => {
+    if (!refused) { refused = true; receipt(CT.exactMismatch, { error }); }
+    ctx.abort();
   };
   // EX4: the request the child would send is replaced by the parent's fields and the concatenated conversation.
-  pi.on("before_provider_request", async (event) => {
+  pi.on("before_provider_request", async (event, ctx: ExtensionContext) => {
     const payload = event.payload as Record<string, unknown> | undefined;
     if (!payload || typeof payload !== "object") return;
     const capture = await captureOf();
     if (!capture) return;
-    spliced = true;
     const model = typeof payload.model === "string" ? payload.model : undefined;
-    if (capture.model && model && model !== capture.model)
-      throw new Error(`exact-mismatch: the request names model ${model}, the capture names ${capture.model}`);
+    // A mismatch is never thrown here: pi's runner catches the error and sends the request unchanged, which would be
+    // a cold request. The turn is aborted instead (the context hook has already refused it).
+    if (capture.model && model && model !== capture.model) {
+      refuse(`exact-mismatch: the request names model ${model}, the capture names ${capture.model}`, ctx);
+      return;
+    }
+    spliced = true;
     return splicePayload(capture.payload, payload, capture.api);
   });
   // EX4: the request is never sent on another provider/model or api: the turn is aborted before the request.
   pi.on("context", async (_event, ctx: ExtensionContext) => {
     const capture = await captureOf();
-    if (!capture) {
-      if (!reported) { reported = true; report(CT.exactMismatch, { error: "exact-mismatch: the pinned capture is unreadable" }); }
-      ctx.abort();
-      return;
-    }
+    if (!capture) { refuse("exact-mismatch: the pinned capture is unreadable", ctx); return; }
     const problem = mismatch(capture, ctx.model ? { provider: ctx.model.provider, id: ctx.model.id, api: ctx.model.api } : undefined);
     if (!problem) return;
-    if (!reported) { reported = true; report(CT.exactMismatch, { error: `exact-mismatch: ${problem}` }); }
-    ctx.abort();
+    refuse(`exact-mismatch: ${problem}`, ctx);
   });
   // EX4: a tool the capture lists but the child may not run is refused; the child continues.
   pi.on("tool_call", (event) => {
@@ -112,10 +123,10 @@ export function registerExactChild(pi: ExtensionAPI, exact: ExactChild): void {
   });
   // EX5: a transport that never offers the payload hook cannot be exact: the call is rebuilt as a fork.
   pi.on("message_end", (event) => {
-    const message = event.message as { role?: string } | undefined;
-    if (spliced || message?.role !== "assistant") return;
-    if (reported) return;
-    reported = true;
-    report(CT.exactRebuilt, { reason: "no-payload-hook" });
+    const message = event.message as { role?: string; stopReason?: string } | undefined;
+    if (spliced || refused || rebuilt) return;
+    if (message?.role !== "assistant" || message?.stopReason === "aborted") return;
+    rebuilt = true;
+    receipt(CT.exactRebuilt, { reason: "no-payload-hook" });
   });
 }

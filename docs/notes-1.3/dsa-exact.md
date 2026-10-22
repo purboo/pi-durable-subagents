@@ -30,6 +30,9 @@ the parent's *whole request* and adds the child's turns to it.
    A call with `context: "exact"` that also names a `model` is refused at admission: an exact call runs on the
    origin's model (remove the `model`). A run that asks for the exact context without an origin is refused too: the
    capture comes from the origin session, and a rebuilt exact call forks it.
+   The exact context of a run is read from its *specs* (the call, the tasks, the chain), not from a word in its
+   source: a task that happens to name the word is not an exact call. A script run (its specs are built while it runs)
+   is read from its source.
 
 3. **The splice (EX3, EX4).** The exact child is a normal dsa child that loads the extensions a top-level session in
    the call's directory would load, plus the dsa child extension. It launches on the captured provider, model and
@@ -44,7 +47,10 @@ the parent's *whole request* and adds the child's turns to it.
      markers are kept only while the request stays within the provider's limit of four; the child's earliest marker
      is dropped first.
    * **A mismatch.** A request on another provider, model or api than the capture is not sent: the call fails with
-     `exact-mismatch: <detail>`.
+     `exact-mismatch: <detail>`. The child detects the mismatch in the `context` hook, which runs before the request,
+     and aborts the turn there: pi's extension runner swallows a handler's error and sends the request unchanged, so
+     an error would not stop it. The child's receipt (`dsa-exact-mismatch`) names its execution like every other child
+     receipt, so the orchestrator ends the call with the mismatch instead of losing it.
    * **Tools.** The tools the model sees are the parent's. The call's own tools (the spec's tools, or the agent's,
      plus the protocol tools) are the allow-list, enforced when the model calls a tool: a tool outside the
      allow-list, a tool the capture lists but the exact child cannot execute, and always `subagents` (no recursion)
@@ -62,7 +68,8 @@ A call that cannot be exact at launch runs as `context: "fork"` (with FC1) and r
 | `model-unknown` | the captured provider is not configured for the orchestrator |
 | `no-payload-hook` | the child transport never offers the payload hook (detected at the first request) |
 
-The decision is taken once per call and recorded in the journal: a rebuilt call never retries exact later.
+The decision is taken once per call and recorded in the journal: a rebuilt call never retries exact later. The
+child's receipt (`dsa-exact-rebuilt`) names its execution, so the orchestrator sees the rebuild.
 
 ## The report (EX6)
 
@@ -76,7 +83,7 @@ exact: cache 97% (148.2K/152.6K) · $0.031 · age 41s
 ```
 
 The cache share is that of the first request (`cacheRead / (input + cacheRead)`); a rebuilt call shows its reason
-instead (`exact: rebuilt (no-capture)`).
+and what it cost instead (`exact: rebuilt (no-capture) · $0.031`).
 
 ## How it is implemented
 
@@ -102,7 +109,9 @@ The capture's own module keeps the payload only; the orchestrator never loads th
   conversation stays the one the capture holds. A capture of a session that has compacted its context carries the
   compacted conversation.
 * The `model-unknown` fallback compares the captured provider with the providers the orchestrator's configuration
-  names (its `providers` map, its pools and its default model). A configuration that names no provider at all
-  configures every provider.
+  names: its `providers` map, its pools and its default model (a provider named by any of them is configured). A
+  configuration that names no provider at all configures every provider.
+* The captures of the sessions that are not written any more (and the temporary file of a write that never finished)
+  go with the retention, when the orchestrator starts.
 * A rebuilt call that is rebuilt *after* its first request (the `no-payload-hook` case) continues in its own session:
   the fork's parent context cannot be published into a session the exact child already wrote.

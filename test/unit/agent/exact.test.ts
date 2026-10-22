@@ -6,9 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { captureFacts, exactCaptureEnabled, exactPath, pruneCaptures, readCapture, writeCapture, type Capture } from "../../../src/agent/exact/capture.ts";
 import { registerCapture } from "../../../src/agent/exact/session.ts";
+import { ExtensionRunner, createExtensionRuntime } from "@earendil-works/pi-coding-agent";
 import { cacheMarkers, childConversation, clone, payloadTools, splicePayload } from "../../../src/agent/exact/splice.ts";
 import { EXACT_REFUSAL, mismatch, registerExactChild } from "../../../src/agent/exact/child.ts";
-import { CT } from "../../../src/types.ts";
+import { CT, ENV } from "../../../src/types.ts";
 
 const capture = (over: Partial<Capture> = {}): Capture => ({
   sessionId: "s1", provider: "qa", model: "m", api: "anthropic-messages", thinking: "off", at: 1_700_000_000_000,
@@ -53,6 +54,19 @@ test("EX1 the captures older than the retention are removed, the fresh ones stay
   assert.equal(await pruneCaptures(home, 7 * 24 * 60 * 60 * 1000), 1);
   assert.equal(await readCapture(home, "old"), undefined);
   assert.ok(await readCapture(home, "new"));
+});
+
+test("EX1 the temporary file of a write that never finished is removed with the old captures", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-exact-capture-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await writeCapture(home, capture({ sessionId: "s1" }));
+  const temp = join(exactPath(home, "s1"), "..", ".s1.1.1.tmp");
+  await writeFile(temp, "{}");
+  const long = Date.now() - 8 * 24 * 60 * 60 * 1000;
+  await utimes(temp, long / 1000, long / 1000);
+  assert.equal(await pruneCaptures(home, 7 * 24 * 60 * 60 * 1000), 1, "the leftover temporary file goes");
+  await assert.rejects(stat(temp), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+  assert.ok(await readCapture(home, "s1"), "the fresh capture stays");
 });
 
 test("EX1 the capture configuration is a boolean that defaults to on", () => {
@@ -167,9 +181,11 @@ test("EX4 the mismatch names the provider, the model and the api that differ", (
 // ---------------------------------------------------------------------------------------------------------------------
 // The exact child: the payload splice, the mismatch guard, the tool refusals and the hook detection.
 // ---------------------------------------------------------------------------------------------------------------------
-function childFixture(t: any, options: { capture?: Capture; allow?: string[]; active?: string[] }) {
+function childFixture(t: any, options: { capture?: Capture; allow?: string[]; active?: string[]; exec?: string }) {
   const hooks = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>(), history: any[] = [];
   const c = options.capture ?? capture();
+  const before = process.env[ENV.exec];
+  if (options.exec !== undefined) process.env[ENV.exec] = options.exec;
   const pi = {
     on: (name: string, fn: any) => hooks.set(name, fn),
     appendEntry: (customType: string, data: unknown) => history.push({ type: "custom", customType, data }),
@@ -177,6 +193,7 @@ function childFixture(t: any, options: { capture?: Capture; allow?: string[]; ac
   };
   registerExactChild(pi as never, { capture: Promise.resolve(c), allow: options.allow ?? ["bash", "ask"] });
   const ctx = { model: { provider: "qa", id: "m", api: "anthropic-messages" }, abort: () => { ctx.aborted = true; }, aborted: false } as any;
+  t.after(() => { if (options.exec === undefined) delete process.env[ENV.exec]; else process.env[ENV.exec] = before!; });
   return { hooks, history, ctx, pi };
 }
 
@@ -190,14 +207,19 @@ test("EX4 the exact child replaces the request with the parent's fields and the 
   assert.equal(out.max_tokens, 4096);
 });
 
-test("EX4 the exact child refuses a request on another model", async t => {
-  const f = childFixture(t, {});
-  await assert.rejects(async () => f.hooks.get("before_provider_request")!({ payload: { model: "other", messages: [] } }, f.ctx),
-    /exact-mismatch: the request names model other, the capture names m/);
+test("EX4 the exact child refuses a request on another model without throwing", async t => {
+  const f = childFixture(t, { exec: "call#1.1" });
+  // pi's runner swallows a handler's error and sends the request unchanged: a mismatch must never be thrown here.
+  const out = await f.hooks.get("before_provider_request")!({ payload: { model: "other", messages: [] } }, f.ctx);
+  assert.equal(out, undefined, "no payload is spliced for a mismatching request");
+  assert.equal(f.ctx.aborted, true, "the turn is aborted: the request is not sent");
+  const receipt = f.history.find(e => e.customType === CT.exactMismatch);
+  assert.match(receipt?.data.error as string, /^exact-mismatch: the request names model other, the capture names m/);
+  assert.equal(receipt?.data.exec, "call#1.1", "the receipt names its execution, like every other child receipt");
 });
 
 test("EX4 the exact child aborts the turn when the provider, the model or the api differ", async t => {
-  const f = childFixture(t, {});
+  const f = childFixture(t, { exec: "call#1.1" });
   await f.hooks.get("context")!({ type: "context" }, f.ctx);
   assert.equal(f.ctx.aborted, false, "a matching model is left alone");
   f.ctx.model = { provider: "qb", id: "m", api: "anthropic-messages" };
@@ -205,6 +227,7 @@ test("EX4 the exact child aborts the turn when the provider, the model or the ap
   assert.equal(f.ctx.aborted, true, "the request is not sent on another provider");
   const receipt = f.history.find(e => e.customType === CT.exactMismatch);
   assert.match(receipt?.data.error as string, /^exact-mismatch: provider qb is not the captured provider qa/);
+  assert.equal(receipt?.data.exec, "call#1.1");
 });
 
 test("EX4 the exact child refuses the tools it may not run and lets the others through", async t => {
@@ -220,8 +243,82 @@ test("EX4 the exact child refuses the tools it may not run and lets the others t
 });
 
 test("EX5 the exact child reports a transport that never offers the payload hook", async t => {
-  const f = childFixture(t, {});
+  const f = childFixture(t, { exec: "call#1.1" });
   await f.hooks.get("message_end")!({ message: { role: "assistant" } }, f.ctx);
   assert.equal(f.history.some(e => e.customType === CT.exactRebuilt), true, "the first answer without a splice rebuilds the call");
-  assert.equal(f.history.find(e => e.customType === CT.exactRebuilt)?.data.reason, "no-payload-hook");
+  const receipt = f.history.find(e => e.customType === CT.exactRebuilt);
+  assert.equal(receipt?.data.reason, "no-payload-hook");
+  assert.equal(receipt?.data.exec, "call#1.1", "the receipt names its execution, like every other child receipt");
+});
+
+test("EX5 an aborted turn is not an answer: it does not rebuild the call", async t => {
+  const f = childFixture(t, { exec: "call#1.1" });
+  await f.hooks.get("message_end")!({ message: { role: "assistant", stopReason: "aborted" } }, f.ctx);
+  assert.equal(f.history.some(e => e.customType === CT.exactRebuilt), false);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The real pi runner: a handler's error does not stop the request, so the exact child must not rely on one.
+// ---------------------------------------------------------------------------------------------------------------------
+/** The exact child's handlers in the shape pi's runner holds them. */
+function runnerOf(options: { capture?: Capture; allow?: string[]; exec?: string; model?: { provider: string; id: string; api: string } }) {
+  const hooks = new Map<string, ((event: any, ctx: any) => Promise<unknown> | unknown)[]>(), history: any[] = [];
+  const before = process.env[ENV.exec];
+  if (options.exec !== undefined) process.env[ENV.exec] = options.exec;
+  const pi = {
+    on: (name: string, fn: any) => { const list = hooks.get(name) ?? []; list.push(fn); hooks.set(name, list); },
+    appendEntry: (customType: string, data: unknown) => history.push({ type: "custom", customType, data }),
+    getActiveTools: () => ["bash", "ask"],
+  };
+  registerExactChild(pi as never, { capture: Promise.resolve(options.capture ?? capture()), allow: options.allow ?? ["bash", "ask"] });
+  const extension = { path: "/test/exact.ts", resolvedPath: "/test/exact.ts", sourceInfo: {} as never,
+    handlers: new Map([...hooks].map(([name, list]) => [name, list])), tools: new Map(), messageRenderers: new Map(),
+    toolRenderers: undefined, markdownTransformer: undefined, entryRenderers: new Map(), commands: new Map(), flags: new Map(), shortcuts: new Map() };
+  const runtime = createExtensionRuntime();
+  const runner = new ExtensionRunner([extension as never], runtime, "/test", {} as never, {} as never);
+  const errors: { event: string; error: string }[] = [];
+  runner.onError(error => errors.push({ event: error.event, error: error.error }));
+  let aborted = 0;
+  // The runner's abort and model come from the session it drives: the test drives them directly.
+  const driven = runner as unknown as { abortFn: () => void; getModel: () => unknown };
+  driven.abortFn = () => { aborted++; };
+  driven.getModel = () => options.model ?? { provider: "qa", id: "m", api: "anthropic-messages" };
+  return { runner, history, errors, aborted: () => aborted, restore: () => { if (options.exec === undefined) delete process.env[ENV.exec]; else process.env[ENV.exec] = before!; } };
+}
+
+test("EX4 pi's runner sends the request when a handler throws: the exact child must not rely on an error", async t => {
+  const f = runnerOf({ exec: "call#1.1" });
+  t.after(f.restore);
+  // What a throwing handler does in pi: the error is reported and the request goes out unchanged.
+  const thrower = new ExtensionRunner([{ path: "/test/throw.ts", resolvedPath: "/test/throw.ts", sourceInfo: {} as never,
+    handlers: new Map([["before_provider_request", [() => { throw new Error("exact-mismatch: boom"); }]]]), tools: new Map(),
+    messageRenderers: new Map(), toolRenderers: undefined, markdownTransformer: undefined, entryRenderers: new Map(),
+    commands: new Map(), flags: new Map(), shortcuts: new Map() } as never], createExtensionRuntime(), "/test", {} as never, {} as never);
+  const errors: string[] = [];
+  thrower.onError(error => errors.push(error.error));
+  const payload = { model: "m", messages: [] };
+  const sent = await thrower.emitBeforeProviderRequest(payload);
+  assert.deepEqual(sent, payload, "pi sends the request unchanged: a thrown error cannot stop it");
+  assert.deepEqual(errors, ["exact-mismatch: boom"], "the error is only reported");
+
+  // The exact child does not throw: it aborts the turn, so the request never goes out.
+  const child = { model: "other", messages: [] };
+  const out = await f.runner.emitBeforeProviderRequest(child);
+  assert.deepEqual(out, child, "the payload is not spliced: the abort, not the payload, keeps the request from going out");
+  assert.equal(f.aborted(), 1, "the turn is aborted before the request");
+  assert.deepEqual(f.errors, [], "the exact child reports no handler error");
+  const receipt = f.history.find(e => e.customType === CT.exactMismatch);
+  assert.match(receipt?.data.error as string, /^exact-mismatch: the request names model other/);
+});
+
+test("EX4 pi's runner aborts the turn before the request when the context hook refuses it", async t => {
+  const f = runnerOf({ exec: "call#1.1", model: { provider: "qb", id: "m", api: "anthropic-messages" } });
+  t.after(f.restore);
+  const messages = [{ role: "user", content: "task" }];
+  const out = await f.runner.emitContext(messages as never);
+  assert.deepEqual(out, messages, "the conversation is unchanged: the turn is aborted, not rewritten");
+  assert.equal(f.aborted(), 1, "the turn is aborted: the request is not sent");
+  const receipt = f.history.find(e => e.customType === CT.exactMismatch);
+  assert.match(receipt?.data.error as string, /^exact-mismatch: provider qb is not the captured provider qa/);
+  assert.equal(receipt?.data.exec, "call#1.1");
 });
