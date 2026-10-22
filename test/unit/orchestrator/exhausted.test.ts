@@ -12,6 +12,62 @@ import { ulid } from "../../../src/kernel/ids.ts";
 import { callDir, callSession, journalPath, orchLedger } from "../../../src/paths.ts";
 import { CT, JT, type Containment, type SpawnSpec } from "../../../src/types.ts";
 import type { CallEffects, CallTicket, OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
+import fs from "node:fs";
+import { registerChild } from "../../../src/agent/child.ts";
+import { publishRequest } from "../../../src/kernel/mailbox.ts";
+
+/** The child extension with every handler kept per event, so all registered `context` handlers run. */
+async function child(t: TestContext, patterns?: Record<string, string[]>) {
+  const home = await mkdtemp(join(tmpdir(), "dsa-exhausted-child-")), inbox = join(home, "inbox"), path = join(home, "journal");
+  await mkdir(inbox);
+  const log = await openJournal(path); await log.append("exec", { call: "call", exec: "call#1.1" }); await log.close();
+  const env: Record<string, string> = { DSA_EXEC: "call#1.1", DSA_CALL: "call", DSA_INBOX: inbox, DSA_JOURNAL: path, DSA_MODEL: "p/m",
+    ...(patterns ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}) };
+  const keys = [...Object.keys(env), "DSA_BUDGET", "DSA_SCHEMA", "DSA_EXHAUSTED_PATTERNS"], before = { ...process.env };
+  for (const key of ["DSA_BUDGET", "DSA_SCHEMA", "DSA_EXHAUSTED_PATTERNS"]) delete process.env[key];
+  Object.assign(process.env, env);
+  const hooks = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>(), history: any[] = [];
+  const model = { provider: "p", id: "m", name: "m" };
+  const ctx = { model, isIdle: () => true, shutdown() {}, sessionManager: { getEntries: () => history },
+    modelRegistry: { refresh: async () => ({ aborted: false, errors: new Map() }), find: () => model, getAll: () => [model] } };
+  t.mock.method(fs, "writeSync", (_fd: number, chunk: string) => chunk.length);
+  t.mock.method(process.stdout, "write", () => true);
+  t.mock.method(console, "error", () => {});
+  registerChild({ on: (name: string, fn: any) => hooks.set(name, [...hooks.get(name) ?? [], fn]), registerTool() {},
+    appendEntry: (customType: string, data: unknown) => history.push({ type: "custom", customType, data }),
+    sendMessage() {}, setModel: async () => true } as unknown as Parameters<typeof registerChild>[0]);
+  t.after(async () => {
+    for (const fn of hooks.get("session_shutdown") ?? []) await fn({}, ctx);
+    for (const key of keys) { if (before[key] === undefined) delete process.env[key]; else process.env[key] = before[key]; }
+    await rm(home, { recursive: true, force: true });
+  });
+  await publishRequest(inbox, { rid: "task", from: "orch", to: "call", kind: "task", sseq: 1, body: { message: "work" } });
+  for (const fn of hooks.get("session_start") ?? []) await fn({}, ctx);
+  const fire = async (name: string, event: unknown) => { const out = []; for (const fn of hooks.get(name) ?? []) out.push(await fn(event, ctx)); return out.filter(r => r !== undefined); };
+  return { fire, history };
+}
+const answer = { role: "assistant", provider: "p", model: "m", content: [{ type: "text", text: `${quota} now` }], stopReason: "stop" };
+
+test("XP1 absent exhaustedPatterns behaves as 1.2: no match, no receipt, context untouched (also without messages)", async t => {
+  const f = await child(t);
+  assert.deepEqual(await f.fire("context", {}), []);
+  assert.deepEqual(await f.fire("context", { type: "context" }), []);
+  assert.deepEqual(await f.fire("message_end", { type: "message_end", message: answer }), []);
+  assert.deepEqual(await f.fire("context", { type: "context", messages: [{ role: "user", content: "work" }, answer] }), []);
+  assert.equal(f.history.some(e => e.customType === CT.exhausted), false);
+});
+
+test("XP1 configured child replaces the quota answer, records it, and drops it from context", async t => {
+  const f = await child(t, { p: [quota] });
+  assert.deepEqual(await f.fire("context", {}), []);
+  const [replaced] = await f.fire("message_end", { type: "message_end", message: answer }) as { message: any }[];
+  assert.deepEqual([replaced!.message.content, replaced!.message.stopReason, replaced!.message.errorMessage], [[], "aborted", CT.exhausted]);
+  assert.deepEqual(f.history.filter(e => e.customType === CT.exhausted).map(e => e.data), [{ exec: "call#1.1", provider: "p", text: `${quota} now` }]);
+  const user = { role: "user", content: "work" };
+  t.mock.method(process, "exit", () => { throw new Error("owned child exited"); });
+  await assert.rejects(f.fire("context", { type: "context", messages: [user, replaced!.message] }), /owned child exited/,
+    "no further request may follow a quota refusal");
+});
 
 const quota = "\u989d\u5ea6\u5df2\u4f7f\u7528\u5b8c\u6bd5";
 const receiptType = "dsa-exhausted-text";
