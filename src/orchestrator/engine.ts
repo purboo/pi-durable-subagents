@@ -27,7 +27,7 @@ import type { CallTicket, Executor, Ledgers } from './contract.ts';
 import { isForceRestart, restartRefusal } from './restart.ts';
 import { EvaluatorClient, type EvaluatorTransport } from './evaluator-client.ts';
 import { Store, revisionEntries, terminalEntry, type Workflow } from './store.ts';
-import { formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
+import { exactLine, formatUsage, holdOf, refusedResult, snapshotFromEntries } from './snapshot.ts';
 import { validateCallSpec } from '../compat/spec.ts';
 import { EventPump } from '../events/pump.ts';
 import { labelsProblem } from '../events/labels.ts';
@@ -93,10 +93,12 @@ export function finishedText(wid: string, entries: readonly Entry[], call?: stri
     const still = going(c) ? ' (a follow-up still going; you are told when it ends)' : '';
     const name = `${c.key}${c.gen > 1 ? `@${c.gen}` : ''}: ${callStatus(c)}${still}${result?.status === 'stopped' ? ' (edits it made so far are left in place)' : ''}`;
     const title = `\n${tail(name, allowance - 1)}`;
+    // EX6: the exactness of the call (one line: the cache share, the cost and the age of the pinned capture).
+    const exact = exactLine(c.exact);
     const error = result?.error && allowance - title.length > 10 ? `\n  Error: ${tail(result.error, Math.min(300, allowance - title.length - 9))}` : '';
-    const space = allowance - title.length - error.length;
+    const space = allowance - title.length - error.length - (exact ? exact.length + 3 : 0);
     const message = commandOutput && c.command !== undefined ? result?.output : result && Object.hasOwn(result, 'data') ? JSON.stringify(result.data) : result?.output;
-    const line = title + (message && space > 4 ? `\n  ${tail(message.trimEnd(), space - 3)}` : '') + error;
+    const line = title + (exact ? `\n  ${exact}` : '') + (message && space > 4 ? `\n  ${tail(message.trimEnd(), space - 3)}` : '') + error;
     lines.push(line);
   }
   return `${prefix}${lines.join('')}${footer}`;
@@ -882,6 +884,7 @@ export class Engine {
     return { wid: st.wf.wid, widRev: `${st.wf.wid}@${st.wf.revision}`, key: entry.key as string, gen: entry.gen as number,
       callId: `${st.wf.wid}@${st.wf.revision}/${entry.key}@${entry.gen}`, spec, agent, workflowBudget: st.wf.pins.usageBudget, cwd: resolve(st.wf.cwd, spec.cwd ?? '.'), journal: st.wf.journal,
       ...(st.wf.originPath !== undefined ? { originSession: st.wf.originPath } : {}),
+      ...(st.wf.exactPath !== undefined && st.wf.pins.exactFacts ? { exactCapture: { path: st.wf.exactPath, facts: st.wf.pins.exactFacts } } : {}),
       ...(entry.type === 'generation' ? { continueFrom: entry.from as CallTicket['continueFrom'], opening: entry.opening as CallTicket['opening'] } : {}),
       ...(entry.type === 'generation' && typeof entry.model === 'string' ? { model: entry.model } : {}) };
   }
