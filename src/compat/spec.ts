@@ -49,7 +49,7 @@ export function validateCallSpec(spec: unknown, options: { fanout?: boolean } = 
   if (has("schema")) errors.push(...schemaProblems(s.schema, "schema"));
   if (has("gate")) errors.push(...gate(s.gate));
   if (has("isolation") && s.isolation !== "none" && s.isolation !== "worktree") errors.push(`isolation must be "none" or "worktree"${got(s.isolation)}`);
-  if (has("context") && s.context !== "fresh" && s.context !== "fork") errors.push(`context must be "fresh" or "fork"${got(s.context)}`);
+  if (has("context") && s.context !== "fresh" && s.context !== "fork" && s.context !== "exact") errors.push(`context must be "fresh", "fork" or "exact"${got(s.context)}`);
   if (has("budget")) errors.push(...budget(s.budget));
   if (has("once") && typeof s.once !== "boolean") errors.push(`once must be a boolean${got(s.once)}`);
   if (has("writer") && typeof s.writer !== "boolean") errors.push(`writer must be a boolean${got(s.writer)}`);

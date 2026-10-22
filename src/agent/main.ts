@@ -281,7 +281,9 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (normalized.kind === "run") checkAgents(normalized.body as RunBody, () => agentsAt(cwd).map(agent => agent.name));
     // P33: any call of the run may fork the origin context, so the origin branch is always offered for pinning.
     const sessionFile = ctx?.sessionManager.getSessionFile();
-    if (normalized.kind === "run" && sessionFile) (normalized.body as RunBody).origin = { sessionFile, leafId: ctx!.sessionManager.getLeafId() };
+    // EX2: the origin names the session the run forks from (its branch) and the session whose capture an exact run
+    // pins at admission.
+    if (normalized.kind === "run" && sessionFile) (normalized.body as RunBody).origin = { sessionFile, leafId: ctx!.sessionManager.getLeafId(), sessionId: ctx!.sessionManager.getSessionId() };
     if (normalized.kind === "restart") {
       // Only an orchestrator that decides restarts is sent one (an older one would keep it as an invalid inbox file).
       const body = normalized.body as RestartBody;

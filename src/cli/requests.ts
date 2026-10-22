@@ -8,10 +8,11 @@ import { findJournalEntry, readJournalFold, readJournalSnapshot, type JournalFol
 import { isResolution, lifecycleResolution } from "../kernel/lifecycle.ts";
 import { journalPath, orchLedger, pinnedDir } from "../paths.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, REQUEST_ID, requestId, requestRid, RequestsBusy, SESSION_ID, specDigest, type Identified } from "../requests.ts";
-import { NOTIFY_SINCE, WAKE_SINCE, HOLD_ENTRY_TYPES, commandLine, commandSendRefusal, isCommandTarget, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, type CallSnapshot } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, WAKE_SINCE, HOLD_ENTRY_TYPES, commandLine, commandSendRefusal, isCommandTarget, heldIn, isLive, orchestratorTooOld, slotsView, workflowSnapshot, writerWaits, writerWaitLine, WRITER_WAIT_HINT, exactLine, type CallSnapshot, type ExactReport } from "../orchestrator/snapshot.ts";
 import { leaseCalls, leaseState, callAddress } from "../platform/lease.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "../agent/main/tool.ts";
 import { discoverAgents } from "../compat/agents.ts";
+import { findSessionFile } from "../compat/pi-session.ts";
 import { JT, askFields, askText, type StructuredAskFields, type CallResult, type Entry, type Request, type RunBody } from "../types.ts";
 import { startOrchestrator, submitIdentified } from "./control.ts";
 import { FENCE_LEDGER_TYPES, endedExecs, fenceReason } from "../events/fence.ts";
@@ -75,6 +76,8 @@ export interface DescribedCall {
   endedAtSeal?: { pid: number; command: string }[];
   endedAtSealMore?: number;
   status?: CallResult["status"]; ok?: boolean; error?: string; output?: string; data?: unknown;
+  /** EX6: the exactness of the call and the usage of its provider requests. */
+  exact?: ExactReport;
   /** Unsealed calls: why they wait — writer lock, resource lease, the provider's slot use and exhaustion (as `status`);
    *  `reason` (WAIT_REASONS precedence), its status line `detail` and `since` (ms) when the call does not move. */
   waiting?: { writerWait?: { root: string; holder: string }; lease?: string; slot?: string; exhausted?: string; hibernated?: true; reason?: WaitReason; detail?: string; since?: number };
@@ -161,6 +164,7 @@ function describeWorkflow(home: string, wid: string, entries: readonly Entry[], 
       ...(live && run.pid !== undefined ? { pid: run.pid } : {}), ...(live && c.startedAt !== undefined ? { elapsed: commandAge(now - c.startedAt) } : {}),
       ...(run?.log ? { log: run.log } : {}),
       ...(r ? { status: r.status, ok: r.ok, ...(r.error ? { error: r.error } : {}), output: r.output, ...(r.data !== undefined ? { data: r.data } : {}) } : {}),
+      ...(c.exact ? { exact: c.exact } : {}),
       ...(waiting && Object.keys(waiting).length ? { waiting } : {}) };
   });
   const keyOf = (call?: string) => call?.replace(/^[^/]*\//, "").replace(/@\d+$/, "");
@@ -195,6 +199,7 @@ export function renderDescription(d: Description): string {
       ? `  ${c.key}@${c.gen} command ${c.phase}${c.status ? ` ${c.status}` : ""}${facts ? ` (${facts})` : ""}${c.error ? ` — ${c.error}` : ""}`
       : `  ${c.key}@${c.gen} ${c.agent} ${c.phase}${c.status ? ` ${c.status}` : ""}${c.model ? ` (${c.model})` : ""}${c.error ? ` — ${c.error}` : ""}`);
     if (c.command !== undefined) lines.push(`    command: ${c.command}`, ...(c.log ? [`    log: ${c.log}`] : []));
+    if (c.exact) lines.push(`    ${exactLine(c.exact)}`);
     if (c.awaiting) for (const run of c.awaiting) lines.push(`    awaiting: ${run.request}${run.wid ? ` (${run.wid})` : ''} ${run.state}`);
     if (c.endedAtSeal) lines.push(`    ended at seal: ${JSON.stringify(c.endedAtSeal)}${c.endedAtSealMore ? ` (${c.endedAtSealMore} more)` : ''}`);
     if (c.waiting) lines.push(`    waiting: ${JSON.stringify(c.waiting)}`);
@@ -292,6 +297,9 @@ async function refusable(args: string[], ctx: Context, run: (args: string[], ctx
 }
 const forks = (spec: Record<string, unknown>) => [spec, ...["tasks", "chain"].flatMap(k => Array.isArray(spec[k]) ? spec[k] as unknown[] : [])]
   .some(s => s && typeof s === "object" && (s as { context?: unknown }).context === "fork");
+/** EX2: a spec that asks for the exact context (in the run itself or in one of its steps). */
+const exacts = (spec: Record<string, unknown>) => [spec, ...["tasks", "chain"].flatMap(k => Array.isArray(spec[k]) ? spec[k] as unknown[] : [])]
+  .some(s => s && typeof s === "object" && (s as { context?: unknown }).context === "exact");
 
 /** The pi session a CLI run is shown in: --session, else $DSA_SESSION (exported by a pi session to what it starts)
  *  unless this process runs inside a subagent call. An unusable inherited value is ignored; a bad flag is an error. */
@@ -308,7 +316,7 @@ export function runSession(flag: string | undefined, env: NodeJS.ProcessEnv): st
 export const runCommand = (args: string[], ctx: Context): Promise<number> => refusable(args, ctx, runRequest);
 async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<number> {
   const dash = args.indexOf("--"), argv = dash < 0 ? undefined : args.slice(dash + 1);
-  const { values, positionals } = flags(dash < 0 ? args : args.slice(0, dash), { request: "value", spec: "value", wake: "value", "timeout-ms": "value", name: "value", cwd: "value", labels: "value", session: "value", json: "flag", "wait-ms": "value" });
+  const { values, positionals } = flags(dash < 0 ? args : args.slice(0, dash), { request: "value", spec: "value", wake: "value", "timeout-ms": "value", name: "value", cwd: "value", labels: "value", session: "value", "origin-session": "value", json: "flag", "wait-ms": "value" });
   const id = text(values, "request"), file = text(values, "spec"), json = values.json === true, wait = waitMs(values, ctx);
   seen.id = id; seen.json = json;
   if (file !== undefined && argv !== undefined) throw new Error("--spec and -- are mutually exclusive");
@@ -333,12 +341,23 @@ async function runRequest(args: string[], ctx: Context, seen: Seen): Promise<num
   if (spec.request !== undefined) throw new Error("the request id is --request, not a spec field");
   if (spec.labels !== undefined) throw new Error("labels are given with --labels <json>, not in the spec");
   if (forks(spec)) throw new Error("context \"fork\" needs a pi session to fork; it is not available to run --request");
+  // EX2: --origin-session names the pi session an exact run pins the capture of (and forks from, when it is rebuilt).
+  const originSession = text(values, "origin-session");
+  if (originSession !== undefined) {
+    if (!SESSION_ID.test(originSession)) throw new Error("--origin-session must be a pi session id ([A-Za-z0-9._:-], at most 128 characters)");
+    if (!exacts(spec)) throw new Error("--origin-session is only for context \"exact\" calls");
+  }
   // RunBody.cwd = spec.cwd ?? --cwd ?? the current directory, absolute before the digest.
   const base = resolve(ctx.cwd ?? process.cwd(), text(values, "cwd") ?? "."), dir = typeof spec.cwd === "string" && spec.cwd ? resolve(base, spec.cwd) : base;
   const normalized = request({ ...spec, action: "run", ...(typeof spec.cwd === "string" && spec.cwd ? { cwd: dir } : {}), ...(labels ? { labels } : {}) }, dir);
   const body = normalized.body as RunBody;
   const session = runSession(text(values, "session"), ctx.env);
   if (session) body.session = session;
+  if (originSession !== undefined) {
+    const file = await findSessionFile(originSession, ctx.env);
+    if (!file) throw new Error(`--origin-session: no pi session file for ${originSession}`);
+    body.origin = { sessionFile: file, sessionId: originSession };
+  }
   if (wake) { body.wake = { to: callAddress(ctx.env.DSA_CALL!) }; body.caller = ctx.env.DSA_CALL; }
   seen.digest = specDigest({ kind: "run", body });
   // An id already recorded is decided by that record: the same content gets its first outcome (the agents it named may
