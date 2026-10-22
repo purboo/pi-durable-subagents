@@ -51,10 +51,10 @@ const text = (m: any): string => m?.role === "compactionSummary" || m?.role === 
   : typeof m.content === "string" ? m.content : (m.content ?? []).map((b: any) => b?.text ?? "").join("");
 
 /** What pi sends for the origin itself: its projection without dsa's receipts (FC1 keeps them out of the fork). */
-function parentMessages(rows: Row[]): any[] {
+function parentProjection(rows: Row[]) {
   const entries = rows.filter(e => e.type !== "session") as any[];
   const projection = pi!.buildSessionProjection(entries, entries.at(-1)!.id);
-  return projection.entries.filter(e => !isReceipt(e.sourceEntry)).flatMap(e => e.messages);
+  return { messages: projection.entries.filter(e => !isReceipt(e.sourceEntry)).flatMap(e => e.messages), model: projection.model };
 }
 /** Pin an origin and publish the fork session the executor would publish. */
 async function fork(f: { root: string; t: any; effects: () => any }, rows: Row[], name: string) {
@@ -114,7 +114,9 @@ test("FC1 the fork child's context equals pi's projection of the origin (receipt
     ["no kept entries", rows.map(e => e.id === "c" ? { ...e, firstKeptEntryId: "c" } : e)]] as const) {
     const forked = await fork(f, origin, name.replaceAll(" ", "-"));
     const child = childMessages(forked.session, f.root, f.cwd);
-    assert.deepEqual(child, parentMessages(origin), name);
+    const parent = parentProjection(origin);
+    assert.deepEqual(child, parent.messages, name);
+    assert.deepEqual(pi!.SessionManager.open(forked.session, join(f.root, "sessions"), f.cwd).buildSessionProjection().model, parent.model, name);
     assert.ok(child.map(text).join(" ").includes("LATEST-SUMMARY"), name);
     assert.ok(!child.map(text).join(" ").includes("EARLY-RAW"), name);
   }
@@ -142,7 +144,7 @@ test("FC1 a kept marker that names a receipt keeps the range that follows it", {
   assert.equal(texts.length, 2, "the summary and the kept message");
   assert.ok(texts[0]!.includes("SUM4"), texts[0]);
   assert.ok(texts[1]!.includes("U3"), texts[1]);
-  assert.deepEqual(child, parentMessages(rows));
+  assert.deepEqual(child, parentProjection(rows).messages);
 });
 
 test("FC1 a kept marker that names an older compaction keeps the range that follows it", { skip: noPi }, async ctx => {
@@ -163,5 +165,5 @@ test("FC1 a kept marker that names an older compaction keeps the range that foll
   assert.equal(texts.length, 2, "the summary and the kept message");
   assert.ok(texts[0]!.includes("SUM3"), texts[0]);
   assert.ok(texts[1]!.includes("U2"), texts[1]);
-  assert.deepEqual(child, parentMessages(rows));
+  assert.deepEqual(child, parentProjection(rows).messages);
 });
