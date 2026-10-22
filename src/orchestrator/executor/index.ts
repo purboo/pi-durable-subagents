@@ -1501,8 +1501,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           wrote: path => wrote(t, exec!, cwd, path),
           modelControl: event => modelControl(journal, exec!, event),
           exactUsage: async event => {
-            // EX6: the usage of every provider request of an exact call, with the cache split.
-            if (t.exactMode?.mode !== "exact") return;
+            // EX6: the usage of every provider request of an exact call (and of a rebuilt one: it shows the cost).
+            if (!t.exactMode) return;
             const usage = (event.message as { usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } } } | undefined)?.usage;
             if (!usage) return;
             await serial(() => journal.append("exact-usage", { call: t.callId, exec, input: usage.input ?? 0, cacheRead: usage.cacheRead ?? 0,

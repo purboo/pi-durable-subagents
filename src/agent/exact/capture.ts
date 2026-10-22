@@ -99,7 +99,8 @@ export async function pruneCaptures(home: string, maxAgeMs: number, now = Date.n
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0; throw error; }
   let removed = 0;
   for (const name of names) {
-    if (!name.endsWith(".json")) continue;
+    // A capture file, or the temporary file of a write that never finished (a crash): both are old enough to go.
+    if (!name.endsWith(".json") && !name.endsWith(".tmp")) continue;
     const path = join(dir, name);
     try {
       const info = await stat(path);

@@ -99,6 +99,14 @@ function usableNames(source: string, args: unknown, agents: AgentDefinition[]): 
   return name => strings.has(name) || ['"', "'", '`'].some(q => source.includes(`${q}${name}${q}`));
 }
 
+/** The specs of a fanout run (a single call, a task list or a chain); undefined for a script run. */
+function runSpecs(body: RunBody): ({ context?: string; model?: unknown } | undefined)[] | undefined {
+  if (body.call !== undefined) return [body.call];
+  if (body.tasks !== undefined) return body.tasks;
+  if (body.chain !== undefined) return body.chain;
+  return undefined;
+}
+
 /** P11, A5, E3: Capture immutable admission inputs before publishing any workflow files. Agent diagnostics reject the
  *  run only for names the run could use (see usableNames); the others are appended to `warnings`. */
 export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, warnings: string[] = [], home?: string): Promise<Pins> {
@@ -126,9 +134,13 @@ export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, wa
   // any other run that asks for it anyway fails with "fork requested but the run has no origin session".
   // EX2: a run that can ask for context "exact" pins the origin branch as well (a rebuilt exact call runs as a fork)
   // and the capture of its origin session (the bytes the child splices).
-  const wantsFork = usableNames(source, body.args, [])('fork'), wantsExact = usableNames(source, body.args, [])('exact');
+  const wantsFork = usableNames(source, body.args, [])('fork');
+  // EX2: the exact context of a fanout run is read from its specs, not from a token in its source: a task that happens
+  // to name the word is not an exact call. A script run (its specs are built at run time) is read from its source.
+  const specs = runSpecs(body);
+  const wantsExact = specs ? specs.some(spec => spec?.context === 'exact') : usableNames(source, body.args, [])('exact');
   // EX2: an exact call runs on the origin's model: a call that names one is refused at admission.
-  for (const spec of (body.tasks ?? body.chain ?? (body.call ? [body.call] : [])) as { context?: string; model?: unknown }[]) {
+  for (const spec of specs ?? []) {
     if (spec?.context === 'exact' && spec.model !== undefined) throw new Error('context "exact" runs on the origin model; remove model');
   }
   const capture = wantsExact && home ? await captureOf(home, body.origin?.sessionId) : undefined;

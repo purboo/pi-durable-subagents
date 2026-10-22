@@ -125,7 +125,8 @@ export const shortTokens = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}K
  */
 export function exactLine(exact: ExactReport | undefined): string {
   if (!exact) return "";
-  if (exact.mode === "rebuilt") return `exact: rebuilt${exact.reason ? ` (${exact.reason})` : ""}`;
+  // EX6: a rebuilt call shows its reason and what it cost.
+  if (exact.mode === "rebuilt") return `exact: rebuilt${exact.reason ? ` (${exact.reason})` : ""}${exact.requests.length ? ` · $${exact.costUsd.toFixed(3)}` : ""}`;
   const first = exact.requests[0];
   const ratio = exact.firstCacheRatio ?? 0;
   const cached = first?.cacheRead ?? 0, total = (first?.input ?? 0) + cached;
