@@ -13,6 +13,7 @@ import { recover, type Question } from './child/history.ts';
 import { askProblem, validate } from './child/schema.ts';
 import { catalogModel, parseModel, sameModel } from '../compat/model.ts';
 import { registerLive } from './child/live.ts';
+import { exhaustedText } from '../orchestrator/providers.ts';
 
 // boundary = turn_end (steer lands between turns); settle = agent_before_settle (follow-ups land only here or idle).
 type Mode = 'idle' | 'boundary' | 'settle' | 'ask';
@@ -51,6 +52,9 @@ type Delivery = { content: { type: 'text'; text: string }[]; details: Record<str
 export function registerChild(pi: ExtensionAPI): void {
   const requireDecision = process.env[ENV.askRequireDecision] === 'true';
   let target = process.env[ENV.model];
+  const patterns = Object.fromEntries(Object.entries(JSON.parse(process.env[ENV.exhaustedPatterns] ?? '{}') as Record<string, string[]>)
+    .map(([provider, values]) => [provider, values.map(value => new RegExp(value, 'i'))]));
+  let exhausted = false;
   const exec = process.env[ENV.exec]!, call = process.env[ENV.call]!, inbox = process.env[ENV.inbox]!, journal = process.env[ENV.journal]!;
   let active = false, watcher: FSWatcher | undefined, queue: Promise<unknown> = Promise.resolve();
   let state = recover([]), blocked: (Question & { resolve: (result: Delivery) => void; reject: (error: Error) => void }) | undefined;
@@ -259,6 +263,17 @@ export function registerChild(pi: ExtensionAPI): void {
     try { return await serial(async () => { const entries = await consume(ctx, mode); return { entries, continue: entries.some(e => e.type === 'custom_message' || (e.type === 'custom' && e.customType === CT.model)) }; }); }
     catch (error) { fail(ctx, error); }
   };
+  // XP1: persist the refusal before replacing the answer. Recovery can finish the decision even if this child
+  // or its orchestrator dies before settlement. No quota notice becomes a successful answer or later context.
+  pi.on('message_end', (event) => {
+    const message = event.message;
+    if (!active || message.role !== 'assistant') return;
+    const text = exhaustedText(message, patterns[message.provider] ?? []);
+    if (text === undefined) return;
+    pi.appendEntry(CT.exhausted, { exec, provider: message.provider, text: text.slice(0, 200) });
+    exhausted = true; active = false; watcher?.close();
+    return { message: { ...message, content: [], stopReason: 'aborted' as const, errorMessage: CT.exhausted } };
+  });
   pi.on('turn_end', boundary('boundary'));
   registerLive(pi, () => active); // UI §3: in-flight response for watching (ephemeral, not durable state)
   pi.on('agent_before_settle', boundary('settle'));
@@ -270,11 +285,17 @@ export function registerChild(pi: ExtensionAPI): void {
   // turn_start runs before the request is prepared (pi reads the model then); `context` runs after it, too late for
   // that request (seen on CI: model_change after the delivered message, then "Unknown provider: unknown"). Keep both.
   const guard = async (_event: unknown, ctx: ExtensionContext) => {
+    if (exhausted) process.exit(1); // another extension's continuation cannot send after a quota refusal
     if (!await ensureModel(ctx, (_event as { type?: string })?.type !== 'context')) {
       // Hook errors are swallowed by pi. Exit this owned child synchronously so a captured fallback model
       // cannot make a request, even when a provider ignores abort. The receipt was appended synchronously.
       process.exit(1);
     }
+    // XP1: a rejected quota turn never reaches a later request's context.
+    const all = (_event as { messages?: { role?: string; stopReason?: string; errorMessage?: string }[] })?.messages;
+    if (!Array.isArray(all)) return;
+    const messages = all.filter(m => !(m.role === 'assistant' && m.stopReason === 'aborted' && m.errorMessage === CT.exhausted));
+    if (messages.length !== all.length) return { messages } as never;
   };
   pi.on('turn_start', guard);
   pi.on('context', guard);
