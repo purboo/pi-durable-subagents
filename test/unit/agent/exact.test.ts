@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { captureFacts, exactCaptureEnabled, exactPath, pruneCaptures, readCapture, writeCapture, type Capture } from "../../../src/agent/exact/capture.ts";
+import { registerCapture } from "../../../src/agent/exact/session.ts";
 import { cacheMarkers, childConversation, clone, payloadTools, splicePayload } from "../../../src/agent/exact/splice.ts";
 import { EXACT_REFUSAL, mismatch, registerExactChild } from "../../../src/agent/exact/child.ts";
 import { CT } from "../../../src/types.ts";
@@ -66,6 +67,36 @@ test("EX1 the facts of a capture are its sha256, size and request", () => {
   assert.equal(facts.provider, "qa"); assert.equal(facts.model, "m"); assert.equal(facts.api, "anthropic-messages");
   assert.equal(facts.at, c.at); assert.equal(facts.bytes, Buffer.byteLength(JSON.stringify(c.payload)));
   assert.match(facts.sha256, /^[0-9a-f]{64}$/);
+});
+
+test("EX1 a top-level session keeps the capture of its latest request without changing it", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-exact-session-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const hooks = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+  await registerCapture({ on: (name: string, fn: (event: unknown, ctx: unknown) => unknown) => hooks.set(name, fn) } as never, home);
+  const ctx = { sessionManager: { getSessionId: () => "s1" }, model: { provider: "qa", id: "m", api: "anthropic-messages" }, thinkingLevel: "off" };
+  const payload = { model: "m", messages: [{ role: "user", content: "hello" }] };
+  assert.equal(await hooks.get("before_provider_request")!({ payload }, ctx), undefined, "the payload is not changed");
+  // The write happens off the request path: it is queued, not awaited.
+  for (let i = 0; i < 50 && !(await readCapture(home, "s1")); i++) await new Promise(resolve => setTimeout(resolve, 20));
+  const written = await readCapture(home, "s1");
+  assert.deepEqual(written?.payload, payload);
+  assert.equal(written?.provider, "qa"); assert.equal(written?.model, "m"); assert.equal(written?.api, "anthropic-messages");
+  assert.equal(written?.thinking, "off");
+  // A second request replaces the capture (latest wins).
+  await hooks.get("before_provider_request")!({ payload: { model: "m", messages: [{ role: "user", content: "later" }] } }, ctx);
+  const first = (c: Capture | undefined) => ((c?.payload.messages as { content?: unknown }[] | undefined)?.[0]?.content);
+  for (let i = 0; i < 50; i++) { if (first(await readCapture(home, "s1")) === "later") break; await new Promise(resolve => setTimeout(resolve, 20)); }
+  assert.equal(first(await readCapture(home, "s1")), "later");
+});
+
+test("EX1 a disabled capture writes nothing", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-exact-session-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await writeFile(join(home, "config.json"), JSON.stringify({ exactCapture: false }));
+  const hooks = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+  await registerCapture({ on: (name: string, fn: (event: unknown, ctx: unknown) => unknown) => hooks.set(name, fn) } as never, home);
+  assert.equal(hooks.has("before_provider_request"), false, "the capture is off: no request is observed");
 });
 
 test("EX4 the splice keeps every parent field and concatenates the conversations (anthropic)", () => {
@@ -161,7 +192,7 @@ test("EX4 the exact child replaces the request with the parent's fields and the 
 
 test("EX4 the exact child refuses a request on another model", async t => {
   const f = childFixture(t, {});
-  await assert.rejects(f.hooks.get("before_provider_request")!({ payload: { model: "other", messages: [] } }, f.ctx),
+  await assert.rejects(async () => f.hooks.get("before_provider_request")!({ payload: { model: "other", messages: [] } }, f.ctx),
     /exact-mismatch: the request names model other, the capture names m/);
 });
 
