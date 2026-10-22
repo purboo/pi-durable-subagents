@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { writeCapture, type Capture } from "../../../src/agent/exact/capture.ts";
 import { exactDecision, modelConfigured } from "../../../src/orchestrator/exact.ts";
 import { prepareRun } from "../../../src/orchestrator/store.ts";
-import { snapshotFromEntries } from "../../../src/orchestrator/snapshot.ts";
+import { snapshotFromEntries, exactLine } from "../../../src/orchestrator/snapshot.ts";
 import { validateCallSpec } from "../../../src/compat/spec.ts";
 import { runCommand } from "../../../src/cli/requests.ts";
 import type { Entry, RunBody } from "../../../src/types.ts";
@@ -112,6 +112,7 @@ test("EX6 the report of an exact call: the capture, the age and the usage of eve
   assert.equal(call.exact?.input, 4900); assert.equal(call.exact?.cacheRead, 296900); assert.equal(call.exact?.output, 200);
   assert.equal(call.exact?.costUsd, 0.035);
   assert.ok(Math.abs((call.exact?.firstCacheRatio ?? 0) - 148200 / 152600) < 1e-9, "the cache share of the first request");
+  assert.equal(exactLine(call.exact), "exact: cache 97% (148.2K/152.6K) · $0.035 · age 41s");
 });
 
 test("EX6 a rebuilt call shows its reason", () => {
@@ -121,6 +122,7 @@ test("EX6 a rebuilt call shows its reason", () => {
   ] as unknown as Entry[];
   const call = snapshotFromEntries("w", entries).calls[0]!;
   assert.equal(call.exact?.mode, "rebuilt"); assert.equal(call.exact?.reason, "no-capture");
+  assert.equal(exactLine(call.exact), "exact: rebuilt (no-capture)");
 });
 
 test("EX2 the CLI names the origin session of an exact run", async t => {
