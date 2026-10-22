@@ -46,7 +46,9 @@ function pin12(rows: Row[], leafId?: string): string {
 async function write(path: string, rows: Row[]) { await writeFile(path, rows.map(e => JSON.stringify(e)).join("\n") + "\n"); }
 const parse = (text: string) => text.trim().split("\n").map(line => JSON.parse(line) as Row);
 const isReceipt = (e: any) => String(e?.customType ?? e?.message?.customType ?? "").startsWith("dsa-");
-const text = (m: any): string => typeof m.content === "string" ? m.content : (m.content ?? []).map((b: any) => b?.text ?? "").join("");
+/** The text of a projected message: pi keeps a compaction or branch summary in its own field, not in content. */
+const text = (m: any): string => m?.role === "compactionSummary" || m?.role === "branchSummary" ? String(m.summary ?? "")
+  : typeof m.content === "string" ? m.content : (m.content ?? []).map((b: any) => b?.text ?? "").join("");
 
 /** What pi sends for the origin itself: its projection without dsa's receipts (FC1 keeps them out of the fork). */
 function parentMessages(rows: Row[]): any[] {
