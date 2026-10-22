@@ -43,7 +43,7 @@ test("P31a, P36, P11: run carries workflow-level budget, spawn limit and resolve
 
 test("T2/T3/T11: invalid call specs fail at the tool with every error; user keys pass through for fan-out", () => {
   assert.throws(() => request({ action: "run", agent: "w", task: "t", isolaton: "worktree", context: "inherit" }, "/w"),
-    { message: 'Invalid call: unknown field "isolaton"; context must be "fresh" or "fork" (got \"inherit\")' });
+    { message: 'Invalid call: unknown field "isolaton"; context must be "fresh", "fork" or "exact" (got \"inherit\")' });
   assert.deepEqual(request({ action: "run", agent: "w", task: "t", key: "a" }, "/w").body, { cwd: "/w", call: { agent: "w", task: "t", key: "a" } }, "a single call may name its key");
   assert.throws(() => request({ action: "run", tasks: [{ agent: "w", task: "a" }, { agent: "w", task: "b", isolation: "vm" }] }, "/w"),
     { message: 'Invalid tasks[1]: isolation must be "none" or "worktree" (got "vm")' });

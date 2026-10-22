@@ -10,12 +10,12 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ENV } from "../../types.ts";
+import { dsaHome } from "../../paths.ts";
 import { writeCapture, type Capture, type ProviderPayload } from "./capture.ts";
 import { clone } from "./splice.ts";
 
-/** The home of the dsa state (the captures live under it). */
-export const homeOf = (env: NodeJS.ProcessEnv = process.env) => env[ENV.home] ?? "";
+/** The home of the dsa state (the captures live under it): $DSA_HOME or the default state root. */
+export const homeOf = (env: NodeJS.ProcessEnv = process.env) => dsaHome(env);
 
 /** Whether the capture is on (the `exactCapture` key of config.json; default true). */
 export async function captureEnabled(home: string): Promise<boolean> {
