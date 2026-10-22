@@ -157,6 +157,7 @@ export const CT = {
   report: "dsa-report",        // custom: { exec, outcome, data?, artifacts? }
   modelReady: "dsa-model-ready", // custom: { exec, selected, model, virtual } - canonical model activated before delivery
   modelUnavailable: "dsa-model-unavailable", // custom: { exec, selected, actual, reason } - no request may follow
+  exhausted: "dsa-exhausted-text", // custom: { exec, provider, text } - XP1 matched quota text, clipped to 200 characters
   model: "dsa-model",          // custom: { rid, provider, model } — model change receipt
   attention: "dsa-attention",  // custom_message (main session): details { items: {id, rev}[] }
   budget: "dsa-budget",        // custom: { exec, usage } — the child refused its next provider request: per-call budget reached (P31b)
@@ -463,4 +464,5 @@ export const ENV = {
   askRequireDecision: "DSA_ASK_REQUIRE_DECISION", // execution-start snapshot of config.askRequireDecision (default false)
   budget: "DSA_BUDGET",   // JSON {tokens?, costUsd?}: per-call budget; the child refuses the next provider request once reached (P31b)
   model: "DSA_MODEL",     // "provider/id" the executor holds a slot for; the child re-applies it if pi started without it (C8)
+  exhaustedPatterns: "DSA_EXHAUSTED_PATTERNS", // JSON provider -> regex strings, snapshotted at execution start (XP1)
 } as const;
