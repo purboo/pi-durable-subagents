@@ -53,8 +53,10 @@ type Delivery = { content: { type: 'text'; text: string }[]; details: Record<str
 export function registerChild(pi: ExtensionAPI): void {
   const requireDecision = process.env[ENV.askRequireDecision] === 'true';
   let target = process.env[ENV.model];
+  // XP1: a pattern the config load rejected (an invalid regular expression) is skipped here, never compiled: the
+  // child keeps the patterns that do compile instead of failing to start.
   const patterns = Object.fromEntries(Object.entries(JSON.parse(process.env[ENV.exhaustedPatterns] ?? '{}') as Record<string, string[]>)
-    .map(([provider, values]) => [provider, values.map(value => new RegExp(value, 'i'))]));
+    .map(([provider, values]) => [provider, values.flatMap(value => { try { return [new RegExp(value, 'i')]; } catch { return []; } })]));
   let exhausted = false;
   const exec = process.env[ENV.exec]!, call = process.env[ENV.call]!, inbox = process.env[ENV.inbox]!, journal = process.env[ENV.journal]!;
   let active = false, watcher: FSWatcher | undefined, queue: Promise<unknown> = Promise.resolve();

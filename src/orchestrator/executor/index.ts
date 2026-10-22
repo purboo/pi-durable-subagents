@@ -135,6 +135,14 @@ async function defaultModel(): Promise<string | undefined> {
   return settings.defaultModel ? `${settings.defaultProvider ? `${settings.defaultProvider}/` : ""}${settings.defaultModel}` : undefined;
 }
 
+/** H1: A pool that does not resolve (a cycle, an empty list, an invalid entry) is a configuration error of the call,
+ *  not a crash of the executor: the call that names it fails with a message that names the pool. */
+class PoolUnresolved extends Error {
+  constructor(pool: string, error: unknown) {
+    super(`model-unavailable: pool "${pool}" does not resolve: ${error instanceof Error ? error.message : String(error)}`);
+    this.name = "PoolUnresolved";
+  }
+}
 /** P2, P9, P22: Construct the journal-owned execution authority under the engine's OS lock. */
 /** Restart feedback: a resumed child believed the test loop it had started was still running and slept on it. Its
  *  previous execution was stopped (fenced), and with it every process its tools started, background ones included. */
@@ -753,7 +761,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const raw = t.spec.model ?? t.agent.model ?? configured ?? await defaultModel();
     const pool = raw && pools?.[raw] ? raw : undefined;
     const failures = modelFailures(t.journal, t.callId);
-    const candidates = (raw ? resolveModel(raw, pools) : [{ id: "" }]).filter(m => !failedModel(failures, m));
+    let candidates: Model[];
+    try { candidates = (raw ? resolveModel(raw, pools) : [{ id: "" }]).filter(m => !failedModel(failures, m)); }
+    catch (error) { throw pool ? new PoolUnresolved(pool, error) : error; }
     if (!candidates.length) throw new Error(`model-unavailable: no usable model remains; ${String(failures.at(-1)?.reason ?? raw)}`);
     const matches = (m: Model, other: Model | undefined) => sameModel(m, other) || !!other && t.journal.entries().some(e => e.type === "model-ready" && sameModel(e.selected as Model, m) && sameModel(e.model as Model, other));
     const candidate = recorded && candidates.some(m => matches(m, recorded));
@@ -1347,8 +1357,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           await serial(() => recordExhausted(provider, exec!, text));
           const pool = entriesOf(journal, "selected", exec).at(-1)?.pool as string | undefined;
           const pools = settings().pools;
-          const alternatives = pool && pools?.[pool] ? resolveModel(pool, pools).filter(m => m.provider !== provider &&
-            !unavailable(m.provider) && !failedModel(modelFailures(journal, t.callId), m)) : [];
+          let alternatives: Model[] = [];
+          if (pool && pools?.[pool]) {
+            try { alternatives = resolveModel(pool, pools).filter(m => m.provider !== provider &&
+              !unavailable(m.provider) && !failedModel(modelFailures(journal, t.callId), m)); }
+            catch (error) { return finish(journal, t.callId, exec, makeResult("failed", "", `${new PoolUnresolved(pool, error).message} (the provider answered with its quota notice: ${text})`)); }
+          }
           if (!alternatives.length) return finish(journal, t.callId, exec, makeResult("failed", "", `model-unavailable: ${text}`));
           await release(exec);
         }
@@ -1405,7 +1419,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       try {
         decision = await acquire(a, exec, () => launchModel(t, entries, previous), writer ??= await writerRoot(t, cwd));
       } catch (error) {
-        await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", String(error)));
+        await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", error instanceof PoolUnresolved ? error.message : String(error)));
       }
       const model = decision.model;
       if (!model || interrupted(a)) {
