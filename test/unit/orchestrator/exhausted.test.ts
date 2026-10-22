@@ -16,6 +16,8 @@ import fs from "node:fs";
 import { registerChild } from "../../../src/agent/child.ts";
 import { publishRequest } from "../../../src/kernel/mailbox.ts";
 
+const quota = "\u989d\u5ea6\u5df2\u4f7f\u7528\u5b8c\u6bd5";
+
 /** The child extension with every handler kept per event, so all registered `context` handlers run. */
 async function child(t: TestContext, patterns?: Record<string, string[]>) {
   const home = await mkdtemp(join(tmpdir(), "dsa-exhausted-child-")), inbox = join(home, "inbox"), path = join(home, "journal");
@@ -28,7 +30,7 @@ async function child(t: TestContext, patterns?: Record<string, string[]>) {
   Object.assign(process.env, env);
   const hooks = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>(), history: any[] = [];
   const model = { provider: "p", id: "m", name: "m" };
-  const ctx = { model, isIdle: () => true, shutdown() {}, sessionManager: { getEntries: () => history },
+  const ctx = { model, isIdle: () => true, shutdown() {}, sessionManager: { getEntries: () => history, getSessionFile: () => undefined },
     modelRegistry: { refresh: async () => ({ aborted: false, errors: new Map() }), find: () => model, getAll: () => [model] } };
   t.mock.method(fs, "writeSync", (_fd: number, chunk: string) => chunk.length);
   t.mock.method(process.stdout, "write", () => true);
@@ -69,7 +71,6 @@ test("XP1 configured child replaces the quota answer, records it, and drops it f
     "no further request may follow a quota refusal");
 });
 
-const quota = "\u989d\u5ea6\u5df2\u4f7f\u7528\u5b8c\u6bd5";
 const receiptType = "dsa-exhausted-text";
 
 test("XP1 config accepts regex strings, preserves absence and hashes configured patterns", () => {
