@@ -42,5 +42,9 @@ export default async function (pi: ExtensionAPI) {
   }
   if (!report.execution) return;
   if (process.env[ENV.exec]) (await import("./child.ts")).registerChild(pi);
-  else (await import("./main.ts")).registerMain(pi, report.ui ? (await import("../ui/index.ts")).registerUi : undefined);
+  else {
+    // EX1: a top-level session keeps the capture of its latest provider request (the exact fork's source).
+    await (await import("./exact/session.ts")).registerCapture(pi, (await import("./exact/session.ts")).homeOf());
+    (await import("./main.ts")).registerMain(pi, report.ui ? (await import("../ui/index.ts")).registerUi : undefined);
+  }
 }

@@ -20,35 +20,41 @@ import { digestDir, factsDir, journalPath, pinnedDir, workflowDir } from '../pat
 import { JT, type Entry, type JournalHandle, type Request, type RunBody, type ReviseBody } from '../types.ts';
 import type { Ledgers } from './contract.ts';
 import { pinOrigin } from './origin.ts';
+import { captureOf, factsOf } from './exact.ts';
+import type { CaptureFacts } from '../agent/exact/capture.ts';
 
 export interface Pins {
   source: string; args: unknown; agents: AgentDefinition[]; inputs: Record<string, string>;
   inputSources?: Record<string, string>; origin?: string; usageBudget?: RunBody['usageBudget']; maxCalls?: number;
+  /** EX2: the pinned capture of the origin session (the whole capture JSON, payload included) and its facts. */
+  exact?: string; exactFacts?: CaptureFacts;
 }
 /** `pins` in memory carry neither the origin branch nor input bytes (both can be tens of MB per workflow); they are read
  *  from the published files: `originPath` (pinned origin.jsonl, when the run has an origin) and `inputs`. */
 export interface Workflow { wid: string; revision: number; origin: string; cwd: string; journal: JournalHandle; pins: Pins; scriptPath: string; inputs: Record<string, string>; originPath?: string;
+  /** EX2: the published copy of the pinned capture (the exact child splices it). */
+  exactPath?: string;
   /** The settled record it was opened from (settled.ts): consult it only while its journal is not loaded. */
   settled?: SettledFacts;
   /** Pinned wake routing, copied only for runs that explicitly request it. */
   wake?: { rid: string; to: string; caller: string } }
 type SnapshotRef = { path: string; hash: string };
 /** pinned/<rN>/pins.json: the in-memory pins of a published revision, valid for the snapshot hash it names. */
-type PinRecord = { snapshot: string; digest: string; pins: Pins; inputs: Record<string, string>; origin: boolean; files: Record<string, string> };
-type PinnedFiles = Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'>;
+type PinRecord = { snapshot: string; digest: string; pins: Pins; inputs: Record<string, string>; origin: boolean; exact: boolean; files: Record<string, string> };
+type PinnedFiles = Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath' | 'exactPath'>;
 /** The same record checks for asynchronous verification and a synchronous released-pins reload. */
 function pinRecordFiles(dir: string, hash: string, record: PinRecord, verify: boolean): PinnedFiles | undefined {
   const { digest, ...body } = record;
   if (body.snapshot !== hash || typeof digest !== 'string' || (verify && contentHash(body) !== digest)) return undefined;
   if (!body.pins || typeof body.pins !== 'object' || !body.inputs || typeof body.inputs !== 'object' || !body.files || typeof body.files !== 'object') return undefined;
-  const names = publishedFiles(Object.values(body.inputs).map(String), body.origin === true);
+  const names = publishedFiles(Object.values(body.inputs).map(String), body.origin === true, body.exact === true);
   if (names.length !== Object.keys(body.files).length || names.some(name => !Object.hasOwn(body.files, name))) return undefined;
   return { pins: body.pins, scriptPath: join(dir, 'script.js'), inputs: Object.fromEntries(Object.entries(body.inputs).map(([name, file]) => [name, join(dir, String(file))])),
-    originPath: body.origin === true ? join(dir, 'origin.jsonl') : undefined };
+    originPath: body.origin === true ? join(dir, 'origin.jsonl') : undefined, exactPath: body.exact === true ? join(dir, 'exact.json') : undefined };
 }
 /** Every file publishPins writes for one revision, relative to its directory (inputs given relative too). */
-function publishedFiles(inputs: string[], origin: boolean): string[] {
-  return [...new Set(['script.js', 'args.json', 'agents.json', 'inputs.json', ...inputs, ...(origin ? ['origin.jsonl'] : [])])];
+function publishedFiles(inputs: string[], origin: boolean, exact = false): string[] {
+  return [...new Set(['script.js', 'args.json', 'agents.json', 'inputs.json', ...inputs, ...(origin ? ['origin.jsonl'] : []), ...(exact ? ['exact.json'] : [])])];
 }
 /** sha256 of a file, streamed. */
 async function fileHash(path: string): Promise<string> {
@@ -93,9 +99,17 @@ function usableNames(source: string, args: unknown, agents: AgentDefinition[]): 
   return name => strings.has(name) || ['"', "'", '`'].some(q => source.includes(`${q}${name}${q}`));
 }
 
+/** The specs of a fanout run (a single call, a task list or a chain); undefined for a script run. */
+function runSpecs(body: RunBody): ({ context?: string; model?: unknown } | undefined)[] | undefined {
+  if (body.call !== undefined) return [body.call];
+  if (body.tasks !== undefined) return body.tasks;
+  if (body.chain !== undefined) return body.chain;
+  return undefined;
+}
+
 /** P11, A5, E3: Capture immutable admission inputs before publishing any workflow files. Agent diagnostics reject the
  *  run only for names the run could use (see usableNames); the others are appended to `warnings`. */
-export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, warnings: string[] = []): Promise<Pins> {
+export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, warnings: string[] = [], home?: string): Promise<Pins> {
   if (!body || typeof body.cwd !== 'string' || [body.workflow, body.source, body.tasks, body.chain, body.call].filter(x => x !== undefined).length !== 1) throw new Error('invalid-run');
   if (body.maxCalls !== undefined && (!Number.isSafeInteger(body.maxCalls) || body.maxCalls < 0)) throw new Error('invalid-maxCalls');
   if (body.usageBudget && Object.values(body.usageBudget).some(n => !Number.isFinite(n) || n < 0)) throw new Error('invalid-usageBudget');
@@ -118,8 +132,23 @@ export async function prepareRun(body: RunBody, discovery?: DiscoveryOptions, wa
   if (blocking.length) throw new Error(blocking.join('\n'));
   // P33: only a run that can ask for context "fork" pins the origin branch (tens of MB for a long session); a call of
   // any other run that asks for it anyway fails with "fork requested but the run has no origin session".
+  // EX2: a run that can ask for context "exact" pins the origin branch as well (a rebuilt exact call runs as a fork)
+  // and the capture of its origin session (the bytes the child splices).
+  const wantsFork = usableNames(source, body.args, [])('fork');
+  // EX2: the exact context of a fanout run is read from its specs, not from a token in its source: a task that happens
+  // to name the word is not an exact call. A script run (its specs are built at run time) is read from its source.
+  const specs = runSpecs(body);
+  const wantsExact = specs ? specs.some(spec => spec?.context === 'exact') : usableNames(source, body.args, [])('exact');
+  // EX2: an exact call runs on the origin's model: a call that names one is refused at admission.
+  for (const spec of specs ?? []) {
+    if (spec?.context === 'exact' && spec.model !== undefined) throw new Error('context "exact" runs on the origin model; remove model');
+  }
+  const capture = wantsExact && home ? await captureOf(home, body.origin?.sessionId) : undefined;
+  // EX2: the exact context needs an origin: the capture comes from its session, and a rebuilt exact call forks it.
+  if (wantsExact && !body.origin?.sessionId) throw new Error('context "exact" needs an origin session: run it from a pi session, or give --origin-session <pi session id>');
   return { source, args: body.args ?? null, agents: found.agents, inputs, inputSources: body.inputs ?? {},
-    ...(body.origin && usableNames(source, body.args, [])('fork') ? { origin: await pinOrigin(body.origin) } : {}),
+    ...(body.origin?.sessionFile && (wantsFork || wantsExact) ? { origin: await pinOrigin(body.origin) } : {}),
+    ...(capture ? { exact: JSON.stringify(capture), exactFacts: factsOf(capture).facts } : {}),
     ...(body.usageBudget ? { usageBudget: body.usageBudget } : {}), ...(body.maxCalls !== undefined ? { maxCalls: body.maxCalls } : {}) };
 }
 
@@ -228,7 +257,7 @@ export class Store {
             usageBudget: wf.pins.usageBudget, maxCalls: wf.pins.maxCalls };
           if (change.workflow !== undefined && change.source !== undefined) throw new Error('invalid-revise');
         } else body = req.body as RunBody;
-        snapshot = { hash: contentHash(req), pins: await prepareRun({ ...body, maxCalls: body.maxCalls ?? this.ledgers.config.k?.spawnBudget ?? 300 }, discovery, warnings),
+        snapshot = { hash: contentHash(req), pins: await prepareRun({ ...body, maxCalls: body.maxCalls ?? this.ledgers.config.k?.spawnBudget ?? 300 }, discovery, warnings, this.ledgers.home),
           ...(warnings.length ? { warnings } : {}) };
         if (req.kind === 'revise') {
           const prior = this.workflows.get((req.body as ReviseBody).wid)?.originPath;
@@ -306,6 +335,7 @@ export class Store {
       if (await publishFile(directory, name, bytes) === 'conflict') throw new Error(`Pinned content conflict: ${directory}/${name}`);
     };
     if (pins.origin !== undefined) await publish(dir, 'origin.jsonl', pins.origin);
+    if (pins.exact !== undefined) await publish(dir, 'exact.json', pins.exact);
     await publish(dir, 'script.js', pins.source);
     await publish(dir, 'args.json', JSON.stringify(pins.args));
     await publish(dir, 'agents.json', JSON.stringify(pins.agents));
@@ -315,8 +345,10 @@ export class Store {
       inputs[name] = join(dir, 'inputs', file);
     }
     await publish(dir, 'inputs.json', JSON.stringify(inputs));
-    const { origin, inputs: _bytes, ...kept } = pins;
-    return { pins: { ...kept, inputs: {} }, scriptPath: join(dir, 'script.js'), inputs, originPath: origin === undefined ? undefined : join(dir, 'origin.jsonl') };
+    const { origin, exact, inputs: _bytes, ...kept } = pins;
+    return { pins: { ...kept, inputs: {} }, scriptPath: join(dir, 'script.js'), inputs,
+      originPath: origin === undefined ? undefined : join(dir, 'origin.jsonl'),
+      exactPath: exact === undefined ? undefined : join(dir, 'exact.json') };
   }
   /** A1: The pinned files of one revision. The first publication verifies the staged snapshot and ends with `pins.json`:
    *  the in-memory pins and the sha256 of every published file, keyed by the snapshot hash. Later starts read that small
@@ -324,7 +356,7 @@ export class Store {
    *  workflow), and use it only when it is well formed, names this snapshot, its pins hash to its digest and every file
    *  hashes as recorded — otherwise they take the snapshot path, whose byte comparison reports a changed file as a
    *  conflict, and record it again. */
-  private async pinnedFiles(wid: string, revision: number, intent: Entry, verify = true): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'>> {
+  private async pinnedFiles(wid: string, revision: number, intent: Entry, verify = true): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath' | 'exactPath'>> {
     const dir = revision === 1 ? pinnedDir(this.ledgers.home, wid) : join(pinnedDir(this.ledgers.home, wid), `r${revision}`);
     const ref = intent.pins ? undefined : intent.snapshot as SnapshotRef | undefined;
     const hash = ref?.hash ?? contentHash(intent.pins);
@@ -333,16 +365,16 @@ export class Store {
     const files = await this.publishPins(wid, revision, await this.pinned(intent));
     {
       const hashes: Record<string, string> = {};
-      for (const name of publishedFiles(Object.values(files.inputs).map(path => relative(dir, path)), files.originPath !== undefined)) hashes[name] = await fileHash(join(dir, name));
+      for (const name of publishedFiles(Object.values(files.inputs).map(path => relative(dir, path)), files.originPath !== undefined, files.exactPath !== undefined)) hashes[name] = await fileHash(join(dir, name));
       const body: Omit<PinRecord, 'digest'> = { snapshot: hash, pins: files.pins,
-        inputs: Object.fromEntries(Object.entries(files.inputs).map(([name, path]) => [name, relative(dir, path)])), origin: files.originPath !== undefined, files: hashes };
+        inputs: Object.fromEntries(Object.entries(files.inputs).map(([name, path]) => [name, relative(dir, path)])), origin: files.originPath !== undefined, exact: files.exactPath !== undefined, files: hashes };
       await replaceFile(dir, 'pins.json', JSON.stringify({ ...body, digest: contentHash(body) }));
     }
     return files;
   }
   /** The files `pins.json` in `dir` records for snapshot `hash`, when the record and every file verify; else undefined.
    *  Without `verify`, only the record's form is checked (its digest and the file hashes are left to `ready`). */
-  private async recorded(dir: string, hash: string, verify: boolean | 'record' = true): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath'> | undefined> {
+  private async recorded(dir: string, hash: string, verify: boolean | 'record' = true): Promise<Pick<Workflow, 'pins' | 'scriptPath' | 'inputs' | 'originPath' | 'exactPath'> | undefined> {
     const record = JSON.parse(await readFile(join(dir, 'pins.json'), 'utf8')) as PinRecord;
     const files = pinRecordFiles(dir, hash, record, verify !== false);
     if (!files) return undefined;
@@ -380,7 +412,7 @@ export class Store {
       if (contentHash(snapshot) !== ref.hash || !snapshot.pins) throw new Error('Staged snapshot hash mismatch');
       source = snapshot.pins;
     }
-    const { origin: _origin, inputs: _inputs, ...pins } = source;
+    const { origin: _origin, exact: _exact, inputs: _inputs, ...pins } = source;
     return { ...pins, inputs: {} };
   }
   /** Whether the workflow's pins are in memory (not released behind the lazy accessor). */
@@ -406,7 +438,7 @@ export class Store {
         // These files were verified in this process. If their cache record changed, recover the same pins from the
         // immutable snapshot, without changing when file verification is required.
         const pins = recorded?.pins ?? await (async () => {
-          const { origin: _origin, inputs: _inputs, ...kept } = await this.pinned(intent); return { ...kept, inputs: {} };
+          const { origin: _origin, exact: _exact, inputs: _inputs, ...kept } = await this.pinned(intent); return { ...kept, inputs: {} };
         })();
         if (wf.revision === revision && Object.getOwnPropertyDescriptor(wf, 'pins')?.get === unloaded) wf.pins = pins;
       }

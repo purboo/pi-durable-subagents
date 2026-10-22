@@ -10,7 +10,7 @@ export interface AgentDefinition {
   tools?: string[]; skills?: string[];
   systemPromptMode: "append" | "replace";
   inheritProjectContext: boolean; inheritSkills: boolean;
-  defaultContext?: "fresh" | "fork";
+  defaultContext?: "fresh" | "fork" | "exact";
   body: string; sourcePath: string; source: "builtin" | "package" | "user" | "project";
 }
 export interface DiscoveryOptions {
@@ -94,7 +94,7 @@ export function parseAgent(content: string, sourcePath: string, source: AgentDef
     systemPromptMode: f.systemPromptMode === "append" || f.systemPromptMode === "replace" ? f.systemPromptMode : f.name === "delegate" ? "append" : "replace",
     inheritProjectContext: f.inheritProjectContext === "true" || (f.inheritProjectContext !== "false" && f.name === "delegate"),
     inheritSkills: f.inheritSkills === "true",
-    ...(f.defaultContext === "fork" || f.defaultContext === "fresh" ? { defaultContext: f.defaultContext } : {}),
+    ...(f.defaultContext === "fork" || f.defaultContext === "fresh" || f.defaultContext === "exact" ? { defaultContext: f.defaultContext } : {}),
     body, sourcePath: path.resolve(sourcePath), source,
   };
 }

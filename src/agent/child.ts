@@ -14,6 +14,7 @@ import { askProblem, validate } from './child/schema.ts';
 import { catalogModel, parseModel, sameModel } from '../compat/model.ts';
 import { registerLive } from './child/live.ts';
 import { exhaustedText } from '../orchestrator/providers.ts';
+import { exactChildFromEnv, registerExactChild } from './exact/child.ts';
 
 // boundary = turn_end (steer lands between turns); settle = agent_before_settle (follow-ups land only here or idle).
 type Mode = 'idle' | 'boundary' | 'settle' | 'ask';
@@ -363,4 +364,7 @@ export function registerChild(pi: ExtensionAPI): void {
       });
     },
   });
+  // EX4: an exact child splices the pinned capture of its parent session into every provider request.
+  const exact = exactChildFromEnv();
+  if (exact) registerExactChild(pi, exact);
 }

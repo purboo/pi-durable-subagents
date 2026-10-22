@@ -157,7 +157,9 @@ export const CT = {
   report: "dsa-report",        // custom: { exec, outcome, data?, artifacts? }
   modelReady: "dsa-model-ready", // custom: { exec, selected, model, virtual } - canonical model activated before delivery
   modelUnavailable: "dsa-model-unavailable", // custom: { exec, selected, actual, reason } - no request may follow
-  exhausted: "dsa-exhausted-text", // custom: { exec, provider, text } - XP1 matched quota text, clipped to 200 characters
+  exhausted: "dsa-exhausted-text", // custom: { exec, provider, text } — XP1 matched quota text, clipped to 200 characters
+  exactMismatch: "dsa-exact-mismatch", // custom: { exec, error } — EX4: the request was not sent (provider/model/api differ)
+  exactRebuilt: "dsa-exact-rebuilt", // custom: { exec, reason } — EX5: the exact call is rebuilt as a fork
   model: "dsa-model",          // custom: { rid, provider, model } — model change receipt
   attention: "dsa-attention",  // custom_message (main session): details { items: {id, rev}[] }
   budget: "dsa-budget",        // custom: { exec, usage } — the child refused its next provider request: per-call budget reached (P31b)
@@ -214,8 +216,9 @@ export interface RunBody {
   usageBudget?: { tokens?: number; costUsd?: number };
   /** Spawn budget override (P36, upstream maxSubagentSpawnsPerRun); default K11 = 300. */
   maxCalls?: number;
-  /** Origin session for `context: "fork"` (P33): its branch up to `leafId` is pinned at admission. */
-  origin?: { sessionFile: string; leafId?: string | null };
+  /** Origin session for `context: "fork"` (P33): its branch up to `leafId` is pinned at admission. For
+   *  `context: "exact"` (EX2) the origin's session id names the capture that is pinned at admission. */
+  origin?: { sessionFile: string; leafId?: string | null; sessionId?: string };
   /** Caller labels (flat string map), part of the spec digest and echoed on every event of the workflow. */
   labels?: Record<string, string>;
   /** The pi session that shows this run as its own (SESSION_ID): the CLI takes it from --session or from $DSA_SESSION,
@@ -341,7 +344,7 @@ export interface CallSpec {
   schema?: unknown;
   gate?: string | { command: string; output?: "json"; schema?: unknown; timeoutMs?: number };
   isolation?: "none" | "worktree";
-  context?: "fresh" | "fork";
+  context?: "fresh" | "fork" | "exact";
   budget?: { tokens?: number; costUsd?: number };
   /** Unknown tool effects park instead of continuing (P9). */
   once?: boolean;
@@ -465,4 +468,6 @@ export const ENV = {
   budget: "DSA_BUDGET",   // JSON {tokens?, costUsd?}: per-call budget; the child refuses the next provider request once reached (P31b)
   model: "DSA_MODEL",     // "provider/id" the executor holds a slot for; the child re-applies it if pi started without it (C8)
   exhaustedPatterns: "DSA_EXHAUSTED_PATTERNS", // JSON provider -> regex strings, snapshotted at execution start (XP1)
+  exactCapture: "DSA_EXACT_CAPTURE", // path of the pinned parent capture of an exact child (EX2)
+  exactTools: "DSA_EXACT_TOOLS", // JSON array of the tool names an exact child may run (EX3/EX4)
 } as const;

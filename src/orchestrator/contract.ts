@@ -3,6 +3,7 @@
 // only writer of orchestrator.jsonl and every w/<wid>/journal.jsonl (A2). They share JournalHandles.
 import type { AgentDefinition } from "../compat/agents.ts";
 import type { PoolEntry } from "../compat/model.ts";
+import type { ExactReason } from "./exact.ts";
 import type { CallId, CallResult, CallSpec, JournalHandle, Request, Wid, WidRev } from "../types.ts";
 import type { SweepSeed } from "./executor/sweep.ts";
 
@@ -11,6 +12,9 @@ export interface OrchestratorConfig {
   /** Default model when neither the call nor the agent names one (before pi's own settings default). */
   /** Require a decision_needed on every ask; snapshotted when each execution starts. Default false. */
   askRequireDecision?: boolean;
+  /** EX1: keep the capture of every top-level pi session (default true). While it is off, no capture file is written
+   *  and an exact run falls back (reason `no-capture`). */
+  exactCapture?: boolean;
   defaultModel?: string;
   /** Model pools: name -> ordered "provider/id[:thinking]" candidates (P12, D10); an entry `{ model, afterMs }` is
    *  taken only by a call that has waited `afterMs` for a slot. */
@@ -43,6 +47,10 @@ export interface CallTicket {
   workflowBudget?: { tokens?: number; costUsd?: number };
   /** P33: pinned origin branch (JSONL of pi session entries, message/model entries only), when the run had one. */
   originSession?: string;
+  /** EX2: the pinned capture of the origin session (the published copy the exact child splices) and its facts. */
+  exactCapture?: { path: string; facts: { sha256: string; bytes: number; at: number; provider: string; model: string; api: string; thinking?: string } };
+  /** EX5: the exactness of this call: "exact" (it splices the pinned capture) or "rebuilt" (it runs as a fork, with a reason). */
+  exactMode?: { mode: "exact" | "rebuilt"; reason?: ExactReason };
   /** P37: this generation continues the session of an earlier, sealed generation of the same key. */
   continueFrom?: CallId;
   /** P37: the send that opened this generation; its message is the first thing the generation receives. */

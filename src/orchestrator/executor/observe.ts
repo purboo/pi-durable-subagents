@@ -33,6 +33,8 @@ type Dependencies = {
   modelControl?(event: Record<string, unknown>): Promise<void | boolean>;
   /** An assistant message ended: an answer of a used-up provider makes it available again. */
   answered?(event: Record<string, unknown>): Promise<void>;
+  /** EX6: the usage of one provider request of an exact call (the cache split the journal's usage entries drop). */
+  exactUsage?(event: Record<string, unknown>): Promise<void>;
   wrote?(path: string): Promise<void>;
   pendingSwitch(): Entry | undefined;
 };
@@ -151,7 +153,7 @@ export async function observeExecution(d: Dependencies) {
       const slim = observation(event);
       if (slim) {
         await serial(() => t.journal.append("observation", { exec, event: slim }));
-        if (event.type === "message_end") { await d.recordUsage([{ id: String(slim.id), usage: slim.usage as Usage }]); await d.answered?.(event); }
+        if (event.type === "message_end") { await d.recordUsage([{ id: String(slim.id), usage: slim.usage as Usage }]); await d.answered?.(event); await d.exactUsage?.(event); }
       }
       await limits(); await stall(); await noProgress();
       if (event.type === "agent_settled") {
