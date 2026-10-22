@@ -19,6 +19,7 @@ import { publishFile } from '../kernel/mailbox.ts';
 import { digestDir, factsDir, journalPath, pinnedDir, workflowDir } from '../paths.ts';
 import { JT, type Entry, type JournalHandle, type Request, type RunBody, type ReviseBody } from '../types.ts';
 import type { Ledgers } from './contract.ts';
+import { pinOrigin } from './origin.ts';
 
 export interface Pins {
   source: string; args: unknown; agents: AgentDefinition[]; inputs: Record<string, string>;
@@ -90,23 +91,6 @@ function usableNames(source: string, args: unknown, agents: AgentDefinition[]): 
   };
   walk(args);
   return name => strings.has(name) || ['"', "'", '`'].some(q => source.includes(`${q}${name}${q}`));
-}
-
-/** P33: Capture the selected branch before admission and exclude extension receipts. */
-async function pinOrigin(origin: NonNullable<RunBody['origin']>): Promise<string> {
-  const rows = (await readFile(origin.sessionFile, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line) as { type: string; id?: string; parentId?: string | null; message?: { customType?: string } });
-  const header = rows.find(e => e.type === 'session');
-  if (!header) throw new Error('Origin session has no header');
-  const byId = new Map(rows.filter(e => e.type !== 'session' && e.id).map(e => [e.id!, e]));
-  let id = origin.leafId === undefined ? rows.findLast(e => e.type !== 'session' && e.id)?.id : origin.leafId;
-  const branch: typeof rows = [], seen = new Set<string>();
-  while (id) {
-    if (seen.has(id)) throw new Error('Cyclic origin branch');
-    seen.add(id);
-    const entry = byId.get(id); if (!entry) throw new Error('Missing origin branch entry');
-    branch.unshift(entry); id = entry.parentId;
-  }
-  return [header, ...branch.filter(e => ['message', 'model_change'].includes(e.type) && !e.message?.customType?.startsWith('dsa-'))].map(e => JSON.stringify(e)).join('\n') + '\n';
 }
 
 /** P11, A5, E3: Capture immutable admission inputs before publishing any workflow files. Agent diagnostics reject the

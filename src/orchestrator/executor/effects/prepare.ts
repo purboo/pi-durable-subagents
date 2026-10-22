@@ -10,6 +10,7 @@ import { publishFile } from "../../../kernel/mailbox.ts";
 import { contentHash } from "../../../kernel/ids.ts";
 import { JT, isEntry, type Entry } from "../../../types.ts";
 import type { CallTicket } from "../../contract.ts";
+import { forkEntry } from "../../origin.ts";
 
 const exec = promisify(execFile);
 const git = async (cwd: string, ...args: string[]) => (await exec("git", args, { cwd, timeout: 30000, maxBuffer: 4 * 1024 * 1024 })).stdout.trim();
@@ -89,7 +90,7 @@ export async function cleanWorktree(t: CallTicket): Promise<void> {
   await git(t.cwd, "worktree", "remove", path);
   await t.journal.append("wt-removed", { call: t.callId });
 }
-/** P33: Publish a fresh session from the already pinned origin branch without importing receipts. */
+/** P33, FC1: Publish a fresh session from the already pinned origin branch (its effective context) without importing receipts. */
 export async function prepareFork(t: CallTicket, cwd: string, sessionPath: string): Promise<void> {
   if (t.spec.context !== "fork" || t.continueFrom) return;
   if (!t.originSession) throw new Error("fork requested but the run has no origin session");
@@ -99,7 +100,7 @@ export async function prepareFork(t: CallTicket, cwd: string, sessionPath: strin
   let intent = records(t, "fork-intent")[0];
   const header = intent?.header ?? { type: "session", id: randomUUID(), version: origin[0].version, cwd, timestamp: new Date().toISOString() };
   let parentId: string | null = null;
-  const entries = origin.filter(e => e.type === "message" || e.type === "model_change").filter(e => !String(e.message?.customType ?? "").startsWith("dsa-")).map(e => {
+  const entries = origin.filter(forkEntry).map(e => {
     const entry = { ...e, parentId }; parentId = e.id; return entry;
   });
   const bytes = [header, ...entries].map(e => JSON.stringify(e)).join("\n") + "\n", hash = contentHash(bytes);
