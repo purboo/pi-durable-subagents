@@ -291,13 +291,14 @@ export function registerChild(pi: ExtensionAPI): void {
       // cannot make a request, even when a provider ignores abort. The receipt was appended synchronously.
       process.exit(1);
     }
+    // XP1: a rejected quota turn never reaches a later request's context.
+    const all = (_event as { messages?: { role?: string; stopReason?: string; errorMessage?: string }[] })?.messages;
+    if (!Array.isArray(all)) return;
+    const messages = all.filter(m => !(m.role === 'assistant' && m.stopReason === 'aborted' && m.errorMessage === CT.exhausted));
+    if (messages.length !== all.length) return { messages } as never;
   };
   pi.on('turn_start', guard);
   pi.on('context', guard);
-  pi.on('context', event => {
-    const messages = event.messages.filter(m => !(m.role === 'assistant' && m.stopReason === 'aborted' && m.errorMessage === CT.exhausted));
-    if (messages.length !== event.messages.length) return { messages };
-  });
   if (budget) pi.on('context', async (_event, ctx) => {
     if (!active) return;
     const used = usage(ctx.sessionManager.getEntries() as unknown as SessionLike[], call);
