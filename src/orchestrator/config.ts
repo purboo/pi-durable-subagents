@@ -50,8 +50,17 @@ export function configProblem(raw: unknown): string | undefined {
   }
   if (providers !== undefined) {
     if (!record(providers)) return "providers must map provider names to { slots }";
-    for (const [name, p] of Object.entries(providers))
+    for (const [name, p] of Object.entries(providers)) {
       if (!record(p) || !Number.isSafeInteger(p.slots) || Number(p.slots) < 0) return `providers.${name}.slots must be a nonnegative integer`;
+      if (p.exhaustedPatterns !== undefined) {
+        if (!Array.isArray(p.exhaustedPatterns) || p.exhaustedPatterns.some(v => typeof v !== "string"))
+          return `providers.${name}.exhaustedPatterns must be a list of regular expression strings`;
+        for (const [i, pattern] of p.exhaustedPatterns.entries()) {
+          try { new RegExp(pattern, "i"); }
+          catch { return `providers.${name}.exhaustedPatterns[${i}] is not a valid regular expression`; }
+        }
+      }
+    }
   }
   if (memory !== undefined) {
     if (!record(memory)) return "memory must be { reserveMb?, perChildMb? }";

@@ -41,6 +41,7 @@ import { continueSession } from "./generation.ts";
 import { fenceAgent } from "./ended.ts";
 import { answerInFlight, boundAnswer, hibernation, openAsked, openQuestion, supersededByBinding } from "./hibernate.ts";
 import { SessionFold, answerKey, digestOpenQuestion, supersededBy } from "./digest.ts";
+import { exhaustedPatterns } from "../providers.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
@@ -927,6 +928,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   async function answered(t: CallTicket, exec: string, event: Record<string, unknown>) {
     const message = event.message as { role?: string; provider?: string; stopReason?: string; timestamp?: number; errorMessage?: string } | undefined, provider = message?.provider;
     if (message?.role !== "assistant" || !provider) return;
+    if (message.stopReason === "aborted" && message.errorMessage === CT.exhausted) return;
     if (message.stopReason === "error") return refused(t, exec, provider, String(message.errorMessage ?? ""));
     refusals.delete(exec);
     await serial(async () => {
@@ -1286,6 +1288,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs)
           return finish(journal, t.callId, exec, makeResult("timeout"));
         if (ev.budget || reached(totalUsage(journal.entries(), t.callId), t.spec.budget)) return finish(journal, t.callId, exec, makeResult("budget"));
+        const textFailure = entries.findLast(e => e.type === "custom" && e.customType === CT.exhausted && e.data?.exec === exec)?.data;
+        if (textFailure) {
+          const provider = String(textFailure.provider), text = String(textFailure.text).slice(0, 200);
+          await serial(() => recordExhausted(provider, exec!, text));
+          const pool = entriesOf(journal, "selected", exec).at(-1)?.pool as string | undefined;
+          const pools = settings().pools;
+          const alternatives = pool && pools?.[pool] ? resolveModel(pool, pools).filter(m => m.provider !== provider &&
+            !unavailable(m.provider) && !failedModel(modelFailures(journal, t.callId), m)) : [];
+          if (!alternatives.length) return finish(journal, t.callId, exec, makeResult("failed", "", `model-unavailable: ${text}`));
+          await release(exec);
+        }
         for (const e of entries) if (e.customType === CT.modelUnavailable && e.data?.exec === exec)
           await modelControl(journal, exec, { type: CT.modelUnavailable, ...e.data });
         const modelFailure = entriesOf(journal, "model-unavailable", exec).at(-1);
@@ -1295,7 +1308,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           await release(exec);
         }
         // A child that never started (its launch failed for a reason of the environment) lost nothing: launch again.
-        if (!bound && !modelFailure && !has(journal, "spawn-env-failed", exec)) {
+        if (!bound && !modelFailure && !textFailure && !has(journal, "spawn-env-failed", exec)) {
         // P28: an execution cut off while its only unfinished tool call is the open question's `ask` (before it
         // hibernated) was waiting, not working: it hibernates now and resumes with the answer, like a planned
         // hibernation; it is neither a loss nor, for `once`, an unknown outcome.
@@ -1384,11 +1397,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       else await sender.send(t.callId, "task", { message: t.opening?.message ?? t.spec.task }, undefined, { rid: contentHash([exec, "dispatch"]) });
       await launchGate(a, exec, "child");
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
+      const patterns = exhaustedPatterns(settings().providers);
       let child: Spawned;
       try {
         child = await containment.spawn({ exec, command: piCommand, args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}) }), "-e", extension], cwd,
           // The orchestrator's node follows binDir: a `#!/usr/bin/env node` pi runs under a PATH without node (a service's).
-          env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
+          env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(Object.keys(patterns).length ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}) } });
       } catch (error) {
         const environment = environmentSpawnError(error);
         if (environment) await serial(() => spawnEnvRecord(t, exec!, error));
