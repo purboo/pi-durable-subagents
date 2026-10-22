@@ -14,9 +14,12 @@ export type OriginEntry = {
   message?: { role?: string; customType?: string };
 };
 
+/** The dsa receipt marker: an entry whose custom type (in its message or at its own level) names the dsa protocol. */
 const receipt = (e: OriginEntry) => String(e.message?.customType ?? e.customType ?? '').startsWith('dsa-');
-/** The 1.2 pin rule (uncompacted branches keep it byte for byte). */
-const plain = (e: OriginEntry) => ['message', 'model_change'].includes(e.type) && !e.message?.customType?.startsWith('dsa-');
+/** The 1.2 pin rule (uncompacted branches keep it byte for byte): message and model_change entries that are not
+ *  receipts. It shares the receipt predicate, so an entry that names a dsa custom type is dropped on every branch
+ *  (pi writes no custom type at the entry level of a message, so the pinned bytes do not change). */
+const plain = (e: OriginEntry) => ['message', 'model_change'].includes(e.type) && !receipt(e);
 /** Entries of a compacted branch's context that a fork child needs to rebuild what pi sends. */
 const contextual = (e: OriginEntry) => ['message', 'model_change', 'custom_message', 'branch_summary', 'context_edit'].includes(e.type) && !receipt(e);
 

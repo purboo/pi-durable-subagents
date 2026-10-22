@@ -6,10 +6,20 @@
 import type { Entry } from "../types.ts";
 import type { OrchestratorConfig } from "./contract.ts";
 
-/** XP1: compile only validated, configured patterns; no implicit quota-text matching. */
+/** XP1: compile only validated, configured patterns; no implicit quota-text matching. A pattern the config load
+ *  rejected (an invalid regular expression, named with its provider) is never handed to a child. */
 export function exhaustedPatterns(providers: OrchestratorConfig["providers"]): Record<string, string[]> {
-  return Object.fromEntries(Object.entries(providers ?? {}).filter(([, p]) => p.exhaustedPatterns?.length)
-    .map(([name, p]) => [name, p.exhaustedPatterns!]));
+  const out: Record<string, string[]> = {};
+  for (const [name, p] of Object.entries(providers ?? {})) {
+    const valid = (p.exhaustedPatterns ?? []).filter(compiles);
+    if (valid.length) out[name] = valid;
+  }
+  return out;
+}
+
+/** Whether a pattern compiles as a regular expression (the config load rejects the others). */
+function compiles(pattern: string): boolean {
+  try { new RegExp(pattern, "i"); return true; } catch { return false; }
 }
 
 /** XP1: only an assistant answer without tool calls can be a quota notice. */
