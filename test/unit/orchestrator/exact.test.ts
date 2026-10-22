@@ -2,16 +2,22 @@
 // fallback reasons and the report.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { writeCapture, type Capture } from "../../../src/agent/exact/capture.ts";
 import { exactDecision, modelConfigured } from "../../../src/orchestrator/exact.ts";
 import { prepareRun } from "../../../src/orchestrator/store.ts";
 import { snapshotFromEntries, exactLine } from "../../../src/orchestrator/snapshot.ts";
 import { validateCallSpec } from "../../../src/compat/spec.ts";
 import { runCommand } from "../../../src/cli/requests.ts";
-import type { Entry, RunBody } from "../../../src/types.ts";
+import createExecutor from "../../../src/orchestrator/executor/index.ts";
+import { openJournal } from "../../../src/kernel/journal.ts";
+import { ulid } from "../../../src/kernel/ids.ts";
+import { callDir, callSession, journalPath, orchLedger } from "../../../src/paths.ts";
+import { CT, JT, type Containment, type SpawnSpec, type Entry, type RunBody } from "../../../src/types.ts";
+import type { CallTicket } from "../../../src/orchestrator/contract.ts";
 
 const capture = (over: Partial<Capture> = {}): Capture => ({
   sessionId: "s1", provider: "qa", model: "m", api: "anthropic-messages", thinking: "off", at: 1_700_000_000_000,
@@ -136,4 +142,70 @@ test("EX2 the CLI names the origin session of an exact run", async t => {
   });
   assert.equal(code, 1, "the flag is only for exact calls");
   assert.match(written.join("\n"), /--origin-session is only for context/);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The executor: an exact call launches on the captured model and refuses a call that names one.
+// ---------------------------------------------------------------------------------------------------------------------
+const agent = { name: "test", description: "test", body: "test", model: "probe/scripted", sourcePath: "/fixture/test.md",
+  source: "project" as const, systemPromptMode: "replace" as const, inheritProjectContext: false, inheritSkills: false };
+const effects = { prepare: async (t: CallTicket) => ({ cwd: t.cwd }), beforeSeal: async (_t: CallTicket, _e: string, r: never) => r,
+  afterSeal: async () => {}, recover: async () => {} };
+
+async function executorFixture(t: any, options: { spec: Record<string, unknown>; capture?: { path: string; facts: Record<string, unknown> }; config?: Record<string, unknown> }) {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "dsa-exact-exec-"))), wid = ulid();
+  const orch = await openJournal(orchLedger(home)), journal = await openJournal(journalPath(home, wid));
+  const call = `${wid}@1/a@1`, session = callSession(home, wid, "a", 1);
+  await mkdir(callDir(home, wid, "a", 1), { recursive: true });
+  await journal.append("call", { key: "a", gen: 1, spec: { agent: "test", task: "task", ...options.spec } });
+  const launches: SpawnSpec[] = [];
+  const lines = (rows: unknown[]) => rows.map(l => JSON.stringify(l)).join("\n") + "\n";
+  const containment: Containment = {
+    async spawn(spec: SpawnSpec) {
+      launches.push(spec);
+      // The child reports its result: the call ends with it.
+      await writeFile(session, lines([{ type: "custom", customType: CT.exec, data: { exec: spec.exec } },
+        { type: "custom", customType: CT.report, data: { exec: spec.exec, outcome: "ok", data: {} } }]));
+      const stdout = new PassThrough(), stderr = new PassThrough();
+      stdout.end('{"type":"agent_settled"}\n'); stderr.end();
+      return { pid: 0, start: "", stdin: new PassThrough(), stdout, stderr, exited: Promise.resolve({ code: 0, signal: null }) };
+    },
+    async scan(known: ReadonlyMap<string, readonly any[]>) { return new Map([...known.keys()].map(exec => [exec, []])); },
+    async fence() {},
+  };
+  const executor = createExecutor({ home, orch, config: { k: { trackerMs: 20 }, writerLock: "off", ...(options.config ?? {}) } },
+    { effects, containment, memory: async () => 1e6, sweepMs: 60000 });
+  t.after(async () => { try { await executor.shutdown(); } finally { await journal.close(); await orch.close(); await rm(home, { recursive: true, force: true }); } });
+  const ticket: CallTicket = { wid, widRev: `${wid}@1`, key: "a", gen: 1, callId: call, cwd: home, journal,
+    spec: { agent: "test", task: "task", ...options.spec } as never, agent,
+    ...(options.capture ? { exactCapture: { path: options.capture.path, facts: options.capture.facts } } : {}) } as CallTicket;
+  return { executor, journal, launches, ticket, home, call };
+}
+
+test("EX3 an exact call launches on the captured model and hands the child the pinned capture", { timeout: 15000 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-exact-exec-home-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const pinned = join(home, "exact.json");
+  await writeFile(pinned, JSON.stringify(capture()));
+  const facts = { sha256: "a".repeat(64), bytes: 10, at: Date.now(), provider: "qa", model: "m", api: "anthropic-messages" };
+  const f = await executorFixture(t, { spec: { context: "exact" }, capture: { path: pinned, facts }, config: { providers: { qa: { slots: 2 } } } });
+  await f.executor.recover((f.ticket as CallTicket).wid, f.journal);
+  await f.executor.run(f.ticket);
+  assert.equal(f.launches.length, 1, "the exact call launches a child");
+  const args = f.launches[0]!.args;
+  assert.ok(args.includes("--model"), "the child runs on the captured model");
+  assert.equal(args[args.indexOf("--model") + 1], "qa/m");
+  assert.equal(f.launches[0]!.env?.DSA_EXACT_CAPTURE, pinned, "the child splices the pinned capture");
+  assert.deepEqual(JSON.parse(f.launches[0]!.env?.DSA_EXACT_TOOLS ?? "[]"), ["read", "bash", "edit", "write", "ask"]);
+  const mode = f.journal.entries().find(e => e.type === "exact-mode");
+  assert.equal(mode?.mode, "exact", "the call is exact");
+});
+
+test("EX2 an exact call that names a model is refused before a child starts", { timeout: 15000 }, async t => {
+  const f = await executorFixture(t, { spec: { context: "exact", model: "qa/m" } });
+  await f.executor.recover((f.ticket as CallTicket).wid, f.journal);
+  const result = await f.executor.run(f.ticket);
+  assert.equal(result.status, "failed");
+  assert.equal(result.error, 'context "exact" runs on the origin model; remove model');
+  assert.equal(f.launches.length, 0, "no child starts");
 });

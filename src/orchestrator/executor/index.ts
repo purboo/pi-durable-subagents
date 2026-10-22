@@ -1223,6 +1223,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const makeResult = (status: CallResult["status"], output = "", error?: string) => buildCallResult({ key: t.key, gen: t.gen, status, output, ...(error ? { error } : {}) });
     let cwd = t.cwd, writer: string | undefined;
     if (sealed(journal, t.callId)) { const result = sealed(journal, t.callId)!; await effects.afterSeal(t, result); return result; }
+    // EX2: an exact call runs on the origin's model. The admission refuses the fanout forms; a script that names a
+    // model in an exact call is refused here (before the call is rebuilt as a fork).
+    if (t.spec.context === "exact" && t.spec.model !== undefined) {
+      const exec = current(journal, t.callId) ?? `${t.callId}#1.1`;
+      if (!current(journal, t.callId)) await serial(() => journal.append(JT.exec, { call: t.callId, exec }));
+      await fence(journal, exec, { park: a });
+      return finish(journal, t.callId, exec, makeResult("failed", "", 'context "exact" runs on the origin model; remove model'));
+    }
     // EX2, EX5: the exactness of the call is decided once and recorded: a rebuilt call never retries exact later.
     const exact = await exactMode(t);
     if (exact) {
