@@ -7,11 +7,13 @@
   model, thinking, max tokens, prompt cache key, metadata) and the child's own conversation is appended to the parent's
   conversation. The child's agent definition, context files and skills never reach the provider. The child launches on
   the captured provider, model and thinking: it holds that provider's slot and waits for it like any launch, and it has
-  no pool failover. The exact context of a run is read from its specs (the call, the tasks, the chain), not from a word
-  in a script's source.
+  no pool failover. The exact context of a run is read from its specs when it has them (the call, the tasks, the chain);
+  a workflow script's specs are built while it runs, so there the context is read from the script's source: a script that
+  quotes `"exact"` (or has `"exact"` as one of its `args`) is an exact run and needs an origin session.
 - The exact capture: a top-level pi session (one that is not inside a dsa call) writes its latest provider payload to
   `$DSA_HOME/exact/<sessionId>.json` (mode 0600, atomic replace, off the request path). The file holds the serialized
-  payload only, never headers and never keys. The orchestrator removes capture files that were not modified for 7 days
+  provider payload and the request's identity (the session id, provider, model, api, thinking and the time of the
+  request); never headers, never credentials. The orchestrator removes capture files that were not modified for 7 days
   when it starts. The configuration key `exactCapture` (boolean, default true) turns the capture off: no file is
   written and an exact run falls back (`no-capture`). An exact run pins the capture of its origin session at admission,
   so a later capture never changes a pinned run.
