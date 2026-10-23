@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.2
+
+- The exact fork works on a provider whose model name on the wire is not its pi catalog id (a gateway alias that
+  registers `M` and sends `p/M`). The child compared the model its request names with the captured catalog id, so
+  every request on such a provider was refused with `exact-mismatch`; it now compares it with the model the captured
+  request named.
+
 ## 1.3.1
 
 - Windows (issue #1): the extension now disables itself at load on any platform other than Linux and macOS, with one
