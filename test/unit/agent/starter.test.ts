@@ -12,7 +12,8 @@ import { journalPath, orchInbox, orchLedger, orchLock } from "../../../src/paths
 import { scanInbox } from "../../../src/kernel/mailbox.ts";
 import { JT } from "../../../src/types.ts";
 import { unfinishedWorkflow } from "../../../src/agent/main/snapshots.ts";
-import { registerMain } from "../../../src/agent/main.ts";
+import { ACTIVITY_CHANNEL, BACKGROUND_REPORT_AFTER, BackgroundFailures, registerMain } from "../../../src/agent/main.ts";
+import { LOCK_TIMEOUT } from "../../../src/platform/lock.ts";
 
 const root = mkdtempSync(join(tmpdir(), "dsa-starter-"));
 const saved = { HOME: process.env.HOME, DSA_HOME: process.env.DSA_HOME, DSA_SCOPE: process.env.DSA_SCOPE, DSA_ORCHESTRATOR_ENTRY: process.env.DSA_ORCHESTRATOR_ENTRY, DSA_SESSION: process.env.DSA_SESSION };
@@ -133,6 +134,44 @@ test("quit pause: the start notice names this session's paused workflows; a quit
       assert.deepEqual(drains.map(r => [r.from, r.body]), [[A, { fence: true, origin: A }]]);
     } finally { await held?.release(); }
   } finally { await lock.release(); }
+});
+
+test("issue #3: a session emits its subagent activity on pi.events on change, and zeros when it ends busy", async () => {
+  const home = fresh();
+  await create(home, "W01", A); await create(home, "W02", B);
+  const j = await openJournal(journalPath(home, "W01"));
+  await j.append("generation", { pos: 0, key: "k", gen: 1, spec: { agent: "worker", task: "x" } }); await j.close();
+  const lock = await new OsLock().tryAcquire(orchLock(home)); // an orchestrator runs: nothing is launched
+  assert.ok(lock);
+  process.env.DSA_HOME = home;
+  const hooks = new Map<string, (event: unknown, ctx?: unknown) => Promise<unknown>>(), seen: [string, unknown][] = [];
+  registerMain({ on: (name: string, fn: (event: unknown, ctx?: unknown) => Promise<unknown>) => hooks.set(name, fn), registerTool() {}, sendMessage() {},
+    events: { emit: (channel: string, data: unknown) => seen.push([channel, data]), on: () => () => {} } } as never);
+  const ctx = { hasUI: false, isIdle: () => false, cwd: root, sessionManager: { getSessionId: () => A.slice(5), getEntries: () => [], getSessionFile: () => undefined, getLeafId: () => null } };
+  try {
+    await hooks.get("session_start")!({}, ctx);
+    await delay(1200); // several poll rounds: an unchanged state is not emitted again
+  } finally { await hooks.get("session_shutdown")!({ reason: "reload" }); await lock.release(); }
+  const sessionId = A.slice(5);
+  assert.deepEqual(seen, [
+    [ACTIVITY_CHANNEL, { sessionId, busy: true, working: 0, asking: 0, queued: 1, paused: 0 }],
+    [ACTIVITY_CHANNEL, { sessionId, busy: false, working: 0, asking: 0, queued: 0, paused: 0 }],
+  ]);
+});
+
+test("issue #2: lock timeouts in the background poll stay quiet until they repeat; other failures show once per streak", () => {
+  const timeout = Object.assign(new Error("C4 lock helper timeout (15000 ms)"), { code: LOCK_TIMEOUT });
+  const f = new BackgroundFailures();
+  for (let i = 1; i < BACKGROUND_REPORT_AFTER; i++) assert.equal(f.fail(timeout), undefined, `timeout ${i}`);
+  assert.equal(f.fail(timeout), `Durable Subagents: background check failed ${BACKGROUND_REPORT_AFTER} times in a row: C4 lock helper timeout (15000 ms)`);
+  assert.equal(f.fail(timeout), undefined, "one line per streak");
+  f.ok();
+  assert.equal(f.fail(timeout), undefined, "a success starts a new streak");
+  f.ok();
+  const text = f.fail(new Error("disk full"));
+  assert.equal(text, "Durable Subagents: background check failed: disk full");
+  assert.doesNotMatch(text!, /\n\s+at /, "no stack trace");
+  assert.equal(f.fail(new Error("disk full")), undefined);
 });
 
 test("R3: a held workflow with a started, unsealed command call is pending work (starter and CLI start); sealed, it is not", async () => {

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Windows (issue #1): the extension now disables itself at load on any platform other than Linux and macOS, with one
+  message naming the platform, instead of registering tools whose every call failed with `C2 capability unavailable`.
+  The README says so and points Windows users to WSL.
+- Background check output (issue #2): a lock helper that answers late in the session's background poll (a machine
+  going in and out of sleep) is retried quietly on the next round; the poll allows it 15 s instead of 3 s. A failure
+  is shown once per streak, without a stack trace, as a pi notification (stderr only without a UI), so it no longer
+  lands inside the TUI's editor. The timeout error carries the code `DSA_LOCK_TIMEOUT`.
+- Activity event (issue #3): a main session emits `durable-subagents:activity` on `pi.events` with
+  `{ sessionId, busy, working, asking, queued, paused }` when its subagent activity changes.
+
 ## 1.3.0
 
 - The exact fork: `context: "exact"` runs a call as a continuation of the calling pi session's last provider request. The

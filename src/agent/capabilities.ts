@@ -16,8 +16,12 @@ export const SURFACES: readonly Surface[] = [
 ];
 export interface CapabilityReport { version?: string; missing: Surface[]; execution: boolean; ui: boolean; messages: string[] }
 
-/** AC5, P21: Check the surfaces present in pi's modules and extension API; produce exact degradation messages. */
-export function checkCapabilities(modules: Record<string, Record<string, unknown> | undefined>, api: object, version?: string): CapabilityReport {
+/** The process layer (process tables and tree kill, flock, the memory probe, `/bin/sh` command calls, service units) exists
+ *  only for these platforms; anywhere else every call would fail at spawn, so execution is disabled at load instead. */
+export const SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = ["linux", "darwin"];
+/** AC5, P21, issue #1: Check the platform and the surfaces present in pi's modules and extension API; produce exact
+ *  degradation messages. */
+export function checkCapabilities(modules: Record<string, Record<string, unknown> | undefined>, api: object, version?: string, platform: NodeJS.Platform = process.platform): CapabilityReport {
   const has = (s: Surface) => s.where === "ExtensionAPI" ? typeof (api as Record<string, unknown>)[s.name] === "function" : modules[s.where]?.[s.name] !== undefined;
   const missing = SURFACES.filter(s => !has(s));
   const name = (list: Surface[]) => list.map(s => `${s.where}.${s.name}`).join(", ");
@@ -25,9 +29,11 @@ export function checkCapabilities(modules: Record<string, Record<string, unknown
   // The evaluator's CPU limit needs worker.cpuUsage and process.threadCpuUsage (Node 22.19); without them a runaway
   // script would never be stopped, so an older Node disables execution rather than run unguarded.
   const node = typeof (process as { threadCpuUsage?: unknown }).threadCpuUsage === "function";
-  const execution = node && !missing.some(s => s.tier === 0), ui = execution && !missing.some(s => s.tier === 2);
+  const os = SUPPORTED_PLATFORMS.includes(platform);
+  const execution = os && node && !missing.some(s => s.tier === 0), ui = execution && !missing.some(s => s.tier === 2);
   const messages: string[] = [];
-  if (!node) messages.push(`Durable Subagents disabled: it needs Node.js 22.19 or later (this is ${process.version}).`);
+  if (!os) messages.push(`Durable Subagents disabled: it runs only on Linux and macOS (this is ${platform}); its process layer (process tracking, file locks, command calls) has no ${platform} implementation. Under Windows, use WSL.`);
+  else if (!node) messages.push(`Durable Subagents disabled: it needs Node.js 22.19 or later (this is ${process.version}).`);
   else if (!execution) messages.push(`Durable Subagents disabled: ${pi} no longer provides ${name(missing.filter(s => s.tier === 0))}. Running workflows are untouched; run \`pi-durable-subagents smoke\` for details.`);
   else if (!ui) messages.push(`Durable Subagents: native watch view disabled (${pi} no longer exports ${name(missing.filter(s => s.tier === 2))}); use \`pi-durable-subagents tail\`.`);
   return { ...(version ? { version } : {}), missing, execution, ui, messages };

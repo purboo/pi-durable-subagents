@@ -33,6 +33,15 @@ for (const surface of SURFACES) test(`removing ${surface.where}.${surface.name} 
   assert.match(report.messages[0]!, surface.tier === 0 ? /^Durable Subagents disabled: .*Running workflows are untouched/ : /^Durable Subagents: native watch view disabled/);
 });
 
+test("issue #1: an unsupported platform disables execution and the UI with one exact message", () => {
+  for (const platform of ["linux", "darwin"] as const) assert.ok(checkCapabilities(real(), api, "1.0.2", platform).execution, platform);
+  const report = checkCapabilities(real(), api, "1.0.2", "win32");
+  assert.equal(report.execution, false); assert.equal(report.ui, false); assert.deepEqual(report.missing, []);
+  assert.equal(report.messages.length, 1);
+  assert.match(report.messages[0]!, /^Durable Subagents disabled: it runs only on Linux and macOS \(this is win32\)/);
+  assert.equal(childRefusal(report, { DSA_EXEC: "w@1/a@1#1.1" }), report.messages[0]);
+});
+
 test("P21 a child missing execution surfaces is refused; main sessions and complete children proceed", () => {
   const broken = checkCapabilities(real(), { ...api, registerTool: undefined }, "9.9.9"), full = checkCapabilities(real(), api, "1.0.2");
   assert.equal(childRefusal(broken, { DSA_EXEC: "w@1/a@1#1.1" }), broken.messages[0]);

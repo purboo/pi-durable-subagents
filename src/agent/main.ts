@@ -6,12 +6,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { defineTool, type ExtensionAPI, type ExtensionContext, type CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { Outbox, scanInbox } from "../kernel/mailbox.ts";
 import { readerLedger } from "../orchestrator/reader-ledger.ts";
-import { OsLock } from "../platform/lock.ts";
+import { OsLock, isLockTimeout } from "../platform/lock.ts";
 import { launchOrchestrator } from "../platform/launch.ts";
 import { dsaHome, orchInbox, orchLock, outboxRoot } from "../paths.ts";
 import { CT, JT, type AttentionItem, type Request, type RunBody, type RestartBody } from "../types.ts";
 import { PendingOutboxReader, attention, presentText, presented, resolved, unfinishedWorkflow } from "./main/snapshots.ts";
-import { NOTIFY_SINCE, commandSendRefusal, isCommandTarget, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusText, statusCallDetail, statusCompactDetail, statusDetail, statusView, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
+import { NOTIFY_SINCE, activityCounts, commandSendRefusal, isCommandTarget, isLive, orchestratorTooOld, ownWorkflows, pausedElsewhere, runningOrchestrator, statusBrief, statusText, statusCallDetail, statusCompactDetail, statusDetail, statusView, outputSelect, writerWaits, writerWaitLine, WRITER_WAIT_HINT } from "../orchestrator/snapshot.ts";
 import { BATCH, checkAgents, followUpReceipt, outcomeLine, request, sendReceipt } from "./main/tool.ts";
 import { parameters } from "./main/schema.ts";
 import { batchConflict, batchDigest, findRequest, manyIds, namesMany, requestRid, sendIdentified, type Identified } from "../requests.ts";
@@ -48,13 +48,38 @@ function quitPolicy(home: string): "pause" | "continue" {
   try { return (JSON.parse(readFileSync(join(home, "config.json"), "utf8")) as { onQuit?: string }).onQuit === "continue" ? "continue" : "pause"; }
   catch { return "pause"; }
 }
+/** The pi.events channel on which a main session announces changes of its subagent activity (issue #3). */
+export const ACTIVITY_CHANNEL = "durable-subagents:activity";
+/** The payload on ACTIVITY_CHANNEL: this session's live calls by state (the dock's counts). `busy` is true while any call
+ *  works, asks or waits for a slot; paused (held) work alone is not busy. Emitted on change only, and once with every
+ *  count at zero when the session ends with any count above zero. */
+export interface SubagentActivity { sessionId: string; busy: boolean; working: number; asking: number; queued: number; paused: number }
+/** The background poll's lock helper may take this long: a machine in and out of sleep answers late (issue #2). */
+const BACKGROUND_LOCK_MS = 15_000;
+/** Consecutive background failures before one is shown; a single slow round is transient. */
+export const BACKGROUND_REPORT_AFTER = 3;
+/** Background-poll failures: a lock timeout is retried quietly on the next round; any other failure, or a timeout
+ *  repeated BACKGROUND_REPORT_AFTER times in a row, yields one line to show (once per streak, never a stack). */
+export class BackgroundFailures {
+  private streak = 0; private told = false;
+  ok(): void { this.streak = 0; this.told = false; }
+  /** The text to show for this failure, or undefined to stay quiet. */
+  fail(error: unknown): string | undefined {
+    this.streak++;
+    if (this.told || (isLockTimeout(error) && this.streak < BACKGROUND_REPORT_AFTER)) return undefined;
+    this.told = true;
+    const text = error instanceof Error ? error.message : String(error);
+    return `Durable Subagents: background check failed${this.streak > 1 ? ` ${this.streak} times in a row` : ""}: ${text}`;
+  }
+}
 const REQUEST_USE = "request is a string id for run, send or stop (not combined with replaces)";
 export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiDeps) => void): void {
   const home = dsaHome();
   let ctx: ExtensionContext | undefined, sender = "", outbox: Outbox | undefined;
   let queue: Promise<unknown> = Promise.resolve(), timer: ReturnType<typeof setInterval> | undefined;
   let reserved: AttentionItem[] = [], notes: string[] = [], stopped = true, lastStarter = 0;
-  let polling = false;
+  let polling = false, lastActivity = "", activityAt = 0;
+  const failures = new BackgroundFailures();
   const pendingReader = new PendingOutboxReader();
   const sink = (text: string) => { notes.push(text); };
   function serial<T>(fn: () => Promise<T>): Promise<T> {
@@ -70,14 +95,30 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   function pendingRids() {
     return pendingReader.read(join(outboxRoot(home), "outbox", `${sender}.jsonl`));
   }
-  async function starter(submitting = false) {
+  /** A background failure goes to pi's UI (a raw stderr write would land inside the TUI's editor); without a UI, stderr. */
+  function report(text: string) {
+    try { if (ctx?.hasUI && ctx.ui?.notify) { ctx.ui.notify(text, "warning"); return; } } catch { /* fall through */ }
+    console.error(text);
+  }
+  /** Issue #3: announce this session's activity on pi.events when it changes. */
+  function emitActivity(sessionEnds = false) {
+    const events = (pi as { events?: { emit?: (channel: string, data: unknown) => void } }).events;
+    if (typeof events?.emit !== "function" || !sender) return;
+    const counts = sessionEnds ? { working: 0, asking: 0, queued: 0, paused: 0 } : activityCounts(ownWorkflows(home, sender));
+    const activity: SubagentActivity = { sessionId: sender.slice("main:".length), busy: counts.working + counts.asking + counts.queued > 0, ...counts };
+    const key = JSON.stringify(activity);
+    if (key === lastActivity || (sessionEnds && !lastActivity)) return;
+    lastActivity = key;
+    try { events.emit(ACTIVITY_CHANNEL, activity); } catch { /* a listener's failure is not ours */ }
+  }
+  async function starter(submitting = false, background = false) {
     if (stopped) return;
     await reconcile();
     // A running orchestrator (it holds its lock) serves every pending request and workflow: then nothing is scanned.
     // Only without one is pending work looked for, stopping at the first; the scan reads workflow journals without
     // keeping them (see unfinishedWorkflow).
     await mkdir(home, { recursive: true });
-    const lock = await new OsLock().tryAcquire(orchLock(home));
+    const lock = await new OsLock(background ? BACKGROUND_LOCK_MS : undefined).tryAcquire(orchLock(home));
     if (!lock) return;
     await lock.release();
     const pending = submitting || pendingOutbox() || (await scanInbox(orchInbox(home))).length > 0 || unfinishedWorkflow(home);
@@ -121,7 +162,8 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     stopped = true; clearInterval(timer); timer = undefined;
     await queue; await outbox?.close(); outbox = undefined; pendingReader.clear();
     if (noteSink === sink) noteSink = undefined;
-    reserved = []; notes = []; ctx = undefined;
+    try { emitActivity(true); } catch { /* never block a shutdown */ }
+    reserved = []; notes = []; ctx = undefined; lastActivity = ""; failures.ok();
   }
   async function start(context: ExtensionContext) {
     await close(); ctx = context; sender = `main:${context.sessionManager.getSessionId()}`; stopped = false;
@@ -130,15 +172,21 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     if (!process.env.DSA_EXEC) process.env.DSA_SESSION = context.sessionManager.getSessionId();
     outbox = await Outbox.open(outboxRoot(home), sender, () => orchInbox(home)); noteSink = sink;
     await reconcile(); await outbox.republishPending(); await starter(); lastStarter = Date.now();
-    try { tellVersion(); } catch (error) { console.error("durable-subagents:", error); }
+    try { emitActivity(); } catch { /* the next poll tries again */ }
+    activityAt = Date.now();
+    try { tellVersion(); } catch (error) { report(`Durable Subagents: ${error instanceof Error ? error.message : String(error)}`); }
     timer = setInterval(() => {
       if (polling || stopped) return;
       polling = true;
       void serial(async () => {
         if (stopped) return;
-        if (Date.now() - lastStarter >= 30_000) { lastStarter = Date.now(); await starter(); tellVersion(); }
+        // Only a completed starter round ends a failure streak: the quiet rounds between two starters prove nothing.
+        const round = Date.now() - lastStarter >= 30_000;
+        if (round) { lastStarter = Date.now(); await starter(false, true); tellVersion(); }
+        if (Date.now() - activityAt >= 500) { activityAt = Date.now(); emitActivity(); }
         await idle();
-      }).catch(error => console.error("durable-subagents:", error)).finally(() => { polling = false; });
+        if (round) failures.ok();
+      }).catch(error => { const text = failures.fail(error); if (text) report(text); }).finally(() => { polling = false; });
     }, 200);
     timer.unref();
   }
