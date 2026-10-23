@@ -56,6 +56,8 @@ the npx cache, so `install-service` refuses to run from there.
 | Two steers arrive out of order and the second replaces the first | Only the second one applies. |
 | A step is refused, or a dependency fails | The workflow stops that branch cleanly. Nothing is retried in vain. |
 | A provider's usage window runs out (`No available accounts`, usage limit, quota exceeded, a daily quota at 0) | Found at the second refusal in a row, while pi is still retrying. A call in a pool continues **in the same session** on the pool's next model (within pi's next retry or two); new calls skip that provider. After 15 minutes the next call that wants it tries it once; when it answers, new calls and new generations use it again. A call with a single model waits for it instead of failing. Billing errors (402, insufficient balance) still fail at once. |
+| A gateway answers HTTP 200 with a quota notice ("your usage window is used up") | Matched against the provider's `exhaustedPatterns` (see [Configuration](#configuration)): the provider is avoided until its next probe, like a quota error, the message never becomes the result, and the call continues on the pool's next usable model. Without one the call fails with `model-unavailable:` and the matched text (clipped to 200 characters). |
+| A pool does not resolve (it names itself, it is empty, or one of its entries is not a model) | That call fails at once with `model-unavailable: pool "<name>" does not resolve: <reason>`. It is a configuration error of the call, not of the orchestrator: other calls are unaffected. |
 | Two subagents would write in the same worktree | Only one runs there at a time. A call that can write (its tools include `edit` or `write`, which pi's default tools do) holds its git worktree's writer lock from its launch until it ends, also while it waits for an answer. Another writer for that worktree waits in order, and status shows `waiting for writer lock: <root> held by <wid>/<key>`. `writer: false` (a call that does not write there), `isolation: "worktree"` and `"writerLock": "off"` opt out. |
 | A subagent waits for an answer for a long time | It releases its model slot and memory, then resumes exactly once when you answer. A forwarded answer prevents planned hibernation. If an execution was stopped after consuming the answer, recovery continues the same session without another answer. The question survives orchestrator restarts (also forced ones) and crashes, including one that hits before the subagent released its slot. |
 | A subagent's work ends (finished, stopped, or cut off) | Every process its tools started ends with that execution, also ones started with `nohup`, `setsid` or `&`: they carry the execution's tag (see the limit below). For work that must outlive its turn, the subagent can start a durable command call with `run --wake caller -- …` (below). A `hold` run directly by its tools is no exception: a forced restart stops it and its lease is released. |
@@ -262,6 +264,106 @@ restarts; a retry with the same request id returns the first outcome. Legacy
 model forwards without the new optional `choice` retain their 1.1
 execution-only semantics; upgrading does not make an old switch sticky.
 
+### The exact fork
+
+`context: "exact"` runs a call as a continuation of the *calling* pi session's
+last provider request: the parent capture supplies every field of that request
+byte for byte (system prompt or instructions, tools, tool choice, model,
+thinking, max tokens, prompt cache key, metadata), and the child's own
+conversation is appended to the parent's conversation. The child's agent
+definition, context files and skills never reach the provider. This is the
+third context value next to `"fresh"` (a call with no context of its own) and
+`"fork"` (a call that inherits the parent's effective context as pi sends it):
+the fork copies the parent's *messages*, the exact fork copies the parent's
+*whole request* and adds the child's turns to it.
+
+The parent session is the one that starts the call. It writes its latest
+provider payload to `$DSA_HOME/exact/<sessionId>.json` (mode 0600, atomic
+replace, off the request path); the file holds the serialized provider payload
+and the request's identity (the session id, provider, model, api, thinking and
+the time of the request), never headers and never credentials. The orchestrator
+removes capture files that were not modified for 7 days when it starts.
+`"exactCapture": false` turns the capture off: no file is written and an exact
+run falls back (`no-capture`).
+
+A run whose specs are known (the call, `tasks`, `chain`) takes its context
+from that spec. A workflow script's specs are built while it runs, so there
+the run is admitted as an exact run only when its source names `"exact"` (or
+has `"exact"` as one of its `args`), and it needs an origin session like any
+other exact run. A call's own spec keeps its `context` in every form, a
+script's `runs.run` spec included.
+
+An exact run pins the capture of its origin session at admission, so a later
+capture never changes a pinned run, and a follow-up of the call reuses it. The
+call launches on the captured provider, model and thinking: it holds that
+provider's slot and waits for it like any launch, and it has no pool failover
+(a provider that is used up makes the call fail as a concrete model would).
+
+Two things are refused at admission: a call with `context: "exact"` that also
+names a `model` (`context "exact" runs on the origin model; remove model`), and
+an exact run without an origin session (`context "exact" needs an origin
+session: run it from a pi session, or give --origin-session <pi session id>`).
+From the CLI, `--origin-session <pi session id>` names that session; it is
+accepted only for `context: "exact"` calls.
+
+The tools the model sees are the parent's. The call's own tools (the spec's
+tools or the agent's, plus the protocol tools) are the allow-list, enforced
+when the model calls a tool: a tool outside the allow-list, a tool the capture
+lists but the exact child cannot execute, and always `subagents` (no
+recursion) are refused with a result starting `tool refused in exact fork:`,
+and the child continues. A request on another provider, model or api than the
+capture is not sent: the call fails with `exact-mismatch: <detail>`. Anthropic
+cache breakpoints of the parent's conversation are kept; the child's own
+markers are kept only while the request stays within the provider's limit of
+four, the child's earliest one first.
+
+A call that cannot be exact at launch runs as `context: "fork"` and records
+why:
+
+| reason | when |
+|---|---|
+| `no-capture` | the origin session has no capture (the capture is off, or the session made no request yet) |
+| `api:<name>` | the capture's api cannot be spliced (only `anthropic-messages` and `openai-responses` can) |
+| `model-unknown` | the captured provider is not configured for the orchestrator |
+| `no-payload-hook` | the child transport never offers the payload hook (detected at the first request) |
+
+The decision is taken once per call: a rebuilt call never retries exact later.
+
+`describe` of such a call adds an `exact` field (the mode, the reason of a
+rebuilt call, the pinned capture's sha256, size and time, the provider and
+model, the age of the capture at the launch, and the usage of every provider
+request). The status text and the finished-call notice show one line:
+
+```text
+exact: cache 97% (148.2K/152.6K) · $0.031 · age 41s
+exact: rebuilt (no-capture) · $0.031
+```
+
+The cache share is that of the first request (`cacheRead / (input +
+cacheRead)`). A provider's cache window is a few minutes: an exact fork of a
+parent that has been idle for longer is exact but reads little cache, and the
+ratio shows it.
+
+### Forked context
+
+`context: "fork"` pins the parent's *effective* context, the one pi itself
+sends to the model, rather than every message on the session branch.
+
+On a compacted branch the fork pins the latest compaction (its summary, shown
+as pi presents it, plus its `systemMessage` when it has one), the entries kept
+from its `firstKeptEntryId` on, and every entry after it — exactly as pi's
+session-context builder selects them. Raw messages from before the compaction
+are not copied, and system messages inside the kept range are dropped, as pi
+drops them. On an uncompacted branch nothing changes from 1.2: the `message`
+and `model_change` entries of the branch are pinned byte for byte.
+
+dsa's own `dsa-*` receipts are never pinned, on either kind of branch, and
+neither are the entries pi does not send to the model (thinking-level changes,
+labels, session info). The child keeps its own thinking level. The pin is
+taken at admission, as before: a compaction in the parent after admission does
+not change a pinned run, and a follow-up generation reuses the child's own
+session.
+
 ### Workflow scripts
 
 A workflow is a plain script. These are the globals it can use:
@@ -284,12 +386,19 @@ single file: it cannot `import` or `require` other modules.
 - `timeoutMs` (active time), `output` (a relative path becomes an artifact);
 - `schema` (a structured `report`);
 - `gate` (a command, or `{command, output: "json", schema, timeoutMs}`);
-- `isolation: "worktree"`, `context: "fork"`, `budget`;
+- `isolation: "worktree"`, `context: "fork"` or `context: "exact"`, `budget`;
 - `writer` (`false`: the call does not write in its cwd's worktree, so it does
   not take that worktree's writer lock; `true`: it does, whatever its tools).
 
 A spec with `command` instead of `agent` and `task` is a
 [command call](#command-calls).
+
+A workflow script's specs are built while it runs, so the run is admitted as an
+exact run only when its source names `"exact"` (or has `"exact"` as one of
+its `args`); such a run needs an origin session (see
+[The exact fork](#the-exact-fork)). A run whose specs are known — the call,
+`tasks`, `chain` — takes its context from that spec. A call's own spec keeps
+its `context` in every form, a script's `runs.run` spec included.
 
 The result has `ok`, `status`, the full `output` text and the structured
 `data`.
@@ -529,7 +638,7 @@ pi-durable-subagents start              start the orchestrator if work is pendin
 pi-durable-subagents resume [wid]       continue unfinished or parked work (undoes drain / stop-all)
 pi-durable-subagents drain              hold existing workflows: running calls finish, nothing new starts in them
 pi-durable-subagents stop <wid|call>
-pi-durable-subagents run --request <id> [--wake caller] --spec <file|-> [--labels <json>] [--session <id>] [--cwd <dir>] [--json] [--wait-ms <n>]
+pi-durable-subagents run --request <id> [--wake caller] --spec <file|-> [--labels <json>] [--session <id>] [--origin-session <id>] [--cwd <dir>] [--json] [--wait-ms <n>]
 pi-durable-subagents run --request <id> [--wake caller] [--cwd <dir>] [--timeout-ms <n>] [--name <text>] [--labels <json>] [--session <id>] [--json] [--wait-ms <n>] -- <program> [args…]
                                         start a run under a caller-chosen id; safe to retry (see below)
 pi-durable-subagents send --request <id> --to <run-id|wid/key> [--to ...] --kind follow-up|answer|steer|notify|model
@@ -572,7 +681,10 @@ retry from the same place or pass it explicitly. The `spec` file is the
 `subagents` tool's run form (`{agent, task, model?, schema?, …}`,
 `{command, cwd?, timeoutMs?, env?, rerun?}` or
 `{tasks: […], name?, usageBudget?, maxCalls?}`); `context: "fork"` needs a pi
-session and is rejected.
+session and is rejected. `context: "exact"` is available here with
+`--origin-session <pi session id>`, which names the session whose capture the
+run pins (see [The exact fork](#the-exact-fork)); without it an exact run is
+refused, because the capture comes from that session.
 
 The `run -- …` shorthand submits `{command: [program, ...args], timeoutMs?,
 name?}` through the same normalizer. Arguments after `--` are literal; use
@@ -626,7 +738,9 @@ run's origin session (what `context: "fork"` copies, and where notices go) is
 not part of the digest. Only a run that can fork copies the origin branch: its
 script quotes `"fork"` or a string in its `args` is `"fork"`; any other run
 copies nothing, and a call of it that builds `context: "fork"` some other way
-fails with "fork requested but the run has no origin session". A retry of the same id from another session therefore
+fails with "fork requested but the run has no origin session". A run that asks
+for `context: "exact"` copies the origin branch too (a rebuilt exact call runs
+as a fork) and pins the capture of its origin session. A retry of the same id from another session therefore
 gets the first session's workflow, its notices and its forked context. A
 retried answer may leave out `to`, `qid` and `rev`: it addresses the question
 the first attempt answered.
@@ -689,6 +803,15 @@ clipped to 200 characters, empty when unreadable (Linux `/proc`, macOS `ps`).
 The direct pi child is excluded; command calls and gates have no such
 records. These fields are absent when nothing was recorded. They diagnose
 signal targets, not proof of death (see the limits below).
+
+A call with `context: "exact"` (or one that was rebuilt as a fork) has an
+`exact` field in `describe`: `mode` (`exact` or `rebuilt`), the `reason` of a
+rebuilt call (`no-capture`, `api:<name>`, `model-unknown`, `no-payload-hook`),
+the pinned capture's `captureSha256`, `captureBytes` and `capturedAt`, its
+`provider` and `model`, `ageMsAtLaunch`, and the usage of every provider
+request (`requests`, `input`, `cacheRead`, `cacheWrite`, `output`, `costUsd`,
+with `firstCacheRatio` for the first request). A call with another context has
+no such field.
 
 ```sh
 pi-durable-subagents run --request build-42 --spec build-42.json --json
@@ -1054,7 +1177,8 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   "providers": { "anthropic": { "slots": 4 } },
   "memory": { "reserveMb": 2048, "perChildMb": 300 },
   "writerLock": "queue",
-  "askRequireDecision": false
+  "askRequireDecision": false,
+  "exactCapture": true
 }
 ```
 
@@ -1144,6 +1268,26 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   It is snapshotted when each child execution starts: changing it affects
   executions started afterwards, not a child already running; a resumed
   execution receives the current setting. False keeps question-only asks valid.
+- **Quota notices in a successful answer:** `"exhaustedPatterns": ["额度已使用完毕"]` on a
+  provider treats a message that says the usage window is used up as a quota
+  failure, even when the gateway answered with HTTP 200. Each entry is a
+  JavaScript regular expression, matched case-insensitively against an
+  assistant message's combined text; a message that carries a tool call is
+  never matched. A match marks the provider exhausted (avoided until its next
+  probe), the message never becomes the call's result and the next model
+  never sees it, and the call continues on the next usable model of its pool.
+  Without one the call fails with `model-unavailable:` and the matched text
+  clipped to 200 characters. Choose patterns specific to the gateway's notice:
+  a broad pattern can also match an ordinary answer quoting it. An invalid
+  expression is rejected when the configuration is loaded, with an error naming
+  the provider; a pattern that still reaches a child is skipped there instead
+  of breaking the child. The patterns are snapshotted when an execution
+  starts, so a configuration change applies to later executions.
+- **The exact capture:** `"exactCapture": false` stops the extension from
+  writing the capture of the top-level sessions' provider requests
+  (`$DSA_HOME/exact/<sessionId>.json`). An exact call then runs as a fork and
+  says why (`no-capture`). The default is true; the key is validated and
+  participates in the orchestrator config hash.
 - **onQuit:** `"pause"` (default) pauses a session's running workflows when
   you quit that pi; `"continue"` lets them run on in the background.
 - **Changes apply without a restart:** the orchestrator re-reads the file
@@ -1266,6 +1410,21 @@ SIGTERM, which is not atomic: a call launched in between is fenced and resumes.
 The old orchestrator cannot record the new audit fields. A pi session started before the update still
 loads the old extension; start a new one.
 
+### Upgrading to 1.3.0
+
+Restart the orchestrator on 1.3.0 and start a new pi session to load the new
+extension before relying on the exact fork, the forked compaction context or
+`exhaustedPatterns`; a child that is already running keeps the settings it
+was started with. Existing journals, request digests and decisions keep their
+meaning. A call with another context has no `exact` field, and a request
+without the new fields keeps its digest.
+
+An exact call needs a parent session that captured a request: a session that
+made no provider request yet, or one with `"exactCapture": false`, produces a
+rebuilt call (a fork) whose reason is shown in `status` and `describe`. A
+fork on a compacted branch now pins the compaction's summary and kept entries
+instead of the raw messages before it; an uncompacted branch is unchanged.
+
 ### Upgrading to 1.2.0
 
 Restart the orchestrator on 1.2.0 and start a new pi session to load the new
@@ -1323,6 +1482,14 @@ records are scoped to the call and revision, not another key or revision.
   Recovery without a persisted direct-child identity omits roots (including
   orphaned descendants) from diagnostics but still fences them. Command
   lines can contain sensitive arguments, like other workflow diagnostics.
+- The exact fork splices the payload of a request. A provider that refuses a
+  request whose conversation does not start at the beginning of a conversation
+  refuses it; the call fails with the provider's own error. The exact fork is
+  one conversation deep: the child's own conversation grows with its turns,
+  while the parent's conversation stays the one the capture holds. A capture
+  of a session that compacted its context carries the compacted conversation,
+  and a provider's cache window is short: an exact fork of a parent that has
+  been idle for a while is exact but reads little cache.
 - Model and tool behaviour belong to the models and tools you use.
 
 ## License

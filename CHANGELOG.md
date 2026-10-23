@@ -1,5 +1,74 @@
 # Changelog
 
+## 1.3.0
+
+- The exact fork: `context: "exact"` runs a call as a continuation of the calling pi session's last provider request. The
+  parent capture supplies every field of the request byte for byte (system prompt or instructions, tools, tool choice,
+  model, thinking, max tokens, prompt cache key, metadata) and the child's own conversation is appended to the parent's
+  conversation. The child's agent definition, context files and skills never reach the provider. The child launches on
+  the captured provider, model and thinking: it holds that provider's slot and waits for it like any launch, and it has
+  no pool failover. The exact context of a run is read from its specs when it has them (the call, the tasks, the chain);
+  a workflow script's specs are built while it runs, so there the run is admitted as an exact run only when its source
+  names `"exact"` (or has `"exact"` as one of its `args`), and such a run needs an origin session. A call's own spec
+  keeps its `context` in every form, a script's `runs.run` spec included.
+- The exact capture: a top-level pi session (one that is not inside a dsa call) writes its latest provider payload to
+  `$DSA_HOME/exact/<sessionId>.json` (mode 0600, atomic replace, off the request path). The file holds the serialized
+  provider payload and the request's identity (the session id, provider, model, api, thinking and the time of the
+  request); never headers, never credentials. The orchestrator removes capture files that were not modified for 7 days
+  when it starts. The configuration key `exactCapture` (boolean, default true) turns the capture off: no file is
+  written and an exact run falls back (`no-capture`). An exact run pins the capture of its origin session at admission,
+  so a later capture never changes a pinned run.
+- Exact admission and the CLI: a call with `context: "exact"` that also names a `model` is refused at admission
+  (`context "exact" runs on the origin model; remove model`), and an exact run without an origin session is refused
+  (`context "exact" needs an origin session: run it from a pi session, or give --origin-session <pi session id>`). The
+  new CLI flag `run --spec ... --origin-session <pi session id>` names that session; it is accepted only for
+  `context: "exact"` calls and refused otherwise. `isolation`, `tools`, `skills`, `budget`, `timeoutMs`, `once` and
+  `writer` keep their meaning.
+- Exact tools and mismatches: the tools the model sees are the parent's. The call's own tools (the spec's tools or the
+  agent's, plus the protocol tools) are the allow-list, enforced when the model calls a tool: a tool outside the
+  allow-list, a tool the capture lists but the exact child cannot execute, and always `subagents` (no recursion) are
+  refused with a result starting `tool refused in exact fork:` and the child continues. A request on another provider,
+  model or api than the capture is not sent: the call fails with `exact-mismatch: <detail>`. Anthropic cache
+  breakpoints of the parent's conversation are kept; the child's own markers are kept only while the request stays
+  within the provider's limit of four, dropping the child's earliest first.
+- Exact fallback and report: a call that cannot be exact at launch runs as `context: "fork"` and records why:
+  `no-capture` (the origin session has no capture), `api:<name>` (the api cannot be spliced; only `anthropic-messages`
+  and `openai-responses` can), `model-unknown` (the captured provider is not configured) or `no-payload-hook` (the child
+  transport never offers the payload hook). The decision is taken once per call: a rebuilt call never retries exact
+  later. `describe` adds an `exact` field to such a call (mode, the reason of a rebuilt call, the pinned capture's
+  sha256, size and time, the provider and model, the age of the capture at the launch, and the usage of every provider
+  request). The status text and the finished-call notice show one line: `exact: cache 97% (148.2K/152.6K) · $0.031 ·
+  age 41s`, or `exact: rebuilt (no-capture) · $0.031` for a rebuilt call. The cache share is that of the first request
+  (`cacheRead / (input + cacheRead)`).
+- Forked context follows compaction: `context: "fork"` now pins the parent's effective context, the one pi itself sends
+  to the model, instead of every message on the session branch. On a compacted branch the fork pins the latest
+  compaction (its summary as pi presents it, plus its `systemMessage` when it has one), the entries kept from its
+  `firstKeptEntryId` on and every entry after it; raw messages from before the compaction are not copied. An
+  uncompacted branch is unchanged from 1.2: the `message` and `model_change` entries are pinned byte for byte. dsa's own
+  `dsa-*` receipts are never pinned, on either kind of branch. The pin is taken at admission, as before: a compaction in
+  the parent after admission does not change a pinned run.
+- Quota notices answered with HTTP 200: a provider's configuration gains `exhaustedPatterns`, a list of JavaScript
+  regular expressions matched case-insensitively against an assistant message's combined text. A message with a tool
+  call is never matched. A match marks the provider exhausted like a quota-class error does (it is avoided until its
+  next probe), the message never becomes the call's result and the next model never sees it, and the call continues on
+  the next usable model of its pool. Without one the call fails with `model-unavailable:` and the matched text clipped
+  to 200 characters. An invalid expression is rejected when the configuration is loaded, with an error naming the
+  provider; a pattern that still reaches a child is skipped there instead of breaking the child.
+- Hardening: a pool that does not resolve (it names itself, it is empty, or one of its entries is not a model) is a
+  configuration error of that call, not of the orchestrator: the call is sealed `failed` with `model-unavailable: pool
+  "<name>" does not resolve: <reason>`. Before this, the launch sealed the call failed with a bare `Error: Cyclic model
+  pool: <name>`; only the mid-call pool step (the executor's quota-notice step, which resolves the pool again when a
+  provider answers with its quota notice) let the error escape the executor unsealed: the call was never sealed and
+  the orchestrator's run promise rejected.
+  A fork's pin now drops every dsa receipt, whether the custom type sits in the entry's message or on the entry
+  itself, so an uncompacted branch, a compacted branch and the published fork session agree.
+- Upgrade notes: restart the orchestrator on 1.3.0 and start a new pi session to load the new extension before relying
+  on the exact fork, the forked compaction context or `exhaustedPatterns`; an already running child keeps the settings
+  it was started with. Existing journals, request digests and decisions keep their meaning; a call with another context
+  has no `exact` field, and a request without the new fields keeps its digest. An exact call needs a pi session that
+  captured a request: a session that made no provider request yet, or one with `exactCapture` turned off, produces a
+  rebuilt call with the reason shown.
+
 ## 1.2.0
 
 - Structured asks: the child `ask` tool keeps required `question: string` and adds optional `decision_needed` (one
