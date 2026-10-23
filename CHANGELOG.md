@@ -8,8 +8,9 @@
   conversation. The child's agent definition, context files and skills never reach the provider. The child launches on
   the captured provider, model and thinking: it holds that provider's slot and waits for it like any launch, and it has
   no pool failover. The exact context of a run is read from its specs when it has them (the call, the tasks, the chain);
-  a workflow script's specs are built while it runs, so there the context is read from the script's source: a script that
-  quotes `"exact"` (or has `"exact"` as one of its `args`) is an exact run and needs an origin session.
+  a workflow script's specs are built while it runs, so there the run is admitted as an exact run only when its source
+  names `"exact"` (or has `"exact"` as one of its `args`), and such a run needs an origin session. A call's own spec
+  keeps its `context` in every form, a script's `runs.run` spec included.
 - The exact capture: a top-level pi session (one that is not inside a dsa call) writes its latest provider payload to
   `$DSA_HOME/exact/<sessionId>.json` (mode 0600, atomic replace, off the request path). The file holds the serialized
   provider payload and the request's identity (the session id, provider, model, api, thinking and the time of the

@@ -288,9 +288,10 @@ run falls back (`no-capture`).
 
 A run whose specs are known (the call, `tasks`, `chain`) takes its context
 from that spec. A workflow script's specs are built while it runs, so there
-the context is read from the script's source: a script that quotes `"exact"`
-(or has `"exact"` as one of its `args`) is an exact run, and it needs an
-origin session like any other exact run.
+the run is admitted as an exact run only when its source names `"exact"` (or
+has `"exact"` as one of its `args`), and it needs an origin session like any
+other exact run. A call's own spec keeps its `context` in every form, a
+script's `runs.run` spec included.
 
 An exact run pins the capture of its origin session at admission, so a later
 capture never changes a pinned run, and a follow-up of the call reuses it. The
@@ -385,18 +386,19 @@ single file: it cannot `import` or `require` other modules.
 - `timeoutMs` (active time), `output` (a relative path becomes an artifact);
 - `schema` (a structured `report`);
 - `gate` (a command, or `{command, output: "json", schema, timeoutMs}`);
-- `isolation: "worktree"`, `context: "fork"`, `budget`;
+- `isolation: "worktree"`, `context: "fork"` or `context: "exact"`, `budget`;
 - `writer` (`false`: the call does not write in its cwd's worktree, so it does
   not take that worktree's writer lock; `true`: it does, whatever its tools).
 
 A spec with `command` instead of `agent` and `task` is a
 [command call](#command-calls).
 
-A workflow script's specs are built while it runs, so the context of such a
-run is read from the script's source: a script that quotes `"exact"` (or has
-`"exact"` as one of its `args`) is an exact run and needs an origin session
-(see [The exact fork](#the-exact-fork)). A run whose specs are known — the
-call, `tasks`, `chain` — takes its context from that spec.
+A workflow script's specs are built while it runs, so the run is admitted as an
+exact run only when its source names `"exact"` (or has `"exact"` as one of
+its `args`); such a run needs an origin session (see
+[The exact fork](#the-exact-fork)). A run whose specs are known — the call,
+`tasks`, `chain` — takes its context from that spec. A call's own spec keeps
+its `context` in every form, a script's `runs.run` spec included.
 
 The result has `ok`, `status`, the full `output` text and the structured
 `data`.
