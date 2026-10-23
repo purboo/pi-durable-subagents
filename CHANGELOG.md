@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.1
 
 - Windows (issue #1): the extension now disables itself at load on any platform other than Linux and macOS, with one
   message naming the platform, instead of registering tools whose every call failed with `C2 capability unavailable`.
