@@ -93,10 +93,14 @@ export function registerExactChild(pi: ExtensionAPI, exact: ExactChild): void {
     const capture = await captureOf();
     if (!capture) return;
     const model = typeof payload.model === "string" ? payload.model : undefined;
+    // The request names its model as the provider receives it (the wire name), which is not always pi's catalog id
+    // (a gateway alias registers "M" and sends "p/M"): it is compared with the captured request's wire name, and with
+    // the catalog id only when the captured request names none.
+    const captured = typeof capture.payload.model === "string" ? capture.payload.model : capture.model;
     // A mismatch is never thrown here: pi's runner catches the error and sends the request unchanged, which would be
     // a cold request. The turn is aborted instead (the context hook has already refused it).
-    if (capture.model && model && model !== capture.model) {
-      refuse(`exact-mismatch: the request names model ${model}, the capture names ${capture.model}`, ctx);
+    if (captured && model && model !== captured) {
+      refuse(`exact-mismatch: the request names model ${model}, the capture names ${captured}`, ctx);
       return;
     }
     spliced = true;
