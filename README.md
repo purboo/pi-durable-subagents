@@ -34,8 +34,14 @@ pi install npm:pi-durable-subagents
 pi install git:github.com/purboo/pi-durable-subagents
 ```
 
-This needs pi 1.0.x and Node.js 22.19 or later. It has been tested with
-pi 1.0.2 on Linux. The CI configuration covers Linux and macOS.
+This needs pi 1.0.x and Node.js 22.19 or later, on Linux or macOS. It has
+been tested with pi 1.0.2 on Linux. The CI configuration covers Linux and
+macOS.
+
+Windows is not supported: process tracking, file locks, command calls and
+the login service exist only for Linux and macOS. On Windows the extension
+disables itself when pi loads it, with one message, and registers no tool.
+Under Windows, run pi inside WSL.
 
 The `pi-durable-subagents` command line (below) is optional. Run it without
 installing through `npx pi-durable-subagents …`, or install it once with
@@ -578,6 +584,30 @@ The main agent is interrupted only when there is something to decide:
 
 Each one arrives once. A reminder that was already resolved is shown as
 resolved, never as open.
+
+Background checks stay quiet too. A slow round (a machine dozing in and out
+of sleep) is retried on the next one; a failure is shown once per streak as
+a pi notification, never written into the terminal under the editor.
+
+### Activity for other extensions
+
+A main session announces its subagent activity on `pi.events` whenever it
+changes, so another extension (a terminal-title spinner, a status bar) can
+tell that work goes on after the main agent settles:
+
+```ts
+pi.events.on("durable-subagents:activity", data => {
+  const { sessionId, busy, working, asking, queued, paused } = data as {
+    sessionId: string; busy: boolean; working: number; asking: number; queued: number; paused: number;
+  };
+});
+```
+
+The counts are this session's live calls by state, the same as the summary
+line above the editor. `busy` is true while any call works, asks or waits
+for a slot; paused work alone is not busy. The first state is sent when the
+session starts, then only changes, and every count at zero when the session
+ends with work still counted.
 
 ## Your pi-subagents scripts, unchanged
 

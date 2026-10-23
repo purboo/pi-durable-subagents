@@ -1,5 +1,5 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { answerForwardedNote, commandLine, isLive, queuedText, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
+import { activityCounts, answerForwardedNote, commandLine, isLive, queuedText, labelsText, liveCalls, ownedBy, progressOf, type CallSnapshot, type WorkflowSnapshot } from "../orchestrator/snapshot.ts";
 import type { CallStatus } from "../types.ts";
 import type { sessionFacts } from "./session.ts";
 import { oneLine } from "./frame.ts";
@@ -173,13 +173,9 @@ const WORD_ORDER = ["done", "stopped", "failed", "timeout", "budget", "unknown",
 
 /** UI §1,4, v12 §4: One working sentence; done/total uses planned totals, `n+` while a script workflow keeps proposing. */
 export function summary(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; queued: number; paused: number; done: number; total: number; plus: boolean } {
-  const running = workflows.filter(isLive), open = (w: WorkflowSnapshot) => liveCalls(w).length;
-  const asking = running.reduce((n, w) => n + liveCalls(w).filter(c => w.attention.some(a => a.kind === "question" && a.call === c.callId)).length, 0);
-  const paused = running.filter(w => w.paused).reduce((n, w) => n + open(w), 0); // held work is not working: it burns nothing
-  // Waiting for a slot is not working either: nothing is spent until it launches.
-  const queued = running.filter(w => !w.paused).reduce((n, w) => n + liveCalls(w).filter(c => c.phase === "queued" && !w.attention.some(a => a.kind === "question" && a.call === c.callId)).length, 0);
-  const progress = running.map(progressOf);
-  return { working: running.reduce((n, w) => n + open(w), 0) - asking - paused - queued, asking, queued, paused,
+  // Held and queued work is not working: nothing is spent until it launches (see activityCounts).
+  const progress = workflows.filter(isLive).map(progressOf);
+  return { ...activityCounts(workflows),
     done: progress.reduce((n, p) => n + p.done, 0), total: progress.reduce((n, p) => n + p.total, 0), plus: progress.some(p => p.plus) };
 }
 /** UI §1, v12 §4: What needs you first, then what is running, then progress — e.g. "1 asking · 3 working · 12/40 done". */

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -129,6 +129,23 @@ test("OS lock releases on holder SIGKILL and exactly one concurrent acquirer suc
     await Promise.all(children.map(cleanup));
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("issue #2: a lock helper that does not answer in time fails with the transient timeout code, after the given limit", { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dsa-lock-slow-"));
+  try {
+    // A perl that never answers (a machine going back to sleep): first on PATH.
+    await writeFile(join(dir, "perl"), "#!/bin/sh\nread x\n", { mode: 0o755 });
+    const child = spawn(process.execPath, ["--input-type=module", "-e", `
+      import {OsLock, isLockTimeout} from ${JSON.stringify(lockModule)};
+      const started = Date.now();
+      try { await new OsLock(400).tryAcquire(process.argv[1]); console.log('acquired'); }
+      catch (error) { console.log(JSON.stringify({ timeout: isLockTimeout(error), message: error.message, ms: Date.now() - started })); }
+    `, join(dir, "lock")], { stdio: "pipe", env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
+    const out = JSON.parse(await line(child)) as { timeout: boolean; message: string; ms: number };
+    assert.equal(out.timeout, true); assert.match(out.message, /^C4 lock helper timeout \(400 ms\)$/);
+    assert.ok(out.ms >= 380 && out.ms < 3000, `${out.ms} ms`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("C3 fence never kills a pid whose start differs from the scanned identity (pid reuse)", { skip: process.platform !== "linux", timeout: 10000 }, async () => {

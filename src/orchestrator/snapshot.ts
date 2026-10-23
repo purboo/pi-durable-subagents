@@ -217,6 +217,18 @@ export function liveCalls(wf: Pick<WorkflowSnapshot, "status" | "calls">): CallS
   return wf.calls.filter(c => c.phase !== "sealed" && (wf.status === "running" || c.afterEnd === true));
 }
 
+/** The live calls of a session's workflows by state: asking (a question is open), paused (held: it burns nothing),
+ *  queued (waiting for a slot or lock, nothing spent yet) and working (everything else). The dock's summary and the
+ *  `durable-subagents:activity` event share these counts. */
+export function activityCounts(workflows: readonly WorkflowSnapshot[]): { working: number; asking: number; queued: number; paused: number } {
+  const running = workflows.filter(isLive), open = (w: WorkflowSnapshot) => liveCalls(w).length;
+  const asks = (w: WorkflowSnapshot, c: CallSnapshot) => w.attention.some(a => a.kind === "question" && a.call === c.callId);
+  const asking = running.reduce((n, w) => n + liveCalls(w).filter(c => asks(w, c)).length, 0);
+  const paused = running.filter(w => w.paused).reduce((n, w) => n + open(w), 0);
+  const queued = running.filter(w => !w.paused).reduce((n, w) => n + liveCalls(w).filter(c => c.phase === "queued" && !asks(w, c)).length, 0);
+  return { working: running.reduce((n, w) => n + open(w), 0) - asking - paused - queued, asking, queued, paused };
+}
+
 /** v12 §4: done/total of one workflow: `done` counts keys whose latest generation is sealed; `total` is the planned
  *  count when known, else keys proposed so far (`plus` marks the `n+` script case while the workflow runs). */
 export function progressOf(wf: Pick<WorkflowSnapshot, "calls" | "planned" | "status">): { done: number; total: number; plus: boolean } {

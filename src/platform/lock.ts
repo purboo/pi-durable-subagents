@@ -15,8 +15,15 @@ print('locked',flush=True)
 while sys.stdin.buffer.read(4096): pass
 `;
 
+/** The error code of a helper that did not answer in time (a slow or suspended machine): transient, not a broken lock. */
+export const LOCK_TIMEOUT = "DSA_LOCK_TIMEOUT";
+export function isLockTimeout(error: unknown): boolean { return (error as { code?: unknown } | undefined)?.code === LOCK_TIMEOUT; }
+
 /** C4: A kernel flock held by a helper whose stdin belongs only to the holder. */
 export class OsLock implements Contract {
+  /** `timeoutMs` bounds how long the helper may take to answer (3 s by default; background callers allow more). */
+  private readonly timeoutMs: number;
+  constructor(timeoutMs = 3000) { this.timeoutMs = timeoutMs; }
   /** C4: Attempt non-blocking exclusion; holder death closes the helper's stdin. */
   async tryAcquire(path: string): Promise<LockHandle | null> {
     if (process.platform !== "linux" && process.platform !== "darwin") throw new Error(`C4 capability unavailable: ${process.platform}`);
@@ -44,7 +51,7 @@ export class OsLock implements Contract {
             if (code === 2) return false;
             throw new Error(`C4 lock helper exited (${code}): ${errorText}`);
           }),
-          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("C4 lock helper timeout")), 3000); }),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error(`C4 lock helper timeout (${this.timeoutMs} ms)`), { code: LOCK_TIMEOUT })), this.timeoutMs); }),
         ]);
         if (!acquired) return null;
         let release: Promise<void> | undefined;
