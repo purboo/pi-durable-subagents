@@ -15,11 +15,14 @@ message that names the pool:
 model-unavailable: pool "writer" does not resolve: Cyclic model pool: writer
 ```
 
-Before this, the error escaped the executor: the call was never sealed, the
-orchestrator's run promise rejected, and the error surfaced as an unhandled
-failure of the whole orchestrator start instead of of the one call. The same
-holds when the pool stops resolving while a call is running (a configuration
-change between two executions of one call).
+Before this, the two sites failed differently. At the launch the call was
+already sealed `failed`, but with the bare message `Error: Cyclic model pool:
+<name>` instead of one that names the pool. Only the mid-call pool step (the
+executor's quota-notice step, which resolves the pool again when a provider
+answers with its quota notice) let the error escape `execute()` unsealed: the
+call was never sealed, the orchestrator's run promise rejected, and the error
+surfaced as an unhandled failure of the whole orchestrator start instead of of
+the one call.
 
 #### A used-up provider ends a quota-notice call at once
 
