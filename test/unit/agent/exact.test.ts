@@ -218,6 +218,25 @@ test("EX4 the exact child refuses a request on another model without throwing", 
   assert.equal(receipt?.data.exec, "call#1.1", "the receipt names its execution, like every other child receipt");
 });
 
+test("EX4 the request's wire model is compared with the captured request's, not with the catalog id", async t => {
+  // A provider whose catalog id ("M") differs from the model name it sends ("p/M"), e.g. a gateway alias.
+  const wire = capture({ model: "M", payload: { ...capture().payload, model: "p/M" } });
+  const f = childFixture(t, { exec: "call#1.1", capture: wire });
+  f.ctx.model = { provider: "qa", id: "M", api: "anthropic-messages" };
+  await f.hooks.get("context")!({ type: "context" }, f.ctx);
+  const out = await f.hooks.get("before_provider_request")!({ payload: { model: "p/M", max_tokens: 1, stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: "child task" }] }] } }, f.ctx) as Record<string, unknown>;
+  assert.equal(f.ctx.aborted, false, "the same wire model is not a mismatch");
+  assert.equal(f.history.some(e => e.customType === CT.exactMismatch), false);
+  assert.equal(out?.model, "p/M");
+  const g = childFixture(t, { exec: "call#1.2", capture: wire });
+  g.ctx.model = { provider: "qa", id: "M", api: "anthropic-messages" };
+  assert.equal(await g.hooks.get("before_provider_request")!({ payload: { model: "p/X", messages: [] } }, g.ctx), undefined);
+  assert.equal(g.ctx.aborted, true, "another wire model is still refused");
+  assert.match(g.history.find(e => e.customType === CT.exactMismatch)?.data.error as string,
+    /^exact-mismatch: the request names model p\/X, the capture names p\/M/);
+});
+
 test("EX4 the exact child aborts the turn when the provider, the model or the api differ", async t => {
   const f = childFixture(t, { exec: "call#1.1" });
   await f.hooks.get("context")!({ type: "context" }, f.ctx);
