@@ -279,10 +279,18 @@ the fork copies the parent's *messages*, the exact fork copies the parent's
 
 The parent session is the one that starts the call. It writes its latest
 provider payload to `$DSA_HOME/exact/<sessionId>.json` (mode 0600, atomic
-replace, off the request path); the file holds the serialized payload only,
-never headers and never keys. The orchestrator removes capture files that
-were not modified for 7 days when it starts. `"exactCapture": false` turns the
-capture off: no file is written and an exact run falls back (`no-capture`).
+replace, off the request path); the file holds the serialized provider payload
+and the request's identity (the session id, provider, model, api, thinking and
+the time of the request), never headers and never credentials. The orchestrator
+removes capture files that were not modified for 7 days when it starts.
+`"exactCapture": false` turns the capture off: no file is written and an exact
+run falls back (`no-capture`).
+
+A run whose specs are known (the call, `tasks`, `chain`) takes its context
+from that spec. A workflow script's specs are built while it runs, so there
+the context is read from the script's source: a script that quotes `"exact"`
+(or has `"exact"` as one of its `args`) is an exact run, and it needs an
+origin session like any other exact run.
 
 An exact run pins the capture of its origin session at admission, so a later
 capture never changes a pinned run, and a follow-up of the call reuses it. The
@@ -377,12 +385,18 @@ single file: it cannot `import` or `require` other modules.
 - `timeoutMs` (active time), `output` (a relative path becomes an artifact);
 - `schema` (a structured `report`);
 - `gate` (a command, or `{command, output: "json", schema, timeoutMs}`);
-- `isolation: "worktree"`, `context: "fork"` or `context: "exact"`, `budget`;
+- `isolation: "worktree"`, `context: "fork"`, `budget`;
 - `writer` (`false`: the call does not write in its cwd's worktree, so it does
   not take that worktree's writer lock; `true`: it does, whatever its tools).
 
 A spec with `command` instead of `agent` and `task` is a
 [command call](#command-calls).
+
+A workflow script's specs are built while it runs, so the context of such a
+run is read from the script's source: a script that quotes `"exact"` (or has
+`"exact"` as one of its `args`) is an exact run and needs an origin session
+(see [The exact fork](#the-exact-fork)). A run whose specs are known — the
+call, `tasks`, `chain` — takes its context from that spec.
 
 The result has `ok`, `status`, the full `output` text and the structured
 `data`.
