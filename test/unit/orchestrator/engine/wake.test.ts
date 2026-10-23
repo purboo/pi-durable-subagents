@@ -26,7 +26,8 @@ class Evaluator implements EvaluatorTransport {
   async close() {}
 }
 async function until<T>(get: () => T, what = 'condition'): Promise<NonNullable<T>> {
-  const end = Date.now() + 5000;
+  // PowerShell process scans and file replacements are slower on Windows; a loaded full-suite run needs more headroom.
+  const end = Date.now() + (process.platform === 'win32' ? 30_000 : 5000);
   for (;;) { const value = get(); if (value) return value as NonNullable<T>; if (Date.now() > end) throw new Error(`timeout: ${what}`); await delay(5); }
 }
 async function fixture(t: test.TestContext) {
@@ -100,6 +101,7 @@ test('wake: a sealed caller opens one generation with the pinned bounded message
 test('wake: running caller receives a forward and reopens when that follow-up is undelivered', async t => {
   const f = await fixture(t), caller = await f.caller('slow', false), { wid } = await f.child(caller, 'slow');
   await f.finish(wid!);
+  await until(() => f.log(caller).some(e => e.type === 'forward'));
   assert.equal(f.log(caller).filter(e => e.type === 'forward').length, 1);
   assert.equal(outcome(f.log(wid!))?.state, 'applied');
   const opened = await until(() => f.log(caller).find(e => e.type === 'generation'));

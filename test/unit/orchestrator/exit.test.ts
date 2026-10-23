@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { existsSync, readdirSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { findOnPath } from "../../../src/platform/launch.ts";
@@ -28,10 +28,12 @@ const discovery = (h: string) => ({ home: h, agentDir: join(h, "config"), global
 const last = (h: string, type: string) => readJournalSnapshot(orchLedger(h)).findLast(e => e.type === type);
 
 test("an idle exit is recorded as idle, with the pi resolved at start", { timeout: 20000 }, async t => {
-  const h = await home(t), pi = join(h, "tools", "pi");
-  await mkdir(join(h, "tools")); await writeFile(pi, "#!/bin/sh\n"); await chmod(pi, 0o755);
+  const h = await home(t), pi = join(h, "tools", process.platform === "win32" ? "pi.cmd" : "pi");
+  await mkdir(join(h, "tools"));
+  await writeFile(pi, process.platform === "win32" ? `@echo off\r\n"${process.execPath}" -e "process.exit(0)" %*\r\n` : "#!/bin/sh\n");
+  if (process.platform !== "win32") await chmod(pi, 0o755);
   // An invalid DSA_PI_BIN falls back to this PATH in the orchestrator.
-  withEnv(t, { DSA_PI_BIN: join(h, "missing"), PATH: `${join(h, "tools")}:${process.env.PATH}` });
+  withEnv(t, { DSA_PI_BIN: join(h, "missing"), PATH: `${join(h, "tools")}${delimiter}${process.env.PATH}` });
   await main({ home: h, config: { k: { idleExitMs: 50 } }, executor: ledgers => fakeExecutor(ledgers), discovery: discovery(h) });
   assert.equal(last(h, "orchestrator")!.pi, pi);
   const exit = last(h, "orchestrator-exit")!;
@@ -40,7 +42,7 @@ test("an idle exit is recorded as idle, with the pi resolved at start", { timeou
   assert.equal(report.pi, pi);
   assert.equal(report.lastExit?.reason, "idle");
   assert.match(renderDoctor(report), /orchestrator: not running; last exit: idle 0m ago/);
-  assert.match(renderDoctor(report), new RegExp(`^pi: ${pi}$`, "m"));
+  assert.ok(renderDoctor(report).split("\n").includes(`pi: ${pi}`));
 });
 
 test("a signal exit is recorded with the signal's name; without pi the start records pi: null", { timeout: 20000 }, async t => {
@@ -85,11 +87,12 @@ test("the start removes temp files in bin older than 10 minutes and keeps newer 
 test("writeShim removes its temp file when the write fails", async t => {
   const h = await home(t), bin = join(h, "bin");
   // The shim's name is a non-empty directory: the rename over it fails after the temp file was written.
-  await mkdir(join(bin, "pi-durable-subagents", "x"), { recursive: true });
+  const shim = process.platform === "win32" ? "pi-durable-subagents.cmd" : "pi-durable-subagents";
+  await mkdir(join(bin, shim, "x"), { recursive: true });
   assert.throws(() => writeShim(bin, process.execPath, "/entry.js"));
   assert.deepEqual(readdirSync(bin).filter(n => n.endsWith(".tmp")), []);
   // And a working write leaves none either.
-  await rm(join(bin, "pi-durable-subagents"), { recursive: true });
+  await rm(join(bin, shim), { recursive: true });
   writeShim(bin, process.execPath, "/entry.js");
-  assert.deepEqual(readdirSync(bin), ["pi-durable-subagents"]);
+  assert.deepEqual(readdirSync(bin).sort(), (process.platform === "win32" ? ["pi-durable-subagents", "pi-durable-subagents.cmd"] : [shim]).sort());
 });

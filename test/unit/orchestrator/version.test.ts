@@ -25,14 +25,16 @@ test("the orchestrator records its package version while it holds the lock, and 
   const controller = new AbortController();
   const run = main({ home, signal: controller.signal, config: { k: { idleExitMs: 60_000 } }, executor: ledgers => fakeExecutor(ledgers),
     discovery: { home, agentDir: join(home, "config"), globalNpmRoot: null } });
-  for (let i = 0; i < 200 && !readJournalSnapshot(orchLedger(home)).some(e => e.type === "orchestrator"); i++) await delay(10);
+  for (let i = 0; i < 3000 && !readJournalSnapshot(orchLedger(home)).some(e => e.type === "orchestrator"); i++) await delay(10);
   const started = readJournalSnapshot(orchLedger(home)).find(e => e.type === "orchestrator")!;
   assert.equal(started.version, packageVersion()); assert.equal(started.pid, process.pid);
   assert.match(packageVersion(), /^\d+\.\d+\.\d+/);
   // Subagents reach `pi-durable-subagents hold` through the shim the orchestrator writes at start.
-  assert.match(readFileSync(join(home, "bin", "pi-durable-subagents"), "utf8"), /src\/cli\/main\.ts' "\$@"/);
+  const shim = process.platform === "win32" ? "pi-durable-subagents.cmd" : "pi-durable-subagents";
+  assert.match(readFileSync(join(home, "bin", shim), "utf8"),
+    process.platform === "win32" ? /src[\\/]cli[\\/]main\.ts/ : /src\/cli\/main\.ts' "\$@"/);
   // Until its `recovered` entry the orchestrator is shown as starting; afterwards the same version carries no note.
-  for (let i = 0; i < 200 && !readJournalSnapshot(orchLedger(home)).some(e => e.type === "recovered"); i++) await delay(10);
+  for (let i = 0; i < 3000 && !readJournalSnapshot(orchLedger(home)).some(e => e.type === "recovered"); i++) await delay(10);
   assert.deepEqual(runningOrchestrator(home), { orchestrator: `${packageVersion()} (pid ${process.pid})` }, "the same version: no note");
   controller.abort(); await run;
   assert.equal(readJournalSnapshot(orchLedger(home)).at(-1)!.type, "orchestrator-exit");

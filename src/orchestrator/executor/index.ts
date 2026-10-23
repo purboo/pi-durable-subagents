@@ -30,7 +30,8 @@ import { CT, JT, askFields, attentionEntries, isCommandCall, isEntry, type CallR
 import { binDir, callDir, callInbox, callSession, journalPath, outboxRoot } from "../../paths.ts";
 import { readJournalSnapshot, syncDirectory } from "../../kernel/journal.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
-import { contentHash, forwardRid } from "../../kernel/ids.ts";
+import { contentHash, fileId, forwardRid } from "../../kernel/ids.ts";
+import { execTarget } from "../../platform/launch.ts";
 import { capacity, seal } from "../../kernel/guards.ts";
 import { buildPiArgs, DEFAULT_TOOLS } from "../../compat/pi-args.ts";
 import { parseModel, plainModel, resolveModel, sameModel, type Model } from "../../compat/model.ts";
@@ -330,12 +331,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const fresh = new Set<string>();
     for (const rid of digestOf(call, entries).receipts.keys()) if (!done.has(rid) && !/^\.|[/\\\0]/.test(rid)) fresh.add(rid);
     if (!fresh.size) return;
-    const a = address(call), file = await open(callSession(home, a.wid, a.key, a.gen), "r");
+    // Windows refuses FlushFileBuffers on a read-only handle; open read/write there (the session is ours to flush).
+    const a = address(call), file = await open(callSession(home, a.wid, a.key, a.gen), process.platform === "win32" ? "r+" : "r");
     try { await file.sync(); } finally { await file.close(); }
     const sender = await outbox, dir = inbox(call);
     for (const rid of fresh) {
       await sender.markResolved(rid);
-      await unlink(join(dir, `${rid}.json`)).catch(ignoreMissing);
+      await unlink(join(dir, `${fileId(rid)}.json`)).catch(ignoreMissing);
       done.add(rid);
     }
   }
@@ -1121,7 +1123,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         else if (closed || a.retired || retiredCall(t.journal, t.callId)) refused = "withdrawn";
         return refused === undefined;
       };
-      const result = await spawnCommand({ command: t.spec.command!, cwd: t.cwd, dir, proceed,
+      const result = await spawnCommand({ command: t.spec.command!, cwd: t.cwd, dir, proceed, exec: id,
         env: commandEnvironment(home, id, t.callId, t.spec.env) });
       if (!result) {
         if (refused === "withdrawn") await serial(() => t.journal.append(COMMAND_WITHDRAWN, { call: t.callId, id }));
@@ -1470,7 +1472,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         ...(t.spec.schema === undefined ? ["ask"] : ["ask", "report"])])] : undefined;
       let child: Spawned;
       try {
-        child = await containment.spawn({ exec, command: piCommand, args: [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}), ...(t.exactMode?.mode === "exact" ? { thinking: (await readPinnedCapture(t.exactCapture?.path))?.thinking ?? false } : {}) }), "-e", extension], cwd,
+        const target = execTarget(piCommand, [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}), ...(t.exactMode?.mode === "exact" ? { thinking: (await readPinnedCapture(t.exactCapture?.path))?.thinking ?? false } : {}) }), "-e", extension]);
+        child = await containment.spawn({ exec, command: target.command, args: target.args, cwd,
           // The orchestrator's node follows binDir: a `#!/usr/bin/env node` pi runs under a PATH without node (a service's).
           env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(Object.keys(patterns).length ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}), ...(exactTools && t.exactCapture ? { DSA_EXACT_CAPTURE: t.exactCapture.path, DSA_EXACT_TOOLS: JSON.stringify(exactTools) } : {}) } });
       } catch (error) {

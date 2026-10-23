@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs, { readdirSync, renameSync, writeFileSync } from "node:fs";
+import { replacePathSync } from "../../../src/kernel/fsx.ts";
 import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, rm } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
@@ -178,7 +179,7 @@ test("truncated and replaced settled journals invalidate at the window boundary"
       ].map(e => frameLine(JSON.stringify(e))).join("");
       const path = journalPath(dir, "wf");
       if (mode === "truncate") writeFileSync(path, content);
-      else { writeFileSync(`${path}.replacement`, content); renameSync(`${path}.replacement`, path); }
+      else { writeFileSync(`${path}.replacement`, content); replacePathSync(`${path}.replacement`, path); }
       assert.equal(ownWorkflows(dir, "main:s")[0]?.name, undefined);
       clock += SETTLED_RECHECK_MS;
       assert.equal(ownWorkflows(dir, "main:s")[0]?.name, mode);

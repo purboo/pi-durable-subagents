@@ -9,6 +9,8 @@ import { openJournal } from '../../../src/kernel/journal.ts';
 import { orchInbox, orchLedger, journalPath } from '../../../src/paths.ts';
 import { findRequest, specDigest } from '../../../src/requests.ts';
 import { packageVersion } from '../../../src/version.ts';
+import { fileId } from '../../../src/kernel/ids.ts';
+const inboxName = (rid: string) => `${fileId(rid)}.json`;
 import { snapshotFromEntries, workflowSnapshot, orchestratorTooOld, WAKE_SINCE } from '../../../src/orchestrator/snapshot.ts';
 
 async function fixture(t: test.TestContext) {
@@ -33,7 +35,7 @@ test('run argv is literal and normalizes cwd, timeout, name, labels and wake cal
   assert.deepEqual(req.body, { cwd: join(f.cwd, 'sub'), name: 'my build', labels: { node: 'A' }, call: { command: ['sh', '-c', 'echo "$literal"', '--spec', '--json'], timeoutMs: 5000 }, wake: { to: 'W/a@12' }, caller: 'W@3/a@12@7' });
   const retry = await f.cli(args, { DSA_CALL: 'W@3/a@12@8' });
   assert.equal(retry.code, 75); assert.equal((await findRequest(f.home, 'req:build'))!.request.body && specDigest(req), specDigest((await findRequest(f.home, 'req:build'))!.request));
-  assert.deepEqual(await f.inbox(), ['req:build.json']);
+  assert.deepEqual(await f.inbox(), [inboxName('req:build')]);
   assert.deepEqual((await describe(f.home, { request: 'build' })).wake, { to: 'W/a@12', state: 'pending' });
 });
 
@@ -79,7 +81,7 @@ test('wake version gate refuses before recording, preserves retries, and allows 
   assert.equal(refused.code, 1);
   assert.equal(JSON.parse(refused.out).reason, `the running orchestrator 0.0.1 predates run --wake (new in 1.1.0); restart it to the installed version ${packageVersion()} first (\`pi-durable-subagents restart\` or the subagents tool's restart action), then send again`);
   assert.equal(orch.entries().length, before); assert.equal(await findRequest(f.home, 'req:refused'), undefined);
-  assert.deepEqual(await f.inbox(), ['req:recorded.json']);
+  assert.deepEqual(await f.inbox(), [inboxName('req:recorded')]);
   assert.deepEqual(await readdir(join(f.home, 'w')).catch(() => []), [], 'the refusal creates no workflow');
   assert.equal((await f.cli(args('recorded'), caller)).code, 75, 'a recorded pending request bypasses the gate');
   await orch.append('request', { request: original });

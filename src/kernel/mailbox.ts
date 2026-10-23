@@ -1,12 +1,14 @@
 import { link, mkdir, open, readdir, readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Conditions, JournalHandle, Request, RequestKind } from '../types.ts';
-import { contentHash, ulid } from './ids.ts';
+import { contentHash, fileId, ulid } from './ids.ts';
 import { journalEntryAt, openFoldedJournal, syncDirectory } from './journal.ts';
 
 type Publication = 'published' | 'exists-identical' | 'conflict';
 function safeName(name: string): string {
   if (!name || name === '.' || name === '..' || /[/\\\0]/.test(name)) throw new Error('Invalid mailbox identity');
+  // Windows file names cannot contain these characters; a caller with an identity must encode it (kernel/ids fileId).
+  if (process.platform === 'win32' && /[:*?"<>|]/.test(name)) throw new Error('Invalid mailbox identity');
   return name;
 }
 /** C11: Publish immutable bytes as dir/name (temp + fsync + no-replace link + dir fsync). `same` decides whether an
@@ -40,7 +42,7 @@ export async function publishFile(dir: string, name: string, bytes: string | Uin
 /** P3, C11: Publish an immutable envelope with atomic no-replace semantics. */
 export async function publishRequest(inboxDir: string, req: Request): Promise<Publication> {
   const bytes = JSON.stringify(req);
-  return publishFile(inboxDir, `${req.rid}.json`, bytes, existing => contentHash(JSON.parse(existing.toString('utf8'))) === contentHash(req));
+  return publishFile(inboxDir, `${fileId(req.rid)}.json`, bytes, existing => contentHash(JSON.parse(existing.toString('utf8'))) === contentHash(req));
 }
 function isRequest(value: unknown): value is Request {
   if (!value || typeof value !== 'object') return false;
@@ -58,7 +60,7 @@ export async function scanInbox(inboxDir: string, report: (path: string, error: 
     const path = join(inboxDir, name);
     try {
       const value: unknown = JSON.parse(await readFile(path, 'utf8'));
-      if (!isRequest(value) || `${value.rid}.json` !== name) throw new Error('Invalid request envelope');
+      if (!isRequest(value) || `${fileId(value.rid)}.json` !== name) throw new Error('Invalid request envelope');
       requests.push(value);
     } catch (error) { report(path, error); }
   }
@@ -82,7 +84,7 @@ export class Outbox {
   }
   /** P38: Open outbox/<senderId>.jsonl; caller supplies recipient routing. Only pending envelopes stay resident. */
   static async open(root: string, senderId: string, inbox: (to: string) => string): Promise<Outbox> {
-    const box = new Outbox(join(root, 'outbox', `${safeName(senderId)}.jsonl`), senderId, inbox);
+    const box = new Outbox(join(root, 'outbox', `${safeName(fileId(senderId))}.jsonl`), senderId, inbox);
     box.journal = await openFoldedJournal(box.path, (entry, offset) => {
       if (entry.type === 'sent') {
         const req = entry.request as Request;

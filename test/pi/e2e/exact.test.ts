@@ -80,7 +80,7 @@ test("EX2 an exact run splices the pinned capture into the child's provider requ
     while (pids().some(alive) && Date.now() < end) await delay(100);
     for (const pid of pids()) if (alive(pid)) process.kill(pid, "SIGKILL");
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
-    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true });
+    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
   const run = async (id: string, context: string, origin?: string) => {
     const spec = join(root, `${id}.json`);

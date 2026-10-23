@@ -30,7 +30,7 @@ test("K7 three consecutive candidate losses skip ten minutes; replay is idempote
   assert.equal(orch.entries().filter(e => e.type === "skip").length, 1);
 });
 
-test("P23 sweep kills a tagged straggler launched after a durable fence", { timeout: 10000 }, async t => {
+test("P23 sweep kills a tagged straggler launched after a durable fence", { timeout: 10000, skip: process.platform === "win32" ? "Windows has no inherited DSA_EXEC tag for a direct spawn" : false }, async t => {
   const root = await mkdtemp(join(tmpdir(), "dsa-sweep-"));
   const journal = await openJournal(join(root, "workflow")), containment = new Containment(), exec = `sweep-${process.pid}-${Date.now()}`;
   t.after(async () => { await containment.fence(exec, []); await journal.close(); await rm(root, { recursive: true, force: true }); });
@@ -107,7 +107,7 @@ test('fenced executions retain only tags and settled seeds share the compact tag
   assert.strictEqual(seededSweep(seed), seed, 'the executor shares the store tag list');
 });
 
-test('restart sweep fences an unfenced retired execution using its persisted identity after its tag changes', { timeout: 10000 }, async t => {
+test('restart sweep fences an unfenced retired execution using its persisted identity after its tag changes', { timeout: 10000, skip: process.platform === 'win32' ? 'Windows has no inherited DSA_EXEC tag for a direct spawn' : false }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'dsa-sweep-restart-'));
   const path = join(root, 'workflow'), containment = new Containment(), exec = `restart-${process.pid}-${Date.now()}#1.1`;
   let journal = await openJournal(path);

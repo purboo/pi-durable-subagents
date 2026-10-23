@@ -16,7 +16,7 @@ import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readdir, unlink } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { contentHash } from '../kernel/ids.ts';
+import { contentHash, fileId } from '../kernel/ids.ts';
 import { LifecycleFold, planDecisions, type DecisionRecord, type Decision } from '../kernel/lifecycle.ts';
 import { scanInbox } from '../kernel/mailbox.ts';
 import { orchInbox, pinnedDir } from '../paths.ts';
@@ -440,7 +440,7 @@ export class Engine {
     }
     for (const req of scanned) {
       if (view.resolved.has(req.rid) || (view.admitted.has(req.rid) && view.admitted.get(req.rid)!.hash !== contentHash(req))) {
-        await unlink(join(orchInbox(this.ledgers.home), `${req.rid}.json`)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+        await unlink(join(orchInbox(this.ledgers.home), `${fileId(req.rid)}.json`)).catch(error => { if (error.code !== 'ENOENT') throw error; });
       }
     }
     await this.deliverWakes();

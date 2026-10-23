@@ -28,7 +28,7 @@ test("worktree roots: git directories, linked worktree files, nested and nonexis
   assert.equal(await root(repo, "inner/file.txt"), join(repo, "inner"));
 });
 
-test("toolPath resolves as pi's edit/write tools do", () => {
+test("toolPath resolves as pi's edit/write tools do", { skip: process.platform === "win32" ? "expected POSIX absolute paths" : false }, () => {
   assert.equal(toolPath("/w", "a/b.txt"), "/w/a/b.txt");
   assert.equal(toolPath("/w", "@/x/b.txt"), "/x/b.txt");
   assert.equal(toolPath("/w", "@rel.txt"), "/w/rel.txt");

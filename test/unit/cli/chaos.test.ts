@@ -10,7 +10,7 @@ test("chaos options reject ambiguous input before allocating a root", async () =
     assert.throws(() => parseChaos(args));
   await assert.rejects(main(["chaos", "--scenario", "0"]), /Invalid chaos argument/);
 });
-test("missing pi reports scenario, failed invariant and retained evidence with a nonzero exit", { timeout: 10_000 }, async t => {
+test("missing pi reports scenario, failed invariant and retained evidence with a nonzero exit", { timeout: process.platform === "win32" ? 30_000 : 10_000, skip: process.platform === "win32" ? "chaos scenarios drive real POSIX sessions (setsid, kill -9) and a shell pi path" : false }, async t => {
   let output = "";
   const code = await chaos(["--scenario", "3", "--json"], { PATH: "/nonexistent-chaos-path" }, text => { output = text; });
   const report = JSON.parse(output);

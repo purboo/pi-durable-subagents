@@ -11,6 +11,7 @@ import { hold, parseHold } from '../../../src/cli/hold.ts';
 import { ProcessTable } from '../../../src/platform/proctable.ts';
 import * as lease from '../../../src/platform/lease.ts';
 
+const unixOnly = process.platform === "win32" ? "uses POSIX sh/sleep command scripts" : false;
 const linux = { skip: process.platform !== 'linux' ? 'DSA_HOLD environment discovery requires Linux /proc; macOS may expose only process groups' : false };
 const cli = fileURLToPath(new URL('../../../src/cli/main.ts', import.meta.url));
 async function until<T>(fn: () => T | false | undefined): Promise<T> {
@@ -45,7 +46,7 @@ const escaped = (home: string, ignoreTerm = false) => ['sh', '-c',
 
 const assertEnded = (home: string) => ['sh', '-c', `p=$(cat ${join(home, 'escaped.pid')}); if [ -r /proc/$p/stat ]; then state=$(awk '{print $3}' /proc/$p/stat); [ "$state" = Z ] || [ "$state" = X ] || exit 99; fi; echo next > ${join(home, 'next')}`];
 
-test('tag: held command receives exact resource:seq and preserves DSA_EXEC / DSA_CALL', async t => {
+test('tag: held command receives exact resource:seq and preserves DSA_EXEC / DSA_CALL', { skip: unixOnly }, async t => {
   const home = await root(t), output = join(home, 'env');
   const a = run(t, home, ['machine', '--', 'sh', '-c', `printf '%s\n' "$DSA_HOLD" "$DSA_EXEC" "$DSA_CALL" > ${output}; while [ ! -f ${join(home, 'go')} ] && [ -d ${home} ]; do sleep 0.02; done`],
     { DSA_EXEC: 'exec-kept', DSA_CALL: 'W1@1/a@2', DSA_HOLD: 'outer:99' });

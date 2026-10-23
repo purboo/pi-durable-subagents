@@ -9,7 +9,7 @@ import { PI_BIN, REPO } from '../../harness/pi.ts';
 
 test('real CLI smoke reports execution and degraded UI; missing pi exits nonzero', { timeout: 45000 }, async t => {
   const home = await mkdtemp(join(tmpdir(), 'dsa-cli-smoke-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {}));
   const env = { ...process.env, HOME: home, DSA_HOME: join(home, 'state'), PI_CODING_AGENT_DIR: join(home, 'agent'), DSA_PI_BIN: PI_BIN };
   const entry = join(home, 'pi-durable-subagents');
   await symlink(join(REPO, 'src/cli/main.ts'), entry);

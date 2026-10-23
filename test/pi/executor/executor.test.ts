@@ -59,7 +59,7 @@ async function setup(t: TestContext, config: OrchestratorConfig = {}, options: P
     try { await executor.shutdown(); } finally {
       await journal.close(); await orch.close();
       for (const [key, value] of Object.entries(old)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true });
+      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
     }
   });
   return { wid, root, home, cwd, orch, executor, ticket, get journal() { return journal; }, async reopen() { journal = await openJournal(journal.path); } };
@@ -956,7 +956,7 @@ test("V1 model forwarding reserves a target before publishing and rejects a full
   assert.deepEqual(f.orch.entries().filter(e => e.type === "release").map(e => e.pool).sort(), ["memory", "other", "probe"]);
 });
 
-test("V1 an expired switch reservation is fenced before its slots are released", { timeout: 30000 }, async t => {
+test("V1 an expired switch reservation is fenced before its slots are released", { timeout: 30000, skip: process.platform === "win32" ? "sub-100 ms switch deadline against PowerShell process observation" : false }, async t => {
   const f = await setup(t, { providers: { probe: { slots: 1 }, other: { slots: 1 } }, k: { trackerMs: 25, switchTimeoutMs: 20, lossBound: 1 } });
   const ticket = f.ticket(), pending = f.executor.run(ticket);
   await until(() => f.journal.entries().some(e => e.type === "tracked"));
@@ -1105,7 +1105,7 @@ test("C1 protocol ask remains available with an empty agent tool allowlist", { t
   assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.resolution === "answered"));
 });
 
-test("C1 SIGKILL during a tool fences its detached orphan and continues", { timeout: 45000 }, async t => {
+test("C1 SIGKILL during a tool fences its detached orphan and continues", { timeout: 45000, skip: process.platform === "win32" ? "finds a detached descendant through the inherited DSA_EXEC tag" : false }, async t => {
   const f = await setup(t, { k: { trackerMs: 25 } }), pidfile = join(f.cwd, "orphan.pid");
   const ticket = f.ticket("a", script([{ tool: "bash", args: { command: `${detachedSleep(60)} > '${pidfile}'; sleep 60` } }, { text: "recovered" }]));
   const pending = f.executor.run(ticket);
@@ -1243,7 +1243,7 @@ test("X1 blocked ask is not charged and does not stall", { timeout: 30000 }, asy
   await f.executor.stop({ wid: f.wid }); await pending;
 });
 
-test("X1 stall resolves on activity and re-arms with the next revision", { timeout: 30000 }, async t => {
+test("X1 stall resolves on activity and re-arms with the next revision", { timeout: 30000, skip: process.platform === "win32" ? "sub-second shell output timing against PowerShell process observation" : false }, async t => {
   const f = await setup(t, { k: { trackerMs: 40, stallMs: 200 } });
   const ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 0.7; echo activity; sleep 0.7" } }, { text: "done" }]));
   await f.executor.run(ticket);
@@ -1386,7 +1386,7 @@ test("P9 P15 AC4 a once call whose tool was cut off seals unknown, raises one un
   const followed = await f.executor.run(next);
   assert.equal(followed.status, "ok"); assert.equal(followed.output, "checked");
   const rows = (await readFile(callSession(f.home, f.wid, "a", 2), "utf8")).trim().split("\n").map(line => JSON.parse(line));
-  const bash = rows.findIndex(e => e.message?.role === "assistant" && JSON.stringify(e.message.content).includes(marker));
+  const bash = rows.findIndex(e => e.message?.role === "assistant" && JSON.stringify(e.message.content).includes(marker.replaceAll("\\", "\\\\")));
   const opening = rows.findIndex(e => e.type === "custom_message" && JSON.stringify(e.content).includes("checked"));
   assert.ok(bash >= 0 && opening > bash, "the follow-up message follows the cut-off call in the same session");
   assert.equal(readFileSync(marker, "utf8"), "ran\n");
@@ -1557,7 +1557,7 @@ test("E4 a torn session line terminated by pi's next load is skipped once; entri
   assert.deepEqual(corrupt(), [[ticket.callId, bad]]);
 });
 
-test("F1 a stuck fence of a real child parks only its call with attention; a sibling completes; the sweep then seals it", { timeout: 45000 }, async t => {
+test("F1 a stuck fence of a real child parks only its call with attention; a sibling completes; the sweep then seals it", { timeout: 45000, skip: process.platform === "win32" ? "finds a detached descendant through the inherited DSA_EXEC tag" : false }, async t => {
   const real = serialContainment();
   let stuck: string | undefined;
   const containment: Containment = { spawn: spec => real.spawn(spec), scan: known => real.scan(known),

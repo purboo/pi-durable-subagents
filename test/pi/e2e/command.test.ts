@@ -47,7 +47,7 @@ async function stack(t: TestContext, config: OrchestratorConfig = { k: { idleExi
     for (const wf of existsSync(join(home, "w")) ? readJournalSnapshot(orchLedger(home)).filter(e => e.type === JT.created) : [])
       for (const e of of(journal(String(wf.wid)), "command-intent")) await new Containment().fence(String(e.id), []).catch(() => {});
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true });
+    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
   return { root, cwd, home, send, ledger, journal, until, created, run, sealed, started, stop, start, get orchestrator() { return orchestrator; } };
 }
@@ -60,7 +60,7 @@ const outputs = (home: string) => (readdirSync(home, { recursive: true }) as str
 /** Live processes carrying the tag `id` (DSA_EXEC). */
 const tagged = async (id: string) => (await new ProcessTable().list(new Set([id]), { fresh: true })).filter(p => p.tag === id);
 
-test("command call: ok without pi or a provider slot; the origin's finished notice; zero usage", { timeout: 60_000 }, async t => {
+test("command call: ok without pi or a provider slot; the origin's finished notice; zero usage", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const wid = await s.run({ call: { command: ["sh", "-c", "sleep 1; exit 0"] } });
   const first = await s.started(wid);
@@ -82,7 +82,7 @@ test("command call: ok without pi or a provider slot; the origin's finished noti
   assert.equal(s.ledger().filter(e => e.type === "hold" || e.type === "mem").length, 0, "no provider or memory slot");
 });
 
-test("command call: a failing command reports its status and both output streams", { timeout: 60_000 }, async t => {
+test("command call: a failing command reports its status and both output streams", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const wid = await s.run({ call: { command: "echo out; echo err >&2; exit 3" } });
   const result = await s.sealed(wid);
@@ -98,7 +98,7 @@ test("command call: a failing command reports its status and both output streams
   assert.equal(of(s.journal(missing), "command-intent").length, 1);
 });
 
-test("command call: timeout ends the whole tree, background and new-session descendants included", { timeout: 60_000 }, async t => {
+test("command call: timeout ends the whole tree, background and new-session descendants included", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const wid = await s.run({ call: { command: `${detachedSleep(60)}; nohup sleep 61 >/dev/null 2>&1 & sleep 62`, timeoutMs: 1000 } });
   const first = await s.started(wid);
@@ -125,7 +125,7 @@ test("command call: the same request submitted twice runs one process", { timeou
   assert.equal(s.ledger().filter(e => e.type === JT.created).length, 1);
 });
 
-test("command call: stop ends the tree and seals stopped", { timeout: 60_000 }, async t => {
+test("command call: stop ends the tree and seals stopped", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const wid = await s.run({ call: { command: `${detachedSleep(60)}; sleep 60` } });
   const first = await s.started(wid);
@@ -137,7 +137,7 @@ test("command call: stop ends the tree and seals stopped", { timeout: 60_000 }, 
   assert.deepEqual(await tagged(String(first.id)), []);
 });
 
-test("command call: restarts (normal and forced) adopt the running command; one that ended meanwhile seals from its exit record", { timeout: 90_000 }, async t => {
+test("command call: restarts (normal and forced) adopt the running command; one that ended meanwhile seals from its exit record", { timeout: 90_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const long = await s.run({ call: { command: "sleep 4; echo survived" } });
   const short = await s.run({ call: { command: "sleep 1; echo meanwhile; exit 5" } });
@@ -170,7 +170,7 @@ test("command call: restarts (normal and forced) adopt the running command; one 
   }
 });
 
-test("command call: a process gone without an exit record seals unknown; rerun starts it once more, never two at once", { timeout: 90_000 }, async t => {
+test("command call: a process gone without an exit record seals unknown; rerun starts it once more, never two at once", { timeout: 90_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const marks = (name: string) => join(s.root, name);
   // Each run records its start and end; the second attempt must start after the first one's processes ended.
@@ -209,7 +209,7 @@ test("command call: a process gone without an exit record seals unknown; rerun s
   assert.deepEqual(of(s.journal(twice), "command-intent").map(e => e.n), [1, 2]);
 });
 
-test("command call: a drain with fence of the session leaves it running; it seals, later steps wait, and the orchestrator stays", { timeout: 60_000 }, async t => {
+test("command call: a drain with fence of the session leaves it running; it seals, later steps wait, and the orchestrator stays", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t, { k: { idleExitMs: 300 } });
   const marker = join(s.root, "b-ran");
   const single = await s.run({ call: { command: "sleep 2; echo single" } });
@@ -270,7 +270,7 @@ test("command call: a revision retires it and ends its process tree", { timeout:
   assert.ok(!s.journal(wid).some(e => e.type === JT.sealed && e.call === first.call));
 });
 
-test("command call integration: a tool-built chain runs command steps, status and describe show the real records, sends are refused, an agent step gets {previous}", { timeout: 60_000 }, async t => {
+test("command call integration: a tool-built chain runs command steps, status and describe show the real records, sends are refused, an agent step gets {previous}", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const { request } = await import("../../../src/agent/main/tool.ts");
   const { statusView } = await import("../../../src/orchestrator/snapshot.ts");
   const { describe, renderDescription } = await import("../../../src/cli/requests.ts");
@@ -308,7 +308,7 @@ test("command call integration: a tool-built chain runs command steps, status an
   assert.equal(done?.pid, undefined, "no pid after the seal");
 });
 
-test("C-hold-queued: a command waiting for the writer lock does not start under a drain with fence; it runs after resume", { timeout: 60_000 }, async t => {
+test("C-hold-queued: a command waiting for the writer lock does not start under a drain with fence; it runs after resume", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const wid = await s.run({ tasks: [{ key: "a", command: "sleep 1.5; echo A", writer: true }, { key: "b", command: "echo B", writer: true }] });
   await s.until(() => of(s.journal(wid), "writer-wait").length > 0 && of(s.journal(wid), "command-started").length === 1, "a runs, b waits for the lock");
@@ -323,7 +323,7 @@ test("C-hold-queued: a command waiting for the writer lock does not start under 
   assert.equal(b.output, "B\n");
 });
 
-test("C-hold-adopt: under a drain, a restart adopts the command and delivers its result; a held chain starts no next step", { timeout: 90_000 }, async t => {
+test("C-hold-adopt: under a drain, a restart adopts the command and delivers its result; a held chain starts no next step", { timeout: 90_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const marker = join(s.root, "b-ran");
   const single = await s.run({ call: { command: "sleep 2; echo single" } });
@@ -349,7 +349,7 @@ test("C-hold-adopt: under a drain, a restart adopts the command and delivers its
   assert.deepEqual(chainDone.result, ["a\n", ""]);
 });
 
-test("C-rerun-held: attempt 1 lost under a hold reruns only after resume, exactly once", { timeout: 90_000 }, async t => {
+test("C-rerun-held: attempt 1 lost under a hold reruns only after resume, exactly once", { timeout: 90_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const marks = join(s.root, "marks");
   const wid = await s.run({ call: { command: `echo start >> '${marks}'; sleep 3; echo end >> '${marks}'`, rerun: true } });
@@ -371,7 +371,7 @@ test("C-rerun-held: attempt 1 lost under a hold reruns only after resume, exactl
   assert.equal(readFileSync(marks, "utf8"), "start\nstart\nend\n");
 });
 
-test("C-path: the wrapper records the status under PATH=/nonexistent (absolute argv, builtin-only string, rerun once)", { timeout: 60_000 }, async t => {
+test("C-path: the wrapper records the status under PATH=/nonexistent (absolute argv, builtin-only string, rerun once)", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const marks = join(s.root, "ran");
   const env = { PATH: "/nonexistent" };
@@ -387,7 +387,7 @@ test("C-path: the wrapper records the status under PATH=/nonexistent (absolute a
   assert.deepEqual(of(s.journal(rerun), "command-intent").map(e => e.n), [1]);
 });
 
-test("C-successor: an orchestrator started from inside a command carries no call identity, survives its end and seals it", { timeout: 90_000 }, async t => {
+test("C-successor: an orchestrator started from inside a command carries no call identity, survives its end and seals it", { timeout: 90_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const go = join(s.root, "go"), cli = join(REPO, "src/cli/main.ts");
   const wid = await s.run({ call: { command: `while [ ! -e '${go}' ]; do sleep 0.1; done; '${process.execPath}' '${cli}' start >/dev/null; sleep 2; echo done`, env: { XDG_RUNTIME_DIR: "" } } }); // no systemd scope for the successor
@@ -415,7 +415,7 @@ test("C-successor: an orchestrator started from inside a command carries no call
   }
 });
 
-test("F1: an adopted command whose result two observers see is exposed once; the next step runs after resume", { timeout: 90_000 }, async t => {
+test("F1: an adopted command whose result two observers see is exposed once; the next step runs after resume", { timeout: 90_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
   const go = join(s.root, "go");
   const wid = await s.run({ source: `const a = await runs.run("a", {command: "while [ ! -e '${go}' ]; do sleep 0.05; done; echo a"});\n` +
@@ -449,7 +449,7 @@ test("F1: an adopted command whose result two observers see is exposed once; the
   assert.equal(s.journal(wid).filter(e => e.type === JT.done).length, 1, "no second workflow-done (no park)");
 });
 
-test("F2: a drain and a command's start decision are ordered: an intent after the drain starts no process", { timeout: 60_000 }, async t => {
+test("F2: a drain and a command's start decision are ordered: an intent after the drain starts no process", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   let release!: () => void, entered!: () => void;
   const gate = new Promise<void>(r => { release = r; }), reached = new Promise<void>(r => { entered = r; });
   let paused = false;

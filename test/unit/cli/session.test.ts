@@ -17,6 +17,8 @@ import { Engine } from '../../../src/orchestrator/engine.ts';
 import { allWorkflows, ownedBy, statusBrief } from '../../../src/orchestrator/snapshot.ts';
 import { orderWorkflows } from '../../../src/ui/view.ts';
 import { requestRid, sendIdentified, specDigest } from '../../../src/requests.ts';
+import { fileId } from '../../../src/kernel/ids.ts';
+const inboxName = (rid: string) => `${fileId(rid)}.json`;
 import { JT, type EvalToOrch, type OrchToEval, type Request } from '../../../src/types.ts';
 import type { EvaluatorTransport } from '../../../src/orchestrator/evaluator-client.ts';
 import { fakeExecutor } from '../orchestrator/engine/fake.ts';
@@ -37,7 +39,7 @@ test('run names the session in the body without changing the digest: a retry fro
   const f = await fixture(t), path = await f.spec('a.json', { agent: 'echo', task: 'hello' });
   const first = await f.cli(['run', '--request', 'S', '--spec', path, '--json'], { DSA_SESSION: 'sess-A' });
   assert.equal(first.code, 75, first.out);
-  const published = JSON.parse(await readFile(join(orchInbox(f.home), 'req:S.json'), 'utf8')) as Request;
+  const published = JSON.parse(await readFile(join(orchInbox(f.home), inboxName('req:S')), 'utf8')) as Request;
   assert.deepEqual(published.body, { cwd: f.cwd, call: { agent: 'echo', task: 'hello' }, session: 'sess-A' });
   assert.equal(specDigest(published), specDigest({ kind: 'run', body: { cwd: f.cwd, call: { agent: 'echo', task: 'hello' } } }), 'not hashed');
   const other = await f.cli(['run', '--request', 'S', '--spec', path, '--json'], { DSA_SESSION: 'sess-B' });
@@ -46,13 +48,13 @@ test('run names the session in the body without changing the digest: a retry fro
   assert.equal(none.code, 75, none.out);
   const flagged = await f.cli(['run', '--request', 'F', '--spec', path, '--session', 'sess-C', '--json'], { DSA_SESSION: 'sess-A' });
   assert.equal(flagged.code, 75, flagged.out);
-  assert.equal((JSON.parse(await readFile(join(orchInbox(f.home), 'req:F.json'), 'utf8')) as Request<{ session?: string }>).body.session, 'sess-C');
+  assert.equal((JSON.parse(await readFile(join(orchInbox(f.home), inboxName('req:F')), 'utf8')) as Request<{ session?: string }>).body.session, 'sess-C');
   const bad = await f.cli(['run', '--request', 'B', '--spec', path, '--session', 'no spaces', '--json']);
   assert.equal(bad.code, 1); assert.match(JSON.parse(bad.out).reason, /--session must be a pi session id/);
   const inCall = await f.cli(['run', '--request', 'C', '--spec', path, '--json'], { DSA_SESSION: 'sess-A', DSA_CALL: 'call-1' });
   assert.equal(inCall.code, 75, inCall.out);
-  assert.equal((JSON.parse(await readFile(join(orchInbox(f.home), 'req:C.json'), 'utf8')) as Request<{ session?: string }>).body.session, undefined);
-  assert.deepEqual((await f.inbox()).sort(), ['req:C.json', 'req:F.json', 'req:S.json'], 'the bad flag published nothing');
+  assert.equal((JSON.parse(await readFile(join(orchInbox(f.home), inboxName('req:C')), 'utf8')) as Request<{ session?: string }>).body.session, undefined);
+  assert.deepEqual((await f.inbox()).sort(), [inboxName('req:C'), inboxName('req:F'), inboxName('req:S')], 'the bad flag published nothing');
 });
 
 test('An admitted run with a session is that session\'s own in status and the UI list; other sessions see it as elsewhere', async t => {

@@ -424,6 +424,8 @@ export interface SpawnSpec {
   args: string[];
   cwd: string;
   env: Record<string, string>;
+  /** Run `command` through the platform shell (Windows: cmd.exe, with Node's own quoting). */
+  shell?: boolean;
 }
 
 export interface Spawned {

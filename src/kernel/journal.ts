@@ -3,6 +3,7 @@ import { closeSync, constants, fstatSync, fsyncSync, ftruncateSync, openSync, re
 import { dirname } from 'node:path';
 import * as zlib from 'node:zlib';
 import type { Entry, JournalHandle } from '../types.ts';
+import { writeAt } from './fsx.ts';
 
 const TABLE = new Uint32Array(256).map((_, n) => { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
 /** The CRC-32 (IEEE) of `bytes` as an unsigned number: node's native one when it has it (22.2+), else a table. */
@@ -61,8 +62,10 @@ function decode(bytes: Buffer, prior: readonly Entry[] = []): { entries: Entry[]
   }
   return { entries, length: offset };
 }
-/** C11: Make directory changes durable before reporting publication success. */
+/** C11: Make directory changes durable before reporting publication success. Windows cannot open a directory for
+ *  FlushFileBuffers (fsync fails with EPERM); NTFS journals metadata itself, so there is nothing to add there. */
 export async function syncDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') return;
   const file = await open(path, 'r');
   try { await file.sync(); } finally { await file.close(); }
 }
@@ -306,9 +309,9 @@ async function openHandle(path: string, lazy?: JournalExpectation, apply?: (entr
   else {
   await mkdir(dirname(path), { recursive: true });
   let created = false;
-  const first = await open(path, 'ax+').then(f => { created = true; return f; }, async error => {
+  const first = await open(path, 'wx+').then(f => { created = true; return f; }, async error => {
     if (error.code !== 'EEXIST') throw error;
-    return open(path, 'a+');
+    return open(path, 'r+');
   });
   try {
     if (apply) {
@@ -336,7 +339,7 @@ async function openHandle(path: string, lazy?: JournalExpectation, apply?: (entr
   // someone else, and appending to it could interleave records.
   const reopen = async (): Promise<FileHandle> => {
     if (file) return file;
-    const f = await open(path, constants.O_WRONLY | constants.O_APPEND);
+    const f = await open(path, constants.O_RDWR);
     try { const now = (await f.stat()).size; if (now !== size) throw new Error(`Journal changed while closed: ${path} has ${now} bytes, ${size} committed`); }
     catch (error) { await f.close(); throw error; }
     descriptors++;
@@ -371,11 +374,12 @@ async function openHandle(path: string, lazy?: JournalExpectation, apply?: (entr
         if (failed) throw failed;
         if (!apply) all();
         const entry = { ...frozen, seq: count + 1, ts: Date.now(), type } as Entry<T>;
-        const json = JSON.stringify(entry), bytes = Buffer.from(json), line = `${crc32(bytes)} ${json}\n`;
+        const json = JSON.stringify(entry), jsonBytes = Buffer.from(json), line = `${crc32(jsonBytes)} ${json}\n`;
         let target: FileHandle;
         try { target = await reopen(); }
         catch (error) { unwritten.add(error as object); throw error; }
-        await target.writeFile(line);
+        const bytes = Buffer.from(line);
+        await writeAt(target, bytes, size);
         await target.sync();
         const offset = size;
         size += Buffer.byteLength(line);

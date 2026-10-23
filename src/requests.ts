@@ -110,7 +110,7 @@ export type Identified = { request: Request; digest: string; sent: boolean } | {
  *  stall its sender's sequence). Same content: the recorded envelope stands (republished when it is this sender's and
  *  pending; `sent` false). */
 export async function sendIdentified(home: string, outbox: Outbox, sender: string, rid: string, kind: RequestKind, body: unknown, cond?: Conditions): Promise<Identified> {
-  const digest = specDigest({ kind, body, cond }), path = join(home, 'requests.lock'), locker = new OsLock(), deadline = performance.now() + 10_000;
+  const digest = specDigest({ kind, body, cond }), path = join(home, 'requests.lock'), locker = new OsLock(), deadline = performance.now() + (process.platform === "win32" ? 30_000 : 10_000);
   let lock = await locker.tryAcquire(path);
   while (!lock && performance.now() < deadline) { await delay(25); lock = await locker.tryAcquire(path); }
   if (!lock) throw new RequestsBusy('request ids are busy; retry the command');

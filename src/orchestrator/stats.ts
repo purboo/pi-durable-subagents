@@ -4,6 +4,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { replacePath } from "../kernel/fsx.ts";
 
 export const STATS_EVERY_MS = 10_000;
 export interface OrchestratorStats {
@@ -38,7 +39,7 @@ export function readBytes(): number | undefined {
 }
 export async function writeStats(home: string, stats: OrchestratorStats): Promise<void> {
   const path = statsPath(home), temp = join(home, `.orchestrator-stats.${process.pid}.tmp`);
-  try { await writeFile(temp, JSON.stringify(stats)); await rename(temp, path); }
+  try { await writeFile(temp, JSON.stringify(stats)); await replacePath(temp, path); }
   catch (error) { await rm(temp, { force: true }); throw error; }
 }
 /** The stats file of orchestrator `pid`, or undefined (missing, unreadable, or written by another process). */

@@ -32,7 +32,7 @@ test("v12 §6: tool description teaches discovery, addresses, verb meaning and l
   }
 });
 
-test("P31a, P36, P11: run carries workflow-level budget, spawn limit and resolved input files, not as call fields", () => {
+test("P31a, P36, P11: run carries workflow-level budget, spawn limit and resolved input files, not as call fields", { skip: process.platform === "win32" ? "expected POSIX paths; Windows resolves them against the drive" : false }, () => {
   const { body } = request({ action: "run", workflow: "flow.js", usageBudget: { tokens: 5000 }, maxCalls: 7, inputs: { plan: "plan.json" }, name: "nightly" }, "/w");
   assert.deepEqual(body, { cwd: "/w", workflow: "/w/flow.js", name: "nightly", usageBudget: { tokens: 5000 }, maxCalls: 7, inputs: { plan: "/w/plan.json" } });
   const single = request({ action: "run", agent: "worker", task: "t", usageBudget: { costUsd: 1 }, by: "user" }, "/w").body as { call: Record<string, unknown> };
@@ -41,7 +41,7 @@ test("P31a, P36, P11: run carries workflow-level budget, spawn limit and resolve
   assert.throws(() => request({ action: "run", workflow: "f.js", maxCalls: 0 }, "/w"), /maxCalls/);
 });
 
-test("T2/T3/T11: invalid call specs fail at the tool with every error; user keys pass through for fan-out", () => {
+test("T2/T3/T11: invalid call specs fail at the tool with every error; user keys pass through for fan-out", { skip: process.platform === "win32" ? "expected POSIX paths; Windows resolves them against the drive" : false }, () => {
   assert.throws(() => request({ action: "run", agent: "w", task: "t", isolaton: "worktree", context: "inherit" }, "/w"),
     { message: 'Invalid call: unknown field "isolaton"; context must be "fresh", "fork" or "exact" (got \"inherit\")' });
   assert.deepEqual(request({ action: "run", agent: "w", task: "t", key: "a" }, "/w").body, { cwd: "/w", call: { agent: "w", task: "t", key: "a" } }, "a single call may name its key");
@@ -54,7 +54,7 @@ test("T2/T3/T11: invalid call specs fail at the tool with every error; user keys
   assert.deepEqual(body, { cwd: "/w", chain: [{ agent: "w", task: "a", key: "plan", cwd: "/w" }, { agent: "w", task: "{previous}" }] });
 });
 
-test("a top-level cwd is the run's directory: relative workflow, inputs and calls resolve against it", () => {
+test("a top-level cwd is the run's directory: relative workflow, inputs and calls resolve against it", { skip: process.platform === "win32" ? "expected POSIX paths; Windows resolves them against the drive" : false }, () => {
   const wf = request({ workflow: "flows/x.js", cwd: "../repo", inputs: { plan: "plan.md" } }, "/w/session");
   assert.deepEqual(wf.body, { cwd: "/w/repo", workflow: "/w/repo/flows/x.js", inputs: { plan: "/w/repo/plan.md" } });
   const tasks = request({ tasks: [{ agent: "a", task: "t" }, { agent: "a", task: "u", cwd: "sub" }], cwd: "/abs" }, "/w") as { body: { cwd: string; tasks: { cwd?: string }[] } };

@@ -36,7 +36,7 @@ for (const window of ["intent", "effect"]) test(`worktree removal reconciles ${w
   await assert.rejects(access(cwd));
   assert.equal(f.journal.entries().filter(e => e.type === "wt-removed").length, 1);
 });
-test("dirty worktree is retained with deduplicated attention and reused by the next generation", async ctx => {
+test("dirty worktree is retained with deduplicated attention and reused by the next generation", { skip: process.platform === "win32" ? "uses a POSIX shell gate and unescaped Windows paths in a RegExp" : false }, async ctx => {
   const f = await fixture(ctx); f.t.spec.isolation = "worktree";
   await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
   const { cwd } = await f.effects().prepare(f.t, { sessionPath: f.sessionPath });

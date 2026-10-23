@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, appendFile, rename, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, appendFile, rm } from 'node:fs/promises';
+import { replacePath } from '../../../src/kernel/fsx.ts';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { frameLine, readJournalFold, findJournalEntry, type JournalFold } from '../../../src/kernel/journal.ts';
@@ -9,7 +10,7 @@ const framed = (entries: Entry[]) => entries.map(e => frameLine(JSON.stringify(e
 function random(seed: number): (n: number) => number { return n => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % n; }; }
 const broken = (line: string) => (line[0] === '0' ? '1' : '0') + line.slice(1);
 
-test('filtered folds equal full folds over 400 randomized multi-chunk journals and appended polls', async t => {
+test('filtered folds equal full folds over 400 randomized multi-chunk journals and appended polls', { timeout: 120_000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dsa-filtered-fold-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const path = join(dir, 'journal'), replacement = join(dir, 'replacement');
@@ -54,7 +55,7 @@ test('filtered folds equal full folds over 400 randomized multi-chunk journals a
     a = filtered(a); b = full(b); check(a, b, 'bad CRC final newline');
     assert.equal(a.length, base.length);
     const changed = entries.map(e => ({ ...e, ts: Number(e.ts) + 10 }));
-    await writeFile(replacement, framed(changed)); await rename(replacement, path);
+    await writeFile(replacement, framed(changed)); await replacePath(replacement, path);
     a = filtered(a); b = full(b); check(a, b, 'replacement');
     await writeFile(path, framed(changed.slice(0, 2)));
     a = filtered(a); b = full(b); check(a, b, 'shrink'); assert.equal(a.seen, 2);

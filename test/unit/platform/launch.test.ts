@@ -34,7 +34,7 @@ function recorder(fail: (command: string) => boolean = () => false) {
   return { calls, spawn };
 }
 
-test("pi resolves from DSA_PI_BIN (an executable file) or the first pi on PATH, unresolved", async t => {
+test("pi resolves from DSA_PI_BIN (an executable file) or the first pi on PATH, unresolved", { skip: process.platform === "win32" ? "POSIX PATH and executable-bit semantics; see the Windows test" : false }, async t => {
   const dir = await root(t), real = await executable(join(dir, "store"), "pi-real");
   await mkdir(join(dir, "shims")); await symlink(real, join(dir, "shims", "pi"));
   await executable(join(dir, "later"), "pi");
@@ -65,7 +65,7 @@ test("the CLI starter refuses to start an orchestrator without pi and starts non
   assert.equal(calls.length, 1); assert.equal(calls[0]!.env.DSA_PI_BIN, undefined);
 });
 
-test("the starter passes the resolved pi as DSA_PI_BIN and never the starting session", async t => {
+test("the starter passes the resolved pi as DSA_PI_BIN and never the starting session", { skip: process.platform === "win32" ? "POSIX fixture paths; see the Windows test" : false }, async t => {
   const dir = await root(t), bin = join(dir, "bin"), pi = await executable(bin, "pi");
   const { calls, spawn } = recorder();
   const launched = await launchOrchestrator("/entry.js", { PATH: bin, DSA_SESSION: "s1", OTHER: "x" }, { home: "/h", spawn, platform: "darwin", requirePi: true, node: "/node" });
@@ -74,7 +74,7 @@ test("the starter passes the resolved pi as DSA_PI_BIN and never the starting se
   assert.deepEqual(calls[0]!.env, { PATH: bin, OTHER: "x", DSA_HOME: "/h", DSA_PI_BIN: pi });
 });
 
-test("an orchestrator started from inside a call never carries the call's identity (DSA_EXEC, DSA_CALL, ...)", async t => {
+test("an orchestrator started from inside a call never carries the call's identity (DSA_EXEC, DSA_CALL, ...)", { skip: process.platform === "win32" ? "POSIX fixture paths; see the Windows test" : false }, async t => {
   const dir = await root(t), bin = join(dir, "bin"), pi = await executable(bin, "pi");
   const call = { DSA_EXEC: "W@1/a@1#1.1", DSA_CALL: "W@1/a@1", DSA_INBOX: "/i", DSA_JOURNAL: "/j", DSA_MODEL: "p/m", DSA_SCHEMA: "/s", DSA_BUDGET: "{}",
     DSA_RESULT: "/r", DSA_OUTPUT: "/o", DSA_SESSION: "s1", DSA_HOME: "/old", DSA_CACHE_HOME: "/c" };
@@ -88,7 +88,7 @@ test("an orchestrator started from inside a call never carries the call's identi
   }
 });
 
-test("scope launch selection: systemd-run on Linux with a lingering user manager when its probe works, else a detached process", async t => {
+test("scope launch selection: systemd-run on Linux with a lingering user manager when its probe works, else a detached process", { skip: process.platform === "win32" ? "systemd is Linux-only" : false }, async t => {
   const dir = await root(t), bin = join(dir, "bin"), runner = await executable(bin, "systemd-run");
   await executable(bin, "pi");
   const env = { PATH: bin, XDG_RUNTIME_DIR: "/run/user/1", USER: "u1" };
@@ -160,4 +160,24 @@ test("the starter service carries the pi resolved at install as DSA_PI_BIN", asy
   assert.match(unit!.content, /\nEnvironment="DSA_PI_BIN=\/opt\/bin\/pi"\n/);
   assert.doesNotMatch(serviceFiles("/home/u", "/state", "/cli.js", "linux", "/node")[0]!.content, /DSA_PI_BIN/);
   assert.match(serviceFiles("/home/u", "/state", "/cli.js", "darwin", "/node", "/opt/bin/pi")[0]!.content, /<key>DSA_PI_BIN<\/key><string>\/opt\/bin\/pi<\/string>/);
+});
+
+test("Windows: pi resolves through PATHEXT (.cmd), DSA_PI_BIN is passed, and the starter service is a .cmd", { skip: process.platform !== "win32" }, async t => {
+  const dir = await root(t), bin = join(dir, "bin"); await mkdir(bin, { recursive: true });
+  const pi = join(bin, "pi.cmd");
+  await writeFile(pi, `@echo off\r\n"${process.execPath}" -e "console.log('pi')" %*\r\n`);
+  await writeFile(join(bin, "pi"), "#!/bin/sh\nexit 0\n"); // the extensionless POSIX shim beside it
+  assert.equal(findOnPath("pi", bin), pi);
+  assert.deepEqual(resolvePi({ PATH: bin }), { path: pi, source: "PATH" });
+  assert.deepEqual(resolvePi({ PATH: bin, DSA_PI_BIN: pi }), { path: pi, source: "DSA_PI_BIN" });
+  assert.match(String(resolvePi({ PATH: bin, DSA_PI_BIN: join(bin, "pi") }).problem), /not an absolute path to an executable file/);
+  const { calls, spawn } = recorder();
+  const launched = await launchOrchestrator("C:\\entry.js", { PATH: bin, DSA_SESSION: "s1", OTHER: "x" }, { home: "C:\\h", spawn, platform: "win32", requirePi: true, node: "C:\\node.exe" });
+  assert.deepEqual(launched, { pid: 4243, scope: false, pi });
+  assert.deepEqual(calls.map(c => [c.command, c.args]), [["C:\\node.exe", ["C:\\entry.js"]]]);
+  assert.deepEqual(calls[0]!.env, { PATH: bin, OTHER: "x", DSA_HOME: "C:\\h", DSA_PI_BIN: pi });
+  const [file] = serviceFiles("C:\\Users\\u", "C:\\state", "C:\\cli.js", "win32", "C:\\node.exe", pi);
+  assert.match(file!.path, /start\.cmd$/);
+  assert.match(file!.content, /set "DSA_HOME=C:\\state"/);
+  assert.ok(file!.content.includes(`set "DSA_PI_BIN=${pi}"`), file!.content);
 });

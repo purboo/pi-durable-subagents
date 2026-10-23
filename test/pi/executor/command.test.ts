@@ -38,7 +38,7 @@ async function setup(t: TestContext, onScan?: (ids: string[], found: number) => 
     try { await executor.shutdown(); } finally {
       for (const e of journal.entries().filter(e => e.type === "command-intent")) await new PlatformContainment().fence(String(e.id), []).catch(() => {});
       await journal.close(); await orch.close();
-      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true });
+      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
     }
   });
   return { home, wid, cwd, journal, executor, ticket };
@@ -90,7 +90,7 @@ test("C-late-exit: an exit recorded after the deadline seals timeout (data from 
   assert.equal(inTime.status, "ok", JSON.stringify(inTime));
 });
 
-test("C-no-started: a live tagged attempt with no started record is held to its deadline from the intent", { timeout: 60_000 }, async t => {
+test("C-no-started: a live tagged attempt with no started record is held to its deadline from the intent", { timeout: 60_000, skip: process.platform === "win32" ? "asserts the inherited DSA_EXEC tag; Windows finds a process by its tree" : false }, async t => {
   const f = await setup(t);
   const call = f.ticket({ command: "sleep 30", timeoutMs: 1000 }), id = `command:${call.callId}#1`, dir = join(callDir(f.home, f.wid, "a", 1), "command-1");
   // The crash cut: the intent and the process, no command-started.
@@ -105,7 +105,7 @@ test("C-no-started: a live tagged attempt with no started record is held to its 
   assert.ok(!f.journal.entries().some(e => e.type === JT.sealed && (e.result as CallResult).status !== "timeout"));
 });
 
-test("F3: a stop recorded while the spawn prepares (its mkdir) starts no process and seals stopped", { timeout: 60_000 }, async t => {
+test("F3: a stop recorded while the spawn prepares (its mkdir) starts no process and seals stopped", { timeout: 60_000, skip: process.platform === "win32" ? "injects a synchronous mkdir hook; Windows command spawn prep differs" : false }, async t => {
   const fs = (await import("node:fs/promises")).default, { syncBuiltinESMExports } = await import("node:module");
   const f = await setup(t);
   const call = f.ticket({ command: "echo side-effect > marker" }), mkdirReal = fs.mkdir;

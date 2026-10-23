@@ -7,7 +7,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { chaos } from "../../../src/cli/chaos/index.ts";
 
 const exec = promisify(execFile);
-test("AC2 / AC4: all nine faults use real main, orchestrator, evaluator and child sessions", { timeout: 240_000 }, async t => {
+test("AC2 / AC4: all nine faults use real main, orchestrator, evaluator and child sessions", { timeout: 240_000, skip: process.platform === "win32" ? "chaos steers and fault injection use POSIX sessions and signals" : false }, async t => {
   let output = "";
   const code = await chaos(["--keep", "--json"], process.env, text => { output += text; });
   const report = JSON.parse(output); t.diagnostic(`durable evidence: ${report.evidence}`);
@@ -24,6 +24,6 @@ test("AC2 / AC4: all nine faults use real main, orchestrator, evaluator and chil
 test("CLI entry runs one offline scenario and prints a readable kept-root summary", { timeout: 60_000 }, async t => {
   const { stdout, stderr } = await exec(process.execPath, ["src/cli/main.ts", "chaos", "--scenario", "3", "--keep"], { timeout: 55_000 });
   assert.equal(stderr, ""); assert.match(stdout, /duplicate runs \.{8} 0/);
-  assert.match(stdout, /scenario 3 .* pass/); assert.match(stdout, /kept: \/.*dsa-chaos-/);
+  assert.match(stdout, /scenario 3 .* pass/); assert.match(stdout, /kept: (?:\/|[A-Za-z]:\\)[^\n]*dsa-chaos-/);
   t.diagnostic(stdout.trim());
 });

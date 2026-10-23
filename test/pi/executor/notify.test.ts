@@ -35,7 +35,7 @@ async function setup(t: TestContext, config: OrchestratorConfig = {}) {
     try { await executor.shutdown(); } finally {
       await journal.close(); await orch.close();
       for (const [key, value] of Object.entries(old)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true });
+      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
     }
   });
   const ctx = { journal, widRev: `${wid}@1` as const, key: "a", gen: 1 };
@@ -143,7 +143,8 @@ for (const end of ["timeout", "stop"] as const) test(`a follow-up forwarded into
   assert.deepEqual(await f.executor.forward(req, f.ctx), { action: "apply" });
   if (end === "stop") await f.executor.stop({ wid: f.wid });
   assert.equal((await pending).status, end === "stop" ? "stopped" : "timeout");
-  const retired = f.journal.entries().find(e => e.type === "forward-retired" && e.rid === req.rid);
-  assert.equal(retired?.reason, end === "stop" ? "retired-without-child-receipt" : "undelivered-follow-up");
+  await until(() => f.journal.entries().some(e => e.type === "forward-retired" && e.rid === req.rid), 5000);
+  const retired = f.journal.entries().find(e => e.type === "forward-retired" && e.rid === req.rid)!;
+  assert.equal(retired.reason, end === "stop" ? "retired-without-child-receipt" : "undelivered-follow-up");
   assert.ok(!f.journal.entries().some(e => e.type === "forward-delivered" && e.rid === req.rid), "the child never took it");
 });

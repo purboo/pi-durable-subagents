@@ -36,7 +36,7 @@ test("FC1 E2E: a fork child's first request carries the origin's compaction summ
     msg("l", "c", "LATER-MESSAGE")];
   await writeFile(origin, rows.map(e => JSON.stringify(e)).join("\n") + "\n");
   const controller = new AbortController(), running = main({ home, signal: controller.signal, discovery: { home: root } });
-  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } if (process.env.DSA_KEEP) t.diagnostic(`kept ${root}`); else await rm(root, { recursive: true, force: true }); });
+  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } if (process.env.DSA_KEEP) t.diagnostic(`kept ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {}); });
   const req: Request = { rid: "run", from: "main:test", to: "orch", sseq: 1, kind: "run", body: { cwd, source: `return await runs.run('a', {agent:'test', context:'fork', task:'FORK-TASK'});`, origin: { sessionFile: origin } } };
   await publishRequest(orchInbox(home), req);
   const created = await until(() => readJournalSnapshot(orchLedger(home)).find(e => e.type === JT.created), "created");

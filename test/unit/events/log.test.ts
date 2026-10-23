@@ -246,11 +246,15 @@ test('event log: failed writes never spend more than EVENT_SEQ_SKIP seqs past th
   /** Partial writes then ENOSPC (the complete lines are visible to a reader until the writer cuts them); `only` picks
    *  the writes that fail. Returns the highest seq a reader saw. */
   const failing = (path: string, log: EventLog, only: (text: string) => boolean) => {
-    const file = (log as unknown as { file: { write: (text: string) => Promise<unknown> } }).file, write = file.write.bind(file);
+    const file = (log as unknown as { file: { write: (...args: any[]) => Promise<unknown> } }).file, write = file.write.bind(file);
     const state = { seen: 0, fail: true };
-    file.write = async (text: string) => {
-      if (!state.fail || !only(text)) return write(text);
-      await write(text.slice(0, Math.floor(text.length / 2)));
+    // The writer now passes a Buffer with an explicit position (Windows append handles cannot truncate); keep the same
+    // partial-write failure for both call shapes.
+    file.write = async (data: any, offset?: number, length?: number, position?: number) => {
+      const text = typeof data === "string" ? data : Buffer.from(data as Uint8Array).toString("utf8");
+      if (!state.fail || !only(text)) return typeof data === "string" ? write(data) : write(data, offset, length, position);
+      if (typeof data === "string") await write(text.slice(0, Math.floor(text.length / 2)));
+      else await write(Buffer.from(data as Uint8Array).subarray(0, Math.floor((data as Uint8Array).length / 2)), 0, Math.floor((data as Uint8Array).length / 2), position ?? 0);
       state.seen = Math.max(state.seen, ...seqs(path));
       throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
     };
@@ -293,7 +297,9 @@ test('event log: a compaction that fails after its rename leaves the log broken 
   // The old handle names the replaced inode: writing there would lose the events.
   await assert.rejects(log.append([draft(3, 'B')]), /EIO/);
   await close();
-  assert.deepEqual(seqs(path), [2]);
+  // Windows closes the writer before the replace, so a failed close leaves the original file (A and B); POSIX had
+  // already replaced it with the compacted one (B only).
+  assert.deepEqual(seqs(path), process.platform === "win32" ? [1, 2] : [2]);
 });
 
 test('event pump: flush rejects when the pass could not log what it derived; the retry logs it', async t => {

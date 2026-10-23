@@ -16,6 +16,7 @@ import { requestRid, sendIdentified, specDigest } from '../../../src/requests.ts
 import { request } from '../../../src/agent/main/tool.ts';
 import { checkLabels, labelsProblem, parseLabels } from '../../../src/events/labels.ts';
 import { JT, type EvalToOrch, type OrchToEval, type Request } from '../../../src/types.ts';
+import { fileId } from '../../../src/kernel/ids.ts';
 import type { EvaluatorTransport } from '../../../src/orchestrator/evaluator-client.ts';
 import { fakeExecutor } from '../orchestrator/engine/fake.ts';
 
@@ -114,7 +115,7 @@ test('Run --labels — invalid JSON, invalid labels and labels in the spec exit 
   const labels = { node: 'n1', attempt: '2' };
   const first = await f.cli(['run', '--request', 'L', '--spec', path, '--labels', JSON.stringify(labels), '--json']);
   assert.equal(first.code, 75, first.out);
-  const published = JSON.parse(await readFile(join(orchInbox(f.home), 'req:L.json'), 'utf8')) as Request;
+  const published = JSON.parse(await readFile(join(orchInbox(f.home), `${fileId('req:L')}.json`), 'utf8')) as Request;
   assert.deepEqual(published.body, { cwd: f.cwd, call: { agent: 'echo', task: 'hello' }, labels });
   const unlabeled = specDigest({ kind: 'run', body: { cwd: f.cwd, call: { agent: 'echo', task: 'hello' } } });
   assert.notEqual(specDigest(published), unlabeled);
@@ -131,7 +132,7 @@ test('Run --labels — invalid JSON, invalid labels and labels in the spec exit 
   // An unlabeled id conflicts with labels added later.
   assert.equal((await f.cli(['run', '--request', 'U', '--spec', path, '--json'])).code, 75);
   assert.equal((await f.cli(['run', '--request', 'U', '--spec', path, '--labels', '{"a":"b"}', '--json'])).code, 3);
-  assert.deepEqual((await f.inbox()).sort(), ['req:L.json', 'req:U.json']);
+  assert.deepEqual((await f.inbox()).sort(), [`${fileId('req:L')}.json`, `${fileId('req:U')}.json`]);
 });
 
 test('Decided runs — same labels get the first outcome, other labels conflict; describe echoes labels, also after prune', async t => {

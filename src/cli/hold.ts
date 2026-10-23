@@ -5,6 +5,8 @@ import { watch, type FSWatcher } from "node:fs";
 import { constants } from "node:os";
 import { dsaHome } from "../paths.ts";
 import { captureStart } from "../platform/proctable.ts";
+import { execTarget } from "../platform/launch.ts";
+import { IS_WINDOWS, killTreeSync } from "../platform/windows.ts";
 import { blockers, endLeaseProcesses, enqueue, grantQueued, holdDetail, holdTag, tryGrant, leaseDir, liveTickets, orphaned, rank, removeTicket, RESOURCE, who, writeTicket, type LeaseMode, type LeaseTicket } from "../platform/lease.ts";
 
 export const HOLD_USAGE = "usage: pi-durable-subagents hold <resource> [--shared | --slots <n>] [--priority <n>] [--yield] [--expect <duration>] [--max-wait <seconds> | --no-wait] [--note <text>] -- <command> [args…]";
@@ -58,7 +60,7 @@ export function parseHold(args: string[]): HoldArgs {
 }
 
 const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`;
-const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+const SIGNALS = (IS_WINDOWS ? ["SIGINT", "SIGTERM", "SIGBREAK"] : ["SIGINT", "SIGTERM", "SIGHUP"]) as readonly NodeJS.Signals[];
 
 export interface HoldOptions { env?: NodeJS.ProcessEnv; stderr?: (line: string) => void; pollMs?: number; graceMs?: number }
 
@@ -86,7 +88,7 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
   const ticket: LeaseTicket = granted ?? await enqueue(home, request);
   let child: ReturnType<typeof spawn> | undefined, interrupted: NodeJS.Signals | undefined, wake = () => {}, cleaned = false;
   const onSignal = (signal: NodeJS.Signals) => {
-    if (child?.pid) { try { process.kill(-child.pid, signal); } catch { /* gone */ } }
+    if (child?.pid) { try { if (IS_WINDOWS) killTreeSync(child.pid); else process.kill(-child.pid, signal); } catch { /* gone */ } }
     else { interrupted = signal; wake(); }
   };
   for (const s of SIGNALS) process.on(s, onSignal);
@@ -135,8 +137,9 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
     if (interrupted) return 128 + (constants.signals[interrupted] ?? 1);
     if (shown) say(`hold: ${args.resource} granted after ${age(ticket.grantedAt! - ticket.since)}`);
     // stdin stays attached only when it is not a terminal: a background group reading the terminal stops.
-    const c = spawn(args.argv[0]!, args.argv.slice(1), { stdio: [process.stdin.isTTY ? "ignore" : "inherit", "inherit", "inherit"], detached: true,
-      env: { ...env, DSA_HOLD: holdTag(ticket) } });
+    const target = execTarget(args.argv[0]!, args.argv.slice(1));
+    const c = spawn(target.command, target.args, { stdio: [process.stdin.isTTY ? "ignore" : "inherit", "inherit", "inherit"], detached: true,
+      env: { ...env, DSA_HOLD: holdTag(ticket) }, windowsHide: true });
     child = c;
     let status: number | undefined;
     const exit = new Promise<number>(resolve => {

@@ -10,10 +10,11 @@
 //
 // A failed write never fails or delays the request: the write happens after the request was handed to the provider
 // and every error is swallowed.
-import { mkdir, open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { contentHash } from "../../kernel/ids.ts";
+import { replacePath } from "../../kernel/fsx.ts";
 
 /** The apis an exact fork can splice (EX4). Every other api falls back to a rebuilt fork. */
 export const EXACT_APIS = ["anthropic-messages", "openai-responses"] as const;
@@ -75,7 +76,7 @@ export async function writeCapture(home: string, capture: Capture): Promise<void
     await file.writeFile(JSON.stringify({ ...capture, payload: capture.payload }));
     await file.sync();
   } finally { await file.close(); }
-  await rename(temp, target);
+  await replacePath(temp, target);
 }
 
 /** Read the capture of a session; undefined when there is none (or it is unreadable). */

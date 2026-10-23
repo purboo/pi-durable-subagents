@@ -26,7 +26,7 @@ async function fixture(t: TestContext, task: string, sibling = false) {
   await writeFile(join(cwd, ".pi/agents/test.md"), "---\nname: test\ndescription: test\nmodel: probe/scripted\n---\nTest.");
   await writeFile(join(home, "config.json"), JSON.stringify({ writerLock: "off", pools: { writer: ["probe/scripted", "probe/scripted2"], alt: ["probe/scripted2", "probe/scripted"] }, k: { trackerMs: 20, hibernateMs: 60, idleExitMs: 60000 } }));
   let controller = new AbortController(), running = main({ home, signal: controller.signal, discovery: { home: root } });
-  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } await rm(root, { recursive: true, force: true }); });
+  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {}); });
   const restart = async () => { controller.abort(); await running; controller = new AbortController(); running = main({ home, signal: controller.signal, discovery: { home: root } }); };
   const call = `runs.run('a', {agent:'test',model:'writer',writer:false,task:${JSON.stringify(task)}})`;
   const source = sibling ? `return await Promise.all([${call}, runs.run('b', {command:['sleep','60']})]);` : `return await ${call};`;

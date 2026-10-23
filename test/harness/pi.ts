@@ -5,10 +5,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execTarget } from "../../src/platform/launch.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const REPO = path.resolve(HERE, "../..");
-export const PI_BIN = path.join(REPO, "node_modules/.bin/pi");
+// Windows has no extensionless executable: the npm shim is `pi.cmd`, and execTarget unwraps it to node + script.
+export const PI_BIN = path.join(REPO, `node_modules/.bin/pi${process.platform === "win32" ? ".cmd" : ""}`);
 export const FAUX = path.join(HERE, "faux-provider.ts");
 
 // Tests must never reach a real provider: drop provider credentials from this process and everything it spawns.
@@ -50,7 +52,8 @@ export function startPi(opts: { root: string; name: string; extensions?: string[
   const extArgs = [FAUX, ...(opts.extensions ?? [])].flatMap(e => ["-e", e]);
   const modelArgs = opts.model === false ? [] : ["--provider", "probe", "--model", "scripted"];
   const args = ["--mode", "rpc", ...extArgs, ...modelArgs, "--session-dir", path.join(dir, "sessions"), ...(opts.args ?? [])];
-  const child = spawn(PI_BIN, args, { cwd: path.join(dir, "work"), env: env as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"], detached: true });
+  const target = execTarget(PI_BIN, args);
+  const child = spawn(target.command, target.args, { cwd: path.join(dir, "work"), env: env as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
   const events: PiEvent[] = [];
   const waiters: { pred: (e: PiEvent) => boolean; resolve: (e: PiEvent) => void }[] = [];
   let buf = "";

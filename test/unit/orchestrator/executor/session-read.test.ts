@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { replacePath } from "../../../../src/kernel/fsx.ts";
 import { forgetSession, readSession, readSessionState } from "../../../../src/orchestrator/executor/session.ts";
 
 const line = (n: number) => JSON.stringify({ type: "custom", id: `e${n}`, data: { text: "ü".repeat(n) } }) + "\n";
@@ -44,7 +45,7 @@ test("F3 a replaced or shortened session is read from scratch", async t => {
   await writeFile(file, line(1) + line(2) + line(3));
   assert.equal((await readSession(file)).length, 3);
   await writeFile(join(root, "next"), line(7) + line(8) + line(9) + line(10));
-  await rename(join(root, "next"), file);
+  await replacePath(join(root, "next"), file);
   assert.deepEqual((await readSession(file)).map(e => e.id), ["e7", "e8", "e9", "e10"]);
   await writeFile(file, line(5));
   assert.deepEqual((await readSession(file)).map(e => e.id), ["e5"]);

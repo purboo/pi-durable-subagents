@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openJournal, readJournalSnapshot } from '../../../src/kernel/journal.ts';
 import { publishRequest, scanInbox, Outbox } from '../../../src/kernel/mailbox.ts';
-import { contentHash, forwardRid, ulid } from '../../../src/kernel/ids.ts';
+import { contentHash, fileId, forwardRid, ulid } from '../../../src/kernel/ids.ts';
 import type { Request } from '../../../src/types.ts';
 
 const req: Request = { rid: 'r1', from: 'main:test', to: 'orch', sseq: 1, kind: 'run', body: { x: 1 } };
@@ -134,12 +134,13 @@ test('tail truncation and appends fsync before success; file creation syncs dire
   });
   await probe.close();
   let journal = await openJournal(path);
-  assert.deepEqual(events, ['file-sync', 'directory-sync']);
+  const directorySync = process.platform === 'win32' ? [] : ['directory-sync'];
+  assert.deepEqual(events, ['file-sync', ...directorySync]);
   events.length = 0; await journal.append('kept', {}); assert.deepEqual(events, ['file-sync']); await journal.close();
   await appendFile(path, 'torn'); events.length = 0;
   journal = await openJournal(path); assert.deepEqual(events, ['truncate', 'file-sync']); await journal.close();
   events.length = 0; await publishRequest(join(dir, 'inbox'), req);
-  assert.deepEqual(events, ['file-sync', 'directory-sync']);
+  assert.deepEqual(events, ['file-sync', ...directorySync]);
 });
 test('canonical identities and monotonic ULIDs', () => {
   assert.equal(contentHash({ z: [1, { b: 2, a: 3 }], a: 0 }), contentHash({ a: 0, z: [1, { a: 3, b: 2 }] }));
@@ -201,7 +202,7 @@ test('A3, C11: requests with a long or unsafe rid are never admitted (no path ca
   const { scanInbox } = await import('../../../src/kernel/mailbox.ts');
   const dir = await mkdtemp(join(tmpdir(), 'dsa-rid-')), bad: string[] = [];
   const base = { from: 's', to: 'orch', sseq: 1, kind: 'run', body: {} };
-  for (const rid of ['ok-01:a.b', 'x'.repeat(129), '\u4efb\u52a1'.repeat(40), '-leading']) await writeFile(join(dir, `${rid}.json`), JSON.stringify({ ...base, rid }));
+  for (const rid of ['ok-01:a.b', 'x'.repeat(129), '\u4efb\u52a1'.repeat(40), '-leading']) await writeFile(join(dir, `${fileId(rid)}.json`), JSON.stringify({ ...base, rid }));
   const admitted = await scanInbox(dir, path => bad.push(path));
   assert.deepEqual(admitted.map(r => r.rid), ['ok-01:a.b']); assert.equal(bad.length, 3);
 });

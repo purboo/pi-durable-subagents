@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, appendFile, rename } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, appendFile } from 'node:fs/promises';
+import { replacePath } from '../../../src/kernel/fsx.ts';
 import { tmpdir } from 'node:os';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -47,7 +48,7 @@ test('request lookup parses no unrelated ledger/outbox line, preserves first mat
     assert.deepEqual(await findRequest(home, hinted.rid), { request: hinted, admitted: false }, 'a hinted miss still reads fresh growth');
     assert.equal(await findRequest(home, 'replaced'), undefined);
     const replaced = request('replaced'), replacement = join(dir, 'replacement');
-    await writeFile(replacement, line(1, 'sent', { request: replaced })); await rename(replacement, foreign);
+    await writeFile(replacement, line(1, 'sent', { request: replaced })); await replacePath(replacement, foreign);
     assert.deepEqual(await findRequest(home, replaced.rid), { request: replaced, admitted: false }, 'a cached miss rebuilds on replacement');
     assert.equal(await findRequest(home, 'shrunk'), undefined);
     const shrunk = request('shrunk'); await writeFile(foreign, line(1, 'sent', { request: shrunk }));
@@ -118,7 +119,7 @@ test('pending session outboxes fold only new bytes and drop resolved identities 
     assert.deepEqual([...reader.read(other)], ['other']);
     await writeFile(path, line(1, 'sent', { request: request('shrunk') }));
     assert.deepEqual([...reader.read(path)], ['shrunk']);
-    const replacement = join(home, 'replacement'); await writeFile(replacement, line(1, 'sent', { request: request('replaced') })); await rename(replacement, path);
+    const replacement = join(home, 'replacement'); await writeFile(replacement, line(1, 'sent', { request: request('replaced') })); await replacePath(replacement, path);
     assert.deepEqual([...reader.read(path)], ['replaced']);
     const tail = line(2, 'resolved', { rid: 'replaced' }), broken = (tail[0] === '0' ? '1' : '0') + tail.slice(1);
     await appendFile(path, broken); assert.deepEqual([...reader.read(path)], ['replaced']);

@@ -59,7 +59,7 @@ test('a resting journal closes its descriptor, reopens it for an append and stay
   // A failed reopen wrote nothing and does not poison the handle: the next append succeeds.
   if (process.getuid?.() !== 0) {
     await chmod(path, 0o400);
-    await assert.rejects(journal.append('denied', {}), /EACCES/);
+    await assert.rejects(journal.append('denied', {}), process.platform === 'win32' ? /EPERM/ : /EACCES/);
     await chmod(path, 0o600);
     await journal.append('five', {});
     assert.deepEqual(readJournalSnapshot(path).map(e => e.type).slice(-2), ['four', 'five']);

@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rename, rm, writeFile as write } from "node:fs/promises";
+import { mkdtemp, rm, writeFile as write } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { replacePath } from "../../../src/kernel/fsx.ts";
 import { openJournal } from "../../../src/kernel/journal.ts";
 import { orchLedger } from "../../../src/paths.ts";
 import { configHash, configProblem, configStamp, recordConfig, watchConfig } from "../../../src/orchestrator/config.ts";
@@ -13,7 +14,7 @@ import type { OrchestratorConfig } from "../../../src/orchestrator/contract.ts";
 
 // Each version is written whole, as an editor saving by rename does: a watcher check can otherwise read the file
 // truncated and half-written, which is reported as invalid JSON until the next check.
-async function writeFile(path: string, text: string) { await write(`${path}.tmp`, text); await rename(`${path}.tmp`, path); }
+async function writeFile(path: string, text: string) { await write(`${path}.tmp`, text); await replacePath(`${path}.tmp`, path); }
 
 test("configProblem accepts pi-side keys and names the first invalid orchestrator setting", () => {
   assert.equal(configProblem({ ui: { dock: "line" }, onQuit: "pause", providers: { a: { slots: 0 } }, pools: { p: ["a/b:low"] }, k: { trackerMs: 50, lossBound: 0 }, memory: { reserveMb: 0 } }), undefined);

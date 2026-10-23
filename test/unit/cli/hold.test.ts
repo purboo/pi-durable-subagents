@@ -15,6 +15,7 @@ import { main, renderView } from '../../../src/cli/main.ts';
 import { blockers, groupAlive, leaseCalls, leaseDir, leaseLines, leaseState, orphaned, readTickets, writeShim, type LeaseTicket } from '../../../src/platform/lease.ts';
 import { statusBrief, statusView } from '../../../src/orchestrator/snapshot.ts';
 import { restartRefusal } from '../../../src/orchestrator/restart.ts';
+const unixOnly = process.platform === "win32" ? "uses POSIX sh/sleep command scripts" : false;
 
 const cli = fileURLToPath(new URL('../../../src/cli/main.ts', import.meta.url));
 async function root(t: test.TestContext) {
@@ -58,7 +59,7 @@ test('hold: blockers are strict FIFO; an exclusive waiter keeps later shared req
   assert.deepEqual(blockers(t(4, 'shared'), [t(1, 'shared'), t(3, 'shared')]), []);
 });
 
-test('hold: exclusive holders run one after another in request order; exit codes pass through', async t => {
+test('hold: exclusive holders run one after another in request order; exit codes pass through', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log');
   // A holds until the test lets it go, so B and C queue behind it however slowly they start.
   const go = join(home, 'go');
@@ -79,7 +80,7 @@ test('hold: exclusive holders run one after another in request order; exit codes
   assert.deepEqual(await readdir(leaseDir(home, 'machine')).then(n => n.filter(x => x.endsWith('.json'))), [], 'released');
 });
 
-test('hold: shared holders run together; an exclusive request waits for them and blocks later shared ones', async t => {
+test('hold: shared holders run together; an exclusive request waits for them and blocks later shared ones', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log');
   const s1 = run(home, ['gpu', '--shared', '--', ...step(file, 's1', 0.8)]);
   const s2 = run(home, ['gpu', '--shared', '--', ...step(file, 's2', 0.8)]);
@@ -93,7 +94,7 @@ test('hold: shared holders run together; an exclusive request waits for them and
   assert.deepEqual(order.slice(4), ['e start', 'e end', 's3 start', 's3 end']);
 });
 
-test('hold: --max-wait gives up with 75 without running the command', async t => {
+test('hold: --max-wait gives up with 75 without running the command', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log');
   const a = run(home, ['machine', '--', ...step(file, 'a', 5)]);
   await until(() => granted(home, 'machine', a.child.pid!));
@@ -105,7 +106,7 @@ test('hold: --max-wait gives up with 75 without running the command', async t =>
   assert.deepEqual(log(file), ['a start', 'a end']);
 });
 
-test('hold: --max-wait 0 / --no-wait takes the lease at once or exits 75 without ever being a waiter', async t => {
+test('hold: --max-wait 0 / --no-wait takes the lease at once or exits 75 without ever being a waiter', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log');
   // Free: runs at once, its ticket granted from the start.
   const free = run(home, ['machine', '--no-wait', '--', ...step(file, 'free', 0.5)]);
@@ -136,7 +137,7 @@ test('hold: --max-wait 0 / --no-wait takes the lease at once or exits 75 without
   assert.ok(!log(file).some(l => l.startsWith('refused')), 'the refused command never ran');
 });
 
-test('hold: a killed wrapper keeps the lease until its command ends; leftovers end before release', async t => {
+test('hold: a killed wrapper keeps the lease until its command ends; leftovers end before release', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log'), pidFile = join(home, 'bg.pid');
   const a = run(home, ['machine', '--', ...step(file, 'a', 1)]);
   const ticket = await until(() => { const x = granted(home, 'machine', a.child.pid!); return x?.command ? x : undefined; });
@@ -148,7 +149,7 @@ test('hold: a killed wrapper keeps the lease until its command ends; leftovers e
   assert.throws(() => process.kill(leftover, 0), /ESRCH/, 'the background process the command left is ended');
 });
 
-test('hold: when the wrapper is killed and the command has ended, its leftovers keep the lease until a waiter ends them', async t => {
+test('hold: when the wrapper is killed and the command has ended, its leftovers keep the lease until a waiter ends them', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log'), pidFile = join(home, 'bg.pid');
   const a = run(home, ['machine', '--', 'sh', '-c', `sleep 30 & echo $! > ${pidFile}; echo "a start" >> ${file}; sleep 0.5`]);
   const ticket = await until(() => { const x = granted(home, 'machine', a.child.pid!); return x?.command && existsSync(pidFile) ? x : undefined; });
@@ -185,7 +186,7 @@ test('hold: leftovers are the command\'s group only: zombies do not hold a lease
   assert.equal(orphaned(ticket({ pid: group.pid, start: '1' })), false, 'another start token: a reused pid, not the command');
 });
 
-test('hold: dead tickets are reclaimed; leases and status show holders and waiters', async t => {
+test('hold: dead tickets are reclaimed; leases and status show holders and waiters', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log');
   await mkdir(leaseDir(home, 'machine'), { recursive: true });
   const dead: LeaseTicket = { seq: 1, resource: 'machine', mode: 'exclusive', wrapper: { pid: 999_999_99 }, argv: ['x'], cwd: '/', since: Date.now() - 60_000, grantedAt: Date.now() };
@@ -215,7 +216,7 @@ test('hold: dead tickets are reclaimed; leases and status show holders and waite
   assert.deepEqual(lines, ['No leases held or waited for']);
 });
 
-test('hold: the shim runs the CLI from a child environment', async t => {
+test('hold: the shim runs the CLI from a child environment', { skip: unixOnly }, async t => {
   const home = await root(t), bin = join(home, 'bin');
   const shim = writeShim(bin, process.execPath, cli);
   const out = await new Promise<string>((resolve, reject) => {
@@ -259,7 +260,7 @@ test('hold --slots: blockers count granted tickets and never overtake an earlier
   assert.deepEqual(blockers(t(1, 'counted', true, 1), [t(1, 'counted', true, 1), t(2, 'shared', true), t(3, 'counted', true, 5)]), []);
 });
 
-test('hold --slots 2: two run together, the third waits until one exits; leases show k/N', async t => {
+test('hold --slots 2: two run together, the third waits until one exits; leases show k/N', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log'), goA = join(home, 'go-a'), goB = join(home, 'go-b');
   const a = run(home, ['build', '--slots', '2', '--note', 'n1', '--', ...gate(file, 'a', goA)]);
   await until(() => granted(home, 'build', a.child.pid!));
@@ -290,7 +291,7 @@ test('hold --slots 2: two run together, the third waits until one exits; leases 
   assert.deepEqual(leaseState(home), []);
 });
 
-test('hold --slots: a counted request behind a waiting exclusive one waits although slots are free; an earlier counted waiter is not overtaken', async t => {
+test('hold --slots: a counted request behind a waiting exclusive one waits although slots are free; an earlier counted waiter is not overtaken', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log'), go = join(home, 'go'), go2 = join(home, 'go2');
   const a = run(home, ['build', '--slots', '3', '--', ...gate(file, 'a', go)]);
   await until(() => granted(home, 'build', a.child.pid!));
@@ -318,7 +319,7 @@ test('hold --slots: a counted request behind a waiting exclusive one waits altho
   assert.ok(order.includes('w start') && order.includes('late start'));
 });
 
-test('hold --slots --no-wait: granted while a slot is free, else refused without ever writing a ticket', async t => {
+test('hold --slots --no-wait: granted while a slot is free, else refused without ever writing a ticket', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log'), go = join(home, 'go');
   const a = run(home, ['build', '--slots', '2', '--no-wait', '--', ...gate(file, 'a', go)]);
   await until(() => granted(home, 'build', a.child.pid!));

@@ -18,7 +18,7 @@ async function until<T>(get: () => T | Promise<T>, what: string): Promise<NonNul
   for (;;) { const value = await get(); if (value) return value as NonNullable<T>; if (Date.now() > deadline) throw new Error(`timeout: ${what}`); await delay(25); }
 }
 
-test('wake caller E2E: a real child bash starts a command that survives its turn, appears in awaiting and opens generation 2 with exit and output', { timeout: 120_000 }, async t => {
+test('wake caller E2E: a real child bash starts a command that survives its turn, appears in awaiting and opens generation 2 with exit and output', { timeout: 120_000, skip: process.platform === 'win32' ? 'POSIX bash tool command and an inherited-process tree' : false }, async t => {
   const root = tempRoot('dsa-e2e-wake-'), home = join(root, 'dsa'), cwd = join(root, 'work'), agentDir = join(root, 'agent');
   const values = { HOME: root, DSA_HOME: home, PATH: `${join(REPO, 'node_modules/.bin')}:${process.env.PATH}`, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', PI_SKIP_VERSION_CHECK: '1', PROBE_DIR: root };
   const old = Object.fromEntries(Object.keys(values).map(k => [k, process.env[k]]));
@@ -34,7 +34,7 @@ test('wake caller E2E: a real child bash starts a command that survives its turn
     for (const e of ledger().filter(e => e.type === JT.created)) for (const entry of journal(String(e.wid)))
       if (entry.type === 'command-intent') await new Containment().fence(String(entry.id), []).catch(() => {});
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    if (process.env.DSA_KEEP) t.diagnostic(`kept ${root}`); else await rm(root, { recursive: true, force: true });
+    if (process.env.DSA_KEEP) t.diagnostic(`kept ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
   const task = script([{ tool: 'bash', args: { command: "pi-durable-subagents run --request durable-check --wake caller -- sh -c 'sleep 1; echo wake-out; exit 3'" } }, { text: 'Durable command started; ending this turn.' }]);
   await publishRequest(orchInbox(home), { rid: 'req:caller', from: 'main:wake-test', to: 'orch', sseq: 1, kind: 'run', body: { cwd, source: `return await runs.run('worker', {agent:'test', writer:false, task:${JSON.stringify(task)}});` } } as Request);

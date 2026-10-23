@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { defineTool, type ExtensionAPI, type ExtensionContext, type CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { Outbox, scanInbox } from "../kernel/mailbox.ts";
+import { fileId } from "../kernel/ids.ts";
 import { readerLedger } from "../orchestrator/reader-ledger.ts";
 import { OsLock, isLockTimeout } from "../platform/lock.ts";
 import { launchOrchestrator } from "../platform/launch.ts";
@@ -93,7 +94,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   }
   function pendingOutbox() { return pendingRids().size > 0; }
   function pendingRids() {
-    return pendingReader.read(join(outboxRoot(home), "outbox", `${sender}.jsonl`));
+    return pendingReader.read(join(outboxRoot(home), "outbox", `${fileId(sender)}.jsonl`));
   }
   /** A background failure goes to pi's UI (a raw stderr write would land inside the TUI's editor); without a UI, stderr. */
   function report(text: string) {

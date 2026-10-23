@@ -29,7 +29,7 @@ class ManualEvaluator implements EvaluatorTransport {
   async close() {}
   current() { return this.messages.findLast(m => m.t === 'start')! as Extract<OrchToEval, { t: 'start' }>; }
 }
-async function until<T>(fn: () => T | Promise<T>, timeout = 10_000): Promise<NonNullable<T>> {
+async function until<T>(fn: () => T | Promise<T>, timeout = 30_000): Promise<NonNullable<T>> {
   const end = Date.now() + timeout;
   for (;;) { const value = await fn(); if (value) return value as NonNullable<T>; if (Date.now() >= end) throw new Error('Timed out'); await delay(10); }
 }
@@ -392,7 +392,7 @@ test('staged budgets reach tickets and create-intent references large input snap
   const intent = ledgers.orch.entries().find(e => e.type === 'create-intent')!;
   assert.equal(intent.pins, undefined);
   const ref = intent.snapshot as { path: string; hash: string };
-  assert.equal(ref.path, 'staging/run-1/snapshot.json');
+  assert.equal(ref.path, process.platform === 'win32' ? 'staging\\run-1\\snapshot.json' : 'staging/run-1/snapshot.json');
   assert.equal(ref.hash, contentHash(JSON.parse(await readFile(join(home, ref.path), 'utf8'))));
   assert.ok(JSON.stringify(intent).length < 1000);
   assert.equal(wf.pins.maxCalls, 7);

@@ -14,6 +14,56 @@ except OSError as e:
 print('locked',flush=True)
 while sys.stdin.buffer.read(4096): pass
 `;
+/** Windows has no flock. A helper holds an atomically created lock directory; its owner record and a stale reclaim on
+ *  the next attempt cover a holder that was killed without releasing. The holder's stdin gives the same release-on-
+ *  parent-death property the Unix helpers get from their pipe. */
+const node = `import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+const path = process.argv[1];
+const token = process.pid + ":" + Math.round(performance.timeOrigin);
+const owner = join(path, "owner.json");
+let held = false;
+function alive(pid) { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } }
+function ownerPid() { try { const info = JSON.parse(readFileSync(owner, "utf8")); return info && typeof info.pid === "number" ? info.pid : 0; } catch { return 0; } }
+function claim() {
+  for (let tries = 0; tries < 20; tries++) {
+    try { mkdirSync(path); writeFileSync(owner, JSON.stringify({ pid: process.pid, token })); return true; }
+    catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      let pid = ownerPid();
+      // The holder may be between mkdir and its owner write. Wait briefly for the owner record instead of reporting
+      // the lock held: a burst of CLI senders would otherwise all miss the same short window.
+      for (let wait = 0; !pid && wait < 40; wait++) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        pid = ownerPid();
+      }
+      if (pid && alive(pid)) return false;
+      if (!pid) { try { if (Date.now() - statSync(path).mtimeMs < 2000) return false; } catch { /* vanished: retry */ } }
+      // A crashed holder left the directory. Rename it aside first: one contender wins the rename, so two cannot both
+      // remove and create the same lock.
+      const grave = path + ".stale." + process.pid + "." + Math.random().toString(36).slice(2);
+      try { renameSync(path, grave); rmSync(grave, { recursive: true, force: true }); } catch { /* another contender */ }
+    }
+  }
+  return false;
+}
+function release() {
+  if (!held) return;
+  held = false;
+  try { const info = JSON.parse(readFileSync(owner, "utf8")); if (info.token !== token) return; } catch { return; }
+  try { rmSync(path, { recursive: true, force: true }); } catch { /* gone */ }
+}
+if (!claim()) process.exit(2);
+held = true;
+process.on("exit", release);
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) process.on(signal, () => { release(); process.exit(0); });
+process.stdout.write("locked\\n");
+process.stdin.resume();
+process.stdin.on("end", () => { release(); process.exit(0); });
+`;
+const helpers = () => process.platform === "win32"
+  ? [[process.execPath, ["--input-type=module", "-e", node]] as const]
+  : [["perl", ["-e", perl]] as const, ["python3", ["-c", python]] as const];
 
 /** The error code of a helper that did not answer in time (a slow or suspended machine): transient, not a broken lock. */
 export const LOCK_TIMEOUT = "DSA_LOCK_TIMEOUT";
@@ -26,9 +76,11 @@ export class OsLock implements Contract {
   constructor(timeoutMs = 3000) { this.timeoutMs = timeoutMs; }
   /** C4: Attempt non-blocking exclusion; holder death closes the helper's stdin. */
   async tryAcquire(path: string): Promise<LockHandle | null> {
-    if (process.platform !== "linux" && process.platform !== "darwin") throw new Error(`C4 capability unavailable: ${process.platform}`);
-    for (const [command, args] of [["perl", ["-e", perl, path]], ["python3", ["-c", python, path]]] as const) {
-      const child = spawn(command, [...args], { stdio: "pipe" });
+    const win = process.platform === "win32";
+    if (!win && process.platform !== "linux" && process.platform !== "darwin") throw new Error(`C4 capability unavailable: ${process.platform}`);
+    // The helper runs on the orchestrator's own Node on Windows: no perl/python3 is installed by default there.
+    for (const [command, args] of helpers().map(([c, a]) => [c, [...a, path]] as const)) {
+      const child = spawn(command, [...args], { stdio: "pipe", windowsHide: true });
       let errorText = "";
       child.stderr.on("data", chunk => { errorText = (errorText + chunk).slice(-4096); });
       child.stdin.on("error", () => {});
@@ -67,6 +119,6 @@ export class OsLock implements Contract {
         throw error;
       } finally { clearTimeout(timer); }
     }
-    throw new Error("C4 capability unavailable: install perl or python3 for flock");
+    throw new Error(process.platform === "win32" ? "C4 capability unavailable: the lock helper did not start" : "C4 capability unavailable: install perl or python3 for flock");
   }
 }

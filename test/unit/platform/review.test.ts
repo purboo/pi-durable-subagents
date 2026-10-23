@@ -37,12 +37,16 @@ test("Containment forwards caller exec ids to macOS ps filtering", async () => {
   assert.equal((await c.scan(new Map())).size, 0);
 });
 
-test("fast true and exit 3 preserve output and status without scanning the table", { timeout: 10000 }, async () => {
+test("fast true and exit 3 preserve output and status without scanning the table", { timeout: process.platform === "win32" ? 30000 : 10000 }, async () => {
   const table = new ProcessTable();
-  for (const fixture of [
+  const fixtures = process.platform === "win32" ? [
+    { command: process.execPath, args: ["-e", "process.exit(0)"], code: 0, stdout: "", stderr: "" },
+    { command: process.execPath, args: ["-e", "process.stdout.write('fast output'); process.stderr.write('fast error'); process.exit(3)"], code: 3, stdout: "fast output", stderr: "fast error" },
+  ] : [
     { command: "/bin/sh", args: ["-c", "true"], code: 0, stdout: "", stderr: "" },
     { command: "/bin/sh", args: ["-c", "printf 'fast output'; printf 'fast error' >&2; exit 3"], code: 3, stdout: "fast output", stderr: "fast error" },
-  ]) {
+  ];
+  for (const fixture of fixtures) {
     const tag = randomUUID();
     let scanned = false;
     const c = new Containment({ list: async known => {

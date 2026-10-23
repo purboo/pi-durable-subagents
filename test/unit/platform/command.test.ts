@@ -12,6 +12,7 @@ import { retiredCommandAttempts, unsealedCommandCalls } from "../../../src/orche
 import type { Entry } from "../../../src/types.ts";
 
 const dirOf = () => mkdtempSync(join(tmpdir(), "dsa-command-"));
+const unixOnly = process.platform === "win32" ? "Unix /bin/sh and POSIX PATH semantics" : false;
 const onPath = (name: string) => (process.env.PATH ?? "").split(":").some(d => d && existsSync(join(d, name)));
 async function finished(dir: string) {
   for (let i = 0; i < 200; i++) { const r = await readExitRecord(dir); if (r) return r; await delay(25); }
@@ -26,7 +27,7 @@ test("exit statuses: 0 and plain codes stay codes; above 128 read as the signal 
   assert.deepEqual(exitMeaning(255), { exitCode: 255, signal: null }, "no signal 127");
 });
 
-test("the wrapper records the status of argv, string and builtin commands; output interleaves in output.log", async t => {
+test("the wrapper records the status of argv, string and builtin commands; output interleaves in output.log", { skip: unixOnly }, async t => {
   const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
   const cases: [string | string[], number, string][] = [
     [["sh", "-c", "echo a; echo b >&2; exit 4"], 4, "a\nb\n"],
@@ -53,7 +54,7 @@ test("the wrapper records the status of argv, string and builtin commands; outpu
   }
 });
 
-test("the wrapper records the status under any environment of the command (PATH unset or bogus, IFS, LC_*)", async t => {
+test("the wrapper records the status under any environment of the command (PATH unset or bogus, IFS, LC_*)", { skip: unixOnly }, async t => {
   const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
   // PATH unset: the shell's default path finds `true`; a bogus PATH finds nothing.
   const envs: NodeJS.ProcessEnv[] = [{}, { PATH: "/nonexistent" }, { PATH: "/nonexistent", IFS: "/", LC_ALL: "xx_XX.bogus", LANG: "C" }];
@@ -64,7 +65,7 @@ test("the wrapper records the status under any environment of the command (PATH 
   }
 });
 
-test("argv looks its program up on the command's PATH (a printf program wins over the shell's builtin)", async t => {
+test("argv looks its program up on the command's PATH (a printf program wins over the shell's builtin)", { skip: unixOnly }, async t => {
   const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
   const bin = join(root, "bin"); mkdirSync(bin);
   writeFileSync(join(bin, "printf"), "#!/bin/sh\necho program \"$@\"\n", { mode: 0o755 });
@@ -81,7 +82,7 @@ test("argv looks its program up on the command's PATH (a printf program wins ove
   assert.equal((await finished(missing)).status, 127, "missing: 127");
 });
 
-test("the command runs detached in its own session with stdin at /dev/null", async t => {
+test("the command runs detached in its own session with stdin at /dev/null", { skip: unixOnly }, async t => {
   const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
   const dir = join(root, "c");
   // Linux ps reports the session id; macOS ps has no session id keyword, so there the process group stands in
@@ -130,4 +131,22 @@ test("restart refusal: command calls are never in the busy list or token; a refu
   assert.match(restartRefusal(home, live, {}, false, now, 1)!, /\nnot fenced: 1 command call keeps running across the restart\n/);
   assert.doesNotMatch(restartRefusal(home, live, {}, false, now)!, /command call/);
   assert.equal(restartRefusal(home, [], {}, false, now, 3), undefined, "only command calls: no refusal");
+});
+
+test("Windows command wrapper: cmd strings, argv programs, missing programs and a .cmd shim", { skip: process.platform !== "win32" }, async t => {
+  const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
+  const shim = join(root, "shim.cmd");
+  writeFileSync(shim, `@echo off\r\n"${process.execPath}" -e "console.log('shim', process.argv[1])" %*\r\n`);
+  const cases: [string | string[], number, RegExp][] = [
+    ["echo hello", 0, /^hello\r?\n$/],
+    [[process.execPath, "-e", "process.exit(4)"], 4, /^$/],
+    [["no-such-program-xyz"], 127, /^$/],
+    [[shim, "arg with space"], 0, /^shim arg with space\r?\n$/],
+  ];
+  for (const [i, [command, status, output]] of cases.entries()) {
+    const dir = join(root, `c${i}`);
+    await spawnCommand({ command, cwd: root, dir, env: { ...process.env } });
+    assert.equal((await finished(dir)).status, status, JSON.stringify(command));
+    assert.match(readFileSync(join(dir, "output.log"), "utf8"), output, JSON.stringify(command));
+  }
 });

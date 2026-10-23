@@ -25,7 +25,7 @@ import { fakeExecutor } from '../orchestrator/engine/fake.ts';
 const fake = fileURLToPath(new URL('../orchestrator/engine/fake.ts', import.meta.url));
 async function root(t: test.TestContext) {
   const home = await mkdtemp(join(tmpdir(), 'dsa-restart-'));
-  t.after(() => rm(home, { recursive: true, force: true })); return home;
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {})); return home;
 }
 async function until<T>(fn: () => T | undefined | false | Promise<T | undefined | false>, ms = 10_000): Promise<T> {
   const end = performance.now() + ms;
@@ -155,7 +155,7 @@ for (const body of [{ token: '0123456789ab', reason: 'upgrade' }, { force: true 
   assert.deepEqual(orch.entries().filter(e => e.type === 'restart').map(e => [e.force, e.live]), [[false, []]]);
 });
 
-test('CLI restart: refused while a call runs, --force replaces the orchestrator process and the call resumes', { timeout: 30_000 }, async t => {
+test('CLI restart: refused while a call runs, --force replaces the orchestrator process and the call resumes', { timeout: process.platform === 'win32' ? 90_000 : 30_000 }, async t => {
   const request = sender(), home = await root(t), env = { ...process.env, NODE_TEST_CONTEXT: undefined, HOME: home, DSA_HOME: home, DSA_ORCHESTRATOR_ENTRY: fake, DSA_FAKE_HOLD: 'a' };
   t.after(() => { const o = currentOrchestrator(home); if (o) process.kill(o.pid, 'SIGTERM'); });
   const out: string[] = [], write = (s: string) => { out.push(s); };

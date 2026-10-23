@@ -3,6 +3,7 @@
 // live.json (next to the session) holds that ephemeral state. It is not durable state: written without fsync,
 // replaced atomically (temp + rename), ignored when stale, and never read by the orchestrator.
 import { renameSync, writeFileSync } from "node:fs";
+import { replacePathSync } from "../../kernel/fsx.ts";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -18,7 +19,7 @@ export function registerLive(pi: ExtensionAPI, enabled: () => boolean): void {
   const flush = () => {
     pending = undefined; last = Date.now();
     if (!path || !state) return;
-    try { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify({ ...state, at: last })); renameSync(tmp, path); }
+    try { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify({ ...state, at: last })); replacePathSync(tmp, path); }
     catch { /* Watching is best effort; the session file stays the truth. */ }
   };
   const publish = (ctx: ExtensionContext, next: Omit<Live, "at">, now = false) => {

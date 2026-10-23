@@ -17,7 +17,7 @@ import { JT } from '../../../src/types.ts';
 
 async function root(t: test.TestContext) {
   const home = await mkdtemp(join(tmpdir(), 'dsa-housekeeping-'));
-  t.after(() => rm(home, { recursive: true, force: true })); return home;
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {})); return home;
 }
 async function until(fn: () => boolean) {
   const end = performance.now() + 10_000;
@@ -85,7 +85,7 @@ test('CLI prune and doctor against journals written by the real engine with the 
   const findings = JSON.parse(r.text).findings as { kind: string; command: string }[];
   assert.deepEqual(findings.map(f => f.kind).sort(), ['fence-failed', 'orphan-staging', 'parked', 'tmp-file']);
   assert.equal(findings.find(f => f.kind === 'parked')!.command, `pi-durable-subagents resume ${parked}`);
-  assert.match(findings.find(f => f.kind === 'fence-failed')!.command, new RegExp(`DSA_EXEC=${exec.replace(/[.@/#]/g, '\\$&')}`));
+  assert.match(findings.find(f => f.kind === 'fence-failed')!.command, process.platform === 'win32' ? /Get-CimInstance/ : new RegExp(`DSA_EXEC=${exec.replace(/[.@/#]/g, '\\$&')}`));
   assert.equal(findings.find(f => f.kind === 'orphan-staging')!.command, `rm -rf '${join(home, 'staging', 'ghost')}'`);
   assert.equal(findings.find(f => f.kind === 'tmp-file')!.command, `rm -f '${join(workflowDir(home, one), '.01ABC.tmp')}'`);
   assert.deepEqual(JSON.parse(r.text).attention.map((a: { id: string }) => a.id), ['q:x']);
