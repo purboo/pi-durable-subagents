@@ -44,6 +44,7 @@ import { SessionFold, answerKey, digestOpenQuestion, supersededBy } from "./dige
 import { exhaustedPatterns } from "../providers.ts";
 import { exactDecision, modelConfigured, readPinnedCapture, type ExactReason } from "../exact.ts";
 import { emptyLedger, foldLedger, holdings as holdingsOf, settingsOf } from "../ledger.ts";
+import { modelLimit, modelPool, slotsFull } from "../slots.ts";
 import { evidence, fatalProviderError, quotaExhausted, refusedByProvider, forgetSession, readSessionState, receiptId, sessionModel, type SessionEntry } from "./session.ts";
 import { activeTotal } from "./time.ts";
 import { callEntries, entriesOf, forwardsTo, trackedState, usageIds } from "./indexes.ts";
@@ -620,11 +621,16 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     return o;
   }
   const widOf = (exec: string) => exec.slice(0, exec.indexOf("@"));
-  /** Slot precedence: every acquisition waiting now. `blockedOn`: the providers its latest attempt (at `at`) found full. */
-  const acquiring = new Map<string, { a: Active; call: string; origin?: string; since: number; resume: boolean; blockedOn: ReadonlySet<string>; at: number }>();
-  /** Whether another waiter with precedence for `provider` found it full on a recent attempt: then `exec` leaves the
-   *  free slot to it. Precedence: a call that ran before (its session, cache and worktree are ready; a parent waits on it)
-   *  before a fresh one; then the workflow origin holding fewer of the provider's slots; then the longer wait; then call id. */
+  /** Slot precedence: every acquisition waiting now. `blockedOn`: the providers (and model pools) its latest attempt (at
+   *  `at`) found full; `tried`: per provider, the model ids that attempt found full at either level. */
+  const acquiring = new Map<string, { a: Active; call: string; origin?: string; since: number; resume: boolean; blockedOn: ReadonlySet<string>; tried: ReadonlyMap<string, ReadonlySet<string>>; at: number }>();
+  /** Whether one more call on `provider/id` has room at both levels (provider slots, and the model's when it has any). */
+  const room = (provider: string, id: string) => { const full = slotsFull(settings().providers, holdings(), provider, id); return !full.provider && !full.model; };
+  /** Whether another waiter with precedence for `provider` found it (or its model there) full on a recent attempt and
+   *  could take a slot now (its model has room too): then `exec` leaves the free slot to it. A waiter blocked only by
+   *  its own model's limit holds back nothing. Precedence: a call that ran before (its session, cache and worktree are
+   *  ready; a parent waits on it) before a fresh one; then the workflow origin holding fewer of the provider's slots;
+   *  then the longer wait; then call id. */
   function yields(exec: string, provider: string): boolean {
     const me = acquiring.get(exec); if (!me) return false;
     const recent = 3 * (config.k?.trackerMs ?? 1000), now = Date.now();
@@ -634,7 +640,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       return held.get(origin) ?? 0;
     };
     for (const [other, w] of acquiring) {
-      if (other === exec || !w.blockedOn.has(provider) || now - w.at >= recent || interrupted(w.a)) continue;
+      if (other === exec || now - w.at >= recent || interrupted(w.a)) continue;
+      const ids = w.tried.get(provider);
+      if (!ids || ![...ids].some(id => room(provider, id))) continue;
       if (w.resume !== me.resume) { if (w.resume) return true; continue; }
       const mine = heldBy(me.origin), theirs = heldBy(w.origin);
       if (theirs !== mine) { if (theirs < mine) return true; continue; }
@@ -648,27 +656,27 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const t = a.ticket, since = Date.now();
     // An execution that never started (its launch failed for a reason of the environment) does not make a resume.
     const resume = !!t.continueFrom || t.journal.entries().some(e => e.type === JT.exec && e.call === t.callId && e.exec !== exec && !has(t.journal, "spawn-env-failed", String(e.exec)));
-    const mine = { a, call: t.callId, origin: originOf(t.wid), since, resume, blockedOn: new Set<string>() as ReadonlySet<string>, at: since };
+    const mine = { a, call: t.callId, origin: originOf(t.wid), since, resume, blockedOn: new Set<string>() as ReadonlySet<string>, tried: new Map() as ReadonlyMap<string, ReadonlySet<string>>, at: since };
     acquiring.set(exec, mine);
     try { return await acquireLoop(a, exec, decide, mine, writer); }
     finally { acquiring.delete(exec); }
   }
   async function acquireLoop(a: Active, exec: string, decide: () => Promise<Awaited<ReturnType<typeof launchModel>>>,
-    mine: { since: number; blockedOn: ReadonlySet<string>; at: number }, writer?: string): Promise<{ model?: Model; continuation: boolean }> {
+    mine: { since: number; blockedOn: ReadonlySet<string>; tried: ReadonlyMap<string, ReadonlySet<string>>; at: number }, writer?: string): Promise<{ model?: Model; continuation: boolean }> {
     let continuation = false;
     let pinnedWait: { model: Model; since: number } | undefined;
     let waitMark = "";
     for (;;) {
       let signal!: () => void;
       const changed = new Promise<void>(resolve => { signal = resolve; waiters.add(resolve); });
-      const blocked = new Set<string>();
+      const blocked = new Set<string>(), tried = new Map<string, Set<string>>();
       const chosen = await serial(async () => { try {
         if (interrupted(a) || await workflowReached(a.ticket)) return;
         if (writer && !await writerAdmit(a, writer)) return;
         const decision = await decide(), pool = decision.pool;
         let models = decision.candidates;
         const pinned = decision.spill?.[0];
-        const full = (m: Model) => holdings().filter(h => h.pool === m.provider).length >= (settings().providers?.[m.provider ?? ""]?.slots ?? Infinity);
+        const full = (m: Model) => { const f = slotsFull(settings().providers, holdings(), m.provider, m.id); return f.provider || f.model; };
         if (pinned && full(pinned)) {
           if (!sameModel(pinnedWait?.model, pinned)) pinnedWait = { model: pinned, since: Date.now() };
           const ms = settings().k?.resumeSpillMs;
@@ -692,7 +700,19 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           const probe = provider !== undefined && folded().exhausted.has(provider);
           const holders = holdings().filter(e => e.pool === provider);
           const limit = settings().providers?.[provider ?? ""]?.slots ?? Infinity;
-          if (!capacity({ kind: "provider", holders: holders.length, capacity: limit })) { if (provider) blocked.add(provider); continue; }
+          // The model's own slots on its provider (when `providers.<p>.models[id]` exists) must have room too.
+          const mpool = provider !== undefined ? modelPool(provider, model.id) : "", mlimit = modelLimit(settings().providers, provider, model.id);
+          const mholders = mlimit === undefined ? [] : holdings().filter(e => e.pool === mpool);
+          const providerFull = !capacity({ kind: "provider", holders: holders.length, capacity: limit });
+          const modelFull = mlimit !== undefined && !capacity({ kind: "provider", holders: mholders.length, capacity: mlimit });
+          if (providerFull || modelFull) {
+            if (provider) {
+              if (providerFull) blocked.add(provider);
+              if (modelFull) blocked.add(mpool);
+              tried.set(provider, (tried.get(provider) ?? new Set()).add(model.id));
+            }
+            continue;
+          }
           if (provider && yields(exec, provider)) continue;
           // A burst of dispatches all read the same MemAvailable before any child has grown: subtract the children
           // admitted in the last 30 s (their memory is not visible yet), so a burst cannot over-commit the headroom.
@@ -711,6 +731,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           if (provider) {
             let slot = 0; while (holders.some(e => e.slot === slot)) slot++;
             await orch.append("hold", { pool: provider, slot, exec });
+            if (mlimit !== undefined) {
+              let mslot = 0; while (mholders.some(e => e.slot === mslot)) mslot++;
+              await orch.append("hold", { pool: mpool, slot: mslot, exec });
+            }
             // After its next try, the first call admitted to a used-up provider is its probe: its first request
             // either goes through (the provider is available again) or is refused, which uses no quota.
             if (probe) await orch.append("provider-probe", { provider, exec });
@@ -723,7 +747,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           await a.ticket.journal.append("selected", { exec, model: plain, ...(pool ? { pool } : {}) });
           return plain;
         }
-      } finally { mine.blockedOn = blocked; mine.at = Date.now(); } });
+      } finally { mine.blockedOn = blocked; mine.tried = tried; mine.at = Date.now(); } });
       if (!chosen) options.attempted?.(exec, [...blocked]);
       if (chosen || interrupted(a) || reached(totalUsage(a.ticket.journal.entries()), a.ticket.workflowBudget)) { waiters.delete(signal); return { model: chosen, continuation }; }
       const timer = setTimeout(signal, config.k?.trackerMs ?? 1000);
@@ -885,11 +909,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           accepted = false; return;
         }
       }
-      const target = holdings().find(h => h.exec === exec && h.pool === provider && h.reserved);
-      if (!target) return;
-      if (!folded().observed.has(`${exec}\n${target.rid}`)) {
+      // A reserved slot of the provider proves the switch by the provider answering; a reserved slot of a model on the
+      // provider the execution already ran on (a switch inside one provider) only by that model answering.
+      const reserved = holdings().filter(h => h.exec === exec && h.reserved && !folded().observed.has(`${exec}\n${h.rid}`));
+      const target = reserved.find(h => h.pool === provider) ?? (message.role === "assistant" && message.model
+        ? reserved.find(h => h.pool.startsWith(`${provider}/`) && answersAs(journal, exec, provider, h.pool.slice(provider.length + 1), message.model!)) : undefined);
+      if (target) {
         await orch.append("switch-observed", { exec, rid: target.rid, pool: provider });
-        for (const h of holdings().filter(h => h.exec === exec && h.pool !== provider && h.pool !== "memory")) await orch.append("release", { pool: h.pool, slot: h.slot, exec });
+        for (const h of holdings().filter(h => h.exec === exec && h.pool !== provider && h.pool !== "memory" && h.rid !== target.rid)) await orch.append("release", { pool: h.pool, slot: h.slot, exec });
       }
     });
     wake();
@@ -938,7 +965,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const rid = contentHash([exec, "failover", provider]);
       if (t.journal.entries().some(e => e.type === "forward" && e.rid === rid)) return;
       const probe = folded().exhausted.has(m.provider); // its next try is due (`unavailable` said so): this is its probe
-      if (!await reserveSwitch(exec, m.provider, rid)) continue;
+      if (await reserveSwitch(exec, m.provider, m.id, rid)) continue;
       if (probe) await orch.append("provider-probe", { provider: m.provider, exec });
       // Bound to this execution: replayed after it ended, a later execution (which chose its model at launch) refuses it.
       const body: ModelBody = { provider: m.provider, model: m.id, ...(m.thinking ? { thinking: m.thinking } : {}), exec };
@@ -948,14 +975,31 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       return;
     }
   }
-  /** Hold a slot of `provider` for a running execution's switch, unless it holds one; false when it is full. */
-  async function reserveSwitch(exec: string, provider: string, rid: string): Promise<boolean> {
-    if (holdings().some(h => h.exec === exec && h.pool === provider)) return true;
-    const target = holdings().filter(h => h.pool === provider);
-    if (!capacity({ kind: "provider", holders: target.length, capacity: settings().providers?.[provider]?.slots ?? Infinity })) return false;
-    let slot = 0; while (target.some(h => h.slot === slot)) slot++;
-    await orch.append("hold", { pool: provider, slot, exec, reserved: true, rid });
-    return true;
+  /** Hold a slot of `provider` for a running execution's switch to model `id`, unless it holds one, and a slot of the
+   *  model there when it has a limit; the reason (holding nothing new) when either is full. Switching inside a provider
+   *  away from a model whose slot it holds also reserves the new model's pool (unlimited without an entry): its
+   *  observation releases the old model's slot, which stays held until then. */
+  async function reserveSwitch(exec: string, provider: string, id: string, rid: string): Promise<"provider-full" | "model-full" | undefined> {
+    const mine = holdings().filter(h => h.exec === exec), mpool = modelPool(provider, id), mlimit = modelLimit(settings().providers, provider, id);
+    const holdsProvider = mine.some(h => h.pool === provider);
+    const needModel = !mine.some(h => h.pool === mpool) &&
+      (mlimit !== undefined || holdsProvider && mine.some(h => h.pool.startsWith(`${provider}/`) && h.pool !== mpool));
+    if (holdsProvider && !needModel) return;
+    const target = holdings().filter(h => h.pool === provider), mtarget = holdings().filter(h => h.pool === mpool);
+    if (!holdsProvider && !capacity({ kind: "provider", holders: target.length, capacity: settings().providers?.[provider]?.slots ?? Infinity })) return "provider-full";
+    if (needModel && !capacity({ kind: "provider", holders: mtarget.length, capacity: mlimit ?? Infinity })) return "model-full";
+    if (!holdsProvider) {
+      let slot = 0; while (target.some(h => h.slot === slot)) slot++;
+      await orch.append("hold", { pool: provider, slot, exec, reserved: true, rid });
+    }
+    if (needModel) {
+      let slot = 0; while (mtarget.some(h => h.slot === slot)) slot++;
+      await orch.append("hold", { pool: mpool, slot, exec, reserved: true, rid });
+    }
+  }
+  /** Whether an answer of `wire` on `provider` is model `id` of it: the same name, or the model pi reported ready for it. */
+  function answersAs(journal: JournalHandle, exec: string, provider: string, id: string, wire: string): boolean {
+    return wire === id || journal.entries().some(e => e.type === "model-ready" && e.exec === exec && sameModel(e.selected as Model, { provider, id }) && (e.model as Model)?.id === wire);
   }
   /** An answer from a used-up provider, requested after it was found used up: available again. */
   async function answered(t: CallTicket, exec: string, event: Record<string, unknown>) {
@@ -1737,9 +1781,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           const pools = settings().pools, pool = pools && Object.hasOwn(pools, model) ? model : undefined;
           if (pool) {
             let models: Model[]; try { models = resolveModel(pool, pools); } catch { return { action: "reject", reason: "unknown-model" } as const; }
-            const free = (p: string) => idle || holdings().some(h => h.exec === exec && h.pool === p) ||
-              capacity({ kind: "provider", holders: holdings().filter(h => h.pool === p).length, capacity: settings().providers?.[p]?.slots ?? Infinity });
-            const m = models.find(m => m.provider && m.afterMs === undefined && !unavailable(m.provider) && free(m.provider));
+            const free = (p: string, id: string) => idle || (holdings().some(h => h.exec === exec && h.pool === p) ||
+              capacity({ kind: "provider", holders: holdings().filter(h => h.pool === p).length, capacity: settings().providers?.[p]?.slots ?? Infinity })) &&
+              (holdings().some(h => h.exec === exec && h.pool === modelPool(p, id)) || !slotsFull(settings().providers, holdings(), p, id).model);
+            const m = models.find(m => m.provider && m.afterMs === undefined && !unavailable(m.provider) && free(m.provider, m.id));
             if (!m) return { action: "reject", reason: "pool-unavailable" } as const;
             model = `${m.provider}/${m.id}${m.thinking ? `:${m.thinking}` : ""}`;
           }
@@ -1750,7 +1795,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           // Launching (`selected`, not `tracked` yet): the child may start on the old model; ask again in a moment.
           if (!idle && !has(ctx.journal, "tracked", exec!)) return { action: "reject", reason: "call-starting" } as const;
           if (!idle && pendingSwitch(exec!)) return { action: "reject", reason: "switch-pending" } as const;
-          if (!idle && !await reserveSwitch(exec!, body.provider, rid)) return { action: "reject", reason: "provider-full" } as const;
+          const full = idle ? undefined : await reserveSwitch(exec!, body.provider, body.model, rid);
+          if (full) return { action: "reject", reason: full } as const;
           await note(req.rid, model, idle ? "next-execution" : "next-request", pool);
           const entry = await ctx.journal.append("forward", { rid, rid2, dest, hash, envelope, choice });
           await replayForward(entry);

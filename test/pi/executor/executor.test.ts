@@ -956,6 +956,62 @@ test("V1 model forwarding reserves a target before publishing and rejects a full
   assert.deepEqual(f.orch.entries().filter(e => e.type === "release").map(e => e.pool).sort(), ["memory", "other", "probe"]);
 });
 
+test("V1 model forwarding checks the target model's own slots and reserves them; inside a provider only the model's", { timeout: 30000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 1, models: { scripted: { slots: 1 }, next: { slots: 1 }, full: { slots: 0 } } }, x: { slots: 5, models: { full: { slots: 0 }, ok: { slots: 1 } } } } });
+  const ticket = f.ticket(), pending = f.executor.run(ticket), exec = `${ticket.callId}#1.1`;
+  await until(() => f.journal.entries().some(e => e.type === "tracked"));
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold").map(e => e.pool), ["memory", "probe", "probe/scripted"]);
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 };
+  const req = (rid: string, model: string): Request => ({ rid, from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "model", model } });
+  assert.deepEqual(await f.executor.forward(req("m1", "x/full"), ctx), { action: "reject", reason: "model-full" });
+  assert.deepEqual(await f.executor.forward(req("m2", "probe/full"), ctx), { action: "reject", reason: "model-full" });
+  assert.equal(f.journal.entries().filter(e => e.type === "forward").length, 0);
+  assert.ok(!f.orch.entries().some(e => e.reserved), "a refused switch holds nothing");
+  // Inside the provider the call already holds: only the new model's slot is reserved (the provider's limit is 1).
+  assert.deepEqual(await f.executor.forward(req("m3", "probe/next"), ctx), { action: "apply" });
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold" && e.reserved).map(e => e.pool), ["probe/next"]);
+  await f.executor.stop({ wid: f.wid }); await pending;
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "release").map(e => e.pool).sort(), ["memory", "probe", "probe/next", "probe/scripted"]);
+});
+
+test("V1 a switch inside one provider is observed by the new model answering, then frees the old model's slot", { timeout: 30000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 1, models: { scripted: { slots: 1 }, scripted2: { slots: 1 } } } } });
+  const ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 2" } }, { text: "after switch" }]));
+  const pending = f.executor.run(ticket), exec = `${ticket.callId}#1.1`;
+  await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 };
+  const req: Request = { rid: "inside", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "model", model: "probe/scripted2" } };
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  assert.ok(!f.orch.entries().some(e => e.type === "switch-observed"), "not observed before the new model answers");
+  assert.equal((await pending).output, "after switch");
+  const observed = f.orch.entries().find(e => e.type === "switch-observed" && e.exec === exec)!;
+  assert.ok(observed, "the new model's answer confirms the switch");
+  const releases = f.orch.entries().filter(e => e.type === "release" && e.exec === exec);
+  const old = releases.find(e => e.pool === "probe/scripted"), provider = releases.find(e => e.pool === "probe");
+  assert.ok(old && old.seq > observed.seq, "the old model's slot is freed at the observation");
+  assert.ok(provider && provider.seq > old.seq, "the provider slot is kept until the execution ends");
+  assert.deepEqual(f.journal.entries().filter(e => e.type === "model-used").map(e => e.model), [{ provider: "probe", id: "scripted2" }]);
+  const held = new Map<string, Set<string>>();
+  for (const e of f.orch.entries()) {
+    const pool = String(e.pool), holders = held.get(pool) ?? new Set<string>(); held.set(pool, holders);
+    if (e.type === "hold") holders.add(String(e.exec));
+    if (e.type === "release") holders.delete(String(e.exec));
+  }
+  assert.ok([...held.values()].every(holders => holders.size === 0));
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold" && e.pool === "probe").length, 1, "one provider slot throughout");
+});
+
+test("V1 model forwarding to another provider reserves its slot and its model's", { timeout: 30000 }, async t => {
+  const f = await setup(t, { providers: { probe: { slots: 1 }, x: { slots: 5, models: { ok: { slots: 1 } } } } });
+  const ticket = f.ticket(), pending = f.executor.run(ticket);
+  await until(() => f.journal.entries().some(e => e.type === "tracked"));
+  const ctx = { journal: f.journal, widRev: ticket.widRev, key: ticket.key, gen: 1 };
+  const req: Request = { rid: "m1", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "model", model: "x/ok" } };
+  assert.deepEqual(await f.executor.forward(req, ctx), { action: "apply" });
+  assert.deepEqual(f.orch.entries().filter(e => e.type === "hold" && e.reserved).map(e => e.pool), ["x", "x/ok"]);
+  await f.executor.stop({ wid: f.wid }); await pending;
+});
+
 test("V1 an expired switch reservation is fenced before its slots are released", { timeout: 30000 }, async t => {
   const f = await setup(t, { providers: { probe: { slots: 1 }, other: { slots: 1 } }, k: { trackerMs: 25, switchTimeoutMs: 20, lossBound: 1 } });
   const ticket = f.ticket(), pending = f.executor.run(ticket);

@@ -19,8 +19,9 @@ export interface OrchestratorConfig {
   /** Model pools: name -> ordered "provider/id[:thinking]" candidates (P12, D10); an entry `{ model, afterMs }` is
    *  taken only by a call that has waited `afterMs` for a slot. */
   pools?: Record<string, PoolEntry[]>;
-  /** Provider slot capacities (V1). Missing provider = unlimited; optional case-insensitive quota-text patterns (XP1). */
-  providers?: Record<string, { slots: number; exhaustedPatterns?: string[] }>;
+  /** Provider slot capacities (V1). Missing provider = unlimited; optional case-insensitive quota-text patterns (XP1).
+   *  `models`: per-model slot limits inside the provider (orchestrator/slots.ts); `slots` may be omitted only with it. */
+  providers?: Record<string, { slots?: number; models?: Record<string, { slots: number }>; exhaustedPatterns?: string[] }>;
   memory?: { reserveMb?: number; perChildMb?: number };
   /** K-parameters overrides (ms / counts). waitCheckMs: period of the waiting/moving check (events/waiting.ts, default 5000; read at orchestrator start). */
   /** Writer lock: "queue" (default) runs one writer call per git worktree at a time; "off" only reminds of observed

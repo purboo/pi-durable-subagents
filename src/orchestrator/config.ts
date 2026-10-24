@@ -52,7 +52,16 @@ export function configProblem(raw: unknown): string | undefined {
   if (providers !== undefined) {
     if (!record(providers)) return "providers must map provider names to { slots }";
     for (const [name, p] of Object.entries(providers)) {
-      if (!record(p) || !Number.isSafeInteger(p.slots) || Number(p.slots) < 0) return `providers.${name}.slots must be a nonnegative integer`;
+      // `slots` may be omitted when `models` is given: then only the model limits apply.
+      if (!record(p) || (p.slots !== undefined || p.models === undefined) && (!Number.isSafeInteger(p.slots) || Number(p.slots) < 0)) return `providers.${name}.slots must be a nonnegative integer`;
+      if (p.models !== undefined) {
+        if (!record(p.models)) return `providers.${name}.models must map model ids to { slots }`;
+        for (const [id, m] of Object.entries(p.models)) {
+          if (!record(m) || !Number.isSafeInteger(m.slots) || Number(m.slots) < 0) return `providers.${name}.models.${id}.slots must be a nonnegative integer`;
+          const extra = Object.keys(m).find(k => k !== "slots");
+          if (extra) return `providers.${name}.models.${id}.${extra} is not a model entry key (slots)`;
+        }
+      }
       if (p.exhaustedPatterns !== undefined) {
         if (!Array.isArray(p.exhaustedPatterns) || p.exhaustedPatterns.some(v => typeof v !== "string"))
           return `providers.${name}.exhaustedPatterns must be a list of regular expression strings`;

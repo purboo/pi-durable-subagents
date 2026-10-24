@@ -26,8 +26,8 @@ import { EVENT_SEQ_SKIP, WAIT_REASONS, type EventDraft, type EventSink, type Wai
 import { emptyLedger, foldLedger, settingsOf, type LedgerState } from "../orchestrator/ledger.ts";
 import type { Exhaustion } from "../orchestrator/providers.ts";
 import type { OrchestratorConfig } from "../orchestrator/contract.ts";
-import { exhaustedLine, heldIn, slotLine } from "../orchestrator/snapshot.ts";
-import { parseModel, resolveModel } from "../compat/model.ts";
+import { candidateSlots, exhaustedLine, heldIn } from "../orchestrator/snapshot.ts";
+import { parseModel, resolveModel, type Model } from "../compat/model.ts";
 import { leaseCalls, leaseState } from "../platform/lease.ts";
 import { requestId } from "../requests.ts";
 
@@ -209,7 +209,8 @@ export function leaseWaits(state: ReturnType<typeof leaseState>, now: number): M
   for (const { waiters } of state) for (const t of waiters) if (t.call) out.set(t.call, { detail: lines.get(t.call) ?? "", since: Math.min(out.get(t.call)?.since ?? Infinity, t.since) });
   return out;
 }
-const providerOf = (model?: string) => { if (!model) return undefined; try { return parseModel(model).provider; } catch { return undefined; } };
+const providerOf = (model?: string) => modelOf(model)?.provider;
+const modelOf = (model?: string): Model | undefined => { if (!model) return undefined; try { return parseModel(model); } catch { return undefined; } };
 /** The call's state as `whyWaiting` reads it. `agentModel` names the model of a pinned agent (for a call naming none). */
 export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: (agent: string) => string | undefined): WaitInput {
   // An answered asker is queued (live) although its hibernated execution is fenced, unless a drain holds its workflow.
@@ -223,22 +224,19 @@ export function waitInput(f: WaitFold, c: CallFacts, env: WaitEnv, agentModel?: 
     attention.push({ id, kind: item.kind, text: item.text, since: item.since, ...(item.exec !== undefined ? { exec: item.exec } : {}) });
     if (item.kind === "question" && item.exec === c.exec) asking = true;
   }
-  let providers: string[] = [];
+  let providers: string[] = [], candidates: Model[] = [];
   if (live && selected) { const p = providerOf(c.model); if (p) providers = [p]; }
   else if (live) {
     // A pool call may launch on any of its pool's models; anything else continues on the model it ran on, or the one
     // it asks for (its spec, its agent's, the configured default). A model pi's own settings choose is not known here.
     const pools = settings.pools ?? {}, raw = c.wanted ?? (c.agent ? agentModel?.(c.agent) : undefined) ?? settings.defaultModel;
-    if (raw && Object.hasOwn(pools, raw)) { try { providers = [...new Set(resolveModel(raw, pools).map(m => m.provider).filter((p): p is string => !!p))]; } catch { /* an invalid pool: unknown */ } }
-    else { const p = providerOf(c.model ?? raw); if (p) providers = [p]; }
+    if (raw && Object.hasOwn(pools, raw)) { try { candidates = resolveModel(raw, pools); } catch { /* an invalid pool: unknown */ } }
+    else { const m = modelOf(c.model ?? raw); if (m?.provider) candidates = [m]; }
+    providers = [...new Set(candidates.map(m => m.provider).filter((p): p is string => !!p))];
   }
-  let full = live && !selected && providers.length > 0;
-  const slot = live && !selected && providers.length ? providers.map(p => {
-    let held = 0; for (const h of env.ledger.held.values()) if (h.pool === p) held++;
-    const limit = settings.providers?.[p]?.slots;
-    if (limit === undefined || held < limit) full = false;
-    return slotLine(p, held, limit);
-  }).join(", ") : undefined;
+  // Every candidate full: its provider's slots, or (providers.<p>.models) its model's, which the line then names.
+  const slots = live && !selected && providers.length ? candidateSlots(candidates, env.ledger.held.values(), settings.providers) : undefined;
+  const full = !!slots?.full, slot = slots?.lines.join(", ");
   const lease = live && selected ? env.leases?.get(c.call) : undefined;
   return {
     asking,
