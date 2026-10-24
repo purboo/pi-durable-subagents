@@ -8,7 +8,9 @@ import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends,
 import { readCache, writeCache } from "../kernel/cache.ts";
 import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
 import { JT, askText, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
-import { parseModel, resolveModel } from "../compat/model.ts";
+import { parseModel, resolveModel, type Model } from "../compat/model.ts";
+import { heldOn, isModelPool, modelLimit, modelPool, slotsFull } from "./slots.ts";
+import type { OrchestratorConfig } from "./contract.ts";
 import { type LedgerState } from "./ledger.ts";
 import { awaitingRuns, readerHold, readerLedger, readerLedgerIdentity, type AwaitingRun, type ReaderLedger } from "./reader-ledger.ts";
 import type { Exhaustion } from "./providers.ts";
@@ -46,7 +48,8 @@ export interface ModelStatus {
   routedModel?: string;
   modelMismatch?: { used: string; selected: string };
   modelUnavailable?: string;
-  poolWait?: { since: number; model: string; pool?: string; free: string[] };
+  /** `blocker`: the full model ("<provider>/<id>") when its model slots, not its provider's, hold it back. */
+  poolWait?: { since: number; model: string; pool?: string; free: string[]; blocker?: string };
   spill?: { from: string; to: string; waitedMs: number };
 }
 const modelName = (m: unknown): string => { const v = m as { provider?: string; id: string }; return v.provider ? `${v.provider}/${v.id}` : v.id; };
@@ -55,7 +58,7 @@ const modelStatus = (c: ModelStatus): ModelStatus => Object.fromEntries(Object.e
 /** Scheduling and model identity facts shared by detailed and compact text status. */
 export function modelStatusText(c: ModelStatus, now = Date.now()): string {
   const w = c.poolWait, s = c.spill, m = c.modelMismatch;
-  return (w ? ` (queued ${age(now - w.since)} on ${w.model.split("/")[0]} (full)${w.free.length ? `; pool has free slots: ${w.free.join(", ")}` : ""})` : "") +
+  return (w ? ` (queued ${age(now - w.since)} on ${w.blocker ?? w.model.split("/")[0]} (full)${w.free.length ? `; pool has free slots: ${w.free.join(", ")}` : ""})` : "") +
     (s ? ` (spilled after ${age(s.waitedMs)}: ${s.from.split("/")[0]} full -> ${s.to})` : "") +
     (c.routedModel ? ` (routed ${c.routedModel})` : "") +
     (m ? ` (used ${m.used}, selected ${m.selected})` : "") + (c.modelUnavailable ? ` (model-unavailable: ${c.modelUnavailable})` : "");
@@ -900,7 +903,6 @@ const startingChecks = new WeakMap<object, { at: number; alive: boolean }>();
 export function queuedText(w: QueueWait, now = Date.now(), span: (ms: number) => string = age): string {
   return w.reason === "starting" ? `orchestrator starting (${span(now - (w.since ?? now))})` : w.detail;
 }
-const providerOf = (model: string) => { try { return parseModel(model).provider; } catch { return undefined; } };
 /** Why a queued call waits, from what the orchestrator ledger records (precedence as events/waiting.ts): the
  *  orchestrator still recovering; every candidate provider used up and not admitted now; the writer lock of its worktree;
  *  every candidate provider full. Undefined when none is known: a call is never said to wait for a slot without a full
@@ -911,22 +913,38 @@ export function queueWait(c: CallSnapshot, state: LedgerState, now = Date.now(),
   if (starting) return { reason: "starting", detail: "orchestrator starting", since: starting.since };
   // A command call takes no provider slot: only the orchestrator's start and a writer lock hold it back.
   const settings = state.config?.settings ?? {}, pools = settings.pools ?? {}, wanted = c.command !== undefined ? undefined : c.poolWait?.model ?? c.model ?? settings.defaultModel;
-  let providers: string[] = [];
-  if (wanted && Object.hasOwn(pools, wanted)) { try { providers = [...new Set(resolveModel(wanted, pools).map(m => m.provider).filter((p): p is string => !!p))]; } catch { /* an invalid pool: unknown */ } }
-  else if (wanted) { const p = providerOf(wanted); if (p) providers = [p]; }
+  let candidates: Model[] = [];
+  if (wanted && Object.hasOwn(pools, wanted)) { try { candidates = resolveModel(wanted, pools); } catch { /* an invalid pool: unknown */ } }
+  else if (wanted) { const m = modelOf(wanted); if (m?.provider) candidates = [m]; }
+  const providers = [...new Set(candidates.map(m => m.provider).filter((p): p is string => !!p))];
   const used = providers.map(p => [p, state.exhausted.get(p)] as const);
   if (used.length && used.every(([, x]) => x && (now < x.nextTry || x.probe !== undefined)))
     return { reason: "provider-exhausted", detail: `${providers.join(", ")} usage window${providers.length > 1 ? "s" : ""} used up` };
   if (c.writerWait) return { reason: "writer-lock", detail: `waiting for the writer lock of ${c.writerWait.root}` };
   if (!providers.length) return undefined;
-  let full = true;
-  const lines = providers.map(p => {
-    let held = 0; for (const h of state.held.values()) if (h.pool === p) held++;
-    const limit = settings.providers?.[p]?.slots;
-    if (limit === undefined || held < limit) full = false;
-    return slotLine(p, held, limit);
-  });
+  const { full, lines } = candidateSlots(candidates, state.held.values(), settings.providers);
   return full ? { reason: "slot", detail: `waiting for a free slot (${lines.join(", ")})` } : undefined;
+}
+const modelOf = (model: string) => { try { return parseModel(model); } catch { return undefined; } };
+/** The slot lines of a queued call's candidate models, and whether every candidate is full. One line per provider
+ *  ("<provider> <held>/<limit>"), except a provider with room whose candidate models are all full at their own limit
+ *  (`providers.<p>.models`): then the full models' lines ("<provider>/<id> <held>/<limit>"), since they are the blocker. */
+export function candidateSlots(candidates: readonly Model[], held: Iterable<{ pool: string }>, providers: OrchestratorConfig["providers"]): { full: boolean; lines: string[] } {
+  const list = [...held], byProvider = new Map<string, string[]>();
+  for (const m of candidates) if (m.provider) {
+    const ids = byProvider.get(m.provider) ?? []; byProvider.set(m.provider, ids);
+    if (!ids.includes(m.id)) ids.push(m.id);
+  }
+  let full = byProvider.size > 0;
+  const lines = [...byProvider].map(([p, ids]) => {
+    const limit = providers?.[p]?.slots, count = heldOn(list, p);
+    const providerFull = limit !== undefined && count >= limit;
+    if (!providerFull && ids.length && ids.every(id => slotsFull(providers, list, p, id).model))
+      return ids.map(id => slotLine(modelPool(p, id), heldOn(list, modelPool(p, id)), modelLimit(providers, p, id))).join(", ");
+    if (!providerFull) full = false;
+    return slotLine(p, count, limit);
+  });
+  return { full, lines };
 }
 /** A mark of the ledger facts a workflow's queued calls show: they are derived again when it changes. */
 function queueMark(wf: WorkflowSnapshot, state: LedgerState, mark: string): string | undefined {
@@ -938,21 +956,27 @@ function withLedgerFacts(wf: WorkflowSnapshot, state: LedgerState): WorkflowSnap
   if (!wf.calls.some(c => c.poolWait || c.phase === "queued")) return wf;
   const held = new Map<string, number>(), now = Date.now(), starting = orchestratorStarting(state);
   for (const h of state.held.values()) held.set(h.pool, (held.get(h.pool) ?? 0) + 1);
+  const heldList = [...state.held.values()];
   const pools = state.config?.settings.pools, limits = state.config?.settings.providers;
   return { ...wf, calls: wf.calls.map(c => {
     const why = queueWait(c, state, now, starting);
     if (why) c = { ...c, queuedFor: why };
     const wait = c.poolWait;
     if (!wait) return c;
-    let providers: string[] = [];
+    let candidates: Model[] = [];
     if (wait.pool && pools?.[wait.pool]) {
-      try { providers = resolveModel(wait.pool, pools).map(m => m.provider).filter((p): p is string => !!p); }
+      try { candidates = resolveModel(wait.pool, pools); }
       catch { /* A removed or invalid pool has no available entries to show. */ }
     }
+    const providers = candidates.map(m => m.provider).filter((p): p is string => !!p);
     const pinned = wait.model.split("/")[0];
+    // A provider has a free slot for the call when some candidate model of it has room at its own limit too.
+    const modelRoom = (p: string) => candidates.some(m => m.provider === p && !slotsFull(limits, heldList, p, m.id).model);
     const free = [...new Set(providers)].filter(p => p !== pinned && (held.get(p) ?? 0) < (limits?.[p]?.slots ?? Infinity) &&
-      !(state.exhausted.get(p)?.nextTry && state.exhausted.get(p)!.nextTry > Date.now()));
-    return { ...c, poolWait: { ...wait, free } };
+      !(state.exhausted.get(p)?.nextTry && state.exhausted.get(p)!.nextTry > Date.now()) && modelRoom(p));
+    // The pinned model held back by its own limit on a provider with room: the status names the model.
+    const pm = modelOf(wait.model), pf = pm?.provider ? slotsFull(limits, heldList, pm.provider, pm.id) : undefined;
+    return { ...c, poolWait: { ...wait, free, ...(pf?.model && !pf.provider ? { blocker: wait.model } : {}) } };
   }) };
 }
 /** P25: Snapshot every workflow under DSA_HOME (newest first by wid, which is a ULID); `paused` marks work a drain holds. */
@@ -1268,8 +1292,11 @@ export interface StatusBrief {
   finished: string[];
   olderFinished?: number;
   paused?: string;
-  /** Provider slots held / limit, e.g. "relay 3/4" or "proxy 2 (no limit)": configured providers and any held ones. */
+  /** Provider slots held / limit, e.g. "relay 3/4" or "proxy 2 (no limit)": configured providers and any held ones; a
+   *  provider with `models` adds its models' holdings: "cli-pool 7/10 (deepseek-v4.1-flash 3/6, gemini-4-argon 2/4)". */
   slots?: string[];
+  /** Per provider with `models`: each configured model's slots held and its limit. */
+  modelSlots?: Record<string, Record<string, { held: number; slots: number }>>;
   /** The orchestrator settings in effect: "<hash> since <age>" (config.json is applied when it changes). */
   config?: string;
   /** The latest change of config.json that was not applied, while the earlier settings stay in effect. */
@@ -1356,14 +1383,15 @@ export function originLabel(origin: string | undefined): string {
   if (origin === undefined) return "unknown";
   return origin.startsWith("main:") ? `session ${origin.slice(5, 13)}` : clip(restartLine(origin), 40);
 }
-export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "config" | "configRejected" | "exhausted" | "orchestrator" | "versionNote"> {
+export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "slots" | "modelSlots" | "config" | "configRejected" | "exhausted" | "orchestrator" | "versionNote"> {
   const ix = readerLedger(home).state, state = ix.state;
   const { held, config, rejected } = state, used = state.exhausted;
   const exhausted = [...used].sort(([a], [b]) => a.localeCompare(b)).map(([p, x]) => exhaustedLine(p, x, now));
-  const limits: Record<string, { slots?: number }> = config?.settings.providers ?? {};
-  const holders = new Map<string, number>(), byOrigin = new Map<string, Map<string, number>>();
+  const limits: NonNullable<OrchestratorConfig["providers"]> = config?.settings.providers ?? {};
+  const holders = new Map<string, number>(), byOrigin = new Map<string, Map<string, number>>(), modelHeld = new Map<string, number>();
   const created = ix.created;
-  for (const e of held.values()) if (e.pool !== "memory") {
+  for (const e of held.values()) if (isModelPool(e.pool)) modelHeld.set(e.pool, (modelHeld.get(e.pool) ?? 0) + 1);
+  else if (e.pool !== "memory") {
     holders.set(e.pool, (holders.get(e.pool) ?? 0) + 1);
     // exec "<wid>@<rev>/<key>@<gen>#<n>" -> the origin of its workflow
     const origin = originLabel(created.get(e.exec.slice(0, e.exec.indexOf("@")))?.origin as string | undefined);
@@ -1377,8 +1405,19 @@ export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "sl
     return ` (${[...counts].sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).map(([o, n]) => `${n} ${o}`).join(", ")})`;
   };
   const names = [...new Set([...Object.keys(limits), ...holders.keys()])].sort();
-  const slots = names.map(p => slotLine(p, holders.get(p) ?? 0, limits[p]?.slots) + who(p));
-  return { ...orchestratorView(state, packageVersion(), now), ...(slots.length ? { slots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
+  // A provider with `models`: its configured models' holdings, in the order config.json lists them.
+  const modelSlots: Record<string, Record<string, { held: number; slots: number }>> = {};
+  for (const p of names) {
+    const models = Object.hasOwn(limits, p) ? limits[p]!.models : undefined;
+    if (models) modelSlots[p] = Object.fromEntries(Object.entries(models).map(([id, m]) => [id, { held: modelHeld.get(modelPool(p, id)) ?? 0, slots: m.slots }]));
+  }
+  const perModel = (p: string) => {
+    const models = modelSlots[p]; if (!models) return "";
+    const list = Object.entries(models).map(([id, m]) => slotLine(id, m.held, m.slots));
+    return list.length ? ` (${list.join(", ")})` : "";
+  };
+  const slots = names.map(p => slotLine(p, holders.get(p) ?? 0, limits[p]?.slots) + perModel(p) + who(p));
+  return { ...orchestratorView(state, packageVersion(), now), ...(slots.length ? { slots } : {}), ...(Object.keys(modelSlots).length ? { modelSlots } : {}), ...(config ? { config: `${config.hash} since ${age(now - config.ts)} ago` } : {}),
     ...(exhausted.length ? { exhausted } : {}),
     ...(rejected ? { configRejected: `${clip(rejected.error, 200)} (${age(now - rejected.ts)} ago); ${config ? config.hash : "the start settings"} stay in effect` } : {}) };
 }

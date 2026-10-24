@@ -1204,7 +1204,17 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   "defaultModel": "provider/id",
   "onQuit": "pause",
   "pools": { "fast": ["anthropic/claude-haiku-4-5", "openai/gpt-5-mini"] },
-  "providers": { "anthropic": { "slots": 4 } },
+  "providers": {
+    "anthropic": { "slots": 4 },
+    "gateway": {
+      "slots": 10,
+      "models": {
+        "deepseek-v4.1-flash": { "slots": 6 },
+        "MiniMax-M3.1-Flash": { "slots": 6 },
+        "gemini-4-argon": { "slots": 4 }
+      }
+    }
+  },
   "memory": { "reserveMb": 2048, "perChildMb": 300 },
   "writerLock": "queue",
   "askRequireDecision": false,
@@ -1284,6 +1294,28 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   anew for each execution: a call launched again (after a loss or a launch
   that failed) starts its wait over. `status` names the holders per origin when more than one
   holds a provider: `anthropic 4/4 (3 cli:alice@host, 1 session 01a11a3b)`.
+- **Model slots inside a provider:** `"models": { "<id>": { "slots": N } }` on
+  a provider limits each listed model there as well. A call on `provider/id`
+  holds one slot of the provider and, when `id` is listed, one of that model;
+  it starts (or switches, spills, fails over or resumes onto it) only when both
+  have room. The id is the part of `provider/id[:thinking]` after the first
+  `/`, without the thinking suffix, compared exactly (it may contain `/`). A
+  model that is not listed is limited by the provider's slots only. With
+  `models`, `slots` may be omitted: then only the model limits apply. In the
+  example one gateway takes 10 requests in flight, at most 6 of DeepSeek, 6 of
+  MiniMax and 4 of Gemini, and a model at its limit does not stop the others.
+  This replaces registering the same endpoint again under alias provider names
+  in pi's `models.json` (one per model, each with its own `slots`), which
+  split the capacity statically and repeated the configuration. A freed slot
+  goes only to a waiter whose model also has room; among those the precedence
+  above applies, and a waiter blocked only by its own model holds no slot
+  back. Used-up detection (`exhaustedPatterns`, `probeMs`) stays per provider.
+  `status` shows the models under their provider,
+  `gateway 7/10 (deepseek-v4.1-flash 3/6, MiniMax-M3.1-Flash 2/6, gemini-4-argon 2/4)`
+  (JSON: `modelSlots: { "<provider>": { "<id>": { held, slots } } }`), and a
+  queued call held back by its model names it (`waiting for a free slot
+  (gateway/gemini-4-argon 4/4)`). A live switch to a full model is refused
+  with `model-full`.
 - **Memory:** new subagents wait while memory is short. Running ones are
   never stopped for memory.
 - **Writer lock:** `"queue"` (default) runs one writing call per git
@@ -1323,7 +1355,7 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
 - **Changes apply without a restart:** the orchestrator re-reads the file
   when it changes (`askRequireDecision` reaches a child at execution start,
   not mid-execution). A new slot limit, pool or default model applies to the
-  next slot acquisition; slots already held are kept when a limit drops. An
+  next slot acquisition (model limits too); slots already held are kept when a limit drops. An
   invalid change is not applied, and `status` reports it next to the settings
   still in effect (`config: <hash> since …`) and the slots held per provider.
 

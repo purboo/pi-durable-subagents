@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.0
+
+- Model slots inside a provider: `providers.<p>.models` maps a model id to `{ "slots": N }`. A call on `p/id` holds a
+  slot of `p` and, when `id` is listed, a slot of that model on `p`; it starts, switches, spills, fails over or resumes
+  onto `p/id` only when both have room. Unlisted models are limited by the provider's slots only; with `models`,
+  `slots` may be omitted (no provider-wide limit). One endpoint serving several models no longer needs alias provider
+  entries in pi's `models.json` to split its capacity.
+- A freed slot goes only to a waiter whose model also has room; a waiter blocked only by its own model's limit holds
+  no provider slot back. The precedence among eligible waiters is unchanged.
+- `status` lists a provider's model holdings after its slots (`gw 7/10 (a 3/6, b 2/6, c 2/4)`), and JSON adds
+  `modelSlots`. A queued call held back by its model names that model (`queued`, `poolWait`, the `waiting` event);
+  a live switch to a full model is refused with `model-full`.
+- Without `models` the behaviour, output and config hash are those of 1.3.2.
+
 ## 1.3.2
 
 - The exact fork works on a provider whose model name on the wire is not its pi catalog id (a gateway alias that

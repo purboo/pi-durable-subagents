@@ -89,6 +89,7 @@ export function plainReason(reason: string | undefined): string {
   if (r === "already-answered" || r === "stale-question") return "that question was already answered";
   if (r === "switch-pending") return "a model switch is already on its way; it takes effect when the current step ends";
   if (r === "provider-full") return "that model's provider has no free slot right now";
+  if (r === "model-full") return "that model has no free slot on its provider right now";
   if (r === "call-not-running") return "the subagent is not running right now (waiting for a slot, paused or finished)";
   if (r === "unknown-model") return "unknown model";
   if (code === "unknown-call") return r.includes("use one of") ? `no such subagent; ${r.slice(r.indexOf("use one of"))}` : "no such subagent";
