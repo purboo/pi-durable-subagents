@@ -76,7 +76,7 @@ export class EvaluatorClient implements EvaluatorTransport {
     }
     this.child = undefined;
   }
-  /** A2, P10: Fence a previous host, commit launch intent, and attach IPC readers. */
+  /** A2, P10: Fence a previous host, commit launch intent, and attach the message-channel readers. */
   async start(message: (message: EvalToOrch) => void, death: (error?: unknown) => void): Promise<void> {
     await this.retire();
     const exec = `eval:${ulid()}`;

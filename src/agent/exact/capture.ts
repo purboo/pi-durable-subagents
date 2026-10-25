@@ -23,7 +23,7 @@ export type ProviderPayload = Record<string, unknown>;
 export interface Capture {
   /** The pi session that made the request. */
   sessionId: string;
-  /** The provider that served it ("relay-claude"). */
+  /** The provider that served it ("anthropic"). */
   provider: string;
   /** The model that answered it ("claude-opus-5-5"). */
   model: string;

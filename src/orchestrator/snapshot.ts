@@ -1292,8 +1292,8 @@ export interface StatusBrief {
   finished: string[];
   olderFinished?: number;
   paused?: string;
-  /** Provider slots held / limit, e.g. "relay 3/4" or "proxy 2 (no limit)": configured providers and any held ones; a
-   *  provider with `models` adds its models' holdings: "cli-pool 7/10 (deepseek-v4.1-flash 3/6, gemini-4-argon 2/4)". */
+  /** Provider slots held / limit, e.g. "openai 3/4" or "gateway 2 (no limit)": configured providers and any held ones; a
+   *  provider with `models` adds its models' holdings: "gateway-cli 7/10 (deepseek-v4.1-flash 3/6, gemini-4-argon 2/4)". */
   slots?: string[];
   /** Per provider with `models`: each configured model's slots held and its limit. */
   modelSlots?: Record<string, Record<string, { held: number; slots: number }>>;

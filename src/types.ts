@@ -377,7 +377,7 @@ export interface CallResult {
 }
 
 // ---------------------------------------------------------------------------
-// Evaluator IPC (P10, P11): orchestrator <-> evaluator host, JSON lines over stdio.
+// Evaluator messages (P10, P11): orchestrator <-> evaluator host, JSON lines over stdio.
 // Every message names the workflow and evaluator incarnation; stale `ev` is ignored by both sides.
 // ---------------------------------------------------------------------------
 

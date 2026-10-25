@@ -16,10 +16,10 @@ import type { Entry } from "../../../src/types.ts";
 const NOW = 1_800_000_000_000;
 let seq = 0;
 const entry = (type: string, fields: Record<string, unknown> = {}, ts = NOW - 12_000): Entry => ({ seq: ++seq, ts, type, ...fields }) as Entry;
-const POOL = { slots: 10, models: { "deepseek-v4.1-flash": { slots: 6 }, "MiniMax-M3.1-Flash": { slots: 6 }, "gemini-4-argon": { slots: 4 } } };
+const GATEWAY = { slots: 10, models: { "deepseek-v4.1-flash": { slots: 6 }, "MiniMax-M3.1-Flash": { slots: 6 }, "gemini-4-argon": { slots: 4 } } };
 
 test("configProblem: models map ids to { slots }; slots may be omitted only with models", () => {
-  assert.equal(configProblem({ providers: { "cli-pool": { ...POOL, exhaustedPatterns: ["quota"] } } }), undefined);
+  assert.equal(configProblem({ providers: { "gateway-cli": { ...GATEWAY, exhaustedPatterns: ["quota"] } } }), undefined);
   assert.equal(configProblem({ providers: { c: { models: { a: { slots: 0 }, "gateway-cli/gemini": { slots: 2 } } } } }), undefined, "no provider-wide limit");
   assert.equal(configProblem({ providers: { c: {} } }), "providers.c.slots must be a nonnegative integer", "neither slots nor models");
   assert.equal(configProblem({ providers: { c: { exhaustedPatterns: [] } } }), "providers.c.slots must be a nonnegative integer");
@@ -44,7 +44,7 @@ test("status: a provider with models shows its models' holdings; JSON adds model
   t.after(() => rm(home, { recursive: true, force: true }));
   const orch = await openJournal(orchLedger(home));
   t.after(() => orch.close());
-  await orch.append("config", { hash: "abc", config: { providers: { "cli-pool": POOL, relay: { slots: 3 }, free: { models: { m: { slots: 1 } } } } } });
+  await orch.append("config", { hash: "abc", config: { providers: { "gateway-cli": GATEWAY, relay: { slots: 3 }, free: { models: { m: { slots: 1 } } } } } });
   await orch.append("created", { rid: "r1", wid: "W1", origin: "cli:alice@host" });
   await orch.append("created", { rid: "r2", wid: "W2", origin: "main:01a11a3b-5c6d-4e7f" });
   const calls: [string, string][] = [["deepseek-v4.1-flash", "W1"], ["deepseek-v4.1-flash", "W1"], ["deepseek-v4.1-flash", "W1"],
@@ -53,18 +53,18 @@ test("status: a provider with models shows its models' holdings; JSON adds model
   for (const [i, [model, wid]] of calls.entries()) {
     const exec = `${wid}@1/k${i}@1#1.1`, n = counts.get(model) ?? 0; counts.set(model, n + 1);
     await orch.append("hold", { pool: "memory", slot: i, exec });
-    await orch.append("hold", { pool: "cli-pool", slot: i, exec });
-    await orch.append("hold", { pool: `cli-pool/${model}`, slot: n, exec });
+    await orch.append("hold", { pool: "gateway-cli", slot: i, exec });
+    await orch.append("hold", { pool: `gateway-cli/${model}`, slot: n, exec });
   }
   await orch.append("hold", { pool: "relay", slot: 0, exec: "W1@1/s@1#1.1" });
   const view = slotsView(home);
   assert.deepEqual(view.slots, [
-    "cli-pool 7/10 (deepseek-v4.1-flash 3/6, MiniMax-M3.1-Flash 2/6, gemini-4-argon 2/4) (4 session 01a11a3b, 3 cli:alice@host)",
     "free 0 (no limit) (m 0/1)",
+    "gateway-cli 7/10 (deepseek-v4.1-flash 3/6, MiniMax-M3.1-Flash 2/6, gemini-4-argon 2/4) (4 session 01a11a3b, 3 cli:alice@host)",
     "relay 1/3",
   ]);
   assert.deepEqual(view.modelSlots, {
-    "cli-pool": { "deepseek-v4.1-flash": { held: 3, slots: 6 }, "MiniMax-M3.1-Flash": { held: 2, slots: 6 }, "gemini-4-argon": { held: 2, slots: 4 } },
+    "gateway-cli": { "deepseek-v4.1-flash": { held: 3, slots: 6 }, "MiniMax-M3.1-Flash": { held: 2, slots: 6 }, "gemini-4-argon": { held: 2, slots: 4 } },
     free: { m: { held: 0, slots: 1 } },
   });
 });

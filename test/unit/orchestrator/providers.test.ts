@@ -46,8 +46,8 @@ test("real provider errors: daily windows fail over, rate and concurrency limits
     "gateway_concurrency_limit: Concurrency limit exceeded for user, please retry later (rate limit)",
     'vendor API error (429): {"message":"Too many concurrent responses create requests; global concurrency limit reached (96/96)","type":"rate_limit_error","param":null,"code":"request_rate_limited"}',
     '429 {"error":{"message":"Upstream rate limit exceeded, please retry later","type":"rate_limit_error"},"type":"error"}',
-    'gateway API error (404): {"message":"Model \\"gpt-6-astra-fast\\" is not supported by any configured account in this group","type":"model_not_found"}',
-    'gateway API error (503): {"message":"Service temporarily unavailable","type":"api_error"}',
+    'openai API error (404): {"message":"Model \\"gpt-6-astra-fast\\" is not supported by any configured account in this group","type":"model_not_found"}',
+    'openai API error (503): {"message":"Service temporarily unavailable","type":"api_error"}',
     "server_error: Scheduler unavailable",
   ]) assert.ok(!quotaExhausted(text) && !fatalProviderError(text), text);
 });

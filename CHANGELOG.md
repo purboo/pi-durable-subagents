@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.1
+
+- Docs, tests and fixtures use neutral example names and paths; no behaviour change.
+
 ## 1.4.0
 
 - Model slots inside a provider: `providers.<p>.models` maps a model id to `{ "slots": N }`. A call on `p/id` holds a

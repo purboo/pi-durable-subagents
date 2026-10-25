@@ -218,10 +218,10 @@ for (const mode of ["explicit", "parent-pinned", "follow-up-pin", "null", "negat
 });
 
 test("same-id spill preference uses the last path segment of real pool identifiers", () => {
-  const pinned = parseModel("proxy/ide/gpt-6.1-sol:high");
-  const pool = resolveModel("writer", { writer: ["relay-claude/claude-opus-5-5:medium", "proxy/ide/gpt-6.1-sol:high", "gateway/GPT-6.1-SOL:high"] });
-  assert.deepEqual(spillCandidates(pinned, pool).map(m => m.provider), ["gateway", "relay-claude"]);
-  assert.equal(spillCandidates({ provider: "proxy", id: "ide/gpt-6.1-sol:high" }, pool)[0]!.thinking, "high");
+  const pinned = parseModel("gateway/ide/gpt-6.1-sol:high");
+  const pool = resolveModel("writer", { writer: ["anthropic/claude-opus-5-5:medium", "gateway/ide/gpt-6.1-sol:high", "openai/GPT-6.1-SOL:high"] });
+  assert.deepEqual(spillCandidates(pinned, pool).map(m => m.provider), ["openai", "anthropic"]);
+  assert.equal(spillCandidates({ provider: "gateway", id: "ide/gpt-6.1-sol:high" }, pool)[0]!.thinking, "high");
 });
 
 test("slot wait journals stay bounded while live status follows free-provider changes", { timeout: 10000 }, async t => {

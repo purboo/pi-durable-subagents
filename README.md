@@ -1330,7 +1330,7 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
   It is snapshotted when each child execution starts: changing it affects
   executions started afterwards, not a child already running; a resumed
   execution receives the current setting. False keeps question-only asks valid.
-- **Quota notices in a successful answer:** `"exhaustedPatterns": ["额度已使用完毕"]` on a
+- **Quota notices in a successful answer:** `"exhaustedPatterns": ["quota exhausted"]` on a
   provider treats a message that says the usage window is used up as a quota
   failure, even when the gateway answered with HTTP 200. Each entry is a
   JavaScript regular expression, matched case-insensitively against an
