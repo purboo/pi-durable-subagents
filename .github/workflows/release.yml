@@ -7,25 +7,6 @@ name: release
 on:
   push:
     tags: ["v*"]
-  # Maintenance only (unpublish inside npm's 72 hour window, or deprecate).
-  # npm blocks publish-affecting calls from bypass-2FA granular tokens, and this
-  # package additionally requires 2FA to publish, so the trusted-publisher OIDC
-  # path is the only non-interactive route. Same workflow file name keeps the
-  # claim npm recorded valid; the `npm` environment admits this branch too.
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "unpublish or deprecate"
-        type: choice
-        options: [deprecate, unpublish]
-        default: deprecate
-      versions:
-        description: 'Space separated versions, e.g. "1.3.0 1.3.1"'
-        required: true
-      message:
-        description: "Deprecation message (deprecate only)"
-        required: false
-        default: "Superseded; please upgrade to the latest version"
 permissions:
   contents: read
 concurrency:
@@ -33,11 +14,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   ci:
-    if: github.event_name == 'push'
     uses: ./.github/workflows/ci.yml
   publish:
     needs: ci
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -60,7 +39,6 @@ jobs:
           echo "::notice::Published $name@${GITHUB_REF_NAME#v}"
   github-release:
     needs: publish
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub Release
@@ -76,33 +54,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-
-  maintenance:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    environment: npm
-    permissions:
-      contents: read
-      id-token: write # exchange the OIDC token for a short-lived maintenance credential
-    steps:
-      - uses: actions/setup-node@v4
-        with: { node-version: "24", registry-url: "https://registry.npmjs.org" }
-      - run: npm install -g npm@latest # trusted publishing needs npm >= 11.5.1
-      - name: ${{ inputs.mode }}
-        env:
-          MODE: ${{ inputs.mode }}
-          PKG: pi-durable-subagents
-          VERSIONS: ${{ inputs.versions }}
-          MESSAGE: ${{ inputs.message }}
-        run: |
-          name="$PKG"
-          latest="$(npm view "$name" dist-tags.latest)"
-          for v in $VERSIONS; do
-            if [ "$v" = "$latest" ]; then echo "::warning::skipping latest $v"; continue; fi
-            if [ "$MODE" = "unpublish" ]; then
-              npm unpublish "$name@$v" --force
-            else
-              npm deprecate "$name@$v" "$MESSAGE"
-            fi
-            echo "::notice::$MODE $name@$v done"
-          done
