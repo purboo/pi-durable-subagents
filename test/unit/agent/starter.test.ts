@@ -136,11 +136,20 @@ test("quit pause: the start notice names this session's paused workflows; a quit
   } finally { await lock.release(); }
 });
 
-test("issue #3: a session emits its subagent activity on pi.events on change, and zeros when it ends busy", async () => {
+test("issue #3: a session emits its subagent activity and cost on pi.events on change, and zeros when it ends busy", async () => {
   const home = fresh();
-  await create(home, "W01", A); await create(home, "W02", B);
+  await create(home, "W01", A); await create(home, "W02", B); await create(home, "W03", A);
+  const usage = (costUsd: number) => ({ input: 10, output: 2, costUsd });
   const j = await openJournal(journalPath(home, "W01"));
-  await j.append("generation", { pos: 0, key: "k", gen: 1, spec: { agent: "worker", task: "x" } }); await j.close();
+  await j.append("generation", { pos: 0, key: "k", gen: 1, spec: { agent: "worker", task: "x" } });
+  await j.append("usage", { call: "W01@1/k@1", id: "m1", usage: usage(0.25) }); await j.close();
+  // Another session's spend is not this session's.
+  await append(journalPath(home, "W02"), "usage", { call: "W02@1/k@1", id: "m1", usage: usage(9) });
+  // A finished workflow still counts: its sealed call carries the total.
+  const done = await openJournal(journalPath(home, "W03"));
+  await done.append("generation", { pos: 0, key: "k", gen: 1, spec: { agent: "worker", task: "x" } });
+  await done.append(JT.sealed, { call: "W03@1/k@1", result: { key: "k", gen: 1, status: "ok", ok: true, output: "", usage: usage(1.5) } });
+  await done.append(JT.done, { status: "done", result: 1 }); await done.close();
   const lock = await new OsLock().tryAcquire(orchLock(home)); // an orchestrator runs: nothing is launched
   assert.ok(lock);
   process.env.DSA_HOME = home;
@@ -151,11 +160,15 @@ test("issue #3: a session emits its subagent activity on pi.events on change, an
   try {
     await hooks.get("session_start")!({}, ctx);
     await delay(1200); // several poll rounds: an unchanged state is not emitted again
+    await append(journalPath(home, "W01"), "usage", { call: "W01@1/k@1", id: "m2", usage: usage(0.5) });
+    await delay(1200); // new spend is a change
   } finally { await hooks.get("session_shutdown")!({ reason: "reload" }); await lock.release(); }
   const sessionId = A.slice(5);
   assert.deepEqual(seen, [
-    [ACTIVITY_CHANNEL, { sessionId, busy: true, working: 0, asking: 0, queued: 1, paused: 0 }],
-    [ACTIVITY_CHANNEL, { sessionId, busy: false, working: 0, asking: 0, queued: 0, paused: 0 }],
+    [ACTIVITY_CHANNEL, { sessionId, busy: true, working: 0, asking: 0, queued: 1, paused: 0, costUsd: 1.75 }],
+    [ACTIVITY_CHANNEL, { sessionId, busy: true, working: 0, asking: 0, queued: 1, paused: 0, costUsd: 2.25 }],
+    // The spend stays: only the live counts drop to zero.
+    [ACTIVITY_CHANNEL, { sessionId, busy: false, working: 0, asking: 0, queued: 0, paused: 0, costUsd: 2.25 }],
   ]);
 });
 
