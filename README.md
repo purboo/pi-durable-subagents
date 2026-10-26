@@ -1034,6 +1034,9 @@ for at most five seconds. Turn boundaries check immediately for late attention.
 Ledger changes force a journal check;
 final sessions are also rechecked within five seconds. Only an explicitly
 opened final call keeps its transcript. Prune removes the workflow's caches.
+A `status` or `send` covers every workflow of the machine but keeps in memory
+only the identity of a settled journal that no poller holds; the few finished
+workflows it shows are read from the cache each time.
 `DSA_CACHE_HOME=<directory>` places the derived cache under that directory
 instead of `DSA_HOME`, without changing where authoritative data is read.
 

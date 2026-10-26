@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.2
+
+- Memory: a main session's polling no longer keeps every earlier pass alive. Each workflow entry's lazy `entries`
+  getter was created inside the polling function and closed over that call's context, which held the preceding pass;
+  so each pass kept the one before it, with its listing of the workflows directory, ledger state and digests. A
+  long-running pi grew by about 0.25 GB per hour while its subagents worked and ran out of heap after about 12 hours.
+  A pass now keeps only the latest result.
+- Memory: `status`, every `send` and the resume check no longer keep a digest of every settled workflow on the
+  machine. They keep only each settled journal's identity and owner, and read the few finished workflows they show
+  from the cache. On a home with 7,800 workflows a pi process kept about 220 MB after its first `status`; it keeps
+  about 26 MB. The output is unchanged.
+
 ## 1.4.1
 
 - Docs, tests and fixtures use neutral example names and paths; no behaviour change.

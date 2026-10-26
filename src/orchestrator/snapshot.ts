@@ -693,6 +693,48 @@ export function workflowDigest(home: string, wid: string, ledger?: string): Work
   if (digest.settled) { storeDigest(home, wid, record, digest); releasable.add(path); }
   return digest;
 }
+/** Settled journals a status listing checked without keeping their digest: the journal's identity and who owns the
+ *  workflow. A listing covers every workflow of the machine (thousands) but shows only a few finished ones; keeping
+ *  all their digests in `digests` cost each pi process hundreds of MB from its first `status` or `send`. */
+const settledMarks = new Map<string, { dev: number; ino: number; size: number; origin?: string; session?: string }>();
+/** Replace a settled digest that no poller held before (`held`) by its mark: the next reader takes it from disk. */
+function markSettled(path: string): void {
+  const memo = digests.get(path);
+  if (!memo?.digest.settled) { settledMarks.delete(path); return; }
+  const { origin, session } = memo.digest.snapshot;
+  settledMarks.set(path, { dev: memo.dev, ino: memo.ino, size: memo.size, ...(origin !== undefined ? { origin } : {}), ...(session !== undefined ? { session } : {}) });
+  digests.delete(path); folds.delete(path); forgetJournalSnapshot(path); releasable.delete(path);
+}
+/** Whether a workflow's journal is settled as it is now, with the origin and session of its snapshot; decided without
+ *  keeping its digest in memory unless a poller already holds it. Undefined: not settled (or not readable). */
+function settledFacts(home: string, wid: string): { origin?: string; session?: string } | undefined {
+  const path = pathsOf(home, wid).journal;
+  if (digests.has(path)) {
+    const digest = workflowDigest(home, wid);
+    settledMarks.delete(path);
+    return digest.settled ? { origin: digest.snapshot.origin, session: digest.snapshot.session } : undefined;
+  }
+  let dev: number, ino: number, size: number;
+  try { ({ dev, ino, size } = statSync(path)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; settledMarks.delete(path); return undefined; }
+  const mark = settledMarks.get(path);
+  if (mark && mark.dev === dev && mark.ino === ino && mark.size === size) return mark;
+  const stored = storedDigest(home, wid, dev, ino, size);
+  if (stored) {
+    const { origin, session } = stored.snapshot;
+    const facts = { ...(origin !== undefined ? { origin } : {}), ...(session !== undefined ? { session } : {}) };
+    settledMarks.set(path, { dev, ino, size, ...facts });
+    return facts;
+  }
+  // No usable stored digest: fold the journal once (this also stores its digest when settled), then keep only the mark.
+  const digest = workflowDigest(home, wid);
+  markSettled(path);
+  return digest.settled ? { origin: digest.snapshot.origin, session: digest.snapshot.session } : undefined;
+}
+/** `read` (one snapshot of a settled workflow) without keeping its digest in memory unless a poller already held it. */
+function unretained<T>(home: string, wid: string, read: () => T): T {
+  const path = pathsOf(home, wid).journal, held = digests.has(path);
+  try { return read(); } finally { if (!held) markSettled(path); }
+}
 /** Last journal identity check of the current digest. Reuse never renews this timestamp. */
 export function workflowDigestChecked(home: string, wid: string): number {
   return digests.get(pathsOf(home, wid).journal)?.checked ?? -Infinity;
@@ -810,7 +852,7 @@ function workflowIds(home: string): string[] {
 function forgetRemovedWorkflows(home: string, names: string[], pruned: Set<string>): void {
   const paths = pathsByHome.get(home), present = new Set(names);
   if (paths) for (const [wid, p] of paths) if (pruned.has(wid) || !present.has(wid)) {
-    digests.delete(p.journal); folds.delete(p.journal); forgetJournalSnapshot(p.journal); firstOrigins.delete(p.journal);
+    digests.delete(p.journal); settledMarks.delete(p.journal); folds.delete(p.journal); forgetJournalSnapshot(p.journal); firstOrigins.delete(p.journal);
     for (const script of p.scripts) if (script) plannedByPath.delete(script);
     paths.delete(wid);
   }
@@ -1203,14 +1245,27 @@ function origins(home: string): Map<string, string | undefined> {
   return ids;
 }
 
+/** One workflow of a status listing. A settled one (finished, nothing live, so never paused) is snapshotted only when
+ *  it is shown, from its stored digest, and that digest is not kept: see settledMarks. */
+interface Listed { wid: string; settled: boolean; own: boolean; snapshot(): WorkflowSnapshot }
 /** Every workflow with its origin and hold, own session first, then newest first. */
-function snapshots(home: string, origin?: string): { all: WorkflowSnapshot[]; since?: number } {
-  const own = (w: WorkflowSnapshot) => Number(!!origin && ownedBy(w, origin));
+function snapshots(home: string, origin?: string): { all: Listed[]; since?: number } {
+  const owned = (w: Pick<WorkflowSnapshot, "origin" | "session">) => !!origin && ownedBy(w, origin);
   const { since, held, labels, session } = heldWorkflows(home);
-  const all = [...origins(home)].sort(([a], [b]) => a < b ? 1 : a > b ? -1 : 0).map(([wid, origin]) => {
-    const wf = labelled(workflowSnapshot(home, wid), labels(wid), session(wid)), withOrigin = wf.origin === undefined && origin !== undefined ? { ...wf, origin } : wf;
+  const full = (wid: string, ledgerOrigin: string | undefined): WorkflowSnapshot => {
+    const wf = labelled(workflowSnapshot(home, wid), labels(wid), session(wid)), withOrigin = wf.origin === undefined && ledgerOrigin !== undefined ? { ...wf, origin: ledgerOrigin } : wf;
     return isLive(withOrigin) && held(wid) ? { ...withOrigin, paused: true } : withOrigin;
-  }).sort((a, b) => own(b) - own(a));
+  };
+  const all = [...origins(home)].sort(([a], [b]) => a < b ? 1 : a > b ? -1 : 0).map(([wid, ledgerOrigin]): Listed => {
+    const facts = settledFacts(home, wid);
+    if (facts) {
+      let wf: WorkflowSnapshot | undefined;
+      return { wid, settled: true, own: owned({ origin: facts.origin ?? ledgerOrigin, session: session(wid) || facts.session }),
+        snapshot: () => wf ??= unretained(home, wid, () => full(wid, ledgerOrigin)) };
+    }
+    const wf = full(wid, ledgerOrigin);
+    return { wid, settled: settled(wf), own: owned(wf), snapshot: () => wf };
+  }).sort((a, b) => Number(b.own) - Number(a.own));
   return { all, ...(since !== undefined ? { since } : {}) };
 }
 
@@ -1219,9 +1274,9 @@ export function statusView(home: string, options: { origin?: string; keep?: numb
   const keep = options.keep ?? 10;
   const { all, since } = snapshots(home, options.origin), leases = leaseState(home), byCall = leaseCalls(leases);
   let finished = 0;
-  const shown = all.filter(w => !settled(w) || ++finished <= keep);
+  const shown = all.filter(w => !w.settled || ++finished <= keep).map(w => w.snapshot());
   const hidden = all.length - shown.length;
-  const paused = all.filter(w => w.paused).length;
+  const paused = all.filter(w => !w.settled && w.snapshot().paused).length;
   return { workflows: shown.map(w => compactWorkflow(w, byCall)), ...(hidden ? { olderFinished: hidden, hint: "status wid=<wid> shows any workflow in detail" } : {}),
     ...(paused ? { paused: `${paused} workflow${paused > 1 ? "s" : ""} paused (stop-all, drain or a quit pi) since ${new Date(since!).toISOString()}; resume continues them (new runs are not affected)` } : {}),
     ...slotsView(home), ...(leases.length ? { leases: leaseLines(leases) } : {}), ...runningStats(home) };
@@ -1426,7 +1481,7 @@ export function slotsView(home: string, now = Date.now()): Pick<StatusBrief, "sl
  *  The full view (every call's last line and usage) ran to tens of thousands of tokens on a busy home. */
 export function statusBrief(home: string, options: { origin?: string; keep?: number; now?: number } = {}): StatusBrief {
   const keep = options.keep ?? 5, now = options.now ?? Date.now(), origin = options.origin;
-  const { all } = snapshots(home, origin), leases = leaseState(home), byCall = leaseCalls(leases, now);
+  const { all: listed } = snapshots(home, origin), leases = leaseState(home), byCall = leaseCalls(leases, now);
   const mine = (w: WorkflowSnapshot) => !origin || ownedBy(w, origin);
   const line = (w: WorkflowSnapshot) => {
     const p = progressOf(w), notOk = latestCalls(w).filter(c => c.result && !c.result.ok).length;
@@ -1458,15 +1513,16 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
       progress: `${p.done}/${p.total}${p.plus ? "+" : ""}`, tokens: tokens(w.usage), calls,
       ...(asking.length ? { asking } : {}), ...(alerts.length ? { alerts } : {}) };
   };
-  const active = all.filter(w => !settled(w));
-  const finished = all.filter(w => settled(w) && mine(w));
+  const active = listed.filter(w => !w.settled).map(w => w.snapshot());
+  // Snapshotted for its line only when shown (the first `keep`); the rest is a count.
+  const finished = listed.filter(w => w.settled && (!origin || w.own));
   const others = active.filter(w => !mine(w));
   const heldMine = active.filter(w => mine(w) && w.paused).length, heldOthers = others.filter(w => w.paused);
   const paused = [heldMine ? `${heldMine} workflow${heldMine > 1 ? "s" : ""} of this session ${heldMine > 1 ? "are" : "is"} paused (stop-all, drain or a quit pi); resume continues ${heldMine > 1 ? "them" : "it"}` : "",
     heldOthers.length ? `${heldOthers.length} workflow${heldOthers.length > 1 ? "s" : ""} of other sessions paused (${heldOthers.slice(0, 8).map(w => w.wid).join(", ")}); resume wid=<wid> continues one` : ""].filter(Boolean).join("; ");
   return {
     active: active.filter(mine).map(brief), ...(others.length ? { otherSessions: others.slice(0, 10).map(line) } : {}),
-    finished: finished.slice(0, keep).map(line), ...(finished.length > keep ? { olderFinished: finished.length - keep } : {}),
+    finished: finished.slice(0, keep).map(w => line(w.snapshot())), ...(finished.length > keep ? { olderFinished: finished.length - keep } : {}),
     ...(paused ? { paused } : {}), ...slotsView(home, now), ...(leases.length ? { leases: leaseLines(leases, now) } : {}),
     hint: "status wid=<wid> shows one workflow (outputs clipped); add key=<key> for one call's full result, or full:true for everything",
   };
@@ -1500,7 +1556,8 @@ export function statusText(home: string, value: unknown): string {
 
 /** Running workflows of other sessions that a pause holds, as "wid" or "wid (name)": a session's own resume skips them. */
 export function pausedElsewhere(home: string, origin: string): string[] {
-  return snapshots(home, origin).all.filter(w => w.paused && w.origin !== origin && !settled(w)).map(w => w.name ? `${w.wid} (${w.name})` : w.wid);
+  return snapshots(home, origin).all.filter(w => !w.settled).map(w => w.snapshot()).filter(w => w.paused && w.origin !== origin)
+    .map(w => w.name ? `${w.wid} (${w.name})` : w.wid);
 }
 /** "<rid>" or "<rid>/<rest>" of a run request that created a workflow → the same address with its wid; else unchanged.
  *  A run replies {submitted:{rid}} when its workflow is not created within 10 s, so the rid is all the caller has. */

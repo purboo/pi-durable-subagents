@@ -36,6 +36,16 @@ export class PendingOutboxReader {
 export type MainWorkflow = { wid: string; origin?: string; settled?: { attention: AttentionItem[] }; readonly entries: Entry[] };
 type MainPass = { mark: string; checked: number; appends: number; names: string[]; retryUnknown: boolean; ids: string[]; pending: string[]; digests: Map<string, WorkflowDigest>; result: MainWorkflow[] };
 const passes = new Map<string, Map<string | undefined, MainPass>>();
+/** One workflow of a pass. Built here, not inside workflows(): a getter created there closes over that call's whole
+ *  context, which holds the preceding pass (`prior`, `old`), so every result entry kept the pass before it alive and,
+ *  through that pass's own entries, every earlier one (each with its listing of w/, ledger state and digests). */
+function mainWorkflow(wid: string, origin: string | undefined, digest: WorkflowDigest, path: string): MainWorkflow {
+  return { wid, origin, ...(digest.settled ? { settled: digest.settled } : {}), get entries() {
+    const entries = readJournalSnapshot(path);
+    if (digest.settled) forgetJournalSnapshot(path);
+    return entries;
+  } };
+}
 export function workflows(home: string, origin?: string, fresh = false): MainWorkflow[] {
   const { record, names, checked: listed } = readerWorkflowListing(home, fresh), ix = record.state, mark = readerLedgerIdentity(record), now = Date.now();
   let byOrigin = passes.get(home);
@@ -56,11 +66,7 @@ export function workflows(home: string, origin?: string, fresh = false): MainWor
       if (origin !== undefined && from !== origin) { old.delete(wid); digests.set(wid, digest); continue; }
       if (prior?.digests.get(wid) === digest && old.get(wid)?.origin === from) { digests.set(wid, digest); continue; }
       digests.set(wid, digest);
-      changes.set(wid, { wid, origin: from as string | undefined, ...(digest.settled ? { settled: digest.settled } : {}), get entries() {
-        const entries = readJournalSnapshot(path);
-        if (digest.settled) forgetJournalSnapshot(path);
-        return entries;
-      } });
+      changes.set(wid, mainWorkflow(wid, from as string | undefined, digest, path));
     }
     const result = ids.map(wid => changes.get(wid) ?? old.get(wid)).filter((w): w is MainWorkflow => !!w);
     const same = prior && prior.result.length === result.length && result.every((w, i) => w === prior.result[i]);
