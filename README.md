@@ -614,7 +614,12 @@ ends with work still counted.
 Agent files, discovery and precedence follow `pi-subagents` 0.75.0. That
 covers user, project and package agents, `model:thinking`, `tools` and
 `skills`. The same builtin agents are included; an agent file of the same name
-in your user or project agents overrides one.
+in your user or project agents overrides one. Packages in npm's global root are
+searched as well. Its location is asked from `npm root -g` once and kept in
+`DSA_HOME/cache/npm-root.json`, until the `npm` or `node` found on `PATH`, the
+`npm_config_prefix`/`PREFIX` environment or an npmrc file changes (a version
+manager's `npm` shim is asked again after ten seconds); with `PI_OFFLINE=1` npm
+is not asked.
 
 | Agent | Use it when you want... |
 |---|---|

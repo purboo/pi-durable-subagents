@@ -34,7 +34,7 @@ let noteSink: ((text: string) => void) | undefined;
 export function presentNote(text: string): void { noteSink?.(text); }
 
 /** P1, P15, P16, P25, P38: Register durable submission and serialized main-session presentation. */
-/** v12 §6: Agent discovery per cwd, reused for a few seconds (discovery may shell out to `npm root -g`). */
+/** v12 §6: Agent discovery per cwd, reused for a few seconds (it reads every package's manifest). */
 const discovered = new Map<string, { at: number; agents: ReturnType<typeof discoverAgents>["agents"] }>();
 function agentsAt(cwd: string) {
   const hit = discovered.get(cwd);

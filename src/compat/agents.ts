@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
+import { cacheDir, dsaHome } from "../paths.ts";
 
 export interface AgentDefinition {
   name: string; description: string; model?: string; thinking?: string | false;
@@ -19,6 +20,73 @@ export interface DiscoveryOptions {
   globalNpmRoot?: string | null;
 }
 type Settings = Record<string, any>;
+
+export interface NpmRootOptions {
+  env?: NodeJS.ProcessEnv;
+  /** The on-disk cache; null keeps the answer in this process only. Default: `<DSA cache>/npm-root.json`. */
+  cacheFile?: string | null;
+  /** Asks npm; default `npm root -g` (5 s timeout). */
+  run?: () => string;
+}
+const stamp = (p: string | undefined) => { if (!p) return null; try { const s = fs.statSync(p); return `${p}@${s.mtimeMs}:${s.size}`; } catch { return `${p}@-`; } };
+/** The first `name` on PATH, resolved, with its stamp: what execFileSync would start. */
+function onPath(name: string, env: NodeJS.ProcessEnv): string | null {
+  const exts = process.platform === "win32" ? (env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";").filter(Boolean).concat("") : [""];
+  for (const dir of (env.PATH ?? env.Path ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      try { const p = fs.realpathSync(path.join(dir, name + ext)); if (fs.statSync(p).isFile()) return p; } catch { /* next */ }
+    }
+  }
+  return null;
+}
+/** Everything `npm root -g` reads to decide its answer, except npm's own code: which npm and node PATH selects, the
+ *  prefix environment, and the user, global and builtin npmrc files. -g ignores the project's .npmrc, so cwd is not
+ *  part of it, unless `npm` is a version manager's shim (asdf, mise, Volta) rather than npm itself: the shim picks a
+ *  node per directory from files this key does not see, so its answer is only `fixed` for a few seconds. */
+function npmRootKey(env: NodeJS.ProcessEnv): { key: string; npm: string | null; fixed: boolean } {
+  const npm = onPath("npm", env), node = onPath("node", env);
+  const vars = Object.keys(env).filter(k => /^(npm_config_(prefix|userconfig|globalconfig)|PREFIX|DESTDIR)$/i.test(k)).sort().map(k => `${k}=${env[k]}`);
+  const userconfig = Object.entries(env).find(([k]) => /^npm_config_userconfig$/i.test(k))?.[1] ?? path.join(env.HOME || env.USERPROFILE || homedir(), ".npmrc");
+  const prefix = env.PREFIX ?? (node ? (process.platform === "win32" ? path.dirname(node) : path.dirname(path.dirname(node))) : undefined);
+  const globalconfig = Object.entries(env).find(([k]) => /^npm_config_globalconfig$/i.test(k))?.[1] ?? (prefix && path.join(prefix, "etc", "npmrc"));
+  const builtin = npm ? path.join(path.dirname(path.dirname(npm)), "npmrc") : undefined;
+  const fixed = !!npm && /[\\/]npm[\\/]bin[\\/]npm(-cli\.js)?$/.test(npm);
+  return { npm, fixed, key: JSON.stringify([stamp(npm ?? undefined), stamp(node ?? undefined), vars, stamp(userconfig), stamp(globalconfig), stamp(builtin), process.platform === "win32" ? null : stamp("/etc/npmrc"), fixed ? null : process.cwd()]) };
+}
+const NPM_ROOT_ENTRIES = 8, NPM_ROOT_RETRY_MS = 60_000, NPM_ROOT_SHIM_MS = 10_000;
+let npmRootMemo: { key: string; root: string | null; until: number } | undefined;
+/** Issue #5: npm's global root without starting npm on every discovery. `npm root -g` takes 100-300 ms, and seconds on
+ *  a busy machine, while every pi start, run admission and CLI request discovers agents. The answer is kept in this
+ *  process and in a small rebuildable cache file, keyed on npmRootKey; a changed input asks npm again. A failed answer
+ *  is null and is retried after a minute, never written to disk. A shim's answer stays in this process for ten seconds
+ *  and is never written to disk. No npm on PATH is null without starting anything. */
+export function globalNpmRoot(options: NpmRootOptions = {}): string | null {
+  const env = options.env ?? process.env;
+  const { key, npm, fixed } = npmRootKey(env);
+  if (!npm) return null;
+  const now = Date.now();
+  if (npmRootMemo?.key === key && npmRootMemo.until > now) return npmRootMemo.root;
+  const file = !fixed ? null : options.cacheFile === undefined ? path.join(cacheDir(dsaHome(env)), "npm-root.json") : options.cacheFile;
+  let entries: { key: string; root: string }[] = [];
+  if (file) {
+    try { const v = JSON.parse(fs.readFileSync(file, "utf8")); if (Array.isArray(v)) entries = v.filter(e => typeof e?.key === "string" && typeof e?.root === "string"); } catch { /* none yet */ }
+    const hit = entries.find(e => e.key === key);
+    if (hit) { npmRootMemo = { key, root: hit.root, until: Infinity }; return hit.root; }
+  }
+  let root: string | null = null;
+  try { root = (options.run ?? (() => execFileSync("npm", ["root", "-g"], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], env })))().trim() || null; } catch { root = null; }
+  npmRootMemo = { key, root, until: !fixed ? now + NPM_ROOT_SHIM_MS : root === null ? now + NPM_ROOT_RETRY_MS : Infinity };
+  if (file && root !== null) {
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify([{ key, root }, ...entries.filter(e => e.key !== key)].slice(0, NPM_ROOT_ENTRIES)));
+      fs.renameSync(tmp, file);
+    } catch { /* A cache failure only costs asking npm again. */ }
+  }
+  return root;
+}
 const directory = (p: string) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
 const canonical = (p: string): string => { try { return fs.realpathSync(p); } catch { const parent = path.dirname(p); return parent === p ? p : path.join(canonical(parent), path.basename(p)); } };
 const within = (root: string, p: string) => { const r = path.relative(root, p); return r === "" || (!r.startsWith(`..${path.sep}`) && r !== ".." && !path.isAbsolute(r)); };
@@ -139,7 +207,8 @@ function scans(values: unknown, cwd: string, home: string): string[] {
   });
 }
 
-/** P35, P11: Discover a fresh snapshot with upstream roots and scope precedence; never write. */
+/** P35, P11: Discover a fresh snapshot with upstream roots and scope precedence; never write (beyond the rebuildable
+ *  npm-root cache, globalNpmRoot). */
 export function discoverAgents(cwd: string, options: DiscoveryOptions = {}): { agents: AgentDefinition[]; diagnostics: { sourcePath: string; error: string }[] } {
   cwd = path.resolve(cwd);
   const home = path.resolve(options.home ?? homedir());
@@ -172,9 +241,7 @@ export function discoverAgents(cwd: string, options: DiscoveryOptions = {}): { a
     }
   }
   let globalRoot = options.globalNpmRoot;
-  if (globalRoot === undefined && scope !== "project" && !/^(1|true|yes)$/i.test(process.env.PI_OFFLINE ?? "")) {
-    try { globalRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { globalRoot = null; }
-  }
+  if (globalRoot === undefined && scope !== "project" && !/^(1|true|yes)$/i.test(process.env.PI_OFFLINE ?? "")) globalRoot = globalNpmRoot();
   if (globalRoot && scope !== "project") roots.push(...packageRoots(globalRoot));
   for (const packageRoot of new Set(roots)) {
     const pkg = json(path.join(packageRoot, "package.json"));

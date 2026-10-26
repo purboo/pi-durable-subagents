@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.3
+
+- Startup: agent discovery no longer starts `npm root -g` every time (issue #5). Each pi start, run admission and CLI
+  request discovered agents, and npm took 100-300 ms to answer (seconds on a busy machine) before the TUI appeared.
+  The global root is now asked once and kept in this process and in `DSA_HOME/cache/npm-root.json`, keyed on the
+  `npm` and `node` executables found on `PATH`, the prefix environment and the user, global and builtin npmrc files;
+  a change asks npm again. A failed answer is not cached and is retried after a minute. When `npm` on `PATH` is a
+  version manager's shim (asdf, mise, Volta), which picks node per directory, its answer is kept only ten seconds in
+  the process. With a warm cache discovery takes about 10 ms; it took 100-140 ms here, and the reporter measured
+  170-225 ms inside the extension's 250-300 ms factory.
+
 ## 1.4.2
 
 - Memory: a main session's polling no longer keeps every earlier pass alive. Each workflow entry's lazy `entries`
