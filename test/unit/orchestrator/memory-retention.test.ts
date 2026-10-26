@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { crc32, openJournal } from "../../../src/kernel/journal.ts";
-import { SETTLED_RECHECK_MS, statusBrief, statusView } from "../../../src/orchestrator/snapshot.ts";
+import { ownWorkflows, pausedElsewhere, SETTLED_RECHECK_MS, statusBrief, statusView, workflowDigest, workflowDigestChecked } from "../../../src/orchestrator/snapshot.ts";
 import { workflows } from "../../../src/agent/main/snapshots.ts";
 import { digestDir, journalPath, orchLedger } from "../../../src/paths.ts";
 import { JT } from "../../../src/types.ts";
@@ -84,5 +84,34 @@ test("a status listing keeps no digest of a settled workflow and reads the ones 
     assert.deepEqual(view(), ["01OWN2:name-01OWN2", "01OWN1:stored-01OWN1", "01OTH3:name-01OTH3", "01OTH2:stored-01OTH2", "01OTH1:stored-01OTH1"]);
     renameStored(home, "01OTH1", "again");
     assert.equal(view().at(-1), "01OTH1:again", "a settled workflow it showed is not kept either");
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a status listing leaves the digests pollers hold, their trust windows and pass identity alone, and still sees holds", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-retain-held-"));
+  try {
+    await created(home, [["01OWN1", "main:s"], ["01OWN2", "main:s"], ["01OTH1", "main:o"], ["01OTH2", "main:o"]]);
+    await workflow(home, "01OWN1", "main:s", true);
+    await workflow(home, "01OWN2", "main:s", false);
+    await workflow(home, "01OTH1", "main:o", true);
+    await workflow(home, "01OTH2", "main:o", false);
+    const ledger = await openJournal(orchLedger(home));
+    await ledger.append("drain", { origin: "main:o" }); // holds main:o's live workflow: paused for main:s
+    await ledger.close();
+    let clock = Date.now() + 60_000;
+    t.mock.method(Date, "now", () => clock);
+    const main = workflows(home, "main:s"), own = ownWorkflows(home, "main:s");
+    const held = ["01OWN1", "01OWN2"].map(wid => ({ wid, digest: workflowDigest(home, wid), checked: workflowDigestChecked(home, wid) }));
+    for (const h of held) assert.ok(Number.isFinite(h.checked), `${h.wid} is held by a poller`);
+    clock += 1;
+    statusBrief(home, { origin: "main:s" }); statusView(home, { origin: "main:s" });
+    assert.deepEqual(pausedElsewhere(home, "main:s"), ["01OTH2 (name-01OTH2)"]);
+    assert.equal(workflowDigestChecked(home, "01OTH1"), -Infinity, "a settled workflow no poller held is not kept");
+    for (const h of held) {
+      assert.equal(workflowDigest(home, h.wid), h.digest, `${h.wid}: the held digest is the same object`);
+      assert.ok(Number.isFinite(workflowDigestChecked(home, h.wid)), `${h.wid}: still checked`);
+    }
+    assert.equal(workflows(home, "main:s"), main, "the main pass is reused");
+    assert.equal(ownWorkflows(home, "main:s"), own, "the owner pass is reused");
   } finally { await rm(home, { recursive: true, force: true }); }
 });

@@ -1246,7 +1246,10 @@ function origins(home: string): Map<string, string | undefined> {
 }
 
 /** One workflow of a status listing. A settled one (finished, nothing live, so never paused) is snapshotted only when
- *  it is shown, from its stored digest, and that digest is not kept: see settledMarks. */
+ *  it is shown (from the cache, or by folding its journal when the cache has no valid digest), and that digest is not
+ *  kept: see settledMarks. Classification and content are read at two moments: a workflow reopened by a follow-up in
+ *  between counts as finished in that one listing (its line shows the follow-up) and moves to the live ones in the
+ *  next; the listing of w/ and the per-workflow reads were never one atomic read either. */
 interface Listed { wid: string; settled: boolean; own: boolean; snapshot(): WorkflowSnapshot }
 /** Every workflow with its origin and hold, own session first, then newest first. */
 function snapshots(home: string, origin?: string): { all: Listed[]; since?: number } {
