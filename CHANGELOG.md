@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.0
+
+- The `durable-subagents:activity` event includes `costUsd`, the sum of recorded costs for the session's retained workflows, including finished runs. Status bars receive a new event when spend changes (#6).
+- Parallel and chained calls with `isolation: "worktree"` can create a Git branch for generated keys such as `tasks:0`. Each key gets a distinct branch, including when the workflow also has a key named `tasks-0` (#8).
+- The CLI guide explains how to start a run whose completion wakes the main pi session (#9).
+
 ## 1.4.3
 
 - Startup: agent discovery no longer starts `npm root -g` every time (issue #5). Each pi start, run admission and CLI
