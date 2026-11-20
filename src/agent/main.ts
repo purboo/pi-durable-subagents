@@ -51,9 +51,10 @@ function quitPolicy(home: string): "pause" | "continue" {
 /** The pi.events channel on which a main session announces changes of its subagent activity (issue #3). */
 export const ACTIVITY_CHANNEL = "durable-subagents:activity";
 /** The payload on ACTIVITY_CHANNEL: this session's live calls by state (the dock's counts). `busy` is true while any call
- *  works, asks or waits for a slot; paused (held) work alone is not busy. Emitted on change only, and once with every
- *  count at zero when the session ends with any count above zero. */
-export interface SubagentActivity { sessionId: string; busy: boolean; working: number; asking: number; queued: number; paused: number }
+ *  works, asks or waits for a slot; paused (held) work alone is not busy. `costUsd` is what this session's workflows
+ *  have spent so far, finished ones included (a pruned workflow no longer counts). Emitted on change only, and once
+ *  with every count at zero (the spend kept) when the session ends with any count above zero. */
+export interface SubagentActivity { sessionId: string; busy: boolean; working: number; asking: number; queued: number; paused: number; costUsd: number }
 /** The background poll's lock helper may take this long: a machine in and out of sleep answers late (issue #2). */
 const BACKGROUND_LOCK_MS = 15_000;
 /** Consecutive background failures before one is shown; a single slow round is transient. */
@@ -78,7 +79,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   let ctx: ExtensionContext | undefined, sender = "", outbox: Outbox | undefined;
   let queue: Promise<unknown> = Promise.resolve(), timer: ReturnType<typeof setInterval> | undefined;
   let reserved: AttentionItem[] = [], notes: string[] = [], stopped = true, lastStarter = 0;
-  let polling = false, lastActivity = "", activityAt = 0;
+  let polling = false, lastActivity = "", lastCostUsd = 0, activityAt = 0;
   const failures = new BackgroundFailures();
   const pendingReader = new PendingOutboxReader();
   const sink = (text: string) => { notes.push(text); };
@@ -104,11 +105,13 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
   function emitActivity(sessionEnds = false) {
     const events = (pi as { events?: { emit?: (channel: string, data: unknown) => void } }).events;
     if (typeof events?.emit !== "function" || !sender) return;
-    const counts = sessionEnds ? { working: 0, asking: 0, queued: 0, paused: 0 } : activityCounts(ownWorkflows(home, sender));
-    const activity: SubagentActivity = { sessionId: sender.slice("main:".length), busy: counts.working + counts.asking + counts.queued > 0, ...counts };
+    const workflows = sessionEnds ? [] : ownWorkflows(home, sender);
+    const counts = sessionEnds ? { working: 0, asking: 0, queued: 0, paused: 0 } : activityCounts(workflows);
+    const costUsd = sessionEnds ? lastCostUsd : workflows.reduce((sum, w) => sum + (w.usage?.costUsd ?? 0), 0);
+    const activity: SubagentActivity = { sessionId: sender.slice("main:".length), busy: counts.working + counts.asking + counts.queued > 0, ...counts, costUsd };
     const key = JSON.stringify(activity);
     if (key === lastActivity || (sessionEnds && !lastActivity)) return;
-    lastActivity = key;
+    lastActivity = key; lastCostUsd = costUsd;
     try { events.emit(ACTIVITY_CHANNEL, activity); } catch { /* a listener's failure is not ours */ }
   }
   async function starter(submitting = false, background = false) {
@@ -163,7 +166,7 @@ export function registerMain(pi: ExtensionAPI, ui?: (pi: ExtensionAPI, deps: UiD
     await queue; await outbox?.close(); outbox = undefined; pendingReader.clear();
     if (noteSink === sink) noteSink = undefined;
     try { emitActivity(true); } catch { /* never block a shutdown */ }
-    reserved = []; notes = []; ctx = undefined; lastActivity = ""; failures.ok();
+    reserved = []; notes = []; ctx = undefined; lastActivity = ""; lastCostUsd = 0; failures.ok();
   }
   async function start(context: ExtensionContext) {
     await close(); ctx = context; sender = `main:${context.sessionManager.getSessionId()}`; stopped = false;

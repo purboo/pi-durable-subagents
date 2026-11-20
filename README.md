@@ -597,17 +597,19 @@ tell that work goes on after the main agent settles:
 
 ```ts
 pi.events.on("durable-subagents:activity", data => {
-  const { sessionId, busy, working, asking, queued, paused } = data as {
-    sessionId: string; busy: boolean; working: number; asking: number; queued: number; paused: number;
+  const { sessionId, busy, working, asking, queued, paused, costUsd } = data as {
+    sessionId: string; busy: boolean; working: number; asking: number; queued: number; paused: number; costUsd: number;
   };
 });
 ```
 
 The counts are this session's live calls by state, the same as the summary
 line above the editor. `busy` is true while any call works, asks or waits
-for a slot; paused work alone is not busy. The first state is sent when the
-session starts, then only changes, and every count at zero when the session
-ends with work still counted.
+for a slot; paused work alone is not busy. `costUsd` is what this session's
+workflows have spent so far, finished ones included, so a status bar can show
+subagent spend next to pi's own cost; a pruned workflow no longer counts. The
+first state is sent when the session starts, then only changes, and every
+count at zero (the spend kept) when the session ends with work still counted.
 
 ## Your pi-subagents scripts, unchanged
 
