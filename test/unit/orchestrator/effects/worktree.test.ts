@@ -58,3 +58,15 @@ test("non-git cwd and foreign branches refuse isolation", async ctx => {
   await git(f.cwd, "branch", `dsa/${f.t.wid}/task`);
   await assert.rejects(f.effects().prepare(f.t, { sessionPath: f.sessionPath }), /already exists/);
 });
+test("a key with ref-forbidden characters still isolates (branch segment is sanitized)", async ctx => {
+  const f = await fixture(ctx); f.t.spec.isolation = "worktree";
+  // The `tasks:<i>` / `chain:<i>` keys of a parallel fan-out contain ':', which `check-ref-format` rejects in a branch.
+  const t = { ...f.t, key: "tasks:0", callId: `${f.t.wid}@1/tasks:0@1` };
+  await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
+  const base = await git(f.cwd, "rev-parse", "HEAD");
+  const prepared = await f.effects().prepare(t, { sessionPath: f.sessionPath });
+  // The path keeps the raw key (':' is valid in a POSIX path); only the branch segment is made ref-safe (':' -> '-').
+  assert.equal(prepared.cwd, join(f.cwd, ".dsa", f.t.wid, "tasks:0"));
+  assert.equal(await git(f.cwd, "rev-parse", `dsa/${f.t.wid}/tasks-0`), base);
+  assert.equal(await git(prepared.cwd, "rev-parse", "HEAD"), base);
+});
