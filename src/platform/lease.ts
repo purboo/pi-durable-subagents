@@ -5,11 +5,13 @@
 // earlier request, so the old FIFO lock-free grant argument no longer applies. No lock is held while commands run or
 // their processes are ended. A ticket stays live while its wrapper, command, group or exact DSA_HOLD tag lives;
 // waiters reclaim orphaned command trees before granting the next request. No orchestrator is involved.
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { replacePath, replacePathSync } from "../kernel/fsx.ts";
 import { OsLock } from "./lock.ts";
 import { ProcessTable } from "./proctable.ts";
+import { IS_WINDOWS, killTreeSync, winSnapshotSync, type WinProcessRow } from "./windows.ts";
 
 export type LeaseMode = "exclusive" | "shared" | "counted";
 export interface LeaseProcess { pid: number; start?: string }
@@ -32,11 +34,30 @@ export const leaseDir = (home: string, resource: string) => path.join(leasesRoot
 const ticketName = (seq: number) => `${String(seq).padStart(12, "0")}.json`;
 const TICKET = /^\d{12}\.json$/;
 
+/** Every live descendant of `pid` (Windows has no process groups: the command's tree is the group). Rows older than the
+ *  root's creation token are never taken for its children: a reused pid has a later token. */
+function winDescendants(pid: number, after?: string): WinProcessRow[] {
+  const rows = winSnapshotSync(), out: WinProcessRow[] = [], queue = [pid];
+  const floor = after && /^\d+$/.test(after) ? BigInt(after) : undefined;
+  for (let i = 0; i < queue.length; i++)
+    for (const row of rows.values()) if (row.ppid === queue[i] && !out.some(o => o.pid === row.pid)) {
+      if (floor !== undefined && /^\d+$/.test(row.start) && BigInt(row.start) < floor) continue;
+      out.push(row); queue.push(row.pid);
+    }
+  return out;
+}
+
 /** Whether a process still runs; on Linux the start token also tells it from a later process with the same pid. */
 export function alive(p: LeaseProcess | undefined): boolean {
   if (!p) return false;
   try { process.kill(p.pid, 0); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPERM") return false; }
+  if (IS_WINDOWS) {
+    // Creation time is Windows' start token. A row missing from the short-lived cache is not proof of death.
+    if (!p.start) return true;
+    const row = winSnapshotSync().get(p.pid);
+    return row ? row.start === p.start : true;
+  }
   if (!p.start || process.platform !== "linux") return true;
   try {
     const fields = readFileSync(`/proc/${p.pid}/stat`, "utf8");
@@ -46,6 +67,10 @@ export function alive(p: LeaseProcess | undefined): boolean {
 }
 /** Whether process group `pgid` still has a member that can run (Linux: zombies, which no signal ends, do not count). */
 export function groupAlive(pgid: number): boolean {
+  if (IS_WINDOWS) {
+    try { process.kill(pgid, 0); return true; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "EPERM") return winDescendants(pgid).length > 0; }
+  }
   try { process.kill(-pgid, 0); }
   catch (e) { if ((e as NodeJS.ErrnoException).code !== "EPERM") return false; }
   if (process.platform !== "linux") return true;
@@ -71,6 +96,12 @@ export function groupAlive(pgid: number): boolean {
 function leftoverGroup(t: LeaseTicket): boolean {
   const c = t.command;
   if (!c) return false;
+  if (IS_WINDOWS) {
+    // The command's pid is the root of its tree, not a process group. Live leader: no leftovers (alive() checks the
+    // creation token). Dead leader: its children keep the parent pid, so they are its leftovers.
+    if (alive(c)) return false;
+    return winDescendants(c.pid, c.start).length > 0;
+  }
   if (process.platform === "linux") {
     try {
       const fields = readFileSync(`/proc/${c.pid}/stat`, "utf8");
@@ -91,13 +122,31 @@ const holdTable = new ProcessTable({ tagName: "DSA_HOLD" });
 export const holdTag = (t: Pick<LeaseTicket, "resource" | "seq">) => `${t.resource}:${t.seq}`;
 export const tagged = (t: Pick<LeaseTicket, "resource" | "seq">): LeaseProcess[] => holdTable.tagged(holdTag(t));
 /** An orphan may retain its tag even after its leader and entire original process group have gone. */
-export const orphaned = (t: LeaseTicket) => !alive(t.wrapper) && !alive(t.command) && (leftoverGroup(t) || tagged(t).length > 0);
+export const orphaned = (t: LeaseTicket) => {
+  if (alive(t.wrapper) || alive(t.command)) return false;
+  if (IS_WINDOWS) return leftoverGroup(t) || winDescendants(t.wrapper.pid, t.wrapper.start).length > 0;
+  return leftoverGroup(t) || tagged(t).length > 0;
+};
 /** A ticket is live while its wrapper, command, process group or exact inherited tag can still act. */
 export const live = (t: LeaseTicket) => alive(t.wrapper) || alive(t.command) || orphaned(t);
 
 /** End the group and escaped tagged descendants, rescanning for forks. Release is bounded even for unkillable tasks. */
 export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (line: string) => void): Promise<void> {
   const started = Date.now(), until = started + 5000;
+  if (IS_WINDOWS) {
+    // taskkill /T is the tree signal (there is no SIGTERM to deliver). The wrapper is this holder process and must
+    // outlive the cleanup: only the command's tree is ended here.
+    for (;;) {
+      if (t.command && alive(t.command)) { try { killTreeSync(t.command.pid); } catch { /* gone */ } }
+      const orphans = t.command ? winDescendants(t.command.pid, t.command.start) : [];
+      for (const row of orphans) if (!alive({ pid: row.pid, start: row.start })) continue; else { try { killTreeSync(row.pid); } catch { /* gone */ } }
+      const remaining = t.command ? winDescendants(t.command.pid, t.command.start).length : 0;
+      if (!(t.command && alive(t.command)) && !remaining) break;
+      if (Date.now() >= until) { say(`hold: ${remaining} processes of ${who(t)} survived; releasing`); break; }
+      await new Promise(r => setTimeout(r, 25));
+    }
+    return;
+  }
   for (;;) {
     const members = tagged(t), group = t.command && (alive(t.command) || leftoverGroup(t));
     const signal = Date.now() - started >= graceMs ? "SIGKILL" : "SIGTERM";
@@ -152,12 +201,12 @@ export function blockers(t: Pick<LeaseTicket, "seq" | "mode" | "slots" | "grante
  *  disk left empty ones behind). */
 export function replaceFileSync(file: string, content: string, mode?: number) {
   const tmp = `${file}.${process.pid}.tmp`;
-  try { writeFileSync(tmp, content); if (mode !== undefined) chmodSync(tmp, mode); renameSync(tmp, file); }
+  try { writeFileSync(tmp, content); if (mode !== undefined) chmodSync(tmp, mode); replacePathSync(tmp, file); }
   catch (error) { try { unlinkSync(tmp); } catch { /* never written */ } throw error; }
 }
 async function replaceFile(file: string, content: string) {
   const tmp = `${file}.${process.pid}.tmp`;
-  try { await writeFile(tmp, content); renameSync(tmp, file); }
+  try { await writeFile(tmp, content); await replacePath(tmp, file); }
   catch (error) { await unlink(tmp).catch(() => {}); throw error; }
 }
 /** Remove `*.tmp` files in `dir` older than `maxAgeMs` (partial writes of processes that died or ran out of disk). Best
@@ -287,10 +336,20 @@ export function leaseCalls(state: LeaseResource[], now = Date.now()): Map<string
 }
 
 const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-/** The `pi-durable-subagents` command for subagents: `<dir>/pi-durable-subagents` runs this node with the CLI entry of
- *  the running orchestrator, so children can `hold` without the package on their PATH. Rewritten at every start. */
+/** A cmd.exe shim: paths quoted, percent signs doubled so batch does not expand them. */
+const batchQuote = (s: string) => `"${s.replace(/%/g, "%%")}"`;
+/** The `pi-durable-subagents` command for subagents: `<dir>/pi-durable-subagents` (a `.cmd` on Windows) runs this node
+ *  with the CLI entry of the running orchestrator, so children can `hold` without the package on their PATH. Rewritten
+ *  at every start. */
 export function writeShim(dir: string, node: string, entry: string): string {
   mkdirSync(dir, { recursive: true });
+  if (IS_WINDOWS) {
+    const file = path.join(dir, "pi-durable-subagents.cmd");
+    replaceFileSync(file, `@echo off\r\n${batchQuote(node)} ${batchQuote(entry)} %*\r\n`);
+    // Git Bash (pi's bash tool) does not run a .cmd by bare name; the same shim as a POSIX script sits beside it.
+    replaceFileSync(path.join(dir, "pi-durable-subagents"), `#!/bin/sh\nexec ${quote(node)} ${quote(entry)} "$@"\n`, 0o755);
+    return file;
+  }
   const file = path.join(dir, "pi-durable-subagents");
   replaceFileSync(file, `#!/bin/sh\nexec ${quote(node)} ${quote(entry)} "$@"\n`, 0o755);
   return file;

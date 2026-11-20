@@ -30,7 +30,7 @@ test("P37/P33 E2E: completed workflow opens g+1 once, same session, pinned origi
     { type: "message", id: "other", parentId: "a", message: { role: "user", content: "other branch" } }];
   await writeFile(origin, rows.map(e => JSON.stringify(e)).join("\n") + "\n");
   let controller = new AbortController(), running = main({ home, signal: controller.signal, discovery: { home: root } });
-  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } await rm(root, { recursive: true, force: true }); });
+  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {}); });
   const req: Request = { rid: "run", from: "main:test", to: "orch", sseq: 1, kind: "run", body: { cwd, source: `return await runs.run('a', {agent:'test', context:'fork', task:${JSON.stringify(script([{ text: "first" }]))}});`, origin: { sessionFile: origin, leafId: "b" } } };
   await publishRequest(orchInbox(home), req);
   const created = await until(() => readJournalSnapshot(orchLedger(home)).find(e => e.type === JT.created));
@@ -64,7 +64,7 @@ test("P37/P12 E2E: a follow-up naming a model runs its generation on that model 
   await writeFile(join(cwd, ".pi/agents/test.md"), "---\nname: test\ndescription: test\nmodel: probe/scripted\n---\nTest.");
   await mkdir(home, { recursive: true }); await writeFile(join(home, "config.json"), JSON.stringify({ pools: { alt: ["probe/scripted"] } }));
   const controller = new AbortController(), running = main({ home, signal: controller.signal, discovery: { home: root } });
-  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } await rm(root, { recursive: true, force: true }); });
+  t.after(async () => { controller.abort(); await running; for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {}); });
   await publishRequest(orchInbox(home), { rid: "run", from: "main:test", to: "orch", sseq: 1, kind: "run", body: { cwd, source: `return await runs.run('a', {agent:'test', task:${JSON.stringify(script([{ text: "first" }]))}});` } } as Request);
   const created = await until(() => readJournalSnapshot(orchLedger(home)).find(e => e.type === JT.created));
   const wid = String(created.wid), entries = () => readJournalSnapshot(journalPath(home, wid)), orch = () => readJournalSnapshot(orchLedger(home));

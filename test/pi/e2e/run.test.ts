@@ -26,7 +26,7 @@ test("E2E: chain of two real child calls runs to workflow-done with the previous
   t.after(async () => {
     controller.abort(); await orchestrator.catch(() => {});
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
 
   const body: RunBody = { cwd, chain: [

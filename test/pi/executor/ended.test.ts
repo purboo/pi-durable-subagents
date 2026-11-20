@@ -32,14 +32,14 @@ async function setup(t: TestContext) {
     try { await executor.shutdown(); } finally {
       await journal.close(); await orch.close();
       for (const [key, value] of Object.entries(old)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
     }
   });
   return { root, home, cwd, wid, journal, executor, ticket };
 }
 
 for (const detached of [false, true]) test(`EX1 real pi ends a background sleep${detached ? " in a new session (setsid)" : " grandchild"} and journals it before seal`,
-  { timeout: 60_000, skip: detached && process.platform !== "linux" ? "setsid is Linux-only; ordinary background process tested on macOS" : false }, async t => {
+  { timeout: 60_000, skip: process.platform === "win32" ? "Windows has no inherited DSA_EXEC tag: a grandchild whose parent exited before a scan cannot be discovered" : detached && process.platform !== "linux" ? "setsid is Linux-only; ordinary background process tested on macOS" : false }, async t => {
     const f = await setup(t), pidFile = join(f.cwd, "sleep.pid");
     f.ticket.spec.task = script([
       { tool: "bash", args: { command: `${detached ? "setsid " : ""}sh -c 'sleep 300' </dev/null > /dev/null 2>&1 & echo $! > sleep.pid`, timeout: 10 } },
@@ -60,10 +60,13 @@ for (const detached of [false, true]) test(`EX1 real pi ends a background sleep$
 
 test("EX3 command call finds the real shim with custom PATH lacking dsa (no version dependency)", { timeout: 30_000 }, async t => {
   const f = await setup(t);
-  f.ticket.spec = { ...f.ticket.spec, command: ["/bin/sh", "-c", "command -v pi-durable-subagents"], env: { PATH: "/usr/bin:/bin" } };
+  const root = process.env.SystemRoot ?? "C:\Windows";
+  f.ticket.spec = { ...f.ticket.spec,
+    command: process.platform === "win32" ? ["cmd", "/d", "/s", "/c", "where pi-durable-subagents.cmd"] : ["/bin/sh", "-c", "command -v pi-durable-subagents"],
+    env: { PATH: process.platform === "win32" ? `${join(root, "System32")};${root}` : "/usr/bin:/bin" } };
   const result = await f.executor.run(f.ticket);
   assert.equal(result.status, "ok", JSON.stringify(result));
   assert.equal((result.data as { exitCode: number }).exitCode, 0);
-  assert.equal(result.output.trim(), join(binDir(f.home), "pi-durable-subagents"));
+  assert.equal(result.output.trim(), join(binDir(f.home), process.platform === "win32" ? "pi-durable-subagents.cmd" : "pi-durable-subagents"));
   assert.ok(!f.journal.entries().some(e => e.type === "ended"), "command fences remain out of scope");
 });

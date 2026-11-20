@@ -6,7 +6,7 @@ import { checkAgents, request } from "../../../src/agent/main/tool.ts";
 import { parameters } from "../../../src/agent/main/schema.ts";
 import type { RunBody } from "../../../src/types.ts";
 
-test("command call: a single command is a launch form of its own, with and without action", () => {
+test("command call: a single command is a launch form of its own, with and without action", { skip: process.platform === "win32" ? "expected POSIX paths; Windows resolves them against the drive" : false }, () => {
   for (const args of [{ command: ["npm", "test"], cwd: "repo", timeoutMs: 5 }, { action: "run", command: ["npm", "test"], cwd: "repo", timeoutMs: 5 }]) {
     const normalized = request(args, "/w");
     assert.equal(normalized.kind, "run");

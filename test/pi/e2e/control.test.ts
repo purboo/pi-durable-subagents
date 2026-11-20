@@ -37,7 +37,7 @@ async function stack(t: TestContext) {
   t.after(async () => {
     controller.abort(); await orchestrator.catch(() => {});
     for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true });
+    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
   return { cwd, home, send, ledger, journal, until, created, restart };
 }

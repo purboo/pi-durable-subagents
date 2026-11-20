@@ -39,7 +39,7 @@ async function setup(t: TestContext, config: OrchestratorConfig, retry: Record<s
     try { await executor.shutdown(); } finally {
       await journal.close(); await orch.close();
       for (const [key, value] of Object.entries(old)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true });
+      if (process.env.DSA_KEEP) console.error(`kept ${t.name}: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
     }
   });
   const requests = async () => (await readFile(join(root, "quota.log"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean);

@@ -123,7 +123,7 @@ test("E3 a broken file naming an agent that is also pinned blocks the run", asyn
   await assert.rejects(f.store.staged(req), /worker-old\.md: .*fallbackModels/);
 });
 
-test("E3 an unreadable agent file is named by its file name", { skip: root ? "root reads mode 000 files" : false }, async t => {
+test("E3 an unreadable agent file is named by its file name", { skip: process.platform === "win32" ? "Windows does not enforce POSIX mode 000" : root ? "root reads mode 000 files" : false }, async t => {
   const f = await fixture(t), secret = join(f.agents, "secret.md");
   await writeFile(secret, "---\nname: other\ndescription: x\n---\n"); await chmod(secret, 0);
   const unused = f.run("unused", { source: "return 1;" });
@@ -166,7 +166,7 @@ test("E3 an overlong (32 CJK chars) input name is a deterministic pin failure, n
   } finally { await engine.close(); }
 });
 
-test("E3 EACCES on a staging temp file is deterministic: failure.json, rejected, no throw", { skip: root ? "root bypasses EACCES" : false }, async t => {
+test("E3 EACCES on a staging temp file is deterministic: failure.json, rejected, no throw", { skip: process.platform === "win32" ? "Windows does not enforce POSIX mode 000" : root ? "root bypasses EACCES" : false }, async t => {
   const f = await fixture(t), input = join(f.home, "input.txt"), dir = f.staging("eacces");
   await writeFile(input, "data");
   const req = f.run("eacces", { source: "return 1;", inputs: { data: input } });

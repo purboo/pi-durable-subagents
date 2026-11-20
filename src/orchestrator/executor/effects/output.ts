@@ -1,10 +1,11 @@
 // Private workflow records (P19, A5): output-intent{call,path,hash,previous,absolute},
 // output{call,path,hash,skipped?}. Intent fixes the artifact identity across crash windows.
-import { readFile, rename, symlink, unlink } from "node:fs/promises";
+import { readFile, symlink, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { publishFile } from "../../../kernel/mailbox.ts";
 import { syncDirectory } from "../../../kernel/journal.ts";
+import { replacePath } from "../../../kernel/fsx.ts";
 import { artifactsDir } from "../../../paths.ts";
 import type { CallResult } from "../../../types.ts";
 import type { CallTicket } from "../../contract.ts";
@@ -19,13 +20,13 @@ async function replace(path: string, bytes: string) {
   const temp = `.${randomUUID()}.tmp`, dir = dirname(path);
   try {
     await publishFile(dir, temp, bytes);
-    await rename(join(dir, temp), path); await syncDirectory(dir);
+    await replacePath(join(dir, temp), path); await syncDirectory(dir);
   } finally { await unlink(join(dir, temp)).catch(() => {}); }
 }
 async function latest(path: string) {
   const dir = dirname(path), temp = join(dir, `.${randomUUID()}.link`);
   try {
-    await symlink(basename(path), temp); await rename(temp, join(dir, "latest")); await syncDirectory(dir);
+    await symlink(basename(path), temp); await replacePath(temp, join(dir, "latest")); await syncDirectory(dir);
   } finally { await unlink(temp).catch(() => {}); }
 }
 /** P19: Reconcile immutable output publication and protect best-effort targets with a recorded hash. */

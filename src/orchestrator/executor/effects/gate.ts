@@ -7,6 +7,7 @@ import { callDir } from "../../../paths.ts";
 import { validate } from "../../../agent/child/schema.ts";
 import { fenceAttentionResolved, recordFenceFailure, recordOnce } from "../sweep.ts";
 import { entriesOf } from "../indexes.ts";
+import { shellTarget } from "../../../platform/launch.ts";
 import type { CallResult, Containment, Entry, JournalHandle, ProcInfo } from "../../../types.ts";
 import type { CallTicket } from "../../contract.ts";
 
@@ -100,7 +101,7 @@ export async function runGate(t: CallTicket, home: string, cwd: string, exec: st
   let fields: Record<string, unknown> = { id, exit: null };
   let finishRead: Promise<void> = Promise.resolve(), retired = false;
   try {
-    const child = await containment.spawn({ command: "sh", args: ["-c", gate.command], cwd, exec: id,
+    const child = await containment.spawn({ ...shellTarget(gate.command, id), cwd, exec: id,
       env: { DSA_RESULT: join(dir, "result.json"), DSA_OUTPUT: join(dir, "output.txt"), DSA_CALL: t.callId } });
     child.stdin.end(); child.stderr.resume(); child.stdout.setEncoding("utf8");
     finishRead = (async () => { for await (const chunk of child.stdout) stdout += chunk.toString(); })();

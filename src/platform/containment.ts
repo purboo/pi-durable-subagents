@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { performance } from "node:perf_hooks";
 import type { Containment as Contract, ExecId, ProcInfo, ProcessTable as Table, Spawned, SpawnSpec } from "../types.ts";
 import { captureStart, ProcessTable } from "./proctable.ts";
+import { IS_WINDOWS, killTree } from "./windows.ts";
 
 // One table per orchestrator process, including evaluator and gate observers.
 const sharedTable = new ProcessTable();
@@ -26,7 +27,7 @@ export class Containment implements Contract {
 
   /** C1, C3: Inject the execution tag and capture the direct child's start token. */
   async spawn(spec: SpawnSpec): Promise<Spawned> {
-    const child = spawn(spec.command, spec.args, { cwd: spec.cwd,
+    const child = spawn(spec.command, spec.args, { cwd: spec.cwd, shell: spec.shell,
       env: { ...process.env, ...spec.env, DSA_EXEC: spec.exec }, stdio: "pipe" });
     // Buffer output immediately: Node drains child pipes on exit, even while
     // identity capture is pending and the caller has not received the streams.
@@ -50,7 +51,7 @@ export class Containment implements Contract {
       return { pid, start, stdin: child.stdin, stdout, stderr, exited };
     } catch (error) {
       stdout.destroy(); stderr.destroy();
-      child.kill("SIGKILL");
+      if (IS_WINDOWS) await killTree(child.pid!).catch(() => {}); else child.kill("SIGKILL");
       await exited.catch(() => {});
       throw error;
     }
@@ -89,7 +90,9 @@ export class Containment implements Contract {
 
   /** P22, P23: Kill tagged and tracked identities until a rescan proves retirement. */
   async fence(exec: ExecId, tracked: readonly ProcInfo[], opts: FenceOptions = {}): Promise<void> {
-    const timeout = opts.timeoutMs ?? 5000;
+    // PowerShell/CIM scans and per-target identity checks are ~0.5 s each on Windows: the Unix 5 s deadline is too
+    // tight under load (several workflows, parallel test files).
+    const timeout = opts.timeoutMs ?? (IS_WINDOWS ? 15_000 : 5000);
     if (!Number.isFinite(timeout) || timeout < 0) throw new Error("Invalid fence timeout");
     const deadline = performance.now() + timeout;
     let recordingMs = 500;
@@ -110,7 +113,8 @@ export class Containment implements Contract {
         // C3: the pid may have exited and been reused since the scan; kill only if it still has the scanned start.
         if (p.start !== "" && await captureStart(p.pid) !== p.start) continue;
         if (!opts.beforeKill) {
-          try { process.kill(p.pid, "SIGKILL"); }
+          if (IS_WINDOWS) await killTree(p.pid).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; });
+          else try { process.kill(p.pid, "SIGKILL"); }
           catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
         } else killing.push(p);
       }
@@ -128,6 +132,7 @@ export class Containment implements Contract {
       for (const p of killing) {
         // Diagnostic I/O was asynchronous: revalidate identity again before signalling.
         if (opts.beforeKill && p.start !== "" && await captureStart(p.pid) !== p.start) continue;
+        if (IS_WINDOWS) { await killTree(p.pid).catch(() => {}); continue; }
         try { process.kill(p.pid, "SIGKILL"); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       }

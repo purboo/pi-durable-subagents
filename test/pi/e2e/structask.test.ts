@@ -45,7 +45,7 @@ async function stack(t: TestContext) {
   t.after(async () => {
     for (const pid of pids()) if (alive(pid)) process.kill(pid, 'SIGTERM');
     await until(() => pids().every(pid => !alive(pid)), 'cleanup', 15_000).catch(() => { for (const pid of pids()) if (alive(pid)) process.kill(pid, 'SIGKILL'); });
-    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true });
+    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
   const run = async (id: string, steps: unknown[]) => {
     const path = join(root, `${id}.json`); await writeFile(path, JSON.stringify({ agent: 'echo', writer: false, task: script(steps) }));

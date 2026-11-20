@@ -42,7 +42,7 @@ test("E2E failover: a pool run on a used-up provider finishes on the next candid
     const end = Date.now() + 15_000;
     while (pids().some(alive) && Date.now() < end) await delay(100);
     for (const pid of pids()) if (alive(pid)) process.kill(pid, "SIGKILL");
-    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true });
+    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
   const requests = async () => (await readFile(join(root, "quota.log"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
   const run = async (id: string) => {

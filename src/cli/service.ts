@@ -21,6 +21,13 @@ export function serviceFiles(home: string, dsa: string, entry: string, platform:
     ];
   }
   if (platform === "darwin") return [{ path: join(home, "Library/LaunchAgents", `${name}.plist`), content: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${name}</string>\n<key>ProgramArguments</key><array>${[node, entry, "start"].map(s => `<string>${xml(s)}</string>`).join("")}</array>\n<key>EnvironmentVariables</key><dict><key>DSA_HOME</key><string>${xml(dsa)}</string>${pi ? `<key>DSA_PI_BIN</key><string>${xml(pi)}</string>` : ""}</dict>\n<key>RunAtLoad</key><true/>\n<!-- Keep the detached orchestrator alive after the starter exits. -->\n<key>AbandonProcessGroup</key><true/>\n<key>StartInterval</key><integer>30</integer>\n</dict></plist>\n` }];
+  if (platform === "win32") {
+    // Task Scheduler runs a hidden cmd.exe wrapper every minute; it starts at the next minute after logon and survives
+    // the starter exiting (the orchestrator is a detached process). Batch escaping: `%` is doubled and `"` becomes "".
+    const bat = (s: string) => s.replace(/%/g, "%%").replace(/"/g, '""');
+    return [{ path: join(home, ".pi", "durable-subagents-service", "start.cmd"), content:
+      `@echo off\r\nsetlocal\r\nset "DSA_HOME=${bat(dsa)}"\r\n${pi ? `set "DSA_PI_BIN=${bat(pi)}"\r\n` : ""}"${bat(node)}" "${bat(entry)}" start\r\n` }];
+  }
   throw new Error(`Starter service unavailable on ${platform}`);
 }
 /** P1: Invoke the platform service manager, surfacing the exact failed command. */
@@ -46,6 +53,12 @@ export async function manageService(files: ServiceFile[], install: boolean, opti
   } else if (platform === "darwin") {
     const domain = `gui/${options.uid ?? process.getuid?.() ?? 0}`;
     await run("launchctl", install ? ["bootstrap", domain, files[0]!.path] : ["bootout", `${domain}/${name}`], install ? /already (bootstrapped|loaded)|service already exists/i : /not loaded|could not find service|no such process/i);
+  } else if (platform === "win32") {
+    const command = `${process.env.ComSpec ?? "cmd.exe"} /d /s /c "${files[0]!.path}"`;
+    if (install) {
+      await run("schtasks", ["/Create", "/F", "/SC", "MINUTE", "/MO", "1", "/TN", name, "/TR", command]);
+      await run("schtasks", ["/Run", "/TN", name], /already running/i);
+    } else await run("schtasks", ["/Delete", "/F", "/TN", name], /cannot find|not found|does not exist/i);
   } else throw new Error(`Starter service unavailable on ${platform}`);
   if (!install && !options.dryRun) await uninstallService(files);
   if (!install && platform === "linux") await run("systemctl", ["--user", "daemon-reload"]);

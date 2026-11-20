@@ -31,3 +31,12 @@ export function contentHash(obj: unknown): string {
 export function forwardRid(rid: string, widRev: string, key: string, hash: string): string {
   return contentHash([rid, widRev, key, hash]);
 }
+/** A file name for an identity. Windows refuses `:` (and several other characters) in a name, while request ids may
+ *  contain them (`req:r1`, a sender `cli:user@host`); percent-encoding keeps the mapping deterministic and reversible
+ *  inside the code. Other platforms keep the historical raw names. */
+export function fileId(id: string): string {
+  if (/[/\\\0]/.test(id)) throw new Error('Invalid file identity');
+  if (process.platform !== "win32") return id;
+  const encoded = id.replace(/[%:/\\<>"|?*\x00-\x1f]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+  return /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i.test(encoded) ? `_${encoded}` : encoded;
+}

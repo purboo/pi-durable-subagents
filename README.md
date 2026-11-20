@@ -34,14 +34,20 @@ pi install npm:pi-durable-subagents
 pi install git:github.com/purboo/pi-durable-subagents
 ```
 
-This needs pi 1.0.x and Node.js 22.19 or later, on Linux or macOS. It has
-been tested with pi 1.0.2 on Linux. The CI configuration covers Linux and
-macOS.
+This needs pi 1.0.x and Node.js 22.19 or later, on Linux, macOS or Windows.
+It has been tested with pi 1.0.2 on Linux and Windows. The CI configuration
+covers Linux, macOS and Windows.
 
-Windows is not supported: process tracking, file locks, command calls and
-the login service exist only for Linux and macOS. On Windows the extension
-disables itself when pi loads it, with one message, and registers no tool.
-Under Windows, run pi inside WSL.
+Windows uses native facilities, no WSL and no POSIX tools: the process table
+comes from PowerShell/CIM (`Win32_Process`, identity is pid plus creation
+time), process trees end with `taskkill /T`, file locks are a small Node
+helper holding an atomically created lock directory, command calls run through
+`cmd.exe`, and `install-service` uses Task Scheduler. Two Windows differences:
+another process's environment is unreadable, so execution identity is the
+process tree (a grandchild whose parent exited before a scan is not found by
+the `DSA_EXEC` tag the way it is on Linux), and Windows has no POSIX signals,
+so `stop`/`restart` requests are the graceful path (the legacy restart check
+and `taskkill` terminate).
 
 The `pi-durable-subagents` command line (below) is optional. Run it without
 installing through `npx pi-durable-subagents …`, or install it once with

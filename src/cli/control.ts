@@ -14,6 +14,7 @@ import { cliInitiator } from "./restart.ts";
 import { restartInputError } from "../orchestrator/restart.ts";
 import { JT, type Conditions, type DrainBody, type PruneBody, type Request, type RequestKind, type RestartBody } from "../types.ts";
 import { RequestsBusy, sendIdentified, type Identified } from "../requests.ts";
+import { fileId } from "../kernel/ids.ts";
 
 export type Control = "resume" | "drain" | "stop" | "stop-all" | "prune" | "restart";
 /** P1: Start the detached orchestrator only after probing its OS lock (platform/launch.ts: pi resolved here, its own
@@ -110,9 +111,9 @@ export async function submitIdentified(home: string, rid: string, kind: RequestK
 async function withSender<T>(home: string, fn: (outbox: Outbox, sender: string) => Promise<T>): Promise<T> {
   await mkdir(home, { recursive: true });
   const sender = `cli:${userInfo().username}@${hostname()}`;
-  const locker = new OsLock(), deadline = performance.now() + 10_000;
-  let lock = await locker.tryAcquire(join(home, `${sender}.lock`));
-  while (!lock && performance.now() < deadline) { await delay(50); lock = await locker.tryAcquire(join(home, `${sender}.lock`)); }
+  const locker = new OsLock(), deadline = performance.now() + (process.platform === "win32" ? 30_000 : 10_000), lockPath = join(home, `${fileId(sender)}.lock`);
+  let lock = await locker.tryAcquire(lockPath);
+  while (!lock && performance.now() < deadline) { await delay(50); lock = await locker.tryAcquire(lockPath); }
   if (!lock) throw new RequestsBusy("CLI sender is busy; retry the command");
   try {
     const outbox = await Outbox.open(outboxRoot(home), sender, () => orchInbox(home));

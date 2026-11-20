@@ -13,11 +13,12 @@ import { journalPath, orchInbox, orchLock, orchLedger } from '../../../src/paths
 import { Engine } from '../../../src/orchestrator/engine.ts';
 import { fakeExecutor } from '../orchestrator/engine/fake.ts';
 import { JT } from '../../../src/types.ts';
+import { fileId } from '../../../src/kernel/ids.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 
 async function root(t: test.TestContext) {
   const home = await mkdtemp(join(tmpdir(), 'dsa-cli-'));
-  t.after(() => rm(home, { recursive: true, force: true })); return home;
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {})); return home;
 }
 async function until(fn: () => boolean | Promise<boolean>) {
   const end = performance.now() + 5000;
@@ -75,7 +76,7 @@ test('CLI outbox recovers pending, retires receipts and serializes concurrent se
   const home = await root(t), held = await new OsLock().tryAcquire(orchLock(home)); assert.ok(held);
   t.after(() => held.release());
   const first = (await submit(home, 'drain'))[0]!;
-  await unlink(join(orchInbox(home), `${first.rid}.json`));
+  await unlink(join(orchInbox(home), `${fileId(first.rid)}.json`));
   const results = await Promise.all([submit(home, 'stop', 'w@1/a@1'), submit(home, 'resume', 'w')]);
   let inbox = await scanInbox(orchInbox(home));
   assert.equal(inbox.length, 3);
@@ -85,12 +86,12 @@ test('CLI outbox recovers pending, retires receipts and serializes concurrent se
   assert.deepEqual(results[1]![0]!.body, { wid: 'w' });
   const ledger = await openJournal(orchLedger(home));
   await ledger.append('applied', { rid: first.rid }); await ledger.close();
-  await unlink(join(orchInbox(home), `${first.rid}.json`));
+  await unlink(join(orchInbox(home), `${fileId(first.rid)}.json`));
   await submit(home, 'resume');
   inbox = await scanInbox(orchInbox(home));
   assert.ok(!inbox.some(r => r.rid === first.rid));
   assert.equal(Math.max(...inbox.map(r => r.sseq)), 4);
-  assert.ok(readJournalSnapshot(join(home, 'outbox', `${first.from}.jsonl`)).some(e => e.type === 'resolved' && e.rid === first.rid));
+  assert.ok(readJournalSnapshot(join(home, 'outbox', `${fileId(first.from)}.jsonl`)).some(e => e.type === 'resolved' && e.rid === first.rid));
 });
 
 test('stop-all sends one drain with fence without altering journals', async t => {

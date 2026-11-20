@@ -74,7 +74,7 @@ test("isolated pi components produce stable full-width list and watch captures",
     for (const [name, content] of [["list", list], ["watch", watch]]) {
       const path = new URL(`./${name}.txt`, import.meta.url);
       if (process.env.UPDATE_UI_CAPTURES === "1") writeFileSync(path, content!);
-      if (name === "watch") assert.equal(content, readFileSync(path, "utf8"));
+      if (name === "watch") assert.equal(content, readFileSync(path, "utf8").replace(/\r\n/g, "\n"));
       else assert.match(content!, /↑ ↓ select · Enter collapse · x stop · Esc back/);
     }
     assert.match(watch, /Review the scheduler/); assert.match(watch, /Checking SDK import path/); assert.match(watch, /3 failing/);

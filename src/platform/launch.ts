@@ -7,26 +7,83 @@
 //   end it. Without lingering the user manager stops its scopes at logout, while a plain detached process survives it
 //   (KillUserProcesses=no, the usual default): it starts as a plain detached process then.
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { userInfo } from "node:os";
-import { delimiter, isAbsolute, join } from "node:path";
+import { delimiter, dirname, extname, isAbsolute, join } from "node:path";
+import { comspec, IS_WINDOWS } from "./windows.ts";
 
-/** Whether `path` is a regular file this process may execute. */
+const WINDOWS_EXECUTABLE = new Set([".exe", ".com", ".cmd", ".bat"]);
+/** Whether `path` is a regular file this process may execute. On Windows only a PE image or a batch file is directly
+ *  executable; the extensionless `pi` (a POSIX shell script an npm install also writes) is not. */
 export function executableFile(path: string): boolean {
   try {
     if (!statSync(path).isFile()) return false;
+    if (IS_WINDOWS) {
+      const ext = extname(path).toLowerCase();
+      if (!WINDOWS_EXECUTABLE.has(ext)) return false;
+      accessSync(path, constants.F_OK);
+      return true;
+    }
     accessSync(path, constants.X_OK);
     return true;
   } catch { return false; }
 }
-/** The first executable `name` in the directories of `PATH`, unresolved (a package-manager shim stays a shim). */
+/** PATH directories. Windows separators are `;`, but POSIX-style test setups prepend `dir:...`; split those too, without
+ *  cutting a `C:` drive prefix (a colon at index 1 after a letter). */
+function pathDirs(PATH: string | undefined): string[] {
+  if (!IS_WINDOWS) return (PATH ?? "").split(delimiter);
+  const out: string[] = [];
+  for (const part of (PATH ?? "").split(";")) {
+    let start = 0;
+    for (let i = 0; i < part.length; i++)
+      if (part[i] === ":" && !(i === 1 && /[A-Za-z]/.test(part[0]!))) { out.push(part.slice(start, i)); start = i + 1; }
+    out.push(part.slice(start));
+  }
+  return out;
+}
+/** The first executable `name` in the directories of `PATH`, unresolved (a package-manager shim stays a shim). Windows
+ *  looks through PATHEXT: `pi` resolves to `pi.cmd`/`pi.exe`, never the extensionless POSIX shim beside them. */
 export function findOnPath(name: string, PATH: string | undefined): string | undefined {
-  for (const dir of (PATH ?? "").split(delimiter)) {
+  const exts = IS_WINDOWS && !extname(name)
+    ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").map(ext => ext.toLowerCase()).filter(ext => WINDOWS_EXECUTABLE.has(ext))
+    : [""];
+  for (const dir of pathDirs(PATH)) {
     if (!dir || !isAbsolute(dir)) continue;
-    const file = join(dir, name);
-    if (executableFile(file)) return file;
+    for (const ext of exts) {
+      const file = join(dir, name + ext);
+      if (executableFile(file)) return file;
+    }
   }
   return undefined;
+}
+
+/** What a spawn actually runs. An npm `.cmd` shim is not a PE image and Node cannot start it directly; the shim names
+ *  the node script it runs, so that script runs under this Node instead and argv stays an argv (no shell quoting). */
+export function execTarget(command: string, args: readonly string[]): { command: string; args: string[] } {
+  if (!IS_WINDOWS) return { command, args: [...args] };
+  // A bare name is looked up through PATHEXT (`pi` → `pi.cmd`), the way a shell would find it.
+  const resolved = !isAbsolute(command) && !/[\\/]/.test(command) ? findOnPath(command, process.env.PATH) ?? command : command;
+  if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args] };
+  const script = shimScript(resolved);
+  if (script) return { command: process.execPath, args: [script, ...args] };
+  return { command: comspec(), args: ["/d", "/s", "/c", resolved, ...args] };
+}
+/** The node script a generated `.cmd`/`.bat` shim runs, when it names one (`%dp0%` is the shim's directory). */
+export function shimScript(file: string): string | undefined {
+  let text: string;
+  try { text = readFileSync(file, "utf8"); } catch { return undefined; }
+  const dir = dirname(file);
+  for (const match of text.matchAll(/"([^"\r\n]+\.(?:js|mjs|cjs))"|'([^'\r\n]+\.(?:js|mjs|cjs))'/gi)) {
+    const raw = match[1] ?? match[2]!, resolved = raw.replace(/%~?dp0%?/gi, dir);
+    if (isAbsolute(resolved) && existsSync(resolved)) return resolved;
+  }
+  return undefined;
+}
+/** The command processor a string command/gate runs through on this platform. */
+export function shellTarget(command: string, exec?: string): { command: string; args: string[]; shell?: boolean } {
+  // A command line is readable across processes on Windows (the environment is not): the marker lets recovery find a
+  // gate whose identity was never journaled. The id is a safe token (no whitespace, `&` or quotes).
+  return IS_WINDOWS ? { command: exec ? `set DSA_EXEC=${exec}&& ${command}` : command, args: [], shell: true } : { command: "/bin/sh", args: ["-c", command] };
 }
 
 export interface PiResolution { path?: string; source?: "DSA_PI_BIN" | "PATH"; problem?: string }

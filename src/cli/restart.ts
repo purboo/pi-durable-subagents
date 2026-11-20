@@ -11,6 +11,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger } from "../paths.ts";
 import { PS } from "../platform/proctable.ts";
+import { winCommandLineSync } from "../platform/windows.ts";
 import { JT, type RestartBody, type RestartInitiator } from "../types.ts";
 import { restartInputError, restartRefusal, type RestartExecution } from "../orchestrator/restart.ts";
 import { readerLedger } from "../orchestrator/reader-ledger.ts";
@@ -30,7 +31,8 @@ export function cliInitiator(env: NodeJS.ProcessEnv): RestartInitiator {
   let parent = "";
   try {
     parent = process.platform === "linux" ? readFileSync(`/proc/${process.ppid}/cmdline`, "utf8").replace(/\0/g, " ").trim()
-      : process.platform === "darwin" ? execFileSync(PS, ["-o", "command=", "-p", String(process.ppid)], { encoding: "utf8", timeout: 1000, maxBuffer: 64 * 1024 }).trim() : "";
+      : process.platform === "darwin" ? execFileSync(PS, ["-o", "command=", "-p", String(process.ppid)], { encoding: "utf8", timeout: 1000, maxBuffer: 64 * 1024 }).trim()
+      : process.platform === "win32" ? winCommandLineSync(process.ppid) : "";
   } catch { /* Parent may have exited or /proc may be unavailable. */ }
   return { cli: { user: userInfo().username, host: hostname(), ppid: process.ppid, parent: parent.slice(0, 200) } };
 }

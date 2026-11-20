@@ -28,7 +28,7 @@ test("E2E: hibernation releases its slot visibly; a config.json change applies w
   t.after(async () => {
     controller.abort(); await orchestrator.catch(() => {});
     for (const [key, v] of Object.entries(old)) { if (v === undefined) delete process.env[key]; else process.env[key] = v; }
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
 
   let sseq = 0;

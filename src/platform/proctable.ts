@@ -6,6 +6,7 @@ import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync } 
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import type { ProcInfo, ProcessTable as Table } from "../types.ts";
+import { winProcessRows, winSnapshotSync, winStart, winTag } from "./windows.ts";
 
 /** `ps` by its absolute path where it has one (macOS and Linux: /bin/ps), so a minimal PATH (a service unit, a test
  *  that hides `pi`) does not take the process table away. */
@@ -51,6 +52,7 @@ export async function captureStart(pid: number): Promise<string> {
       throw error;
     }
   }
+  if (process.platform === "win32") return winStart(pid);
   throw new Error(`C2 capability unavailable: ${process.platform}`);
 }
 
@@ -75,8 +77,14 @@ export class ProcessTable implements Table {
       { env: { ...process.env, LC_ALL: "C" }, timeout: 10_000, maxBuffer: 32 * 1024 * 1024 })).stdout);
   }
 
-  /** Synchronous liveness for lease readers. Unlike execution tracking, hold tags are reread after each exec. */
+  /** Synchronous liveness for lease readers. Unlike execution tracking, hold tags are reread after each exec. Windows
+   *  cannot read another process's environment, so hold tags fall back to the ticket's process tree (tagged returns
+   *  nothing there). */
   tagged(tag: string): Pick<ProcInfo, "pid" | "start">[] {
+    if (this.platform === "win32") {
+      return [...winSnapshotSync().values()].filter(row => winTag(row.command, this.tagName) === tag)
+        .map(row => ({ pid: row.pid, start: row.start }));
+    }
     if (this.platform === "darwin") {
       try {
         return this.mac(execFileSync(PS, ["-axEww", "-o", "pid=,ppid=,lstart=,time=,stat=,command="],
@@ -102,7 +110,10 @@ export class ProcessTable implements Table {
   /** C2, F1: Concurrent observations share a scan; fences wait out all pre-request work. */
   async list(knownExecs: ReadonlySet<string> = new Set(), options: { maxAgeMs?: number; fresh?: boolean } = {}): Promise<Observation[]> {
     const value = await this.listRaw(options);
-    return typeof value === "string" ? this.mac(value, knownExecs) : value;
+    if (typeof value === "string") return this.mac(value, knownExecs);
+    // A Windows tag comes from a command line, so a known-id filter keeps unrelated text from becoming an execution.
+    if (this.platform === "win32") return value.map(p => p.tag !== undefined && !knownExecs.has(p.tag) ? { ...p, tag: undefined } : p);
+    return value;
   }
   private async listRaw(options: { maxAgeMs?: number; fresh?: boolean }): Promise<Snapshot> {
     if (options.fresh && this.pending) await this.pending.catch(() => {});
@@ -115,6 +126,9 @@ export class ProcessTable implements Table {
     try { return await promise; } finally { if (this.pending === promise) this.pending = undefined; }
   }
   private async read(): Promise<Snapshot> {
+    if (this.platform === "win32") return (await winProcessRows()).map(row =>
+      ({ pid: row.pid, ppid: row.ppid, start: row.start, ...(row.cpuMs !== undefined ? { cpuMs: row.cpuMs } : {}),
+        ...(winTag(row.command, this.tagName) ? { tag: winTag(row.command, this.tagName) } : {}) }));
     if (this.platform === "darwin") return this.ps();
     if (this.platform !== "linux") throw new Error(`C2 capability unavailable: ${this.platform}`);
     this.ticks ??= exec("getconf", ["CLK_TCK"], { timeout: 2000 }).then(({ stdout }) => {

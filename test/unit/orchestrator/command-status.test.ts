@@ -47,11 +47,11 @@ test("snapshot: a command call runs from its intent, with pid, attempt and log f
   const base = 1_800_000_000_000, wf = snapshotFromEntries(W, entries("/a", base));
   const by = Object.fromEntries(wf.calls.map(c => [c.key, c])) as Record<string, CallSnapshot>;
   assert.deepEqual([by.held!.phase, by.held!.command, by.held!.agent, by.held!.model, by.held!.exec], ["running", "sleep 100", "", undefined, undefined]);
-  assert.deepEqual(by.held!.commandRun, { attempt: 1, id: id("held"), pid: 4242, log: "/a/held/output.log" });
+  assert.deepEqual(by.held!.commandRun, { attempt: 1, id: id("held"), pid: 4242, log: join("/a", "held", "output.log") });
   assert.equal(by.held!.startedAt, base + 2000, "elapsed counts from command-started");
   assert.deepEqual([by.done!.phase, by.done!.result?.status, (by.done!.result?.data as { exitCode: number }).exitCode], ["sealed", "failed", 3]);
   assert.deepEqual([by.wait!.phase, by.wait!.command, by.wait!.writerWait], ["queued", "npm run 'a b'", { root: "/w", holder: `${W}/held` }]);
-  assert.deepEqual(by.rerun!.commandRun, { attempt: 2, id: id("rerun", 2), pid: 5001, log: "/a/rerun2/output.log" });
+  assert.deepEqual(by.rerun!.commandRun, { attempt: 2, id: id("rerun", 2), pid: 5001, log: join("/a", "rerun2", "output.log") });
   assert.equal(by.rerun!.startedAt, base + 3000);
   assert.deepEqual(wf.counts, { queued: 1, running: 2, asking: 0, sealed: 1 });
   assert.equal(commandText(["a", "it's", "$x", "-k=v"]), `a 'it'\\''s' '$x' -k=v`);
@@ -104,7 +104,7 @@ test("status, describe and the tool's rendering of a running and a finished comm
   assert.deepEqual([described.done!.status, described.done!.error, described.done!.data], ["failed", "Command exited 3", { exitCode: 3, signal: null, durationMs: 41_000 }]);
   assert.equal(described.wait!.waiting?.reason, "writer-lock");
   const text = renderDescription(d);
-  assert.match(text, /\n {2}held@1 command running \(pid 4242, attempt 1, 2m05s\)\n {4}command: sleep 100\n {4}log: .*\/runs\/held\/output\.log\n/);
+  assert.match(text, /\n {2}held@1 command running \(pid 4242, attempt 1, 2m05s\)\n {4}command: sleep 100\n {4}log: .*[\/\\\\]runs[\/\\\\]held[\/\\\\]output\.log\n/);
   assert.match(text, /\n {2}done@1 command sealed failed \(attempt 1\) — Command exited 3\n {4}command: make test; exit 3\n {4}log: .*\n {4}data: \{"exitCode":3,"signal":null,"durationMs":41000\}\n {4}\| build ok/);
 
   assert.equal(callLine({ action: "run", command: ["npm", "run", "a b"] }), "run command: npm run 'a b'");
@@ -130,8 +130,8 @@ test("UI: rows, dock and watch view show the command, pid and elapsed time inste
   // Generated keys of command steps go by "command".
   assert.equal(callName({ calls: [{ key: "tasks:0", agent: "" }, { key: "tasks:1", agent: "" }] as CallSnapshot[] }, { key: "tasks:1", gen: 1, agent: "", command: "make" }), "command 2");
   // Watch view: the command, its process and log; after the seal its status, exit code, duration and output.
-  assert.equal(commandHead(held, wf, now), "running · pid 4242 · 1m03s · /a/held/output.log");
-  assert.equal(commandHead(done, wf, now), "failed · exit 3 · 41s · /a/done/output.log");
-  assert.deepEqual(commandTranscript(held, wf, now), ["$ sleep 100", "", "running · pid 4242 · 1m03s; output goes to /a/held/output.log"]);
+  assert.equal(commandHead(held, wf, now), `running · pid 4242 · 1m03s · ${join("/a", "held", "output.log")}`);
+  assert.equal(commandHead(done, wf, now), `failed · exit 3 · 41s · ${join("/a", "done", "output.log")}`);
+  assert.deepEqual(commandTranscript(held, wf, now), ["$ sleep 100", "", `running · pid 4242 · 1m03s; output goes to ${join("/a", "held", "output.log")}`]);
   assert.deepEqual(commandTranscript(done, wf, now), ["$ make test; exit 3", "", "Command exited 3", "", "build ok", "3 tests failed"]);
 });
