@@ -1,15 +1,18 @@
-// Command calls (CallSpec.command): the launcher. A command runs detached in its own session under a tiny /bin/sh
-// wrapper that runs it, then records its exit status atomically in the attempt directory (`exit.tmp`, renamed to `exit`)
-// and exits with the same status. Its output (stdout and stderr, interleaved) is appended to `output.log` in the same
-// directory through a descriptor the orchestrator opens, passes and closes: no pipe leads back into the orchestrator and
-// no node process stays resident for the life of the command, so it outlives the orchestrator that started it.
+// Command calls (CallSpec.command): the launcher. On Unix a command runs detached in its own session under a tiny
+// /bin/sh wrapper that runs it, then records its exit status atomically in the attempt directory (`exit.tmp`, renamed
+// to `exit`) and exits with the same status. Windows has no /bin/sh: the same wrapper is a short Node program (Node is
+// already the runtime), and a string command runs through cmd.exe. Its output (stdout and stderr, interleaved) is
+// appended to `output.log` in the same directory through a descriptor the orchestrator opens, passes and closes: no
+// pipe leads back into the orchestrator and no node process stays resident for the life of the command, so it outlives
+// the orchestrator that started it.
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { mkdir, readFile, stat, open } from "node:fs/promises";
+import { mkdir, readFile, stat, open, writeFile } from "node:fs/promises";
 import { constants } from "node:os";
 import { join } from "node:path";
 import { captureStart } from "./proctable.ts";
-import { findOnPath } from "./launch.ts";
+import { execTarget, findOnPath } from "./launch.ts";
+import { comspec, IS_WINDOWS } from "./windows.ts";
 
 export const COMMAND_LOG = "output.log";
 export const COMMAND_EXIT = "exit";
@@ -23,6 +26,25 @@ export const OUTPUT_TAIL_BYTES = 16 * 1024;
  *  it), and its end, however it comes, never skips recording the status. A program named by a path that does not exist
  *  is 127 before `exec`: some shells (bash 3.2, the macOS /bin/sh) report 126 for it instead. */
 const WRAPPER = 'd="$1"; m="$2"; shift 2; ( case "$1" in (*/*) [ -e "$1" ] || { printf "%s: %s: not found\\n" "$0" "$1" >&2; exit 127; } ;; esac; exec "$@" ); s="$?"; printf "%s\\n" "$s" > "$d/exit.tmp" && "$m" -f "$d/exit.tmp" "$d/exit"; exit "$s"';
+/** Windows wrapper: `argv[1]` is the attempt directory (its command.json holds the command, cwd and environment).
+ *  It runs the child with inherited output descriptors, records the status and exits with it. */
+const WIN_WRAPPER = `import { spawn } from "node:child_process";
+import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const dir = process.argv[1];
+const spec = JSON.parse(readFileSync(join(dir, "command.json"), "utf8"));
+try { unlinkSync(join(dir, "command.json")); } catch { /* already gone */ }
+function record(status) {
+  try { writeFileSync(join(dir, "exit.tmp"), String(status)); renameSync(join(dir, "exit.tmp"), join(dir, "exit")); } catch { /* never lose the command's own result */ }
+}
+const shell = spec.env.ComSpec || spec.env.COMSPEC || process.env.ComSpec || "cmd.exe";
+const options = { cwd: spec.cwd, env: { ...spec.env, ComSpec: shell, PATHEXT: spec.env.PATHEXT || process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD" }, stdio: ["ignore", "inherit", "inherit"], windowsHide: true };
+let child;
+try { child = typeof spec.command === "string" ? spawn(spec.command, { ...options, shell: true }) : spawn(spec.command[0], spec.command.slice(1), options); }
+catch (error) { const status = error && error.code === "ENOENT" ? 127 : 126; record(status); process.exit(status); }
+child.once("error", error => { const status = error && error.code === "ENOENT" ? 127 : 126; record(status); process.exit(status); });
+child.once("exit", (code, signal) => { const status = code === null ? (signal ? 128 : 1) : code; record(status); process.exit(status); });
+`;
 
 /** `mv` for the wrapper: from this process's PATH, else /bin or /usr/bin; resolved once. */
 let mvPath: string | undefined;
@@ -39,6 +61,8 @@ export interface CommandSpawn {
   env: NodeJS.ProcessEnv;
   /** The attempt directory (absolute): holds output.log and the exit record. */
   dir: string;
+  /** The execution tag, written into the Windows wrapper's command line (its environment is unreadable elsewhere). */
+  exec?: string;
   /** The last check, synchronous, after every preparation and immediately before the spawn (no await between them):
    *  false starts no process (spawnCommand resolves undefined). */
   proceed?: () => boolean;
@@ -50,8 +74,9 @@ export interface SpawnedCommand {
   exited: Promise<void>;
 }
 
-/** The argv the wrapper runs: an argv as given (a program, never shell syntax), a string through `/bin/sh -c`. */
-export const commandArgv = (command: string | readonly string[]): string[] => typeof command === "string" ? ["/bin/sh", "-c", command] : [...command];
+/** The argv the wrapper runs: an argv as given (a program, never shell syntax), a string through the platform shell. */
+export const commandArgv = (command: string | readonly string[]): string[] =>
+  typeof command === "string" ? [IS_WINDOWS ? comspec() : "/bin/sh", "-c", command] : [...command];
 
 /** Start a command (see the module comment). Rejects when it cannot start (a missing cwd, no /bin/sh); undefined when
  *  `proceed` said no. */
@@ -61,6 +86,22 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
   await mkdir(spec.dir, { recursive: true });
   const fd = openSync(join(spec.dir, COMMAND_LOG), "a");
   try {
+    if (IS_WINDOWS) {
+      // A command line can be long and contain anything: pass it through a file, not argv. An argv whose program is a
+      // .cmd/.bat shim is unwrapped here, before it is recorded, so the child runs the program its shim names.
+      const command = typeof spec.command === "string" ? spec.command : (() => { const target = execTarget(spec.command[0]!, spec.command.slice(1)); return [target.command, ...target.args]; })();
+      await writeFile(join(spec.dir, "command.json"), JSON.stringify({ command, cwd: spec.cwd, env: spec.env }));
+      if (spec.proceed && !spec.proceed()) return undefined;
+      const child = spawn(process.execPath, ["--input-type=module", "-e", WIN_WRAPPER, spec.dir, ...(spec.exec ? [`DSA_EXEC=${spec.exec}`] : [])],
+        { cwd: spec.cwd, env: { ...spec.env, ...(spec.env.ComSpec || spec.env.COMSPEC ? {} : { ComSpec: comspec() }) },
+          detached: true, stdio: ["ignore", fd, fd], windowsHide: true });
+      const exited = new Promise<void>(resolve => { child.once("exit", () => resolve()); child.once("error", () => resolve()); });
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      child.unref();
+      const pid = child.pid!;
+      const start = child.exitCode !== null || child.signalCode !== null ? "" : await captureStart(pid).catch(() => "");
+      return { pid, start, exited };
+    }
     const mv = resolveMv(), argv = commandArgv(spec.command);
     if (spec.proceed && !spec.proceed()) return undefined;
     const child = spawn("/bin/sh", ["-c", WRAPPER, "dsa-command", spec.dir, mv, ...argv],

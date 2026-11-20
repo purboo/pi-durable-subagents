@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { startPi, tempRoot, script, settled } from "../../harness/pi.ts";
 import { scanInbox } from "../../../src/kernel/mailbox.ts";
 import { readJournalSnapshot } from "../../../src/kernel/journal.ts";
+import { fileId } from "../../../src/kernel/ids.ts";
 
 test("real isolated RPC pi degrades quietly and durable UI deps record user provenance plus a non-waking note", { timeout: 30_000 }, async () => {
   const root = tempRoot("dsa-ui-rpc-"), home = join(root, "dsa"), starter = join(root, "starter.mjs");
@@ -16,11 +17,11 @@ test("real isolated RPC pi degrades quietly and durable UI deps record user prov
     const requests = await scanInbox(join(home, "inbox")); assert.equal(requests.length, 1);
     assert.equal(requests[0]!.kind, "send");
     assert.deepEqual(requests[0]!.body, { to: "workflow@1/E02@1", kind: "steer", message: "keep tests", by: "user" });
-    const outbox = readJournalSnapshot(join(home, "outbox", `${requests[0]!.from}.jsonl`));
+    const outbox = readJournalSnapshot(join(home, "outbox", `${fileId(requests[0]!.from)}.jsonl`));
     assert(outbox.some(e => e.type === "sent"));
     assert(!pi.events.some(e => e.type === "agent_start" || e.type === "extension_ui_request"));
     pi.send({ type: "prompt", message: script([{ text: "main response" }]) }); await pi.waitFor(settled);
     assert(pi.sessionEntries().some(e => e.type === "custom_message" && e.customType === "dsa-note" && e.content.includes("steered E02")));
     assert(!pi.events.some(e => e.type === "extension_error"));
-  } finally { await pi.stop(); rmSync(root, { recursive: true, force: true }); }
+  } finally { await pi.stop(); try { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch {}; }
 });

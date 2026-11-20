@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { captureStart, ProcessTable } from "../../platform/proctable.ts";
 import { Containment } from "../../platform/containment.ts";
+import { execTarget } from "../../platform/launch.ts";
+import { IS_WINDOWS, killTreeSync } from "../../platform/windows.ts";
 import { readJournalSnapshot } from "../../kernel/journal.ts";
 import { orchLedger, journalPath } from "../../paths.ts";
 import { JT } from "../../types.ts";
@@ -38,7 +40,8 @@ export function stack(root: string, inherited: NodeJS.ProcessEnv) {
   function launch() {
     let child!: ChildProcessWithoutNullStreams, events: any[] = [], buffer = "", error: Error | undefined, requestId = 0, ready = false;
     const start = () => {
-      child = spawn("pi", ["--mode", "rpc", "--session", session], { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+      const target = execTarget("pi", ["--mode", "rpc", "--session", session]);
+      child = spawn(target.command, target.args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
       events = []; buffer = ""; error = undefined; const own = child;
       child.on("error", e => { if (own === child) error = e; }); child.stdin.on("error", e => { if (own === child) error = e; });
       child.stdout.on("data", data => {
@@ -83,7 +86,7 @@ export function stack(root: string, inherited: NodeJS.ProcessEnv) {
             return;
           }
           if (attempt >= 5) throw failure;
-          try { process.kill(-child.pid!, "SIGKILL"); } catch {}
+          try { if (IS_WINDOWS) killTreeSync(child.pid!); else process.kill(-child.pid!, "SIGKILL"); } catch {}
           await until(() => child.exitCode !== null || child.signalCode !== null, "unready main exited", 5_000);
           start();
         }
@@ -102,15 +105,18 @@ export function stack(root: string, inherited: NodeJS.ProcessEnv) {
   async function signalHost(signal: NodeJS.Signals) {
     const host = rows(join(root, "hosts.jsonl")).at(-1);
     if (!host || await captureStart(host.pid) !== host.start) throw new Error("host identity unavailable");
-    process.kill(host.pid, signal); return host;
+    if (IS_WINDOWS) killTreeSync(host.pid); else process.kill(host.pid, signal); return host;
   }
   async function close() {
-    for (const pi of instances) if (pi.child.exitCode === null && pi.child.signalCode === null) { try { process.kill(-pi.child.pid!, "SIGKILL"); } catch {} }
+    for (const pi of instances) if (pi.child.exitCode === null && pi.child.signalCode === null) { try { if (IS_WINDOWS) killTreeSync(pi.child.pid!); else process.kill(-pi.child.pid!, "SIGKILL"); } catch {} }
     for (const pi of instances) { pi.child.stdin.destroy(); pi.child.stdout.destroy(); pi.child.stderr.destroy(); pi.child.unref(); }
     for (const host of rows(join(root, "hosts.jsonl"))) if (await captureStart(host.pid) === host.start) {
-      process.kill(host.pid, "SIGCONT"); process.kill(host.pid, "SIGTERM");
-      try { await until(async () => await captureStart(host.pid) !== host.start, "host shutdown", 8000); }
-      catch { if (await captureStart(host.pid) === host.start) process.kill(host.pid, "SIGKILL"); }
+      if (IS_WINDOWS) killTreeSync(host.pid);
+      else {
+        process.kill(host.pid, "SIGCONT"); process.kill(host.pid, "SIGTERM");
+        try { await until(async () => await captureStart(host.pid) !== host.start, "host shutdown", 8000); }
+        catch { if (await captureStart(host.pid) === host.start) process.kill(host.pid, "SIGKILL"); }
+      }
     }
     const containment = new Containment(new ProcessTable());
     for (const created of ledger().filter(e => e.type === JT.created)) for (const exec of journal(String(created.wid)).filter(e => e.type === JT.exec))

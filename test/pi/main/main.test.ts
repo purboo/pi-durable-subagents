@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { startPi, tempRoot, REPO, script, type PiInstance } from "../../harness/pi.ts";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
 import { Outbox, scanInbox } from "../../../src/kernel/mailbox.ts";
+import { fileId } from "../../../src/kernel/ids.ts";
 import { OsLock } from "../../../src/platform/lock.ts";
 import { orchInbox, orchLedger, orchLock, journalPath } from "../../../src/paths.ts";
 import { CT, JT, type AttentionItem, type RunBody } from "../../../src/types.ts";
@@ -75,13 +76,13 @@ test("run publishes pinned call body through the durable outbox and returns crea
   // P33: the origin branch is offered for pinning: the live session file and its current leaf.
   assert.ok(origin && existsSync(origin.sessionFile) && typeof origin.leafId === "string");
   assert.equal(result(pi).isError, false); assert.deepEqual(result(pi).result.details, { wid: `w-${req.rid}` });
-  const entries = readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
+  const entries = readJournalSnapshot(join(home, "outbox", `${fileId(sender)}.jsonl`));
   assert.deepEqual(entries.find(e => e.type === "sent")?.request, req);
   assert.ok(entries.some(e => e.type === "resolved" && e.rid === req.rid));
   assert.equal(readFileSync(join(home, "spawn.log"), "utf8").trim().split("\n").length, 1);
 });
 
-test("a pi session exports DSA_SESSION to the processes it starts, but not to the orchestrator it starts", { timeout: 30000 }, async t => {
+test("a pi session exports DSA_SESSION to the processes it starts, but not to the orchestrator it starts", { timeout: 30000, skip: process.platform === "win32" ? "uses the POSIX bash tool and a shell printf redirect" : false }, async t => {
   const { home, launch } = setup(t), pi = launch(), out = join(home, "bash-session.txt");
   await prompt(pi, [{ tool: "bash", args: { command: `printf %s "$DSA_SESSION" > ${out}` } }, { text: "done" }]);
   assert.equal(readFileSync(out, "utf8"), sessionId, "a CLI run from this session's bash names this session");
@@ -111,7 +112,7 @@ test("v12 §2/§6 agents lists cwd-scoped definitions without publishing, and re
   }
   assert.deepEqual(await scanInbox(orchInbox(home)), []);
   assert.deepEqual(readJournalSnapshot(orchLedger(home)), []);
-  assert.deepEqual(readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`)), []);
+  assert.deepEqual(readJournalSnapshot(join(home, "outbox", `${fileId(sender)}.jsonl`)), []);
   assert.equal(existsSync(join(home, "spawn.log")), false);
 });
 
@@ -154,7 +155,7 @@ test("send replaces publishes withdrawal first; all other actions use correct wi
   await append(orchLedger(home), JT.rejected, { rid: reqs[2]!.rid, reason: "identity-conflict" });
   const restarted = launch("restarted", ["--session", session]);
   await prompt(restarted, [{ tool: "subagents", args: { action: "resume" } }, { text: "done" }], 30000);
-  const entries = readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
+  const entries = readJournalSnapshot(join(home, "outbox", `${fileId(sender)}.jsonl`));
   assert.deepEqual(entries.filter(e => e.type === "resolved").map(e => e.rid), [reqs[0]!.rid, reqs[1]!.rid]);
   const current = (await scanInbox(orchInbox(home))).sort((a, b) => a.sseq - b.sseq);
   assert.equal(current.at(-1)!.sseq, 7); assert.deepEqual(current.at(-1)!.body, { origin: sender }); // a session resumes its own held work
@@ -260,7 +261,7 @@ test("T6/T10 real orchestrator: control actions report applied or the rejection 
   assert.match(readFileSync(detail.scriptLog, "utf8"), /ev=1 log: from script 7\n/);
   // Every resolved control request is retired from the session outbox (a reply that came back as submitted is
   // retired by the session's next reconcile, so wait for it).
-  const outbox = () => readJournalSnapshot(join(home, "outbox", `${sender}.jsonl`));
+  const outbox = () => readJournalSnapshot(join(home, "outbox", `${fileId(sender)}.jsonl`));
   const retired = () => {
     const entries = outbox(), sent = entries.filter(e => e.type === "sent").map(e => (e.request as { rid: string }).rid).sort();
     return JSON.stringify(entries.filter(e => e.type === "resolved").map(e => e.rid).sort()) === JSON.stringify(sent);

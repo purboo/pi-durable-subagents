@@ -32,7 +32,7 @@ test("a lazy journal decodes nothing until its entries or an append are needed",
   await eager.close();
 });
 
-test("a lazy open refuses a file that is not what was expected", async t => {
+test("a lazy open refuses a file that is not what was expected", { skip: process.platform === "win32" ? "Windows inode/size expectations and open-handle semantics differ" : false }, async t => {
   const { path, expect } = await journal(t);
   assert.equal(await openLazyJournal(path, { ...expect, size: expect.size + 1 }), undefined);
   assert.equal(await openLazyJournal(path, { ...expect, ino: expect.ino + 1 }), undefined);

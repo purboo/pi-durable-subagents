@@ -65,7 +65,7 @@ test("ownWorkflows equals allWorkflows filtered by ownedBy: origins, a session-n
   assert.deepEqual(ownWorkflows(home, A).find(w => w.wid === "W03")?.labels, { attempt: "2" });
 });
 
-test("UiData.refresh(own) never opens other sessions' journals: unreadable foreign ones do not matter", async () => {
+test("UiData.refresh(own) never opens other sessions' journals: unreadable foreign ones do not matter", { skip: process.platform === "win32" ? "Windows does not enforce POSIX mode 000" : false }, async () => {
   const home = join(root, "foreign");
   await create(home, "W10", A); await seal(home, "W10");
   await create(home, "W11", B, { journal: "dir" });
@@ -157,7 +157,7 @@ test("a workflow another session creates while the list is being read is attribu
   assert.ok(!opened.includes(foreign), "the foreign journal was opened");
 });
 
-test("an unreadable journal the ledger does not know is read again once it changes", { skip: process.getuid?.() === 0 ? "root reads mode 000 files" : false }, async () => {
+test("an unreadable journal the ledger does not know is read again once it changes", { skip: process.platform === "win32" ? "Windows does not enforce POSIX mode 000" : process.getuid?.() === 0 ? "root reads mode 000 files" : false }, async () => {
   const home = join(root, "unreadable"), j = await openJournal(journalPath(home, "W50"));
   await j.append("wf-created", { origin: A, cwd: root, revision: 1 }); await j.close();
   chmodSync(journalPath(home, "W50"), 0o000);
@@ -169,7 +169,7 @@ test("an unreadable journal the ledger does not know is read again once it chang
   assert.deepEqual(data.workflows.map(w => w.wid), ["W50"]);
 });
 
-test("a journal made readable right after a failed read is read again on the next refresh", { skip: process.getuid?.() === 0 ? "root reads mode 000 files" : false }, async t => {
+test("a journal made readable right after a failed read is read again on the next refresh", { skip: process.platform === "win32" ? "Windows does not enforce POSIX mode 000" : process.getuid?.() === 0 ? "root reads mode 000 files" : false }, async t => {
   // The permission comes back between the failed open and anything sampled after it: the failure must not be kept
   // under the restored file's identity.
   const home = join(root, "unreadable-race"), path = journalPath(home, "W60"), j = await openJournal(path);

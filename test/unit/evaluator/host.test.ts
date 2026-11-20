@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import type { EvalToOrch, OrchToEval, CallResult } from '../../../src/types.ts';
@@ -12,7 +13,7 @@ async function harness(source: string, env: Record<string, string> = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'dsa-evaluator-'));
   const scriptPath = join(dir, 'workflow.js');
   await writeFile(scriptPath, source);
-  const child = spawn(process.execPath, [hostPath.pathname], {
+  const child = spawn(process.execPath, [fileURLToPath(hostPath)], {
     env: { ...process.env, DSA_HOME: dir, ...env }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const messages: EvalToOrch[] = [];

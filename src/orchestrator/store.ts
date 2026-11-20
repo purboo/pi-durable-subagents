@@ -5,7 +5,7 @@
 // revised {rid,revision,snapshot} commit publications; old pins remain immutable.
 // pruned {rid,wid,endedAt,bytes} (written by the engine) is decisive: the wid is gone, its create-intent and
 // created entries stay for identity (A1), and recovery finishes removing w/<wid> and its staging dirs.
-import { lstat, open, readdir, readFile, rename, stat, rm } from 'node:fs/promises';
+import { lstat, open, readdir, readFile, stat, rm } from 'node:fs/promises';
 import { createReadStream, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { basename, extname, join, relative } from 'node:path';
@@ -16,6 +16,7 @@ import { contentHash, ulid } from '../kernel/ids.ts';
 import { openJournal, openLazyJournal, syncDirectory } from '../kernel/journal.ts';
 import { readSettled, settledPath, type SettledFacts } from './settled.ts';
 import { publishFile } from '../kernel/mailbox.ts';
+import { replacePath } from '../kernel/fsx.ts';
 import { digestDir, factsDir, journalPath, pinnedDir, workflowDir } from '../paths.ts';
 import { JT, type Entry, type JournalHandle, type Request, type RunBody, type ReviseBody } from '../types.ts';
 import type { Ledgers } from './contract.ts';
@@ -66,7 +67,7 @@ async function fileHash(path: string): Promise<string> {
 async function replaceFile(dir: string, name: string, text: string): Promise<void> {
   const temp = join(dir, `.${ulid()}.tmp`), file = await open(temp, 'wx', 0o600);
   try { await file.writeFile(text); await file.sync(); } finally { await file.close(); }
-  try { await rename(temp, join(dir, name)); } catch (error) { await rm(temp, { force: true }); throw error; }
+  try { await replacePath(temp, join(dir, name)); } catch (error) { await rm(temp, { force: true }); throw error; }
   await syncDirectory(dir);
 }
 type Snapshot = { hash: string; pins?: Pins; error?: string; warnings?: string[] };

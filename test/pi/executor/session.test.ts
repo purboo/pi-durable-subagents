@@ -8,7 +8,7 @@ import { join } from "node:path";
 
 test("C5 E4 snapshot ignores a torn trailing line and skips (reports) interior corruption like pi", async t => {
   const root = tempRoot("dsa-session-"), file = join(root, "session.jsonl");
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {}));
   await writeFile(file, '{"type":"session"}\n{"type":');
   assert.deepEqual(await readSession(file), [{ type: "session" }]);
   await writeFile(file, '{oops}\n{"type":"session"}\n');

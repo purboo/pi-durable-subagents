@@ -55,7 +55,9 @@ async function lockHeld(home: string): Promise<DoctorReport["orchestrator"]> {
   catch { return "unknown"; }
 }
 /** C2: The command that lists the processes still tagged with an execution identity. */
-const stuckProcesses = (exec: string) => process.platform === "linux" ? `grep -lsz ${quote(`DSA_EXEC=${exec}`)} /proc/*/environ` : `ps -Eww -o pid,command | grep -F ${quote(`DSA_EXEC=${exec}`)}`;
+const stuckProcesses = (exec: string) => process.platform === "linux" ? `grep -lsz ${quote(`DSA_EXEC=${exec}`)} /proc/*/environ`
+  : process.platform === "win32" ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${exec}*' } | Select-Object ProcessId,CommandLine"`
+  : `ps -Eww -o pid,command | grep -F ${quote(`DSA_EXEC=${exec}`)}`;
 
 /** Housekeeping: Collect DSA_HOME health facts read-only; `findings` lists only actionable ones, one command each. */
 export async function doctor(home: string, env: NodeJS.ProcessEnv = process.env, now = Date.now()): Promise<DoctorReport> {

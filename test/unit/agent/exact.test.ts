@@ -19,7 +19,7 @@ const capture = (over: Partial<Capture> = {}): Capture => ({
   ...over,
 });
 
-test("EX1 the capture is written mode 0600 and read back as the latest request", async t => {
+test("EX1 the capture is written mode 0600 and read back as the latest request", { skip: process.platform === "win32" ? "Windows does not enforce POSIX file modes" : false }, async t => {
   const home = await mkdtemp(join(tmpdir(), "dsa-exact-capture-"));
   t.after(() => rm(home, { recursive: true, force: true }));
   const first = capture({ payload: { model: "m", messages: [{ role: "user", content: "one" }] } });

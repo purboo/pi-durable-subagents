@@ -34,10 +34,10 @@ test("drill failover --keep prints each step, the kept root and one summary line
   const kept = /^  kept: (\S+)$/m.exec(stdout)?.[1];
   assert.ok(kept && existsSync(join(kept, "report.json")), stdout);
   assert.match(stdout.trim().split("\n").at(-1)!, /^failover drill: pass \(5\/5 steps, [\d.]+ s\)$/);
-  const { rm } = await import("node:fs/promises"); await rm(kept!, { recursive: true, force: true });
+  const { rm } = await import("node:fs/promises"); await rm(kept!, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
 });
 for (const [signal, keep, code] of [["SIGINT", false, 130], ["SIGTERM", true, 143]] as const)
-  test(`drill failover interrupted by ${signal}${keep ? " with --keep" : ""}: stops its orchestrator, ${keep ? "keeps and prints" : "removes"} the root, exits ${code}`, { timeout: 90_000 }, async t => {
+  test(`drill failover interrupted by ${signal}${keep ? " with --keep" : ""}: stops its orchestrator, ${keep ? "keeps and prints" : "removes"} the root, exits ${code}`, { timeout: 90_000, skip: process.platform === "win32" ? "Windows cannot deliver SIGINT/SIGTERM to a detached process with process.kill" : false }, async t => {
     const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}` };
     for (const key of ["DSA_EXEC", "DSA_CALL", "DSA_HOME", "DSA_JOURNAL", "DSA_INBOX", "DSA_MODEL"]) delete env[key];
     const child = spawn(process.execPath, [join(REPO, "src/cli/main.ts"), "drill", "failover", ...(keep ? ["--keep"] : [])], { env, cwd: REPO, stdio: ["ignore", "pipe", "pipe"] });
@@ -56,6 +56,6 @@ for (const [signal, keep, code] of [["SIGINT", false, 130], ["SIGTERM", true, 14
     assert.match(out, new RegExp(`failover drill: interrupted by ${signal}`));
     assert.throws(() => process.kill(Number(pid), 0), "the drill's orchestrator was stopped");
     const root = join(home, "..");
-    if (keep) { assert.match(out, new RegExp(`kept: ${root}`)); assert.ok(existsSync(root)); await rm(root, { recursive: true, force: true }); }
+    if (keep) { assert.match(out, new RegExp(`kept: ${root}`)); assert.ok(existsSync(root)); await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {}); }
     else assert.ok(!existsSync(root), `root left behind: ${root}`);
   });

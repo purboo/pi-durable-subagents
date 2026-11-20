@@ -25,6 +25,7 @@ import { open, readdir, rename, rm, type FileHandle } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { frameLine, syncDirectory, unframeLine } from "../kernel/journal.ts";
+import { replacePath, writeAt } from "../kernel/fsx.ts";
 import { EVENT_SEQ_SKIP, type Event, type EventDraft } from "./types.ts";
 
 export type LogRecord =
@@ -145,14 +146,16 @@ export class EventLog {
     if (!scan) {
       const epoch = randomBytes(8).toString("hex"), text = frameLine(JSON.stringify({ k: "log", v: 1, epoch, dropped: 0 }));
       await replace(path, async file => { await file.writeFile(text); });
-      const file = await open(path, "a");
+      const file = await open(path, "r+");
       return { log: new EventLog(path, file, { epoch, dropped: 0, head: 0, end: Buffer.byteLength(text), records: 0, events: 0 }), created: true, marks: new Map(), ...(corrupt ? { corrupt } : {}) };
     }
+    // A read/write handle (not append mode): Windows append handles cannot truncate a torn tail, and every append writes
+    // at an explicit position anyway.
     const file = await open(path, "r+");
     try {
       if (scan.end !== (await file.stat()).size) { await file.truncate(scan.end); await file.sync(); }
-    } finally { await file.close(); }
-    const log = new EventLog(path, await open(path, "a"), scan);
+    } catch (error) { await file.close().catch(() => {}); throw error; }
+    const log = new EventLog(path, file, scan);
     // The pump retries a broken log's reopen every second: a failed start skip must not leak the handle.
     try { await log.write(frameLine(JSON.stringify({ k: "head", seq: log.head + EVENT_SEQ_SKIP })), log.head + EVENT_SEQ_SKIP); }
     catch (error) { await log.file.close().catch(() => {}); throw error; }
@@ -167,7 +170,7 @@ export class EventLog {
   /** Write and fsync records whose last position is `position`; on failure cut the file back to its last good length
    *  (or break the log when that fails too). */
   private async write(text: string, position: number): Promise<void> {
-    try { await this.file.write(text); await this.file.sync(); }
+    try { await writeAt(this.file, Buffer.from(text), this.size); await this.file.sync(); }
     catch (error) {
       try { await this.file.truncate(this.size); await this.file.sync(); } catch (cause) { this.failed = cause; }
       throw error;
@@ -203,7 +206,7 @@ export class EventLog {
    *  records pile up), keeping the header's epoch, a monotone `dropped`, every other event and the watermarks. */
   compact(drop: (r: Extract<LogRecord, { k: "ev" }>) => boolean, marks: ReadonlyMap<string, number>): Promise<number> {
     return this.serial(async () => {
-      const fd = openSync(this.path, "r");
+      let fd: number | undefined = openSync(this.path, "r");
       let count = 0, highest = this.dropped;
       try {
         scanLines(fd, 0, this.size, line => {
@@ -233,16 +236,25 @@ export class EventLog {
           fsyncSync(out);
         } catch (error) { closeSync(out); await rm(temp, { force: true }); throw error; }
         closeSync(out);
-        try { await rename(temp, this.path); } catch (error) { await rm(temp, { force: true }); throw error; }
+        // The scan handle also names the log: close it (and the writer) before the replace, or Windows refuses it.
+        closeSync(fd); fd = undefined;
+        // Windows cannot replace a file that a handle has open, and the append handle names this log: close it around
+        // the rename, then reopen (on every platform: one code path, and the writer never keeps a stale handle).
+        try { await this.file.close(); } catch (error) { this.failed = error; throw error; }
+        try { await replacePath(temp, this.path); }
+        catch (error) {
+          await rm(temp, { force: true });
+          try { this.file = await open(this.path, "r+"); } catch (cause) { this.failed = cause; }
+          throw error;
+        }
         // Past the rename this handle names the replaced file: any failure breaks the writer (the owner reopens).
         try {
           await syncDirectory(dirname(this.path));
-          await this.file.close();
-          this.file = await open(this.path, "a");
+          this.file = await open(this.path, "r+");
         } catch (error) { this.failed = error; throw error; }
         this.size = size; this.dropped = highest; this.redundant = 1; this.durable = this.head;
         return count;
-      } finally { closeSync(fd); }
+      } finally { if (fd !== undefined) closeSync(fd); }
     });
   }
   close(): Promise<void> { return this.queue.then(() => this.file.close()).catch(() => {}); }
@@ -254,7 +266,7 @@ async function replace(path: string, fill: (file: FileHandle) => Promise<void>):
   try { await fill(file); await file.sync(); }
   catch (error) { await file.close().catch(() => {}); await rm(temp, { force: true }); throw error; }
   await file.close();
-  try { await rename(temp, path); } catch (error) { await rm(temp, { force: true }); throw error; }
+  try { await replacePath(temp, path); } catch (error) { await rm(temp, { force: true }); throw error; }
   await syncDirectory(dirname(path));
 }
 

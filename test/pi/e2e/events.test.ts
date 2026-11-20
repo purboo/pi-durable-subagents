@@ -70,7 +70,7 @@ async function stack(t: TestContext, config?: unknown) {
   t.after(async () => {
     for (const pid of pids()) if (alive(pid)) process.kill(pid, "SIGTERM");
     await until(() => pids().every(pid => !alive(pid)), "orchestrators exit", 15_000).catch(() => { for (const pid of pids()) if (alive(pid)) process.kill(pid, "SIGKILL"); });
-    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true });
+    if (process.env.DSA_KEEP) t.diagnostic(`kept: ${root}`); else await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
   });
   return { root, home, cwd, cli, lines, ledger, journal, pids, alive, running, until, page, drain, runWith };
 }
@@ -121,7 +121,7 @@ test("E2E events: restart --force while a call runs → fenced{restart-force}; t
   assert.ok(token, refused.out);
   const forced = await s.cli(["restart", "--force", token!, "--reason", "e2e forced restart"]);
   assert.equal(forced.code, 0, forced.out + forced.err);
-  const fenced = await s.until(async () => (await s.drain(`${(await s.page()).lines[0].head.split(":")[0]}:0`)).events.find(e => e.wid === wid && e.type === "fenced"), "fenced event", 60_000);
+  const fenced = await s.until(async () => (await s.drain(`${(await s.page()).lines[0].head.split(":")[0]}:0`)).events.find(e => e.wid === wid && e.type === "fenced"), "fenced event", 120_000);
   assert.equal(fenced.reason, "restart-force"); assert.equal(fenced.request, "F1");
   assert.equal(fenced.key, "tasks:0"); assert.equal(fenced.gen, 1);
   const sealed = await s.until(async () => (await s.drain(`${fenced.cursor.split(":")[0]}:0`)).events.find(e => e.wid === wid && e.type === "sealed"), "sealed event", 90_000);

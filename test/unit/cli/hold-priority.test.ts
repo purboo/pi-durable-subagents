@@ -13,6 +13,7 @@ import * as lease from '../../../src/platform/lease.ts';
 import { OsLock } from '../../../src/platform/lock.ts';
 import type { LeaseTicket } from '../../../src/platform/lease.ts';
 
+const unixOnly = process.platform === "win32" ? "uses POSIX sh/sleep command scripts" : false;
 const cli = fileURLToPath(new URL('../../../src/cli/main.ts', import.meta.url));
 async function until<T>(fn: () => T | false | undefined, ms = 10_000): Promise<T> {
   const end = Date.now() + ms;
@@ -81,7 +82,7 @@ test('priority: counted requests respect granted slot limits, exclusive holders 
   assert.equal(lease.slotCount([fake(1, 'counted', -1, false, 2), fake(2, 'counted', 1, false, 4)]), 4);
 });
 
-test('priority: later high-priority waiter overtakes low; ties retain FIFO', async t => {
+test('priority: later high-priority waiter overtakes low; ties retain FIFO', { skip: unixOnly }, async t => {
   const home = await root(t);
   const a = run(t, home, ['machine', '--', ...gate(home, 'a')]);
   await until(() => ticket(home, a.child)?.command && existsSync(join(home, 'log')));
@@ -145,7 +146,7 @@ test('priority: concurrent counted grants cannot oversubscribe slots', async t =
   assert.equal(lease.readTickets(home, 'machine').filter(t => t.grantedAt !== undefined).length, 2);
 });
 
-test('expect: holder and waiter display, waiting hold line and JSON fields', async t => {
+test('expect: holder and waiter display, waiting hold line and JSON fields', { skip: unixOnly }, async t => {
   const home = await root(t), now = Date.now();
   const holder = { ...fake(1, 'exclusive', 3, true), grantedAt: now - 180_000, expectMs: 25 * 60_000, yield: true as const };
   const waiter = { ...fake(2, 'exclusive', -2), expectMs: 25 * 60_000 };
@@ -179,7 +180,7 @@ test('old tickets: no new fields retain priority zero, compatibility and stored 
   assert.deepEqual(lease.blockers(fake(2, 'shared', 100), lease.readTickets(home, 'machine')).map(t => t.seq), [old.seq]);
 });
 
-test('yield: compatible shared requests and refused no-wait probes never trigger yield', async t => {
+test('yield: compatible shared requests and refused no-wait probes never trigger yield', { skip: unixOnly }, async t => {
   const home = await root(t);
   const a = run(t, home, ['machine', '--shared', '--yield', '--', ...gate(home, 'a')]);
   await until(() => ticket(home, a.child)?.command);
@@ -192,7 +193,7 @@ test('yield: compatible shared requests and refused no-wait probes never trigger
   assert.deepEqual(await Promise.all([a.exit, b.exit]), [0, 0]);
 });
 
-test('stable lines: no-wait, timed-out and yielded lines pin the program interface', async t => {
+test('stable lines: no-wait, timed-out and yielded lines pin the program interface', { skip: unixOnly }, async t => {
   const home = await root(t), output: string[] = [];
   const a = run(t, home, ['machine', '--', ...gate(home, 'a')]);
   await until(() => ticket(home, a.child)?.command);

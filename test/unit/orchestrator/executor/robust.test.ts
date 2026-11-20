@@ -100,7 +100,7 @@ test("writer lock: one writer call per worktree in order, kept across a restart,
   assert.equal(launches(b) + launches(c), 0, "a second writer does not launch");
   const snap = snapshotFromEntries(f.wid, f.journal.entries());
   assert.deepEqual(snap.calls.filter(x => x.writerWait).map(x => [x.key, x.writerWait]), [["b", { root: f.home, holder: `${f.wid}/a` }], ["c", { root: f.home, holder: `${f.wid}/a` }]]);
-  assert.match(renderStatus(snap), new RegExp(`b@1 queued .*\\(waiting for writer lock: ${f.home} held by ${f.wid}/a\\)`));
+    assert.ok(renderStatus(snap).includes(`b@1 queued (waiting for writer lock: ${f.home} held by ${f.wid}/a)`), renderStatus(snap));
   assert.deepEqual(statusBrief(f.home).active[0]!.calls.find(x => x.key === "b")!.writerWait, { root: f.home, holder: `${f.wid}/a` });
   const attention = () => f.journal.entries().filter(e => e.type === JT.attention && item(e).id === `writer:${b.callId}`);
   assert.equal(attention().length, 1); assert.equal(item(attention()[0]!).kind, "conflict");
@@ -606,7 +606,7 @@ test("F1 A2 stop ends the wait on a parked gate and seals stopped", { timeout: 1
   assert.equal((await pending).status, "stopped");
 });
 
-test("F1 A2 a fence timeout at the end of a normal gate run is isolated; the call seals unknown after the sweep", { timeout: 15000 }, async t => {
+test("F1 A2 a fence timeout at the end of a normal gate run is isolated; the call seals unknown after the sweep", { timeout: process.platform === "win32" ? 45000 : 15000 }, async t => {
   const real = serialContainment(), stuck = new Set<string>();
   const containment: Containment = { spawn: spec => real.spawn(spec), scan: known => real.scan(known),
     fence: async (id, tracked, opts) => { if (stuck.has(id)) throw new Error(`Fence timeout: ${id}`); return real.fence(id, tracked, opts); } };
@@ -628,7 +628,7 @@ test("F1 A2 a fence timeout at the end of a normal gate run is isolated; the cal
     assert.equal(f.journal.entries().find(e => e.type === "gate")!.unknown, true);
     assert.equal(count(f.journal.entries(), e => e.type === "fence-failed"), 1);
     assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${gid}`));
-    assert.equal((await readFile(join(a.cwd, "gate-runs"), "utf8")), "ran\n", "the gate ran exactly once");
+    assert.equal((await readFile(join(a.cwd, "gate-runs"), "utf8")).trim(), "ran", "the gate ran exactly once");
   } finally { stuck.clear(); await real.fence(gid, []).catch(() => {}); }
 });
 

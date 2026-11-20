@@ -11,6 +11,8 @@ import { Outbox } from '../../../src/kernel/mailbox.ts';
 import { journalPath, orchInbox, orchLedger, outboxRoot } from '../../../src/paths.ts';
 import { Engine } from '../../../src/orchestrator/engine.ts';
 import { findRequest, requestRid, sendIdentified, specDigest } from '../../../src/requests.ts';
+import { fileId } from '../../../src/kernel/ids.ts';
+const inboxName = (rid: string) => `${fileId(rid)}.json`;
 import { lastFence } from '../../../src/cli/requests.ts';
 import { JT, type EvalToOrch, type OrchToEval, type Request } from '../../../src/types.ts';
 import type { EvaluatorTransport } from '../../../src/orchestrator/evaluator-client.ts';
@@ -74,8 +76,8 @@ test('Run --request without a decision is pending (75); retries reuse the envelo
   const f = await fixture(t), path = await f.spec('a.json', { agent: 'echo', task: 'hello' });
   const first = await f.cli(['run', '--request', 'job-1', '--spec', path, '--json']);
   assert.equal(first.code, 75); assert.deepEqual(JSON.parse(first.out), { request: 'job-1', pending: true });
-  assert.deepEqual(await f.inbox(), ['req:job-1.json']);
-  const published = JSON.parse(await readFile(join(orchInbox(f.home), 'req:job-1.json'), 'utf8')) as Request;
+  assert.deepEqual(await f.inbox(), [inboxName('req:job-1')]);
+  const published = JSON.parse(await readFile(join(orchInbox(f.home), inboxName('req:job-1')), 'utf8')) as Request;
   assert.deepEqual(published.body, { cwd: f.cwd, call: { agent: 'echo', task: 'hello' } });
   const pending = await f.cli(['describe', '--key', 'job-1', '--json']);
   assert.deepEqual(JSON.parse(pending.out), { state: 'pending', request: 'job-1', kind: 'run', spec_digest: specDigest(published) });
@@ -85,8 +87,8 @@ test('Run --request without a decision is pending (75); retries reuse the envelo
   const other = await f.cli(['run', '--request', 'job-1', '--spec', await f.spec('b.json', { agent: 'echo', task: 'other' }), '--json']);
   assert.equal(other.code, 3);
   assert.deepEqual(JSON.parse(other.out), { request: 'job-1', error: 'request-conflict', spec_digest: specDigest(published), state: 'pending' });
-  assert.deepEqual(await f.inbox(), ['req:job-1.json']);
-  assert.deepEqual(JSON.parse(await readFile(join(orchInbox(f.home), 'req:job-1.json'), 'utf8')), published);
+  assert.deepEqual(await f.inbox(), [inboxName('req:job-1')]);
+  assert.deepEqual(JSON.parse(await readFile(join(orchInbox(f.home), inboxName('req:job-1')), 'utf8')), published);
   // The tool's sender (another outbox) sees the same identity under the home-wide check.
   const outbox = await Outbox.open(outboxRoot(f.home), 'main:tool', () => orchInbox(f.home));
   t.after(() => outbox.close());
@@ -94,7 +96,7 @@ test('Run --request without a decision is pending (75); retries reuse the envelo
   assert.ok('sent' in same && same.sent === false && same.request.from === published.from);
   const differs = await sendIdentified(f.home, outbox, 'main:tool', 'req:job-1', 'stop', { target: 'x' });
   assert.ok('conflict' in differs && differs.digest === specDigest(published));
-  assert.deepEqual(await f.inbox(), ['req:job-1.json']);
+  assert.deepEqual(await f.inbox(), [inboxName('req:job-1')]);
   // A run absent anywhere is absent.
   assert.deepEqual(JSON.parse((await f.cli(['describe', '--key', 'nope', '--json'])).out), { state: 'absent', request: 'nope' });
 });
@@ -194,7 +196,7 @@ test('With --json a refused run or send answers {request, applied:false, reason,
   assert.deepEqual(await f.inbox(), [], 'nothing was published');
 });
 
-test('A retry of a recorded run, or a failure after submission, is pending (75), never a refusal', async t => {
+test('A retry of a recorded run, or a failure after submission, is pending (75), never a refusal', { skip: process.platform === 'win32' ? 'reads a directory as the ledger; Windows returns EPERM without the POSIX pending-reason path' : false }, async t => {
   const f = await fixture(t);
   const path = await f.spec('r.json', { agent: 'echo', task: 't' });
   assert.equal((await f.cli(['run', '--request', 'R', '--spec', path, '--json'])).code, 75);
@@ -209,7 +211,7 @@ test('A retry of a recorded run, or a failure after submission, is pending (75),
     starter: async () => { await rm(orchLedger(f.home), { force: true }); await mkdir(orchLedger(f.home), { recursive: true }); } });
   assert.equal(code, 75, lines.join('\n'));
   const reply = JSON.parse(lines.join(''));
-  assert.equal(reply.pending, true); assert.match(reply.reason, /^submitted, then: .*EISDIR/);
+  assert.equal(reply.pending, true); assert.match(reply.reason, process.platform === 'win32' ? /^submitted, then: .*(EISDIR|EPERM)/ : /^submitted, then: .*EISDIR/);
   await rm(orchLedger(f.home), { recursive: true, force: true });
   // Other content under a recorded id is a conflict (3) even when its agent does not exist.
   const other = await f.cli(['run', '--request', 'R', '--spec', await f.spec('o.json', { agent: 'nobody', task: 't' }), '--json']);
@@ -362,26 +364,26 @@ test('An envelope another sender recorded but never published is published by a 
   await dead.close();
   assert.ok('sent' in sent && sent.sent);
   // The session died between recording and publishing: the inbox never got the file.
-  await rm(join(orchInbox(f.home), 'req:orphan.json'));
+  await rm(join(orchInbox(f.home), inboxName('req:orphan')));
   const retry = await f.cli(['run', '--request', 'orphan', '--spec', await f.spec('a.json', { agent: 'echo', task: 'hello' }), '--json']);
   assert.equal(retry.code, 75, retry.out);
-  assert.deepEqual(await f.inbox(), ['req:orphan.json']);
-  assert.deepEqual(JSON.parse(await readFile(join(orchInbox(f.home), 'req:orphan.json'), 'utf8')), sent.request, 'published verbatim, from the original sender');
+  assert.deepEqual(await f.inbox(), [inboxName('req:orphan')]);
+  assert.deepEqual(JSON.parse(await readFile(join(orchInbox(f.home), inboxName('req:orphan')), 'utf8')), sent.request, 'published verbatim, from the original sender');
 });
 
 test('Run --request takes command call bodies: a single command and command steps, normalized like the tool; agent-only fields refused', async t => {
   const f = await fixture(t);
   const single = await f.cli(['run', '--request', 'cmd-1', '--spec', await f.spec('c.json', { command: ['npm', 'test'], cwd: 'sub', env: { CI: '1' } }), '--json']);
   assert.equal(single.code, 75);
-  assert.deepEqual((JSON.parse(await readFile(join(orchInbox(f.home), 'req:cmd-1.json'), 'utf8')) as Request).body,
+  assert.deepEqual((JSON.parse(await readFile(join(orchInbox(f.home), inboxName('req:cmd-1')), 'utf8')) as Request).body,
     { cwd: join(f.cwd, 'sub'), call: { command: ['npm', 'test'], cwd: join(f.cwd, 'sub'), env: { CI: '1' } } });
   const chain = await f.cli(['run', '--request', 'cmd-2', '--spec', await f.spec('d.json', { chain: [{ command: 'make' }, { agent: 'echo', task: '{previous}' }], model: 'p/m', rerun: true }), '--json']);
   assert.equal(chain.code, 75);
-  assert.deepEqual((JSON.parse(await readFile(join(orchInbox(f.home), 'req:cmd-2.json'), 'utf8')) as Request).body,
+  assert.deepEqual((JSON.parse(await readFile(join(orchInbox(f.home), inboxName('req:cmd-2')), 'utf8')) as Request).body,
     { cwd: f.cwd, chain: [{ command: 'make', rerun: true }, { agent: 'echo', task: '{previous}', model: 'p/m' }] });
   await assert.rejects(f.cli(['run', '--request', 'cmd-3', '--spec', await f.spec('e.json', { command: 'true', model: 'p/m' })]), /model is not allowed in a command call/);
   await assert.rejects(f.cli(['run', '--request', 'cmd-4', '--spec', await f.spec('g.json', { tasks: [{ command: 'true' }], command: 'x' })]), /command cannot be set beside tasks: put it in a step/);
-  assert.deepEqual((await f.inbox()).sort(), ['req:cmd-1.json', 'req:cmd-2.json']);
+  assert.deepEqual((await f.inbox()).sort(), [inboxName('req:cmd-1'), inboxName('req:cmd-2')]);
 });
 
 test('R8: an answer to a command call, running or sealed, with or without qid/rev, from the tool and the CLI, gets the pinned reason', async t => {

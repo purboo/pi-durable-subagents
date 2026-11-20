@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Native Windows support: the extension enables itself on `win32` instead of refusing to load. The process layer uses
+  PowerShell/CIM (`Win32_Process`, pid plus creation time), `taskkill /T` for tree fences, a Node-held lock directory
+  for file exclusion, a Node command wrapper that records exit status, `cmd.exe` for string commands and gates, and
+  Task Scheduler for `install-service`. No WSL or POSIX tools are required.
+- Windows filesystem semantics: directory `fsync` is skipped (EPERM), replacements retry a transient sharing violation,
+  journals and the event log use positional writes with read/write handles (append handles cannot truncate), and request
+  ids/senders that contain `:` get a file-safe name (`fileId`).
+- Windows launcher: `pi` resolves through `PATHEXT` (`.cmd`), npm shims are unwrapped to `node <script>` so argv stays an
+  argv, and subagents get both `.cmd` and POSIX shims on `PATH`.
+- Windows memory admission uses free commit (`Win32_OperatingSystem.FreeVirtualMemory`), not free physical memory, which
+  Windows keeps low in standby/cache and which made dispatch wait indefinitely.
+- Linux/macOS mechanism tests (inherited `DSA_EXEC` tags, POSIX shell scripts, `setsid`, `chmod 000`, POSIX signals) are
+  skipped on Windows with an explicit reason; Windows has equivalent process-table, lock, command-wrapper, hold and
+  launcher coverage.
+
 ## 1.5.1
 
 - A worktree on an unexpected branch or detached HEAD can no longer block unrelated workflows during startup recovery. If the call already succeeded, recovery keeps its result and files and records one notice that survives restarts. The notice identifies the call, path, expected branch and actual checkout (#10).

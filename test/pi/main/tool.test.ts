@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { resolve } from "node:path";
 import { request } from "../../../src/agent/main/tool.ts";
 
 // Public normalization is also exercised through real pi in main.test.ts.
 test("run normalizes task/chain cwd and rejects ambiguous or incomplete launches", () => {
   for (const key of ["tasks", "chain"] as const) {
     assert.deepEqual(request({ action: "run", [key]: [{ agent: "worker", task: "work", cwd: "sub" }] }, "/project"),
-      { kind: "run", body: { cwd: "/project", [key]: [{ agent: "worker", task: "work", cwd: "/project/sub" }] } });
+      { kind: "run", body: { cwd: "/project", [key]: [{ agent: "worker", task: "work", cwd: resolve("/project", "sub") }] } });
   }
   assert.deepEqual(request({ action: "run", source: "return args", args: 1, name: "inline" }, "/project"),
     { kind: "run", body: { cwd: "/project", source: "return args", args: 1, name: "inline" } });
