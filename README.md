@@ -952,7 +952,9 @@ any row; the run still belongs to its sender: that session's main agent gets
 no completion notices for it, quitting that pi does not pause it, and the
 session is not part of the content, so a retry from another session gets the
 first outcome. An invalid `--session` exits 1; an invalid inherited value
-is ignored.
+is ignored. To have the main agent receive a completion notice, start the run
+with the `subagents` tool in that pi session. `--wake caller` delivers to the
+subagent call that launched a CLI run (see above).
 
 When an unsealed call does not move, its `waiting` in `describe` adds
 `reason`, `detail` (the status line for that cause, e.g. `waiting for a slot:
