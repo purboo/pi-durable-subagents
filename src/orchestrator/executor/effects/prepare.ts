@@ -49,12 +49,13 @@ export async function prepareWorktree(t: CallTicket): Promise<string> {
   if (t.spec.isolation !== "worktree") return t.cwd;
   let intent = records(t, "wt-intent")[0];
   if (!intent) {
-    // `check-ref-format` rejects a branch segment containing ':' and other ref-forbidden characters, so the auto keys
-    // `tasks:<i>` / `chain:<i>` (and any colon-bearing key) break `isolation: "worktree"` on the tasks/chain fan-out
-    // forms. The address and path keep the raw key (both tolerate those characters); only the branch segment needs a
-    // ref-safe form. The `check-ref-format` call below still rejects the rare key unsafe even after this (e.g. `..`).
-    const branchKey = t.key.replace(/[^A-Za-z0-9._-]/g, "-");
-    const root = resolve(t.cwd, ".dsa", t.wid), path = resolve(root, t.key), branch = `dsa/${t.wid}/${branchKey}`;
+    const root = resolve(t.cwd, ".dsa", t.wid), path = resolve(root, t.key);
+    // Colon keys could never create a branch in the original namespace. Give them their own namespace so
+    // existing literal keys (including percent-encoded spellings) retain their branches across upgrades.
+    const branch = t.key.includes(":")
+      ? `dsa-colon/${t.wid}/${contentHash(t.key)}`
+      : `dsa/${t.wid}/${t.key}`;
+    if (t.key.split("/").some(part => !part || part === "." || part === "..")) throw new Error("Invalid worktree key");
     if (!path.startsWith(root + sep)) throw new Error("Invalid worktree key");
     await git(t.cwd, "check-ref-format", "--branch", branch);
     const base = await git(t.cwd, "rev-parse", "HEAD");
