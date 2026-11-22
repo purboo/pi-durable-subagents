@@ -22,6 +22,12 @@
   ends the packaged run with its whole process tree; `ci-test.mjs` ends a timed-out run the same way and reads failing
   test files with either separator; `check-imports.mjs` resolves the repository from its own location, not the working
   directory.
+- Worktree identity on Windows: a call's path and the path Git lists are compared as Windows compares them (case,
+  `\\?\` prefix, `/` separators), and after creating a worktree the path Git listed is recorded (`wt-path`), so a
+  recorded short (8.3) or differently-cased path no longer names a second worktree, fails creation because its own
+  directory is in the way, or runs the gate and the cleanup in a directory Git does not know. Elsewhere the comparison
+  is unchanged (exact spelling, through each path's real form). A worktree key must also stay inside its workflow's
+  directory: an absolute or drive-qualified key no longer escapes `.dsa/<workflow>` on Windows.
 
 ## 1.5.1
 

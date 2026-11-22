@@ -1,7 +1,7 @@
 import type { CallEffects, Ledgers } from "../../contract.ts";
 import { serialContainment } from "../sweep.ts";
 import type { Containment } from "../../../types.ts";
-import { cleanWorktree, prepareFork, prepareWorktree } from "./prepare.ts";
+import { cleanWorktree, prepareFork, prepareWorktree, worktreePath } from "./prepare.ts";
 import { recoverGates, runGate } from "./gate.ts";
 import { publishOutput } from "./output.ts";
 
@@ -21,8 +21,7 @@ export default function createEffects(ledgers: Ledgers, containment: Containment
     beforeSeal: (t, exec, result, ctl) => serial(t.callId, async () => {
       // A refused call did no work: no gate, no output (the executor does not call this for one either).
       if (t.refusal !== undefined || ctl.signal.aborted || ["stopped", "timeout", "budget"].includes(result.status)) return result;
-      const intent = t.journal.entries().find(e => e.type === "wt-intent" && e.call === t.callId);
-      const gated = await runGate(t, ledgers.home, intent ? String(intent.path) : t.cwd, exec, result, ctl.signal, containment);
+      const gated = await runGate(t, ledgers.home, worktreePath(t.journal, t.callId) ?? t.cwd, exec, result, ctl.signal, containment);
       if (ctl.signal.aborted) return result;
       return serial(`output:${t.journal.path}`, () => publishOutput(t, ledgers.home, gated));
     }),
