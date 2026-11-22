@@ -181,6 +181,12 @@ public static class DsaJob
     static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr CreateFileW(string name, uint access, uint share, ref SECURITY_ATTRIBUTES attributes, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")]
+    static extern uint GetCurrentProcessId();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
 
     /** argv[0] is the attempt directory, argv[1] (ignored) the attempt's DSA_EXEC tag: a process-table scan finds
      *  the attempt by that tag while this host is starting, before it writes its group record. 126 means no directory,
@@ -189,8 +195,8 @@ public static class DsaJob
     {
         if (args == null || args.Length < 1 || String.IsNullOrEmpty(args[0])) return 126;
         string dir = args[0];
-        // Before anything else: its absence says this program never got to run.
-        try { File.WriteAllText(Path.Combine(dir, "helper-begin"), "begin"); } catch (Exception) { }
+        // Before anything else: its absence says this program never got to run; its identity is from this live handle.
+        try { WriteAtomic(Path.Combine(dir, "helper-begin"), ProcessIdentity(unchecked((int)GetCurrentProcessId()), GetCurrentProcess())); } catch (Exception) { }
         string application, workingDirectory, logPath;
         string[] arguments, environment;
         try { ReadSpec(dir, out application, out workingDirectory, out logPath, out arguments, out environment); }
@@ -294,7 +300,7 @@ public static class DsaJob
                 return Fail(dir, "IsProcessInJob", Marshal.GetLastWin32Error());
             }
             // Before the child's first instruction: the orchestrator waits for this record before it counts the attempt.
-            WriteAtomic(Path.Combine(dir, "group"), @"{""pid"":" + child.dwProcessId.ToString(CultureInfo.InvariantCulture) + "}");
+            WriteAtomic(Path.Combine(dir, "group"), GroupRecord(child.dwProcessId, child.hProcess));
             if (ResumeThread(child.hThread) == 0xFFFFFFFF)
             {
                 TerminateProcess(child.hProcess, 1);
@@ -342,6 +348,25 @@ public static class DsaJob
         File.WriteAllText(temporary, text);
         if (File.Exists(path)) File.Delete(path);
         File.Move(temporary, path);
+    }
+
+    static string ProcessStart(IntPtr process)
+    {
+        long creation, exit, kernel, user;
+        if (!GetProcessTimes(process, out creation, out exit, out kernel, out user) || creation <= 0) return "";
+        try { return DateTime.FromFileTime((creation / 10) * 10).Ticks.ToString(CultureInfo.InvariantCulture); }
+        catch (Exception) { return ""; }
+    }
+
+    static string ProcessIdentity(int pid, IntPtr process)
+    {
+        return @"{""pid"":" + pid.ToString(CultureInfo.InvariantCulture) + @",""start"":""" + ProcessStart(process) + @"""}";
+    }
+
+    static string GroupRecord(int pid, IntPtr process)
+    {
+        return @"{""pid"":" + pid.ToString(CultureInfo.InvariantCulture) + @",""start"":""" + ProcessStart(process) +
+            @""",""group"":" + ProcessIdentity(unchecked((int)GetCurrentProcessId()), GetCurrentProcess()) + "}";
     }
 
     /** The child's environment (CREATE_UNICODE_ENVIRONMENT): its variables, then the empty terminator. */
