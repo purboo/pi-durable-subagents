@@ -69,6 +69,10 @@ public static class DsaJob
     const uint DETACHED_PROCESS = 0x00000008;
     const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
     const uint STARTF_USESTDHANDLES = 0x00000100;
+    // The wrapper inherits the three standard handles by name (a one-entry proc-thread attribute list), never "every
+    // inheritable handle this host happens to hold".
+    const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    const int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
     const int JobObjectExtendedLimitInformation = 9;
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     const uint GENERIC_READ = 0x80000000;
@@ -111,6 +115,13 @@ public static class DsaJob
         public IntPtr hStdInput;
         public IntPtr hStdOutput;
         public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFOEX
+    {
+        public STARTUPINFO StartupInfo;
+        public IntPtr lpAttributeList;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -168,7 +179,13 @@ public static class DsaJob
     static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool CreateProcessW(string application, string commandLine, IntPtr processAttributes, IntPtr threadAttributes,
-        bool inheritHandles, uint flags, IntPtr environment, string currentDirectory, ref STARTUPINFO startup, out PROCESS_INFORMATION info);
+        bool inheritHandles, uint flags, IntPtr environment, string currentDirectory, ref STARTUPINFOEX startup, out PROCESS_INFORMATION info);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returnSize);
+    [DllImport("kernel32.dll")]
+    static extern void DeleteProcThreadAttributeList(IntPtr list);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern uint ResumeThread(IntPtr thread);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -190,7 +207,7 @@ public static class DsaJob
 
     /** argv[0] is the attempt directory, argv[1] (ignored) the attempt's DSA_EXEC tag: a process-table scan finds
      *  the attempt by that tag while this host is starting, before it writes its group record. 126 means no directory,
-     *  125 a failure this host recorded in start-error; otherwise the wrapper's own exit status. */
+     *  125 a failure this host recorded in start-error; otherwise the wrapper's own exit status, the whole DWORD. */
     public static int Main(string[] args)
     {
         if (args == null || args.Length < 1 || String.IsNullOrEmpty(args[0])) return 126;
@@ -205,8 +222,11 @@ public static class DsaJob
             Fail(dir, "job spec", 0, failure.GetType().Name + ": " + failure.Message);
             return 125;
         }
-        int status = Run(dir, application, arguments, workingDirectory, logPath, environment);
-        return status < 0 ? 125 : status;
+        // The wrapper's status is the kernel's DWORD and nothing else: a status above 0x7fffffff stays that status
+        // instead of turning into this host's own failure code. 125/126 are only ever written by a host that recorded
+        // why it did not get to run (or did not get) the wrapper, so a caller can tell the two apart.
+        uint status;
+        return Run(dir, application, arguments, workingDirectory, logPath, environment, out status) ? unchecked((int)status) : 125;
     }
 
     /** The attempt's spec: ASCII lines, one base64-encoded UTF-16LE field each, so no code page, quoting rule or
@@ -241,13 +261,22 @@ public static class DsaJob
 
     static string Field(string line)
     {
-        return Encoding.Unicode.GetString(Convert.FromBase64String(line));
+        string value = Encoding.Unicode.GetString(Convert.FromBase64String(line));
+        // A NUL would end the field where a Win32 API (CreateProcess, the environment block) reads it, so a path or an
+        // argument would silently become a shorter one. Refuse the spec instead: nothing has been started yet.
+        if (value.IndexOf((char)0) >= 0) throw new FormatException("a job spec field contains a NUL character");
+        return value;
     }
 
-    /** Run the wrapper inside a new group and return its exit status (negative: this host failed, see start-error). */
-    static int Run(string dir, string application, string[] arguments, string workingDirectory, string logPath, string[] environment)
+    /** Run the wrapper inside a new group. True means the wrapper ran and the returned status is the full exit code the
+     *  kernel gave it; false means this host failed, wrote start-error and started nothing (or killed what it started). */
+    static bool Run(string dir, string application, string[] arguments, string workingDirectory, string logPath, string[] environment, out uint status)
     {
+        status = 0;
         IntPtr job = IntPtr.Zero, output = IntPtr.Zero, errorHandle = IntPtr.Zero, input = IntPtr.Zero, block = IntPtr.Zero;
+        IntPtr list = IntPtr.Zero, inheritable = IntPtr.Zero;
+        // DeleteProcThreadAttributeList takes only a list InitializeProcThreadAttributeList produced.
+        bool listReady = false;
         PROCESS_INFORMATION child = new PROCESS_INFORMATION();
         bool started = false;
         try
@@ -274,18 +303,48 @@ public static class DsaJob
             input = CreateFileW("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, ref inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
             if (input == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile NUL", Marshal.GetLastWin32Error());
 
-            STARTUPINFO startup = new STARTUPINFO();
-            startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-            startup.dwFlags = (int)STARTF_USESTDHANDLES;
-            startup.hStdInput = input;
-            startup.hStdOutput = output;
-            startup.hStdError = errorHandle;
+            // inheritHandles is true because the wrapper needs its standard handles, so the handle list is what says
+            // which: without it the child inherits every inheritable handle this host holds (the .NET runtime and the
+            // host that started it may keep some open), and a descriptor the command never asked for would reach it.
+            // The list names exactly the three standard handles, so the command's handle set is the one declared here.
+            IntPtr listSize = IntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref listSize);
+            if (listSize == IntPtr.Zero) return Fail(dir, "InitializeProcThreadAttributeList", Marshal.GetLastWin32Error());
+            list = Marshal.AllocHGlobal(listSize);
+            if (!InitializeProcThreadAttributeList(list, 1, 0, ref listSize))
+                return Fail(dir, "InitializeProcThreadAttributeList", Marshal.GetLastWin32Error());
+            listReady = true;
+            // The list is an array of HANDLEs; the three are the ones the child's STARTUPINFO names below.
+            inheritable = Marshal.AllocHGlobal(3 * IntPtr.Size);
+            Marshal.WriteIntPtr(inheritable, 0, input);
+            Marshal.WriteIntPtr(inheritable, IntPtr.Size, output);
+            Marshal.WriteIntPtr(inheritable, IntPtr.Size * 2, errorHandle);
+            if (!UpdateProcThreadAttribute(list, 0, new IntPtr(PROC_THREAD_ATTRIBUTE_HANDLE_LIST), inheritable, new IntPtr(3 * IntPtr.Size), IntPtr.Zero, IntPtr.Zero))
+                return Fail(dir, "UpdateProcThreadAttribute", Marshal.GetLastWin32Error());
+
+            STARTUPINFOEX startup = new STARTUPINFOEX();
+            // With EXTENDED_STARTUPINFO_PRESENT the size is the extended structure's, not STARTUPINFO's.
+            startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+            startup.StartupInfo.dwFlags = (int)STARTF_USESTDHANDLES;
+            startup.StartupInfo.hStdInput = input;
+            startup.StartupInfo.hStdOutput = output;
+            startup.StartupInfo.hStdError = errorHandle;
+            startup.lpAttributeList = list;
             block = EnvironmentBlock(environment);
-            uint flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+            uint flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT;
             if (!CreateProcessW(application, CommandLine(application, arguments), IntPtr.Zero, IntPtr.Zero, true, flags, block,
                     workingDirectory, ref startup, out child))
                 return Fail(dir, "CreateProcess " + application, Marshal.GetLastWin32Error());
             started = true;
+            // The child holds its own copies now, so this host's are closed at once instead of when the command ends:
+            // the output file and NUL are open for exactly as long as the kernel needed to hand them over, and a stopped
+            // command never leaves its log held open by a process that only started it. The attribute list is done too.
+            CloseHandle(input); input = IntPtr.Zero;
+            CloseHandle(output); output = IntPtr.Zero;
+            CloseHandle(errorHandle); errorHandle = IntPtr.Zero;
+            DeleteProcThreadAttributeList(list); listReady = false;
+            Marshal.FreeHGlobal(list); list = IntPtr.Zero;
+            Marshal.FreeHGlobal(inheritable); inheritable = IntPtr.Zero;
 
             // The wrapper is still suspended: nothing it could start runs before it belongs to the group.
             if (!AssignProcessToJobObject(job, child.hProcess))
@@ -309,8 +368,10 @@ public static class DsaJob
             if (WaitForSingleObject(child.hProcess, INFINITE) != 0) return Fail(dir, "WaitForSingleObject", Marshal.GetLastWin32Error());
             uint code;
             if (!GetExitCodeProcess(child.hProcess, out code)) return Fail(dir, "GetExitCodeProcess", Marshal.GetLastWin32Error());
+            // The record and the returned status carry the whole DWORD, above 0x7fffffff included: it is the wrapper's.
             WriteAtomic(Path.Combine(dir, "group-end"), @"{""status"":" + code.ToString(CultureInfo.InvariantCulture) + "}");
-            return unchecked((int)code);
+            status = code;
+            return true;
         }
         catch (Exception failure)
         {
@@ -324,22 +385,27 @@ public static class DsaJob
             if (input != IntPtr.Zero && input != INVALID_HANDLE_VALUE) CloseHandle(input);
             if (output != IntPtr.Zero && output != INVALID_HANDLE_VALUE) CloseHandle(output);
             if (errorHandle != IntPtr.Zero && errorHandle != INVALID_HANDLE_VALUE) CloseHandle(errorHandle);
+            if (listReady) DeleteProcThreadAttributeList(list);
+            if (list != IntPtr.Zero) Marshal.FreeHGlobal(list);
+            if (inheritable != IntPtr.Zero) Marshal.FreeHGlobal(inheritable);
             if (block != IntPtr.Zero) Marshal.FreeHGlobal(block);
             // The group's only handle (non-inherited): closing it kills every process the command left behind.
             if (job != IntPtr.Zero) CloseHandle(job);
         }
     }
 
-    static int Fail(string dir, string what, int code)
+    /** Record why this host did not start the wrapper and answer false (see Run): the negative return this code used to
+     *  carry could be confused with a wrapper status above 0x7fffffff. */
+    static bool Fail(string dir, string what, int code)
     {
         return Fail(dir, what, code, null);
     }
 
-    static int Fail(string dir, string what, int code, string detail)
+    static bool Fail(string dir, string what, int code, string detail)
     {
         string text = what + " failed (error " + code.ToString(CultureInfo.InvariantCulture) + ")" + (detail == null ? "" : ": " + detail);
         try { File.WriteAllText(Path.Combine(dir, "start-error"), text); } catch (Exception) { }
-        return -1;
+        return false;
     }
 
     static void WriteAtomic(string path, string text)

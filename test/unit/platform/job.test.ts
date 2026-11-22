@@ -81,8 +81,43 @@ test("the owner source is self-contained, ASCII, and carries the Win32 group con
   assert.match(JOB_HOST_SOURCE, /CreateFileW\("NUL"/);
   assert.match(JOB_HOST_SOURCE, /FILE_APPEND_DATA/);
   assert.ok(!/GENERIC_WRITE|SetFilePointerEx/.test(JOB_HOST_SOURCE), "no read/write handle seeking to the end");
-  assert.equal(JOB_HOST_SOURCE.match(/startup\.hStd(Output|Error)/g)?.length, 2, "stdout and stderr have their own handle");
-  assert.equal(JOB_HOST_SOURCE.match(/startup\.hStdInput/g)?.length, 1, "stdin is the empty NUL handle");
+  assert.equal(JOB_HOST_SOURCE.match(/startup\.StartupInfo\.hStd(Output|Error)/g)?.length, 2, "stdout and stderr have their own handle");
+  assert.equal(JOB_HOST_SOURCE.match(/startup\.StartupInfo\.hStdInput/g)?.length, 1, "stdin is the empty NUL handle");
+  // The wrapper inherits exactly the three standard handles (STARTUPINFOEX + a one-entry handle list), not every
+  // inheritable handle the owner happens to hold: the list names all three, and inheritHandles stays true for it.
+  assert.match(JOB_HOST_SOURCE, /struct STARTUPINFOEX/);
+  assert.match(JOB_HOST_SOURCE, /ref STARTUPINFOEX startup/);
+  assert.match(JOB_HOST_SOURCE, /EXTENDED_STARTUPINFO_PRESENT/);
+  assert.match(JOB_HOST_SOURCE, /CREATE_SUSPENDED \| CREATE_UNICODE_ENVIRONMENT \| DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP \| EXTENDED_STARTUPINFO_PRESENT;/,
+    "the creation carries the extended startup info");
+  assert.match(JOB_HOST_SOURCE, /startup\.StartupInfo\.cb = Marshal\.SizeOf\(typeof\(STARTUPINFOEX\)\)/,
+    "the extended structure's size, which is what the flag requires");
+  assert.match(JOB_HOST_SOURCE, /startup\.lpAttributeList = list;/);
+  assert.match(JOB_HOST_SOURCE, /InitializeProcThreadAttributeList/);
+  assert.match(JOB_HOST_SOURCE, /UpdateProcThreadAttribute\(list, 0, new IntPtr\(PROC_THREAD_ATTRIBUTE_HANDLE_LIST\)/,
+    "one attribute: the handle list");
+  assert.match(JOB_HOST_SOURCE, /DeleteProcThreadAttributeList/);
+  assert.equal(JOB_HOST_SOURCE.match(/Marshal\.WriteIntPtr\(inheritable/g)?.length, 3, "the list names the three handles");
+  assert.match(JOB_HOST_SOURCE, /IntPtr\.Zero, IntPtr\.Zero, true, flags, block,/, "inheritHandles stays true, restricted by the list");
+  // The owner's own copies of those handles are closed as soon as the kernel has passed them on: the log is not held
+  // open by a program that only started the command, and the suspended child is not waited on with open stdio here.
+  for (const name of ["input", "output", "errorHandle"]) {
+    const at = JOB_HOST_SOURCE.indexOf(`CloseHandle(${name}); ${name} = IntPtr.Zero;`);
+    assert.ok(at > JOB_HOST_SOURCE.indexOf("CreateProcessW(application"), `${name} is closed after the creation`);
+    assert.ok(at < JOB_HOST_SOURCE.indexOf("AssignProcessToJobObject(job, child.hProcess)"),
+      `${name} is closed before the child may run`);
+    assert.ok(at < JOB_HOST_SOURCE.indexOf("WaitForSingleObject(child.hProcess"), `${name} is not held until the command ends`);
+  }
+  // A spec field with an embedded NUL is refused while the spec is decoded: no Win32 API ever sees a truncated path.
+  assert.match(JOB_HOST_SOURCE, /IndexOf\(\(char\)0\) >= 0\) throw new FormatException/);
+  assert.ok(JOB_HOST_SOURCE.indexOf("a job spec field contains a NUL character") < JOB_HOST_SOURCE.indexOf("job = CreateJobObjectW"),
+    "the NUL check precedes anything Win32 is handed");
+  // The wrapper's status is the full DWORD; 125/126 stay this host's own "nothing ran" codes.
+  assert.match(JOB_HOST_SOURCE, /bool Run\(.*out uint status\)/);
+  assert.match(JOB_HOST_SOURCE, /unchecked\(\(int\)status\)/);
+  assert.ok(!/status < 0 \? 125 : status/.test(JOB_HOST_SOURCE), "a status above 0x7fffffff is never re-read as a failure");
+  assert.match(JOB_HOST_SOURCE, /status = code;/);
+  assert.match(JOB_HOST_SOURCE, /static bool Fail\(/);
   // A run that never reached the program is distinguishable from one that failed inside it.
   assert.ok(JOB_HOST_SOURCE.indexOf(JOB_BEGIN) < JOB_HOST_SOURCE.indexOf("job = CreateJobObjectW"), "the begin record precedes any group");
   // No PowerShell anywhere in the launch path (the reason the previous helper could not start detached).
@@ -240,6 +275,38 @@ test("a Unicode and curly-quoted attempt directory, argv, cwd and environment ar
   assert.equal(seen.cwd, dir);
   assert.equal(seen.env, "v\u00e4l\u00fce \u2019x\u2019");
   assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0);
+});
+
+test("a spec field with an embedded NUL is refused before Win32 sees it", { skip: windowsOnly, timeout: 120_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  // The owner decodes every field before it hands anything to Win32: a NUL would end a path or an environment value
+  // there and the attempt would quietly run a different program with a shorter argument. It refuses the spec instead.
+  const reason = await spawnInJob(dir, { exe: process.execPath, args: ["-e", "0"], cwd: dir,
+    log: join(dir, "output.log"), env: { ...process.env, DSA_NUL: "before\u0000after" } })
+    .then(() => "", (error: Error) => error.message);
+  assert.match(reason, /job spec/);
+  assert.match(reason, /NUL/);
+  assert.ok(existsSync(join(dir, JOB_BEGIN)), "the owner ran and refused the spec itself");
+  assert.ok(!existsSync(join(dir, JOB_GROUP)), "no group was created");
+  assert.ok(!existsSync(join(dir, JOB_END)), "no wrapper ran");
+  assert.match(readFileSync(join(dir, JOB_ERROR), "utf8"), /FormatException: a job spec field contains a NUL character/);
+  assert.match(readFileSync(join(dir, JOB_HOST_EXIT), "utf8"), /"code":125/, "a refused spec exits 125, the host's own code");
+});
+
+test("a wrapper status above 0x7fffffff stays the wrapper's status", { skip: windowsOnly, timeout: 120_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const program = join(dir, "wide.mjs");
+  const status = 0xC0000005; // the whole DWORD, negative as a signed int
+  writeFileSync(program, `process.exit(${status});\n`);
+  const launched = await spawnInJob(dir, { exe: process.execPath, args: [program], cwd: dir,
+    log: join(dir, "output.log"), env: { ...process.env } });
+  assert.ok(launched, "the wrapper started, so this is not a host failure");
+  await launched.exited;
+  assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, status, "the record carries the whole DWORD");
+  assert.ok(!existsSync(join(dir, JOB_ERROR)), "nothing failed in this host");
+  // The owner's own exit is the same DWORD: 125 would mean this host's failure and would be indistinguishable from it.
+  const code = (JSON.parse(readFileSync(join(dir, JOB_HOST_EXIT), "utf8")) as { code: number }).code;
+  assert.equal(code >>> 0, status, `the owner exits with the wrapper's status, got ${code}`);
 });
 
 test("a program is in the group before it may act, and the group's crash takes its descendants with it", { skip: windowsOnly, timeout: 180_000 }, async t => {
