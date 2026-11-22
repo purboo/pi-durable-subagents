@@ -13,9 +13,9 @@
 // Command calls (CallSpec.command) record no exec/tracked/fenced entries (nothing that handles agent executions picks them
 // up): command-intent{call,id,n} before the spawn (id = command:<call>#<n> is the attempt and its process tag DSA_EXEC;
 // n is 1, or 2 for the single rerun); command-started{call,id,pid,start,dir,group?,uncertain?} after it (the wrapper's identity, the
-// attempt directory, and on Windows {pid,start} of the job helper that owns the attempt's kernel group; its ts starts the
-// wall-clock timeout; `uncertain` means the start could not be confirmed -- the helper was adopted with pid/start of the
-// helper itself, and only a scan that finds it gone may let another attempt start); command-spawn-failed{call,id,error}: the command could not
+// attempt directory, and on Windows {pid,start} of the job host that owns the attempt's kernel group; its ts starts the
+// wall-clock timeout; `uncertain` means the start could not be confirmed -- the host was adopted with pid/start of the
+// host itself, and only a scan that finds it gone may let another attempt start); command-spawn-failed{call,id,error}: the command could not
 // start (it seals failed, never reruns); command-timeout{call,id}: the deadline passed, recorded before the process tree
 // is ended (as stop-intent is for a stop), so a crash during that fence still seals timeout; command-withdrawn{call,id}:
 // the intent was recorded but no process started (a retirement or the orchestrator's exit came first): a later start
@@ -1065,7 +1065,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   /** Attempts whose process table read failed (logged once: a broken observer would otherwise fill the log). */
   const unobserved = new Set<string>();
   const hasStopIntent = (journal: JournalHandle, call: string) => entriesFor(journal, call).some(e => e.type === "stop-intent");
-  /** The attempt's known identities (from its latest command-started): the wrapper and, on Windows, the job helper that
+  /** The attempt's known identities (from its latest command-started): the wrapper and, on Windows, the job host that
    *  owns its kernel group (whose descendants are the whole attempt), for scans and fences. */
   const commandKnown = (started: Entry | undefined): ProcInfo[] => {
     if (!started) return [];

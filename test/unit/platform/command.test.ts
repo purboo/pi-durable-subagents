@@ -124,7 +124,7 @@ test("journal questions: unsealed command calls and retired attempts", () => {
 });
 
 test("retired command attempts carry the Windows job group identity for their fence", () => {
-  // The attempt's group (the helper that holds its Job Object) must travel with the wrapper's identity: a retired call is
+  // The attempt's group (the job host that holds its Job Object) must travel with the wrapper's identity: a retired call is
   // fenced by both, so a second attempt never starts while the first attempt's group can still act.
   let seq = 0;
   const e = (type: string, fields: Record<string, unknown>) => ({ seq: ++seq, ts: 0, type, ...fields }) as Entry;

@@ -52,7 +52,7 @@ export function liveCommandCalls(entries: readonly Entry[]): string[] {
   return [...latest].filter(([call, id]) => !ended.has(call) && !withdrawn.has(id)).map(([call]) => call);
 }
 /** Retired command calls without a seal: their processes, if any still run, are ended at the next start. `group` is the
- *  Windows job helper that owns the attempt's kernel group (absent on POSIX). */
+ *  Windows job host that owns the attempt's kernel group (absent on POSIX). */
 export function retiredCommandAttempts(entries: readonly Entry[]): { call: string; id: string; pid?: number; start?: string; group?: { pid: number; start: string } }[] {
   const retired = new Set(entries.filter(e => e.type === "retired").map(e => String(e.call)));
   const sealed = new Set(entries.filter(e => e.type === JT.sealed).map(e => String(e.call)));

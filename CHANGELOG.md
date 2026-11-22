@@ -3,14 +3,14 @@
 ## Unreleased
 
 - Command attempt recovery across the window before the group record: the attempt's `DSA_EXEC` tag is now spelled in the
-  job helper's own command line (previously only a Windows-unreadable environment carried it for the helper), so a
-  successor that finds a durable `command-intent` while the helper is still compiling finds the attempt by scanning and
+  job host's own command line (previously only a Windows-unreadable environment carried it for the owner), so a
+  successor that finds a durable `command-intent` while the host is still starting finds the attempt by scanning and
   starts no second one; the wrapper keeps its tag too. A handshake that cannot be completed no longer reports the attempt
-  failed while it may still act: the helper is ended and a refusal is raised only when its end is confirmed (its exit
+  failed while it may still act: the host is ended and a refusal is raised only when its end is confirmed (its exit
   closes the group's only handle), otherwise the attempt is adopted — its identity is recorded in `command-started` (with
   the reason as `uncertain`) and the call keeps watching it, so no rerun, retirement or stop can start a second attempt
   until a scan finds it gone, and nothing is killed by a bare pid. A sharing failure while reading the group record is
-  retried (the helper still holds or renames the file), a failed process-table observation is retried and never read as
+  retried (the host still holds or renames the file), a failed process-table observation is retried and never read as
   "no process left" (the executor watches again instead of calling the attempt lost), and the same retry guards the
   scans that end a stopped or timed-out attempt.
 - Windows command environments merge by variable name, not by spelling. Windows has one variable per name (`Path` is
@@ -27,12 +27,19 @@
 - Windows command attempts run inside a Job Object of their own: the wrapper is created suspended, assigned to the
   kernel-owned group before its first instruction, and the group's only handle (non-inherited) dies with the attempt, so
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ends every process the command left behind — when it finishes, when its wrapper
-  crashes, and when the orchestrator that started it is gone. A small PowerShell helper (PowerShell 5.1 compiling the
-  Win32 calls in memory with `Add-Type`; no native binary, no npm dependency, no separate file in the package) owns the
-  group and records the suspended wrapper's pid before resuming it; the orchestrator fails closed when the group cannot
-  be created, assigned or observed. The start record keeps the wrapper's identity and adds the helper's, so a scan finds
-  the whole attempt even after its wrapper has gone and no second attempt starts while the group can still act. POSIX
-  command calls are unchanged.
+  crashes, and when the orchestrator that started it is gone. The group is owned by a standalone .NET Framework winexe
+  compiled from C# embedded in `src/platform/job.ts` with the framework's own `csc.exe` (the verified absolute path under
+  `%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319`, `Framework\` as the x86 fallback; no npm dependency, no native
+  addon, no file to ship): Node spawns that one executable directly, detached and hidden, with no PowerShell in the
+  detached path (PowerShell 5.1 and pwsh exit 0 without running a script when they have no console). Each launch compiles
+  into a fresh private directory inside the attempt directory, so a stale executable is never reused. The compilation is
+  foreground and bounded and starts no command: a starter that dies during it leaves only inert files, and a missing or
+  failing compiler refuses the start closed rather than weakening the group. The executor's proceed/stop gate is checked
+  again after the compilation, immediately before the spawn, so a stop that arrived while the compiler ran starts
+  nothing. The owner records the suspended wrapper's pid before resuming it, takes its argv marker
+  (`DSA_EXEC=<id>`), decodes a UTF-16LE spec (Unicode paths, curly quotes, empty stdin, two append-only output handles),
+  and its identity is recorded with the wrapper's, so a scan finds the whole attempt even after its wrapper has gone and
+  no second attempt starts while the group can still act. POSIX command calls are unchanged.
 - Native Windows support: the extension enables itself on `win32` instead of refusing to load. The process layer uses
   PowerShell/CIM (`Win32_Process`, pid plus creation time), `taskkill /T` for tree fences, a Node-held lock directory
   for file exclusion, a Node command wrapper that records exit status, `cmd.exe` for string commands and gates, and

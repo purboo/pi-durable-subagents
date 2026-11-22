@@ -7,11 +7,13 @@
 // the orchestrator that started it.
 //
 // On Windows the wrapper also runs inside a Windows Job Object of its own (platform/job.ts): the wrapper is the group's
-// root, created suspended and assigned before its first instruction, and the group's only handle dies with the helper.
-// A command attempt therefore cannot leave descendants behind, and a scan that finds the wrapper gone finds the group
-// closed: no second attempt starts while processes of the first can still act. The attempt's `exec` tag goes into the
-// helper's own command line as well, so the attempt is findable while the helper is still compiling -- the window between
-// the recorded intent and the group record, where the wrapper does not exist yet.
+// root, created suspended and assigned before its first instruction, and the group's only handle dies with the owner --
+// a small .NET Framework winexe compiled per launch with the framework's own csc.exe. A command attempt therefore cannot
+// leave descendants behind, and a scan that finds the wrapper gone finds the group closed: no second attempt starts
+// while processes of the first can still act. The attempt's `exec` tag goes into the owner's own command line as well,
+// so the attempt is findable while the owner is still starting -- the window between the recorded intent and the group
+// record, where the wrapper does not exist yet. The owner is compiled during the start, so `proceed` is checked again
+// after the compilation and immediately before the spawn: a stop that arrived while the compiler ran starts nothing.
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, stat, open, writeFile } from "node:fs/promises";
@@ -90,17 +92,18 @@ export interface CommandSpawn {
   /** The execution tag, written into the Windows wrapper's command line (its environment is unreadable elsewhere). */
   exec?: string;
   /** The last check, synchronous, after every preparation and immediately before the spawn (no await between them):
-   *  false starts no process (spawnCommand resolves undefined). */
+   *  false starts no process (spawnCommand resolves undefined). On Windows the preparation includes compiling the Job
+   *  Object owner, so the check is made twice: before the compilation and again after it, immediately before the spawn. */
   proceed?: () => boolean;
 }
 export interface SpawnedCommand {
   /** The wrapper process (the session leader); `start` is its start token ("" when it ended before it was captured). */
   pid: number; start: string;
-  /** Windows: the job helper that owns the attempt's kernel group. Its identity is tracked with the wrapper's, so a scan
-   *  finds the whole group and its absence proves the group is closed (see platform/job.ts). */
+  /** Windows: the job host (compiled owner) that holds the attempt's kernel group. Its identity is tracked with the
+   *  wrapper's, so a scan finds the whole group and its absence proves the group is closed (see platform/job.ts). */
   group?: { pid: number; start: string };
-  /** Windows: the attempt was started but its helper could not be confirmed retired (platform/job.ts). `pid`/`start` are
-   *  then the helper's identity; the attempt must be watched until a scan confirms it retired, never started again. */
+  /** Windows: the attempt was started but its owner could not be confirmed retired (platform/job.ts). `pid`/`start` are
+   *  then the owner's identity; the attempt must be watched until a scan confirms it retired, never started again. */
   uncertain?: string;
   /** Resolves when the wrapper ends while this process runs (a wake-up only: the exit record is the outcome). */
   exited: Promise<void>;
@@ -130,11 +133,15 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
       const command = typeof spec.command === "string" ? spec.command : (() => { const target = execTarget(spec.command[0]!, spec.command.slice(1), { env }); return [target.command, ...target.args]; })();
       await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command, cwd: spec.cwd, env }));
       await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
+      // An already revoked permission never compiles; spawnInJob checks again after the compilation, immediately before
+      // the spawn (a stop or retirement that arrived while the compiler ran still starts no process).
       if (spec.proceed && !spec.proceed()) return undefined;
       // The wrapper's environment as a direct spawn would give it; the command inside still gets command.json's env.
+      // spawnInJob compiles the Job Object owner (bounded, foreground, no process of the attempt) and resolves undefined
+      // when its post-compilation check refuses.
       return await spawnInJob(spec.dir, { exe: process.execPath, env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
         args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [`DSA_EXEC=${spec.exec}`] : [])],
-        ...(spec.exec ? { exec: spec.exec } : {}) });
+        ...(spec.exec ? { exec: spec.exec } : {}) }, spec.proceed ? { proceed: spec.proceed } : {});
     }
     const mv = resolveMv(), argv = commandArgv(spec.command);
     if (spec.proceed && !spec.proceed()) return undefined;

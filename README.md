@@ -43,8 +43,11 @@ comes from PowerShell/CIM (`Win32_Process`, identity is pid plus creation
 time), process trees end with `taskkill /T`, file locks are a small Node
 helper holding an atomically created lock directory, command calls run through
 `cmd.exe` inside a Windows Job Object per attempt (a kernel-owned group: the
-wrapper is assigned before it runs, and the group's last handle dying kills
-whatever the command left behind), and `install-service` uses Task Scheduler.
+wrapper is assigned before it runs, the group's only handle is held by a small
+.NET Framework executable compiled per launch from source carried in the
+package with the framework's own `csc.exe`, and the group's last handle dying
+kills whatever the command left behind), and `install-service` uses Task
+Scheduler.
 Two Windows differences: another process's environment is unreadable, so
 execution identity is the process tree (a grandchild whose parent exited
 before a scan is not found by the `DSA_EXEC` tag the way it is on Linux, while
@@ -454,12 +457,21 @@ directory. On Windows the wrapper is the root of a Job Object of its own: it
 is created suspended, assigned to the group before its first instruction, and
 the group's only handle dies with the attempt, so every process the command
 starts is in the group and cannot outlive it (a wrapper crash or a killed job
-helper ends the group; a command that is still running keeps running when the
-orchestrator stops). The attempt's tag is also spelled in that helper's own
-command line, so a successor that finds a recorded intent while the helper is
-still compiling -- before the group record and the wrapper exist -- still finds
-the attempt and starts nothing else. Only a confirmed retirement lets a start
-fail: when the handshake cannot be completed and the helper cannot be shown to
+host ends the group; a command that is still running keeps running when the
+orchestrator stops). The group is held by a small .NET Framework winexe that
+this package compiles per launch -- in a fresh private directory -- with the
+C# compiler of the framework every supported Windows ships
+(`%SystemRoot%\Microsoft.NET\Framework64|Framework\v4.0.30319\csc.exe`, with
+the 32-bit framework as fallback). The compilation is foreground and bounded,
+starts no command, and finishes before the wrapper exists; the orchestrator
+rechecks its proceed/stop decision after it, immediately before the spawn. If
+the compiler is missing or fails, the start is refused closed: no group, no
+command, and the reason is recorded with the attempt. The attempt's tag is
+also spelled in the owner's own command line, so a successor that finds a
+recorded intent while the owner is still starting -- before the group record
+and the wrapper exist -- still finds the attempt and starts nothing else. Only
+a confirmed retirement lets a start
+fail: when the handshake cannot be completed and the owner cannot be shown to
 have ended, the attempt is adopted and tracked (its identity is recorded, and a
 scan that finds it gone is what lets another attempt start), never reported
 failed while it may still act. The command sees the orchestrator's environment plus `env`,

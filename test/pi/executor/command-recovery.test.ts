@@ -1,6 +1,6 @@
 // Command lifetime recovery at the executor, narrowly: the cut between a recorded `command-intent` and its
-// `command-started` record. A successor finds the intent, the attempt (or the job helper that will run it) is still live,
-// and nothing may start a second attempt -- not when the helper is still compiling, not when the process table fails for
+// `command-started` record. A successor finds the intent, the attempt (or the job host that will run it) is still live,
+// and nothing may start a second attempt -- not when the host is still starting, not when the process table fails for
 // a moment. Distinct from the crash-cut checks of command.test.ts, which run with the start record's identity.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
@@ -127,7 +127,7 @@ test("recovery before command-started: the compile window (a tag, no group recor
   const call = f.ticket({ command, rerun: true }), id = `command:${call.callId}#1`, dir = join(callDir(f.home, f.wid, "a", 1), "command-1");
   await mkdirSync(dir, { recursive: true });
   await f.journal.append("command-intent", { call: call.callId, id, n: 1 });
-  // The shape a successor sees while the Windows helper is still compiling: one process carrying the attempt's tag, no
+  // The shape a successor sees while the Windows host is still starting: one process carrying the attempt's tag, no
   // group record, no wrapper, no exit record. Its end is what may let another start; its life must never overlap one.
   const helper = join(f.cwd, "helper.mjs");
   writeFileSync(helper, `import { appendFileSync } from "node:fs";\nsetTimeout(() => appendFileSync(${JSON.stringify(marker)}, "helper-end\\n"), 700);\n`);
