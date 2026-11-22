@@ -1,5 +1,6 @@
 // Run the same process-table read with selected Windows system variables. Log only timings and row counts.
 import { execFile } from "node:child_process";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { IS_WINDOWS, PROCESS_ROWS_SCRIPT, cimScript, helperEnv, parseProcessRows, powershellPath } from "../src/platform/windows.ts";
 
@@ -33,6 +34,15 @@ await query('derived-scan', helperEnv(isolated));
 const fixed = await query('explicit-import', helperEnv(isolated), cimScript(PROCESS_ROWS_SCRIPT));
 if (!fixed) {
   process.exitCode = 1;
+  const root = process.env.SystemRoot;
+  const programModules = join(process.env.ProgramFiles, 'WindowsPowerShell', 'Modules');
+  const systemModules = join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
+  for (const [label, path] of Object.entries({ programModules, systemModules, combined: `${programModules};${systemModules}` })) {
+    await query(label, { ...helperEnv(isolated), PSModulePath: path }, cimScript(PROCESS_ROWS_SCRIPT));
+  }
+  // Query System.Management without importing a PowerShell module. Verify PID and creation time using the production parser.
+  const managed = String.raw`$ErrorActionPreference = 'Stop'; $s = [wmisearcher]'SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process'; foreach ($p in $s.Get()) { if ($p.CreationDate) { $d = [System.Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate); [string]$p.ProcessId + [char]9 + $p.ParentProcessId + [char]9 + $d.Ticks } }`;
+  await query('system-management', helperEnv(isolated), managed);
   // Record which *individual* directory restores discovery if an explicit import is insufficient.
   for (const [index, path] of (process.env.PSModulePath ?? '').split(';').filter(Boolean).entries()) {
     await query(`module-dir-${index}`, { ...isolated, PSModulePath: path });
