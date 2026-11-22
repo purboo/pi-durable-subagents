@@ -16,8 +16,8 @@ import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   JOB_BEGIN, JOB_END, JOB_ERROR, JOB_GROUP, JOB_HOST_EXE, JOB_HOST_EXIT, JOB_HOST_LOG, JOB_HOST_MARKER, JOB_HOST_PREFIX,
-  JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, asciiJson, compileJobHost, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
-  jobHostArgv, jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, spawnInJob, startError,
+  JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, JobPrepareCancelled, asciiJson, compileJobHost, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
+  jobHostArgv, jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, spawnInJob, startError, type PublishBuild,
 } from "../../../src/platform/job.ts";
 import { winProcessRows } from "../../../src/platform/windows.ts";
 
@@ -627,6 +627,64 @@ test("publishing the compiler's output retries a transient rename and keeps the 
   // Only a build file that is genuinely absent reads as "wrote no executable".
   await assert.rejects(publishBuild("DsaJob.build.exe", "DsaJob.exe",
     { renameFile: async () => { throw Object.assign(new Error("ENOENT: no such file or directory, rename"), { code: "ENOENT" }); } }), /wrote no executable/);
+});
+
+// A cancelled publication is a different outcome from a publication that failed: the caller removes what the compiler
+// wrote and records nothing, so a stop or a suspension cannot seal an attempt as failed for a rename it no longer needs.
+test("a cancelled publication wakes the retry at once and is never reported as a publish failure", async () => {
+  const controller = new AbortController(), busy = () => Object.assign(new Error("EBUSY: resource busy or locked, rename 'DsaJob.build.exe' -> 'DsaJob.exe'"), { code: "EBUSY" });
+  let attempts = 0;
+  const started = Date.now();
+  const publishing = publishBuild("DsaJob.build.exe", "DsaJob.exe", { retryMs: 5_000, timeoutMs: 60_000, signal: controller.signal,
+    renameFile: async () => { attempts += 1; setTimeout(() => controller.abort(), 10); throw busy(); } });
+  const error = await publishing.then(() => undefined, (reason: unknown) => reason);
+  const elapsed = Date.now() - started;
+  assert.ok(prepareCancelled(error), `a cancellation, not a publish failure: ${String(error)}`);
+  assert.equal((error as Error).name, "JobPrepareCancelled");
+  assert.equal(attempts, 1, "the retry delay is not waited out");
+  assert.doesNotMatch(String((error as Error).message), /could not be published/);
+  assert.ok(elapsed < 2_000, `the retry wait is woken by the abort (${elapsed} ms against a ${5_000} ms retry delay)`);
+  // A publication that was already cancelled when it started never renames at all.
+  const done = new AbortController(); done.abort();
+  let renamed = 0;
+  const early = await publishBuild("DsaJob.build.exe", "DsaJob.exe", { signal: done.signal,
+    renameFile: async () => { renamed += 1; } }).then(() => undefined, (reason: unknown) => reason);
+  assert.ok(prepareCancelled(early), `a cancellation, not a success: ${String(early)}`);
+  assert.equal(renamed, 0, "nothing is published for a start that was already cancelled");
+  // A rename that succeeds does not make a cancellation that arrived meanwhile a success: nothing may follow it.
+  const late = new AbortController();
+  const after = await publishBuild("DsaJob.build.exe", "DsaJob.exe", { signal: late.signal,
+    renameFile: async () => { late.abort(); } }).then(() => undefined, (reason: unknown) => reason);
+  assert.ok(prepareCancelled(after), `a cancellation that raced the rename, not a success: ${String(after)}`);
+  // The distinction holds the other way too: a real publish failure is reported with its reason, never as a cancellation.
+  const failed = await publishBuild("DsaJob.build.exe", "DsaJob.exe", { retryMs: 5, timeoutMs: 30, signal: new AbortController().signal,
+    renameFile: async () => { throw Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" }); } })
+    .then(() => undefined, (reason: unknown) => reason);
+  assert.ok(!prepareCancelled(failed), `a publish failure, not a cancellation: ${String(failed)}`);
+  assert.match((failed as Error).message, /could not be published as DsaJob\.exe.*EPERM/);
+});
+
+test("a cancellation while the compiler's output is published records nothing and removes what it wrote", { skip: posixOnly, timeout: 60_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const compiler = await stubCompiler(dir, 'import { writeFileSync } from "node:fs"; writeFileSync("DsaJob.build.exe", "MZ");');
+  const controller = new AbortController();
+  let entered!: () => void; const publishing = new Promise<void>(resolve => { entered = resolve; });
+  // The publication the compiler's success leads to: it holds the fresh file (the renamer is busy) until it is cancelled.
+  const publish: PublishBuild = (_build, _exe, options) => new Promise<void>((_resolve, reject) => {
+    entered();
+    if (options?.signal?.aborted) return reject(new JobPrepareCancelled());
+    options?.signal?.addEventListener("abort", () => reject(new JobPrepareCancelled()), { once: true });
+  });
+  const staging = prepareJob(dir, launchFor(dir), { compiler, publish, signal: controller.signal });
+  await publishing;
+  const written = readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX));
+  assert.equal(written.length, 1, "the compiler wrote its output while the publication was in flight");
+  controller.abort();
+  const error = await staging.then(() => undefined, (reason: unknown) => reason);
+  assert.ok(prepareCancelled(error), `a cancellation, not a publish failure: ${String(error)}`);
+  assert.ok(!existsSync(join(dir, JOB_ERROR)), "no reason is recorded for a cancellation");
+  assert.deepEqual(readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX)), [], "what it wrote is removed");
+  assert.ok(!existsSync(join(dir, JOB_SPEC)), "no spec is left for an attempt that did not start");
 });
 
 test("a staged owner is the one the start runs, and the start checks the gate with it already compiled", { skip: windowsOnly, timeout: 180_000 }, async t => {

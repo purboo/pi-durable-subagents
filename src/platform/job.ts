@@ -653,11 +653,12 @@ export interface JobPrep {
  *  and write the spec the owner reads. A rejection is either fail-closed (`JOB_ERROR` recorded, the attempt cannot start)
  *  or a {@link JobPrepareCancelled} (nothing was recorded and nothing stays). */
 export async function prepareJob(dir: string, launch: JobLaunch,
-  options: { compiler?: string; compileMs?: number; signal?: AbortSignal } = {}): Promise<JobPrep> {
+  options: { compiler?: string; compileMs?: number; signal?: AbortSignal; publish?: PublishBuild } = {}): Promise<JobPrep> {
   // Evidence of an earlier attempt in the same directory must never be read as this attempt's.
   for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
   const host = await compileJobHost(dir, { ...(options.compiler ? { compiler: options.compiler } : {}),
-    ...(options.compileMs ? { timeoutMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}) });
+    ...(options.compileMs ? { timeoutMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.publish ? { publish: options.publish } : {}) });
   const release = async () => { await rm(host.dir, { recursive: true, force: true }); await rm(join(dir, JOB_SPEC), { force: true }); };
   if (options.signal?.aborted) { await release(); throw new JobPrepareCancelled(); }
   await writeFile(join(dir, JOB_SPEC), jobSpecText(launch));
@@ -668,8 +669,10 @@ export async function prepareJob(dir: string, launch: JobLaunch,
  *  command is started, so a starter that dies here leaves only inert files), and fail-closed (a missing compiler, a
  *  compiler failure or a missing executable throws before anything of the attempt exists). `signal` cancels it: the
  *  compiler is ended, what it wrote is removed and the rejection is a {@link JobPrepareCancelled}, which is not a failure
- *  of the attempt (nothing of it exists, and it is never recorded as one). */
-export async function compileJobHost(dir: string, options: { compiler?: string; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<JobHostPaths> {
+ *  of the attempt (nothing of it exists, and it is never recorded as one). A cancellation during the publication of the
+ *  compiler's output is the same cancellation: the retries stop at once, what the compiler wrote is removed and nothing is
+ *  recorded as a publish failure. */
+export async function compileJobHost(dir: string, options: { compiler?: string; timeoutMs?: number; signal?: AbortSignal; publish?: PublishBuild } = {}): Promise<JobHostPaths> {
   const paths = jobHostPaths(dir), signal = options.signal;
   await mkdir(paths.dir, { recursive: true });
   /** A cancelled preparation leaves nothing behind: no compiled owner, no source, no reason (nothing failed). */
@@ -703,7 +706,14 @@ export async function compileJobHost(dir: string, options: { compiler?: string; 
     if (signal?.aborted) throw await cancelled();
     // The executable is the one just produced: the directory is new, so this cannot be a stale binary (a compiler that
     // reports success without writing it is a failure, never a reason to look elsewhere).
-    await publishBuild(join(paths.dir, build), paths.exe);
+    try { await (options.publish ?? publishBuild)(join(paths.dir, build), paths.exe, { ...(signal ? { signal } : {}) }); }
+    catch (error) {
+      // A publication ended by the cancellation is the cancellation (nothing was started, nothing is recorded): only a
+      // publish that failed on its own is fail-closed.
+      if (prepareCancelled(error) || signal?.aborted) throw await cancelled();
+      throw error;
+    }
+    if (signal?.aborted) throw await cancelled();
     if (!existsSync(paths.exe)) throw new Error(`the Windows .NET Framework compiler wrote no executable at ${paths.exe}`);
   } catch (error) {
     if (prepareCancelled(error)) throw error;
@@ -717,21 +727,55 @@ export async function compileJobHost(dir: string, options: { compiler?: string; 
 /** Publish the compiler's output under its final name: the rename is atomic, so a retry can never expose a half-written
  *  executable, and Windows scanners and indexers hold a fresh file for a moment (a transient code). A failure that stays
  *  is reported with its own reason, and only a build file that is genuinely absent reads as "wrote no executable" --
- *  reporting every rename failure that way hides the real cause. `renameFile` and the timings are test seams. */
+ *  reporting every rename failure that way hides the real cause. `signal` cancels it: the retries and their delay end at
+ *  once with a {@link JobPrepareCancelled}, which is a cancellation and never a publish failure (the caller removes what
+ *  the compiler wrote). `renameFile` and the timings are test seams. */
 export async function publishBuild(build: string, exe: string,
-  options: { timeoutMs?: number; retryMs?: number; renameFile?: (from: string, to: string) => Promise<void> } = {}): Promise<void> {
+  options: { timeoutMs?: number; retryMs?: number; renameFile?: (from: string, to: string) => Promise<void>; signal?: AbortSignal } = {}): Promise<void> {
   const renameFile = options.renameFile ?? rename, retryMs = options.retryMs ?? JOB_PUBLISH_RETRY_MS,
-    budgetMs = options.timeoutMs ?? JOB_PUBLISH_MS, end = Date.now() + budgetMs;
+    budgetMs = options.timeoutMs ?? JOB_PUBLISH_MS, signal = options.signal, end = Date.now() + budgetMs;
+  /** A cancelled publication is not a failure to publish: nothing is recorded about it and the output is not needed. */
+  const cancelled = () => new JobPrepareCancelled();
   for (;;) {
-    try { await renameFile(build, exe); return; }
-    catch (error) {
-      const reason = String((error as Error)?.message ?? error);
-      if (absent(error)) throw new Error(`the Windows .NET Framework compiler wrote no executable for ${exe}`);
-      if (!transientRead(error)) throw new Error(`the Windows .NET Framework compiler output could not be published as ${exe}: ${reason}`);
-      if (Date.now() + retryMs >= end) throw new Error(`the Windows .NET Framework compiler output could not be published as ${exe} within ${budgetMs} ms: ${reason}`);
-      await delay(retryMs);
+    if (signal?.aborted) throw cancelled();
+    let failure: unknown;
+    try { await renameFile(build, exe); } catch (error) { failure = error; }
+    if (failure === undefined) {
+      // The rename succeeded, but a cancellation that arrived while it ran still wins: nothing may follow it (the caller
+      // removes what the compiler wrote).
+      if (signal?.aborted) throw cancelled();
+      return;
     }
+    // A rename that failed while the start was cancelled is that cancellation, not its own reason: the classification
+    // below (absent, transient, otherwise) describes a publish the attempt still needs, and it is not needed here.
+    if (signal?.aborted) throw cancelled();
+    const reason = String((failure as Error)?.message ?? failure);
+    if (absent(failure)) throw new Error(`the Windows .NET Framework compiler wrote no executable for ${exe}`);
+    if (!transientRead(failure)) throw new Error(`the Windows .NET Framework compiler output could not be published as ${exe}: ${reason}`);
+    if (Date.now() + retryMs >= end) throw new Error(`the Windows .NET Framework compiler output could not be published as ${exe} within ${budgetMs} ms: ${reason}`);
+    // The retry delay is woken by the signal: a cancellation does not wait out the rest of the budget.
+    if (!await wokenBy(retryMs, signal)) throw cancelled();
   }
+}
+export type PublishBuild = typeof publishBuild;
+
+/** Wait `ms`, or end at once when `signal` aborts: a cancelled preparation wakes promptly instead of sitting out a retry
+ *  delay (which is bounded only by the publish budget). Resolves false when the signal aborted first. */
+function wokenBy(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (!signal) return delay(ms).then(() => true);
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise<boolean>(resolve => {
+    let settled = false, timer: ReturnType<typeof setTimeout>;
+    const done = (waited: boolean) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); signal.removeEventListener("abort", aborted); resolve(waited);
+    };
+    const aborted = () => done(false);
+    timer = setTimeout(() => done(true), ms);
+    signal.addEventListener("abort", aborted, { once: true });
+    // An abort between the check above and the listener: the event would never reach it.
+    if (signal.aborted) done(false);
+  });
 }
 
 /** What a failed compiler run says: its bounded own words, whether it timed out, and its exit status. */
@@ -789,6 +833,8 @@ export interface JobOptions {
   compiler?: string;
   /** Test seam: how long the foreground compilation may take (default JOB_COMPILE_TIMEOUT_MS). */
   compileMs?: number;
+  /** Test seam: publishing the compiler's output (default publishBuild). */
+  publish?: PublishBuild;
   /** The handshake deadline (the group record), after the spawn: an owner that reported none by then started nothing. */
   timeoutMs?: number;
   /** How long a failed process-table observation is retried before the attempt is adopted (default JOB_OBSERVE_MS). */
@@ -876,7 +922,8 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   // A staged preparation was made before the attempt's durable intent (prepareJob clears the earlier evidence and writes
   // the spec); one this call stages itself does the same here.
   const host = (options.prepared ?? await prepareJob(dir, launch, { ...(options.compiler ? { compiler: options.compiler } : {}),
-    ...(options.compileMs ? { compileMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}) })).host;
+    ...(options.compileMs ? { compileMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.publish ? { publish: options.publish } : {}) })).host;
   // The owner's stderr is a file, not a pipe: it outlives this process and nothing drains it.
   const errors = openSync(join(dir, JOB_HOST_LOG), "a");
   let helper: ChildProcess;

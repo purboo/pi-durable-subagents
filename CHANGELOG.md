@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A command start's preparation that is cancelled while the compiler's output is being published is a cancellation,
+  never a compiler failure: the transient-rename retries end at once instead of running out the publish budget, a rename
+  that was in flight when the start was revoked is not reported as its own cause, and the preparation removes what the
+  compiler wrote and records no failure reason (`start-error`) for it. A publication that fails on its own still reports its
+  real cause, and one that was cancelled before it began never renames at all.
 - Two Win32 contract edges of a command attempt now hold end to end. The job host decodes every spec field to its exact
   UTF-16 code units — each byte pair is one char, never through a decoder fallback — so a Unicode path, a curly quote, an
   emoji or an unpaired surrogate still reaches Win32 unchanged, and a field that is not a whole number of code units is
