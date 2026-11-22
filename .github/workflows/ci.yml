@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         # 22.19 is the engines floor (runs .ts without flags; worker.cpuUsage and process.threadCpuUsage, which the
         # evaluator's CPU limit needs); the real-pi suite runs on 24.
         node: ["24", "22.19"]
