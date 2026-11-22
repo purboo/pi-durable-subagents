@@ -43,6 +43,7 @@ import { fakeExecutor } from "../orchestrator/engine/fake.ts";
 const T_BOOT = "639000000100000000";
 const T_HOST = "639000000500000000";
 const T_TOOL = "639000000550000000";
+const T_TOOL_WMI = "639000000550000007";
 const T_GRAND = "639000000580000000";
 const T_BOOT_CHILD = "639000000600000000";
 const T_REUSED = "639000000900000000";
@@ -56,6 +57,8 @@ async function tempHome(t: test.TestContext): Promise<string> {
 
 test("Windows tree ownership primitives reject pre-existing boot orphans, exited/reused parents and malformed tokens", () => {
   assert.equal(isWinStart(T_HOST), true);
+  assert.equal(sameCreation("639000000500000000", "639000000500000010"), true, "1-us (10-tick) boundary matches");
+  assert.equal(sameCreation("639000000500000000", "639000000500000011"), false, ">10-tick skew fails closed");
   for (const bad of ["", undefined, "0", "-1", "abc", "639000000500000000x", "9999999999999999999"]) {
     assert.equal(isWinStart(bad), false, `must reject start=${String(bad)}`);
     assert.equal(sameCreation(bad, T_HOST), false);
@@ -102,11 +105,14 @@ test("reproduction (PID 6400 / critical PID 6160): Engine + EvaluatorClient clea
   const killCalls: WinProcessIdentity[][] = [];
   let hostAliveInTable = true;
   let hostPidInSim = 6400;
+  let activeScriptWatching = false;
+  let activeTableScans = 0;
 
   // Simulate Windows process table where our real evaluator/host.ts sits at PID 6400 while critical system process
   // PID 6160 (and its child 7000) still list ParentProcessId = 6400 from boot.
   const fakeWinContainment = new Containment({
     async list(knownExecs = new Set()) {
+      if (activeScriptWatching) activeTableScans++;
       const rows: ProcInfo[] = [
         { pid: 6160, ppid: hostPidInSim, start: T_BOOT },
         { pid: 7000, ppid: 6160, start: T_BOOT_CHILD },
@@ -133,6 +139,7 @@ test("reproduction (PID 6400 / critical PID 6160): Engine + EvaluatorClient clea
       killCalls.push(targets.map(x => ({ ...x })));
       hostAliveInTable = false;
     },
+    killPosix: pid => assert.fail(`Windows containment must never send POSIX signal to pid ${pid}`),
   });
 
   // Wrap spawn to run the real evaluator/host.ts process locally while presenting simulated PID 6400 to EvaluatorClient.
@@ -170,8 +177,14 @@ test("reproduction (PID 6400 / critical PID 6160): Engine + EvaluatorClient clea
   while (!readJournalSnapshot(journalPath(home, wid)).some(e => e.type === "fake-run")) {
     await new Promise(r => setTimeout(r, 15));
   }
-  // Wait across at least two trackerMs periods so EvaluatorClient's active-script scan runs against PID 6400 + PID 6160.
-  await new Promise(r => setTimeout(r, 90));
+  // Deterministically observe at least two EvaluatorClient active-script tracker scans against PID 6400 + PID 6160.
+  activeScriptWatching = true;
+  const scanDeadline = Date.now() + 5000;
+  while (activeTableScans < 2) {
+    if (Date.now() > scanDeadline) throw new Error("Timed out waiting for EvaluatorClient periodic scans");
+    await new Promise(r => setTimeout(r, 15));
+  }
+  activeScriptWatching = false;
 
   const trackedEntries = orch.entries().filter(e => e.type === "eval-tracked").map(e => e.process as ProcInfo);
   assert.deepEqual(
@@ -211,18 +224,25 @@ test("Containment.fence and fenceAgent (Windows): exact owned targets under exit
 
   const exec = "01WINOWN@1/a@1#1.1";
   const killCalls: WinProcessIdentity[][] = [];
+  const commandReads: number[] = [];
+  const fakeArgv = new Map<number, string>([[6404, "node.exe tool"], [6408, "node.exe leaf"]]);
+  const readCommand = async (pid: number) => {
+    commandReads.push(pid);
+    return fakeArgv.get(pid) ?? "";
+  };
   let phase: "full-tree" | "parent-reused" | "retired" = "full-tree";
 
   const containment = new Containment({
     async list() {
       if (phase === "retired") return [{ pid: 6160, ppid: 6400, start: T_BOOT }, { pid: 6400, ppid: 4, start: T_REUSED }];
       if (phase === "parent-reused") {
-        // Direct child 6400 exited and PID 6400 was reused by T_REUSED (spawning 6500); tracked 6404 + live child 6408 remain.
+        // Direct child 6400 exited and PID 6400 was reused by T_REUSED (spawning 6500); tracked 6404 (observed with
+        // 7-tick DMTF jitter within 1-us precision) + live child 6408 remain.
         return [
           { pid: 6400, ppid: 4, start: T_REUSED },
           { pid: 6500, ppid: 6400, start: T_REUSED_CHILD },
           { pid: 6160, ppid: 6400, start: T_BOOT },
-          { pid: 6404, ppid: 6400, start: T_TOOL },
+          { pid: 6404, ppid: 6400, start: T_TOOL_WMI },
           { pid: 6408, ppid: 6404, start: T_GRAND },
         ];
       }
@@ -237,6 +257,8 @@ test("Containment.fence and fenceAgent (Windows): exact owned targets under exit
     },
   }, {
     platform: "win32",
+    captureStart: async () => assert.fail("Windows fence must not call POSIX captureStart"),
+    killPosix: pid => assert.fail(`Windows fence must never send POSIX signal to pid ${pid}`),
     killWindows: async targets => {
       killCalls.push(targets.map(x => ({ ...x })));
       phase = phase === "full-tree" ? "parent-reused" : "retired";
@@ -252,25 +274,32 @@ test("Containment.fence and fenceAgent (Windows): exact owned targets under exit
       { pid: 5000, ppid: 4212, start: T_BOOT }, // historical tracked pid, now reused by T_REUSED
     ],
     { pid: 6400, start: T_HOST },
+    { readCommand },
   );
 
   assert.deepEqual(killCalls, [
     [{ pid: 6400, start: T_HOST }, { pid: 6404, start: T_TOOL }],
-    [{ pid: 6404, start: T_TOOL }, { pid: 6408, start: T_GRAND }],
+    [{ pid: 6404, start: T_TOOL_WMI }, { pid: 6408, start: T_GRAND }],
   ]);
-  const endedPids = journal.entries().filter(e => e.type === "ended")
-    .flatMap(e => (e.procs as { pid: number }[]).map(p => p.pid));
-  assert.deepEqual(endedPids, [6404, 6404, 6408], "beforeKill records only proven-owned non-direct descendants");
+  assert.deepEqual(commandReads, [6404, 6404, 6408], "injected readCommand inspected only proven-owned non-direct descendants");
+  const endedProcs = journal.entries().filter(e => e.type === "ended")
+    .map(e => e.procs as { pid: number; command: string }[]);
+  assert.deepEqual(endedProcs, [
+    [{ pid: 6404, command: "node.exe tool" }],
+    [{ pid: 6404, command: "node.exe tool" }, { pid: 6408, command: "node.exe leaf" }],
+  ], "beforeKill records only proven-owned non-direct descendants");
 
   // A failure terminating a verified live target must reject fenceAgent too (never swallowed into a silent spin).
   const failingContainment = new Containment({
     list: async () => [{ pid: 6400, ppid: 4212, start: T_HOST }],
   }, {
     platform: "win32",
+    captureStart: async () => assert.fail("Windows fence must not call POSIX captureStart"),
+    killPosix: pid => assert.fail(`Windows fence must never send POSIX signal to pid ${pid}`),
     killWindows: async () => { throw new Error("TerminateProcess(6400) failed with Win32 error 5"); },
   });
   await assert.rejects(
-    fenceAgent(failingContainment, journal, exec, [{ pid: 6400, ppid: 4212, start: T_HOST }], { pid: 6400, start: T_HOST }),
+    fenceAgent(failingContainment, journal, exec, [{ pid: 6400, ppid: 4212, start: T_HOST }], { pid: 6400, start: T_HOST }, { readCommand }),
     /TerminateProcess\(6400\) failed/,
   );
 });
@@ -295,6 +324,7 @@ test("fail-closed identity enforcement across Containment.spawn/fence, killProce
     list: async () => [{ pid: 6160, ppid: 6400, start: "", tag: "exec-unverified" }],
   }, {
     platform: "win32",
+    killPosix: pid => assert.fail(`must never send POSIX signal to pid ${pid}`),
     killWindows: async targets => { fenceKillCalls.push([...targets]); },
   });
   await assert.rejects(
@@ -377,6 +407,7 @@ test("fail-closed identity enforcement across Containment.spawn/fence, killProce
     const restartKills: WinProcessIdentity[] = [];
     const refused = legacyRestart(restartHome, { version: "1.0.17", pid: 6400, ts: 1 }, {}, {
       platform: "win32",
+      killPosix: pid => assert.fail(`must never send POSIX signal to pid ${pid}`),
       killWinSync: target => { restartKills.push(target); },
     });
     assert.equal(refused.applied, false);
@@ -385,6 +416,7 @@ test("fail-closed identity enforcement across Containment.spawn/fence, killProce
 
     const applied = legacyRestart(restartHome, { version: "1.0.17", pid: 6400, start: T_HOST, ts: 1 }, {}, {
       platform: "win32",
+      killPosix: pid => assert.fail(`must never send POSIX signal to pid ${pid}`),
       killWinSync: target => { restartKills.push(target); },
     });
     assert.deepEqual(applied, { applied: true });

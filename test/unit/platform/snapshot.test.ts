@@ -31,14 +31,60 @@ test("F1 fence waits for pre-request work then starts its own scan", async () =>
 });
 
 test("C2 cached identity matching excludes reused pids and retains untagged descendants", async () => {
-  const rows = [{ pid: 10, ppid: 1, start: "new" }, { pid: 11, ppid: 10, start: "child" }];
-  const containment = new Containment({ list: async () => rows });
-  const groups = await containment.scan(new Map([
-    ["stale", [{ pid: 10, ppid: 1, start: "old" }]],
-    ["live", [{ pid: 10, ppid: 1, start: "new" }]],
+  // 1. Default host-platform Containment with valid native start-token format.
+  const nativeTokens = process.platform === "win32"
+    ? { old: "639000000100000000", live: "639000000500000000", child: "639000000550000000" }
+    : process.platform === "darwin"
+      ? { old: "Sun Oct 4 01:02:00 2026", live: "Sun Oct 4 01:02:03 2026", child: "Sun Oct 4 01:02:04 2026" }
+      : { old: "1000", live: "2000", child: "2050" };
+  const hostRows = [{ pid: 10, ppid: 1, start: nativeTokens.live }, { pid: 11, ppid: 10, start: nativeTokens.child }];
+  const hostGroups = await new Containment({ list: async () => hostRows }).scan(new Map([
+    ["stale", [{ pid: 10, ppid: 1, start: nativeTokens.old }]],
+    ["live", [{ pid: 10, ppid: 1, start: nativeTokens.live }]],
   ]));
-  assert.deepEqual(groups.get("stale"), []);
-  assert.deepEqual(groups.get("live")?.map(p => p.pid), [10, 11]);
+  assert.deepEqual(hostGroups.get("stale"), []);
+  assert.deepEqual(hostGroups.get("live")?.map(p => p.pid), [10, 11]);
+
+  // 2. Darwin lstart tokens: exact token match excludes reused pid and retains untagged child.
+  const macRows = [
+    { pid: 10, ppid: 1, start: "Sun Oct 4 01:02:03 2026" },
+    { pid: 11, ppid: 10, start: "Sun Oct 4 01:02:04 2026" },
+  ];
+  const macGroups = await new Containment({ list: async () => macRows }, { platform: "darwin" }).scan(new Map([
+    ["stale", [{ pid: 10, ppid: 1, start: "Sun Oct 4 01:02:00 2026" }]],
+    ["live", [{ pid: 10, ppid: 1, start: "Sun Oct 4 01:02:03 2026" }]],
+  ]));
+  assert.deepEqual(macGroups.get("stale"), []);
+  assert.deepEqual(macGroups.get("live")?.map(p => p.pid), [10, 11]);
+
+  // 3. Linux /proc clock-tick tokens: excludes reused pid and pre-reuse orphan (child.start < parent.start).
+  const linuxRows = [
+    { pid: 10, ppid: 1, start: "2000" },
+    { pid: 9, ppid: 10, start: "1500" },
+    { pid: 11, ppid: 10, start: "2050" },
+  ];
+  const linuxGroups = await new Containment({ list: async () => linuxRows }, { platform: "linux" }).scan(new Map([
+    ["stale", [{ pid: 10, ppid: 1, start: "1000" }]],
+    ["live", [{ pid: 10, ppid: 1, start: "2000" }]],
+  ]));
+  assert.deepEqual(linuxGroups.get("stale"), []);
+  assert.deepEqual(linuxGroups.get("live")?.map(p => p.pid), [10, 11]);
+
+  // 4. Windows .NET creation ticks: preserves 1-us (<=10-tick) WMI/GetProcessTimes precision while excluding >10-tick
+  //    skew, reused pids, and pre-existing boot orphans on a recycled parent pid.
+  const winRows = [
+    { pid: 10, ppid: 1, start: "639000000500000007" },
+    { pid: 9, ppid: 10, start: "639000000100000000" },
+    { pid: 11, ppid: 10, start: "639000000550000000" },
+  ];
+  const winGroups = await new Containment({ list: async () => winRows }, { platform: "win32" }).scan(new Map([
+    ["stale", [{ pid: 10, ppid: 1, start: "639000000100000000" }]],
+    ["beyond-precision", [{ pid: 10, ppid: 1, start: "639000000500000018" }]],
+    ["live", [{ pid: 10, ppid: 1, start: "639000000500000000" }]],
+  ]));
+  assert.deepEqual(winGroups.get("stale"), []);
+  assert.deepEqual(winGroups.get("beyond-precision"), []);
+  assert.deepEqual(winGroups.get("live")?.map(p => p.pid), [10, 11]);
 });
 
 test("C2 failed scans are shared but not cached; macOS known ids cannot contaminate each other", async () => {

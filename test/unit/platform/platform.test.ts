@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
 import { Containment } from "../../../src/platform/containment.ts";
@@ -106,7 +107,11 @@ test("scan discovers untagged descendants and ignores mismatched start tokens", 
 });
 
 test("fence rejects when process-table evidence does not arrive; spawn errors reject", { timeout: 5000 }, async () => {
-  const c = new Containment({ list: () => new Promise(() => {}) });
+  const c = new Containment({ list: () => new Promise(() => {}) }, {
+    captureStart: async () => "",
+    killPosix: () => { throw new Error("unexpected POSIX signal"); },
+    killWindows: async () => { throw new Error("unexpected Windows kill"); },
+  });
   // The rejection names where the budget went: a scan that never answered is not a process that survived a kill.
   await assert.rejects(c.fence("missing", [], { timeoutMs: 30 }), (error: Error) => {
     assert.match(error.message, /^Fence timeout: missing after \d+ ms of 30 ms \(0 scan\(s\) completed, .*waiting on the scan\)$/);
@@ -115,13 +120,68 @@ test("fence rejects when process-table evidence does not arrive; spawn errors re
   await assert.rejects(new Containment().spawn(spec(randomUUID(), "/nonexistent-dsa-command", [])), /ENOENT/);
 });
 
-test("a fence that only ever skips unconfirmed identities says so instead of blaming a kill", { timeout: 5000 }, async () => {
-  // The listed process never confirms its start token (a reused pid, or a probe that cannot answer): nothing is
-  // signalled, so the timeout must not read as "processes survived SIGKILL".
-  const c = new Containment({ list: async () => [{ pid: 999_999, ppid: 1, start: "s" }] });
-  await assert.rejects(c.fence("w@1/a@1#1.1", [{ pid: 999_999, ppid: 1, start: "s" }], { timeoutMs: 60 }), (error: Error) => {
-    assert.match(error.message, /^Fence timeout: w@1\/a@1#1\.1 after \d+ ms of 60 ms/);
-    assert.match(error.message, /\d+ scan\(s\) completed, slowest \d+ ms, 1 process\(es\) at the last scan, 0 kill\(s\), \d+ skipped for an unconfirmed identity/);
+test("a fence that only ever skips unconfirmed identities says so instead of blaming a kill", { timeout: 5000 }, async t => {
+  // The listed process never confirms its start token (a reused pid on POSIX, or an unverified tagged row on Windows):
+  // nothing is signalled, so the timeout must not read as "processes survived SIGKILL". All probes and kill paths are
+  // injected seams on a harmless synthetic pid (<= Darwin PID_MAX 99999) so no OS pid is ever inspected or signalled.
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const exec = "w@1/a@1#1.1", fakePid = 42_424;
+  const neverKill = {
+    killPosix: (pid: number) => assert.fail(`must never signal unconfirmed POSIX pid ${pid}`),
+    killWindows: async () => assert.fail("must never terminate unconfirmed Windows target"),
+  };
+
+  // 1. Default host platform (exercises the active OS branch without platform override).
+  now = 0;
+  const hostWin = process.platform === "win32";
+  const hostRow = hostWin
+    ? { pid: fakePid, ppid: 1, start: "", tag: exec }
+    : { pid: fakePid, ppid: 1, start: "recorded-start" };
+  const hostTracked = hostWin ? [] : [hostRow];
+  const hostContainment = new Containment({ list: async () => { now += 75; return [hostRow]; } }, {
+    ...neverKill,
+    captureStart: async () => "reused-start",
+  });
+  await assert.rejects(hostContainment.fence(exec, hostTracked, { timeoutMs: 200 }), (error: Error) => {
+    assert.match(error.message, /^Fence timeout: w@1\/a@1#1\.1 after \d+ ms of 200 ms/);
+    assert.match(error.message, /[1-9]\d* scan\(s\) completed, slowest \d+ ms, 1 process\(es\) at the last scan, 0 kill\(s\), [1-9]\d* skipped for an unconfirmed identity/);
+    if (hostWin) assert.match(error.message, /, unverified identity for pid 42424\)$/);
+    return true;
+  });
+
+  // 2. POSIX (Darwin/Linux): pre-kill captureStart mismatch and post-beforeKill PID-reuse recheck both count as skips.
+  for (const platform of ["darwin", "linux"] as const) {
+    now = 0;
+    let checks = 0, beforeKillRuns = 0;
+    const posixRow = { pid: fakePid, ppid: 1, start: "Sun Oct 4 01:02:03 2026" };
+    const posix = new Containment({ list: async () => { now += 75; return [posixRow]; } }, {
+      ...neverKill,
+      platform,
+      // Odd checks confirm before `beforeKill`; even checks see PID reuse right before SIGKILL.
+      captureStart: async () => (++checks % 2 === 1 ? posixRow.start : "Sun Oct 4 01:02:09 2026"),
+    });
+    await assert.rejects(posix.fence(exec, [posixRow], {
+      timeoutMs: 200,
+      beforeKill: async () => { beforeKillRuns++; },
+    }), (error: Error) => {
+      assert.match(error.message, /^Fence timeout: w@1\/a@1#1\.1 after \d+ ms of 200 ms/);
+      assert.match(error.message, /[1-9]\d* scan\(s\) completed, slowest \d+ ms, 1 process\(es\) at the last scan, 0 kill\(s\), [1-9]\d* skipped for an unconfirmed identity/);
+      return true;
+    });
+    assert.ok(beforeKillRuns >= 1, `${platform}: exercised post-beforeKill identity revalidation`);
+  }
+
+  // 3. Windows: a tagged process without a verifiable .NET tick identity is skipped fail-closed with zero kills.
+  now = 0;
+  const win = new Containment({ list: async () => { now += 75; return [{ pid: fakePid, ppid: 1, start: "", tag: exec }]; } }, {
+    ...neverKill,
+    platform: "win32",
+    captureStart: async () => "",
+  });
+  await assert.rejects(win.fence(exec, [], { timeoutMs: 200 }), (error: Error) => {
+    assert.match(error.message, /^Fence timeout: w@1\/a@1#1\.1 after \d+ ms of 200 ms/);
+    assert.match(error.message, /[1-9]\d* scan\(s\) completed, slowest \d+ ms, 1 process\(es\) at the last scan, 0 kill\(s\), [1-9]\d* skipped for an unconfirmed identity.*unverified identity for pid 42424\)$/);
     return true;
   });
 });

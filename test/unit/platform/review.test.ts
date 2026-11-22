@@ -66,7 +66,22 @@ test("fast true and exit 3 preserve output and status without scanning the table
 });
 
 test("fence treats empty start records as retired even if pid matches a live process", async () => {
-  // If an empty token were matched, fence would SIGKILL this test runner.
-  const c = new Containment({ list: async () => [{ pid: process.pid, ppid: process.ppid, start: "" }] });
-  await c.fence("retired", [{ pid: process.pid, ppid: process.ppid, start: "" }]);
+  // Use a harmless synthetic pid and injected kill seams so a regression fails cleanly instead of signalling a real process.
+  const killed: number[] = [];
+  const fakePid = 42_424;
+  for (const [platform, liveStart] of [
+    [undefined, process.platform === "win32" ? "639000000500000000" : "live-start"],
+    ["linux", ""],
+    ["darwin", "Sun Oct 4 01:02:03 2026"],
+    ["win32", "639000000500000000"],
+  ] as const) {
+    const c = new Containment({ list: async () => [{ pid: fakePid, ppid: 1, start: liveStart }] }, {
+      ...(platform ? { platform } : {}),
+      captureStart: async () => liveStart,
+      killPosix: pid => { killed.push(pid); },
+      killWindows: async targets => { killed.push(...targets.map(t => t.pid)); },
+    });
+    await c.fence("retired", [{ pid: fakePid, ppid: 1, start: "" }]);
+  }
+  assert.deepEqual(killed, []);
 });
