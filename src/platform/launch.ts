@@ -173,8 +173,8 @@ function orchestratorStdio(env: NodeJS.ProcessEnv): { stdio: SpawnOptions["stdio
   if (!log) return { stdio: "ignore", fds: [] };
   try {
     mkdirSync(dirname(log), { recursive: true });
-    const out = openSync(log, "a"), err = openSync(log, "a");
-    return { stdio: ["ignore", out, err], fds: [out, err] };
+    const fd = openSync(log, "a", 0o600);
+    return { stdio: ["ignore", fd, fd], fds: [fd] };
   } catch { return { stdio: "ignore", fds: [] }; }
 }
 

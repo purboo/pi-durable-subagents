@@ -34,17 +34,13 @@ jobs:
         shell: bash
       - run: node scripts/ci-annotate.mjs unit.log pi.log pack.log
         if: failure()
-      # A failing real-pi case on Windows: the detached orchestrator has no terminal, so nothing it says reaches the run.
-      # This collects the first failing stage (chaos scenario, failover drill, event log) with the orchestrator's own
-      # output, its ledger and each workflow's journal tail, and keeps the temp state for the artifact below. Bounded;
-      # it never turns a failure into a pass and changes no test's timeout or platform skip.
+  windows-diagnostics:
+    if: github.ref == 'refs/heads/port/windows-native-ci'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - run: npm ci
       - run: node scripts/diagnose-e2e.mjs
-        if: failure() && matrix.os == 'windows-latest' && matrix.node == '24'
-        timeout-minutes: 20
-      - uses: actions/upload-artifact@v4
-        if: failure() && matrix.os == 'windows-latest' && matrix.node == '24'
-        with:
-          name: dsa-diag-windows-node24
-          path: ${{ runner.temp }}/dsa-diag-*/**
-          if-no-files-found: ignore
-          retention-days: 7

@@ -50,7 +50,7 @@ function tail(file, lines) {
   try { return readFileSync(file, "utf8").trimEnd().split("\n").slice(-lines); } catch { return []; }
 }
 /** Every DSA home under the diag root (each case makes its own temp root with a `dsa` state directory). */
-function homes(dir = root, depth = 0) {
+function homes(dir, depth = 0) {
   if (depth > 4) return [];
   const found = [];
   let names = [];
@@ -58,7 +58,7 @@ function homes(dir = root, depth = 0) {
   for (const name of names) {
     const path = join(dir, name);
     try { if (!statSync(path).isDirectory()) continue; } catch { continue; }
-    if (existsSync(join(path, "orchestrator.jsonl"))) found.push(path);
+    if (name === "dsa" || existsSync(join(path, "orchestrator.jsonl"))) found.push(path);
     else found.push(...homes(path, depth + 1));
   }
   return found;
@@ -89,12 +89,12 @@ function verdict(s) {
   if (s.exited) return `the orchestrator exited (reason ${s.exited.reason}) after recovery — the workflow below stopped, not the orchestrator`;
   return "the orchestrator was still recorded as running when the stage ended: the workflow below stopped";
 }
-function report(name, code, ms, out) {
+function report(name, code, ms, out, stageRoot) {
   console.log(`\n===== ${name}: ${code === 0 ? "passed" : `FAILED (exit ${code})`} in ${ms} ms =====`);
   const kept = [...out.matchAll(/^\s*kept: (.+)$/gm)].map(m => m[1].trim());
   for (const line of kept) console.log(`kept: ${redact(line)}`);
   if (code === 0) return true;
-  const found = homes();
+  const found = homes(stageRoot);
   if (!found.length) console.log("no DSA home was left under the diag root: the stage failed before it created state");
   for (const home of found) {
     const s = state(home);
@@ -108,9 +108,9 @@ function report(name, code, ms, out) {
       for (const line of wf.tail) if (line.trim().length > 6) console.log(`     ${clip(line, 200)}`);
     }
     const log = join(home, "..", "orchestrator.log");
-    for (const line of tail(log, 30)) console.log(`   log | ${clip(line, 300)}`);
+    for (const line of tail(log, 30)) console.log(`   log | ${clip(redact(line), 300)}`);
     for (const extra of ["host-errors.log", "pi-stderr.log", "readiness.jsonl", "pi-startup-retries.jsonl"])
-      for (const line of tail(join(home, "..", extra), 10)) console.log(`   ${extra} | ${clip(line, 300)}`);
+      for (const line of tail(join(home, "..", extra), 10)) console.log(`   ${extra} | ${clip(redact(line), 300)}`);
     console.log(`   verdict: ${clip(verdict(s), 500)}`);
   }
   return false;
@@ -120,11 +120,12 @@ const env = setEnvPath({ ...process.env, TMPDIR: root, TEMP: root, TMP: root, DS
 let failed = [];
 for (const name of stages) {
   const stage = STAGES[name], started = Date.now();
-  const run = spawnSync(stage.command, stage.args, { cwd: REPO, env, encoding: "utf8", timeout: stage.ms, maxBuffer: 32 * 1024 * 1024 });
+  const stageRoot = mkdtempSync(join(root, `${name}-`));
+  const run = spawnSync(stage.command, stage.args, { cwd: REPO, env: { ...env, TMPDIR: stageRoot, TEMP: stageRoot, TMP: stageRoot }, encoding: "utf8", timeout: stage.ms, maxBuffer: 32 * 1024 * 1024 });
   const out = `${run.stdout ?? ""}${run.stderr ?? ""}`, ms = Date.now() - started;
-  process.stdout.write(out.endsWith("\n") || !out ? out : `${out}\n`);
+  if (out) console.log(redact(out.trimEnd()));
   if (run.error) console.log(`stage ${name}: ${run.error.message}`);
-  if (!report(name, run.status ?? 1, ms, out)) failed.push(name);
+  if (!report(name, run.status ?? 1, ms, out, stageRoot)) failed.push(name);
 }
 console.log(`\nstages: ${stages.map(n => `${n} ${failed.includes(n) ? "FAILED" : "ok"}`).join(", ")}`);
 if (failed.length) console.log(`first failing stage: ${failed[0]}`);
