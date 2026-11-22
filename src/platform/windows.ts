@@ -56,11 +56,16 @@ export function comspec(env: NodeJS.ProcessEnv = process.env): string {
   return env.ComSpec || env.COMSPEC || join(systemRoot(), "System32", "cmd.exe");
 }
 
+// Import the Windows PowerShell module relative to its installation even when the parent isolated PSModulePath.
+export function cimScript(script: string): string {
+  return String.raw`$ErrorActionPreference = 'Stop'; Import-Module "$PSHOME\Modules\CimCmdlets" -ErrorAction Stop; ` + script;
+}
+
 const PS_FLAGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
 /** Run a PowerShell script; rejects with its stderr. */
 export async function powershell(script: string, options: { signal?: AbortSignal; timeout?: number } = {}): Promise<string> {
   try {
-    const { stdout } = await exec(powershellPath(), [...PS_FLAGS, script],
+    const { stdout } = await exec(powershellPath(), [...PS_FLAGS, cimScript(script)],
       { signal: options.signal, timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, env: helperEnv() });
     return stdout;
   } catch (error) {
@@ -70,7 +75,7 @@ export async function powershell(script: string, options: { signal?: AbortSignal
   }
 }
 export function powershellSync(script: string, options: { timeout?: number } = {}): string {
-  return execFileSync(powershellPath(), [...PS_FLAGS, script], { timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8", env: helperEnv() });
+  return execFileSync(powershellPath(), [...PS_FLAGS, cimScript(script)], { timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8", env: helperEnv() });
 }
 
 export interface WinProcessRow {

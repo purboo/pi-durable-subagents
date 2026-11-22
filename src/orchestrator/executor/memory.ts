@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { freemem } from "node:os";
 import { promisify } from "node:util";
-import { powershellPath, helperEnv } from "../../platform/windows.ts";
+import { powershell } from "../../platform/windows.ts";
 
 /** P29: Observe available memory in MB; capability errors refuse dispatch instead of bypassing V1. */
 export async function availableMemory(): Promise<number> {
@@ -23,9 +23,7 @@ export async function availableMemory(): Promise<number> {
   // forever; commit headroom is what another child can still allocate. FreeVirtualMemory is KB.
   if (process.platform === "win32") {
     try {
-      const { stdout } = await promisify(execFile)(powershellPath(),
-        ["-NoProfile", "-NonInteractive", "-Command", "$os = Get-CimInstance Win32_OperatingSystem; $os.FreeVirtualMemory"],
-        { timeout: 5000, windowsHide: true, env: helperEnv() });
+      const stdout = await powershell("$os = Get-CimInstance Win32_OperatingSystem; $os.FreeVirtualMemory", { timeout: 5000 });
       const kb = Number(stdout.trim());
       if (kb > 0) return kb / 1024;
     } catch { /* fall through to the physical free memory */ }
