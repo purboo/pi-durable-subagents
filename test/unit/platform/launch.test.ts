@@ -228,11 +228,12 @@ test("execTarget resolves a bare program on the command's own environment, with 
   assert.equal(findOnPath("tool", third, { ...windows, pathext: ".BAT" }), thirdShim);
   assert.equal(executableFile(thirdShim, "win32"), true);
   const hostExec = await executable(join(dir, "host"), "tool.sh");
-  assert.equal(executableFile(hostExec), true, "the host's own rule still applies by default");
+  assert.equal(executableFile(hostExec), process.platform !== "win32", "only POSIX runs the executable shell script directly");
   if (process.platform !== "win32") assert.equal(executableFile(secondShim), false, "a .cmd without an executable bit is no program on POSIX");
   // POSIX and every other platform are untouched: argv is what the caller passed, whatever the environment.
   assert.deepEqual(execTarget("tool", ["x"], { env: { PATH: first }, platform: "linux" }), { command: "tool", args: ["x"] });
-  assert.deepEqual(execTarget("tool", ["x"], { env: { PATH: first } }), { command: "tool", args: ["x"] });
+  assert.deepEqual(execTarget("tool", ["x"], { env: { PATH: first } }), process.platform === "win32"
+    ? { command: process.execPath, args: [script, "x"] } : { command: "tool", args: ["x"] });
   // pi resolution reads the PATH and PATHEXT of the environment it is given, under the host's naming rules.
   if (process.platform === "win32") {
     const piShim = join(first, "pi.cmd"); await writeFile(piShim, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);

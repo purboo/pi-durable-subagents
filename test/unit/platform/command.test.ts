@@ -21,7 +21,11 @@ const windowsOnly = process.platform === "win32" ? false : "a Windows Job Object
 const onPath = (name: string) => (process.env.PATH ?? "").split(":").some(d => d && existsSync(join(d, name)));
 async function finished(dir: string) {
   for (let i = 0; i < 200; i++) { const r = await readExitRecord(dir); if (r) return r; await delay(25); }
-  throw new Error("no exit record");
+  const evidence = ["group-end", "host-exit", "start-error", "host.log", COMMAND_LOG].map(name => {
+    const file = join(dir, name);
+    return existsSync(file) ? `${name}=${readFileSync(file, "utf8").slice(-500)}` : `${name} missing`;
+  });
+  throw new Error(`no exit record (${evidence.join(", ")})`);
 }
 
 test("exit statuses: 0 and plain codes stay codes; above 128 read as the signal (the shell convention)", () => {
