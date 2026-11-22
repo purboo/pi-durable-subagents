@@ -3,18 +3,21 @@
 // Shared CI runners are much slower and noisier than a workstation; real-process and timing-sensitive tests can
 // miss a deadline there. A failure that repeats is a real failure.
 // Output streams live, so a run that hangs shows its last test in the job log; a run still going after
-// DSA_CI_RUN_MINUTES (default 25) is killed with its whole process group and counts as a failure.
+// DSA_CI_RUN_MINUTES (default 25) is killed with its whole process tree and counts as a failure.
 //   node scripts/ci-test.mjs <log> [node --test args...]
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
+import { failingTestFiles } from "./lib/ci-log.mjs";
+import { setEnvPath, treeKillCommand, withBinPath } from "./lib/platform.mjs";
 
 const [log, ...args] = process.argv.slice(2);
 const runMs = Number(process.env.DSA_CI_RUN_MINUTES ?? 25) * 60_000;
 const run = (testArgs) => new Promise(resolve => {
   // Like `npm run`: the repository's node_modules/.bin (the `pi` the real-process tests launch) comes first on PATH.
-  const env = { ...process.env, PATH: `${join(process.cwd(), "node_modules", ".bin")}${delimiter}${process.env.PATH ?? ""}` };
-  // Its own process group, so a deadline kill also reaches the per-file test processes holding the output pipes.
+  const env = setEnvPath({ ...process.env }, withBinPath(join(process.cwd(), "node_modules", ".bin"), process.platform, process.env.PATH ?? ""));
+  // Its own process group, so a deadline kill also reaches the per-file test processes holding the output pipes. Windows
+  // has no process groups: the kill below ends the tree with taskkill /T instead.
   const child = spawn(process.execPath, ["--test", ...testArgs], { env, detached: process.platform !== "win32" });
   let output = "", timedOut = false;
   const collect = stream => stream.setEncoding("utf8").on("data", chunk => { process.stdout.write(chunk); output += chunk; });
@@ -23,7 +26,9 @@ const run = (testArgs) => new Promise(resolve => {
     timedOut = true;
     const note = `\n::error::node --test ${testArgs.join(" ")} still running after ${runMs / 60_000} min; killed\n`;
     process.stdout.write(note); output += note;
-    try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+    const tree = child.pid ? treeKillCommand(child.pid) : undefined;
+    if (tree) spawnSync(tree.command, tree.args, { stdio: "ignore" });
+    else try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
   }, runMs);
   child.on("close", code => { clearTimeout(deadline); resolve({ code: timedOut ? 1 : code ?? 1, output }); });
 });
@@ -31,14 +36,9 @@ const first = await run(args);
 writeFileSync(log, first.output);
 if (first.code === 0) process.exit(0);
 
-// Failing files: "test at <file>:<line>" (spec reporter) or a TAP "location: '<file>:<line>:<col>'".
-const files = new Set();
-const text = first.output.replace(/\x1b\[[0-9;]*m/g, "");
-// The spec reporter indents "test at" under a nested test; this repository names test files *.test.{ts,mts,js,mjs,…}.
-const testFile = /\.test\.[cm]?[jt]s$/;
-for (const m of text.matchAll(/^\s*test at (\S+?):\d+:\d+\s*$/gm)) files.add(m[1]);
-for (const m of text.matchAll(/location: '([^']+?):\d+:\d+'/g)) files.add(m[1]);
-const relative = [...files].map(f => f.replace(`${process.cwd()}/`, "")).filter(f => testFile.test(f));
+// Failing files: "test at <file>:<line>" (spec reporter) or a TAP "location: '<file>:<line>:<col>'", whatever separator
+// the platform prints (see lib/ci-log.mjs; this repository names test files *.test.{ts,mts,cts,js,mjs,cjs}).
+const relative = failingTestFiles(first.output, process.cwd());
 if (!relative.length) { console.log("::error::test run failed without an identifiable failing file"); process.exit(first.code); }
 
 const flags = args.filter(a => a.startsWith("--"));

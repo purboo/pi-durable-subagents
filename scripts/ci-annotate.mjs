@@ -1,8 +1,9 @@
 // CI: turn the "failing tests" section of node --test logs into public annotations (job logs need a sign-in to read).
 import { existsSync, readFileSync } from "node:fs";
+import { stripAnsi } from "./lib/ci-log.mjs";
 for (const file of process.argv.slice(2)) {
   if (!existsSync(file)) continue;
-  const text = readFileSync(file, "utf8").replace(/\x1b\[[0-9;]*m/g, ""), at = text.lastIndexOf("failing tests:");
+  const text = stripAnsi(readFileSync(file, "utf8")), at = text.lastIndexOf("failing tests:");
   // TAP (the non-TTY default on older Node): each failure is a "not ok" block; skip the per-file summary ones.
   const tap = [...text.matchAll(/^\s*not ok \d+ - (.*)\n([\s\S]*?)\n\s*\.\.\./gm)].filter(m => !/failureType: 'subtestsFailed'|error: 'test failed'/.test(m[2]));
   if (at < 0 && tap.length) {

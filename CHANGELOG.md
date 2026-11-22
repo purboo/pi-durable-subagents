@@ -16,6 +16,12 @@
 - Linux/macOS mechanism tests (inherited `DSA_EXEC` tags, POSIX shell scripts, `setsid`, `chmod 000`, POSIX signals) are
   skipped on Windows with an explicit reason; Windows has equivalent process-table, lock, command-wrapper, hold and
   launcher coverage.
+- Windows CI: the repository's own scripts run on a native Windows runner. `pack:smoke` starts npm without a shell
+  (`npm_execpath`) or through `cmd.exe` (`npm.cmd`), puts `node_modules/.bin` first on `PATH` with `;` and under the
+  single name Windows gives it, imports the packaged modules as `file:` URLs (a drive letter is not a URL scheme) and
+  ends the packaged run with its whole process tree; `ci-test.mjs` ends a timed-out run the same way and reads failing
+  test files with either separator; `check-imports.mjs` resolves the repository from its own location, not the working
+  directory.
 
 ## 1.5.1
 

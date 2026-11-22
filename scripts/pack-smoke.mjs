@@ -1,22 +1,41 @@
 // Release check: build, `npm pack`, unpack into a temp prefix and run the PACKAGED product end to end:
 // `pi-durable-subagents smoke`, then a real two-step chain through the packaged orchestrator, executor, evaluator
 // and child extension (pi with the test faux provider). Never touches ~/.pi or the real DSA_HOME.
-import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } from "node:fs";
+// Runs unchanged on a real Windows runner: npm is started without a shell (npm_execpath) or through cmd.exe (npm.cmd)
+// there, PATH is joined with `;` under its `Path` name, packaged modules are imported as `file:` URLs, and the run is
+// ended with its whole process tree so no pi subagent keeps the temp directory or this job's stdout.
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire } from "node:module";
+import { cmdArgs, fileSpecifier, npmInvocation, setEnvPath, treeKillCommand, withBinPath } from "./lib/platform.mjs";
 
 const repo = resolve(import.meta.dirname, ".."), keep = process.argv.includes("--keep");
+const windows = process.platform === "win32";
 const root = mkdtempSync(join(tmpdir(), "dsa-pack-"));
+const npm = npmInvocation();
 const run = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], ...opts });
+const npmRun = (args, opts = {}) => npm.shell
+  ? run(npm.command, [...npm.args, ...cmdArgs(args)], { ...opts, shell: true })
+  : run(npm.command, [...npm.args, ...args], opts);
+/** Ends the orchestrator with the pi subagents it started; a bare signal on Windows would leave them running. */
+async function stop(child) {
+  const ended = new Promise(r => child.exitCode !== null || child.signalCode !== null ? r() : child.once("exit", () => r()));
+  const tree = child.pid ? treeKillCommand(child.pid) : undefined;
+  if (tree) spawnSync(tree.command, tree.args, { stdio: "ignore" });
+  else child.kill("SIGTERM");
+  await Promise.race([ended, new Promise(r => setTimeout(r, 15_000))]);
+}
 try {
-  run("npm", ["run", "build"], { cwd: repo });
-  const tgz = run("npm", ["pack", "--pack-destination", root, "--silent"], { cwd: repo }).trim().split("\n").at(-1);
+  npmRun(["run", "build"], { cwd: repo });
+  const tgz = npmRun(["pack", "--pack-destination", root, "--silent"], { cwd: repo }).trim().split(/\r?\n/).at(-1);
   const pkg = join(root, "node_modules", "pi-durable-subagents");
   mkdirSync(pkg, { recursive: true });
+  // The `tar` npm depends on: GNU/bsdtar on Linux and macOS, and bsdtar, which ships with Windows 10 and later, there.
   run("tar", ["-xzf", join(root, tgz), "-C", pkg, "--strip-components=1"]);
-  const files = run("tar", ["-tzf", join(root, tgz)]).trim().split("\n");
+  // The listing is compared below as `/`-separated package paths whichever separator the platform's tar prints.
+  const files = run("tar", ["-tzf", join(root, tgz)]).split(/\r?\n/).map(line => line.trim().replace(/\\/g, "/")).filter(Boolean);
   for (const bad of files.filter(f => /\/(src|test|design)\/|\.ts$/.test(f) && !f.endsWith(".d.ts"))) throw new Error(`unexpected file in package: ${bad}`);
   for (const need of ["package/index.js", "package/dist/agent/extension.js", "package/dist/orchestrator/main.js", "package/dist/evaluator/worker.js", "package/dist/cli/main.js", "package/agents/worker.md", "package/LICENSE", "package/README.md"])
     if (!files.includes(need)) throw new Error(`missing from package: ${need}`);
@@ -33,17 +52,18 @@ try {
     if (found) throw new Error(`${peer} resolves from the unpacked package (${found}); the CLI check below would prove nothing`);
   }
   const { NODE_PATH: _, ...inherited } = process.env;
-  const env = { ...inherited, DSA_HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root,
-    PATH: `${join(repo, "node_modules/.bin")}:${process.env.PATH}` };
+  // node_modules/.bin first on PATH: the packaged CLI and the orchestrator find `pi` there (as `pi.cmd` on Windows).
+  const env = setEnvPath({ ...inherited, DSA_HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root },
+    withBinPath(join(repo, "node_modules", ".bin"), process.platform, process.env.PATH ?? ""));
   console.log(run(process.execPath, [join(pkg, "dist/cli/main.js"), "smoke"], { env }).trim());
 
   const script = steps => `#script: ${JSON.stringify(steps)}`;
   const req = { rid: "pack-1", from: "pack:smoke", to: "orch", sseq: 1, kind: "run",
     body: { cwd, chain: [{ agent: "echo", task: script([{ text: "alpha" }]) }, { agent: "echo", task: `after {previous}: ${script([{ text: "beta" }])}` }] } };
   mkdirSync(join(home, "inbox"), { recursive: true });
-  const { publishRequest } = await import(join(pkg, "dist/kernel/mailbox.js"));
-  const { orchInbox, orchLedger, journalPath } = await import(join(pkg, "dist/paths.js"));
-  const { readJournalSnapshot } = await import(join(pkg, "dist/kernel/journal.js"));
+  const { publishRequest } = await import(fileSpecifier(join(pkg, "dist/kernel/mailbox.js")));
+  const { orchInbox, orchLedger, journalPath } = await import(fileSpecifier(join(pkg, "dist/paths.js")));
+  const { readJournalSnapshot } = await import(fileSpecifier(join(pkg, "dist/kernel/journal.js")));
   await publishRequest(orchInbox(home), req);
   const orch = spawn(process.execPath, [join(pkg, "dist/orchestrator/main.js")], { env, stdio: ["ignore", "inherit", "inherit"] });
   const deadline = Date.now() + 90_000;
@@ -78,16 +98,15 @@ try {
   if (refused.code !== 1 || JSON.parse(refused.out).applied !== false) throw new Error(`packaged CLI refusal: exit ${refused.code} ${refused.out}`);
   console.log("packaged CLI: run, describe, follow-up and refusal ok");
   // Wait for the orchestrator to end (it may still be writing the follow-up generation) before the directory goes.
-  const ended = new Promise(r => orch.exitCode !== null || orch.signalCode !== null ? r() : orch.once("exit", () => r()));
-  orch.kill("SIGTERM");
-  await Promise.race([ended, new Promise(r => setTimeout(r, 15_000))]);
+  await stop(orch);
   const outputs = Array.isArray(done.result) ? done.result.map(r => r.output) : [];
   if (done.status !== "done" || outputs.join(",") !== "alpha,beta") throw new Error(`unexpected result: ${JSON.stringify(done)}`);
   console.log(`packaged chain: ${done.status} ${JSON.stringify(outputs)}`);
   console.log("pack-smoke ok");
 } finally {
-  // Cleanup must not turn a passing check into a failure: a late writer (macOS ENOTEMPTY) gets retries, then a warning.
+  // Cleanup must not turn a passing check into a failure: a late writer (macOS ENOTEMPTY, Windows a still-closing handle)
+  // gets retries, then a warning.
   if (keep) console.log(`kept: ${root}`);
-  else try { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
+  else try { rmSync(root, { recursive: true, force: true, maxRetries: windows ? 20 : 10, retryDelay: 250 }); }
   catch (error) { console.warn(`pack-smoke: could not remove ${root}: ${error.message}`); }
 }
