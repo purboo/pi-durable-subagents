@@ -217,9 +217,9 @@ test("a program's stdout and stderr both land in one log, neither overwriting th
   assert.ok(launched);
   await launched.exited;
   const log = readFileSync(join(dir, "output.log"), "utf8");
-  for (let at = 0; at < 40; at += 1) {
-    assert.equal(log.split(`line-${at}`).length - 1, 1, `line-${at} appears exactly once`);
-  }
+  const lines = log.trimEnd().split(/\r?\n/).sort();
+  const expected = Array.from({ length: 40 }, (_, at) => `line-${at}`).sort();
+  assert.deepEqual(lines, expected);
 });
 
 test("a Unicode and curly-quoted attempt directory, argv, cwd and environment arrive unchanged", { skip: windowsOnly, timeout: 120_000 }, async t => {

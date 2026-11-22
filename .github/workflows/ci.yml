@@ -63,7 +63,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "24" }
-      - run: npm ci
+      - id: install
+        run: npm ci
       - run: node scripts/probe-win-job-start.mjs
       # The group, its crash/normal-end fences, the starter-death survival and the handshake/adoption checks.
       - run: node --test --test-force-exit test/unit/platform/job.test.ts test/unit/platform/job-handshake.test.ts
+      - name: Verify restart adoption and one rerun through the executor
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: node --test --test-force-exit --test-name-pattern="restarts \(normal and forced\) adopt|seals unknown; rerun" test/pi/e2e/command.test.ts
