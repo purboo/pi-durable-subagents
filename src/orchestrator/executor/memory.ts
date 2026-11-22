@@ -23,7 +23,7 @@ export async function availableMemory(): Promise<number> {
   // forever; commit headroom is what another child can still allocate. FreeVirtualMemory is KB.
   if (process.platform === "win32") {
     try {
-      const stdout = await powershell("$os = Get-CimInstance Win32_OperatingSystem; $os.FreeVirtualMemory", { timeout: 5000 });
+      const stdout = await powershell("$s = [wmisearcher]'SELECT FreeVirtualMemory FROM Win32_OperatingSystem'; foreach ($os in $s.Get()) { $os.FreeVirtualMemory }", { timeout: 5000 });
       const kb = Number(stdout.trim());
       if (kb > 0) return kb / 1024;
     } catch { /* fall through to the physical free memory */ }

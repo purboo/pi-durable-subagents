@@ -13,18 +13,7 @@ export const IS_WINDOWS = process.platform === "win32";
 /** The Windows directory holding powershell.exe and taskkill.exe. */
 export function systemRoot(env: NodeJS.ProcessEnv = process.env): string { return env.SystemRoot || env.windir || "C:\\Windows"; }
 
-/** The system variables a Windows helper resolves its own files, its temp directory and its module path from.
- *  An orchestrator can be handed a deliberately isolated environment — a chaos/drill/e2e fixture, the evaluator host, a
- *  service starter — that keeps PATH and HOME but drops these. `powershell.exe` then starts with an empty
- *  `%SystemRoot%` (its default module path becomes a drive-relative `System32\WindowsPowerShell\v1.0\Modules`, so
- *  `Get-CimInstance` cannot autoload) and no module analysis cache under `%LOCALAPPDATA%`, so the CIM scan of the
- *  process table either fails or outlasts its deadline: on native Windows a fence then reports `Fence timeout` at its
- *  full 15 s budget while the sweep reports the PowerShell failure. On a native Windows runner (Node 22.19, normal
- *  environment) the unit test that captures one identity, scans the table and fences the child — five helper calls —
- *  takes 2.9 s, so a call costs about 0.6 s there.
- *  Present values are kept, so nothing of the caller's environment (HOME, PATH, credentials) is replaced, and only
- *  missing system variables are derived from the operating system: a helper gains no variable the isolated caller did
- *  not already have. */
+/** Supply OS defaults to helpers launched from deliberately isolated environments. */
 export function helperEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   // A derivation that fails must not take the helper down with it: a variable that stays unset is what it had before.
   const attempt = (read: () => string, fallback: string) => { try { return read() || fallback; } catch { return fallback; } };
@@ -56,26 +45,16 @@ export function comspec(env: NodeJS.ProcessEnv = process.env): string {
   return env.ComSpec || env.COMSPEC || join(systemRoot(), "System32", "cmd.exe");
 }
 
-// Import the Windows PowerShell module relative to its installation even when the parent isolated PSModulePath.
-export function cimScript(script: string): string {
-  return String.raw`$ErrorActionPreference = 'Stop'; Import-Module "$PSHOME\Modules\CimCmdlets" -ErrorAction Stop; ` + script;
-}
-
+const PS_PREAMBLE = "$ErrorActionPreference = 'Stop'; ";
 const PS_FLAGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
 /** Run a PowerShell script; rejects with its stderr. */
 export async function powershell(script: string, options: { signal?: AbortSignal; timeout?: number } = {}): Promise<string> {
-  try {
-    const { stdout } = await exec(powershellPath(), [...PS_FLAGS, cimScript(script)],
-      { signal: options.signal, timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, env: helperEnv() });
-    return stdout;
-  } catch (error) {
-    // A process that vanished while it was queried is not an error: the caller reads an empty answer.
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error;
-    throw error;
-  }
+  const { stdout } = await exec(powershellPath(), [...PS_FLAGS, PS_PREAMBLE + script],
+    { signal: options.signal, timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, env: helperEnv() });
+  return stdout;
 }
 export function powershellSync(script: string, options: { timeout?: number } = {}): string {
-  return execFileSync(powershellPath(), [...PS_FLAGS, cimScript(script)], { timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8", env: helperEnv() });
+  return execFileSync(powershellPath(), [...PS_FLAGS, PS_PREAMBLE + script], { timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8", env: helperEnv() });
 }
 
 export interface WinProcessRow {
@@ -89,10 +68,15 @@ export interface WinProcessRow {
 
 /** One line per process: pid, ppid, creation ticks, CPU (100ns -> ms) and command line (tabs/newlines replaced by
  *  spaces so a line stays one row). */
-export const PROCESS_ROWS_SCRIPT = "Get-CimInstance Win32_Process | ForEach-Object { " +
-  "$d = $_.CreationDate; $t = if ($d) { $d.Ticks } else { '' }; " +
-  "$c = [string]$_.CommandLine; $c = $c.Replace(\"`t\", ' ').Replace(\"`r\", ' ').Replace(\"`n\", ' '); " +
-  "\"{0}`t{1}`t{2}`t{3}`t{4}\" -f $_.ProcessId, $_.ParentProcessId, $t, ($_.UserModeTime + $_.KernelModeTime), $c }";
+const creationTicks = "[System.Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate).Ticks";
+function processQuery(fields: string, body: string, pid?: number): string {
+  const where = pid === undefined ? "" : ` WHERE ProcessId=${pid}`;
+  return `$s = [wmisearcher]'SELECT ${fields} FROM Win32_Process${where}'; foreach ($p in $s.Get()) { ${body} }`;
+}
+export const PROCESS_ROWS_SCRIPT = processQuery("ProcessId,ParentProcessId,CreationDate,UserModeTime,KernelModeTime,CommandLine",
+  `if (!$p.CreationDate) { continue }; $t = ${creationTicks}; ` +
+  '$c = ([string]$p.CommandLine) -replace "[`t`r`n]", " "; ' +
+  '"{0}`t{1}`t{2}`t{3}`t{4}" -f $p.ProcessId, $p.ParentProcessId, $t, ([uint64]$p.UserModeTime + [uint64]$p.KernelModeTime), $c');
 
 export function parseProcessRows(stdout: string): WinProcessRow[] {
   const rows: WinProcessRow[] = [];
@@ -126,27 +110,27 @@ export function winSnapshotSync(maxAgeMs = 250): Map<number, WinProcessRow> {
 export async function winStart(pid: number, options: { signal?: AbortSignal; timeout?: number } = {}): Promise<string> {
   if (!Number.isInteger(pid) || pid <= 0) return "";
   try {
-    const out = await powershell(`$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.CreationDate.Ticks }`, options);
+    const out = await powershell(processQuery("CreationDate", `if ($p.CreationDate) { ${creationTicks} }`, pid), options);
     return out.trim();
   } catch { return ""; }
 }
 export function winStartSync(pid: number): string {
   if (!Number.isInteger(pid) || pid <= 0) return "";
-  try { return powershellSync(`$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.CreationDate.Ticks }`).trim(); }
+  try { return powershellSync(processQuery("CreationDate", `if ($p.CreationDate) { ${creationTicks} }`, pid)).trim(); }
   catch { return ""; }
 }
 /** A diagnostic command line (never evidence of identity or death). */
 export async function winCommandLine(pid: number, signal?: AbortSignal): Promise<string> {
   if (!Number.isInteger(pid) || pid <= 0) return "";
   try {
-    const out = await powershell(`$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.CommandLine }`, { signal, timeout: 1000 });
+    const out = await powershell(processQuery("CommandLine", "$p.CommandLine", pid), { signal, timeout: 1000 });
     return out.trim().replace(/\s+/g, " ").slice(0, 200);
   } catch { return ""; }
 }
 export function winCommandLineSync(pid: number): string {
   if (!Number.isInteger(pid) || pid <= 0) return "";
   try {
-    return powershellSync(`$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.CommandLine }`, { timeout: 1000 })
+    return powershellSync(processQuery("CommandLine", "$p.CommandLine", pid), { timeout: 1000 })
       .trim().replace(/\s+/g, " ").slice(0, 200);
   } catch { return ""; }
 }
