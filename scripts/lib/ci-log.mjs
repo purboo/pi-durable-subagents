@@ -12,7 +12,12 @@ const TEST_FILE = /\.test\.[cm]?[jt]s$/;
 export function failingTestFiles(output, cwd, platform = process.platform) {
   const text = stripAnsi(output), found = new Set();
   for (const match of text.matchAll(/^\s*test at (\S+?):\d+:\d+\s*$/gm)) found.add(match[1]);
-  for (const match of text.matchAll(/location: '([^']+?):\d+:\d+'/g)) found.add(match[1]);
+  for (const match of text.matchAll(/location: '([^']+?):\d+:\d+'/g)) {
+    // Node's TAP reporter escapes backslashes in quoted locations. Spec locations are printed verbatim.
+    const file = match[1];
+    const escaped = platform === "win32" && /^(?:[a-z]:\\\\|\\\\\\\\)/i.test(file);
+    found.add(escaped ? file.replace(/\\\\/g, "\\") : file);
+  }
   const separator = platform === "win32" ? "\\" : "/", fold = path => platform === "win32" ? path.toLowerCase() : path;
   const trimmed = path => path.replace(/[\\/]+$/, ""), base = trimmed(cwd) + separator;
   const files = new Set();

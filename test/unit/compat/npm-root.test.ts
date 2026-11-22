@@ -5,10 +5,9 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { globalNpmRoot } from "../../../src/compat/agents.ts";
 
-const agents = fileURLToPath(new URL("../../../src/compat/agents.ts", import.meta.url));
+const agents = new URL("../../../src/compat/agents.ts", import.meta.url).href;
 
 /** A home with a fake `npm` first on PATH that counts its starts and prints `root` (or fails). Like a real install,
  *  `bin/npm` links to the npm package's `bin/npm-cli.js`; `shim` puts a version manager's shim there instead. */

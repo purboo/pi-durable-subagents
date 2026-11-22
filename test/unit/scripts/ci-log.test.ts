@@ -35,6 +35,7 @@ test("Windows path forms: backslashes, drive letters, and case-insensitive cwd m
     String.raw`test at test\unit\cli\run.test.ts:4:2`,
     String.raw`location: 'C:\Work\repo\test\unit\cli\start.test.ts:9:1'`,
     String.raw`test at c:\work\repo\test\unit\kernel\io.test.ts:1:1`,
+    String.raw`location: 'C:\\Work\\repo\\test\\unit\\cli\\start.test.ts:9:1'`,
   ].join("\n");
   // Under cwd: the cwd-relative form node --test accepted on the command line (spec lines first, then TAP).
   assert.deepEqual(log.failingTestFiles(output, String.raw`C:\Work\repo`, "win32"), [
@@ -53,8 +54,8 @@ test("a POSIX path outside cwd stays absolute, and each file is listed once", ()
     "test at /build/test/unit/a.test.ts:2:1",
     "  location: '/build/test/unit/a.test.ts:3:1'",
   ].join("\n");
-  assert.deepEqual(log.failingTestFiles(output, "/build"), ["test/unit/a.test.ts"]);
-  assert.deepEqual(log.failingTestFiles(output, "/elsewhere"), ["/build/test/unit/a.test.ts"]);
+  assert.deepEqual(log.failingTestFiles(output, "/build", "linux"), ["test/unit/a.test.ts"]);
+  assert.deepEqual(log.failingTestFiles(output, "/elsewhere", "linux"), ["/build/test/unit/a.test.ts"]);
 });
 
 test("a run without a failing test file yields nothing", () => {
