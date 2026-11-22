@@ -32,10 +32,10 @@ try {
   const tgz = npmRun(["pack", "--pack-destination", root, "--silent"], { cwd: repo }).trim().split(/\r?\n/).at(-1);
   const pkg = join(root, "node_modules", "pi-durable-subagents");
   mkdirSync(pkg, { recursive: true });
-  // The `tar` npm depends on: GNU/bsdtar on Linux and macOS, and bsdtar, which ships with Windows 10 and later, there.
-  run("tar", ["-xzf", join(root, tgz), "-C", pkg, "--strip-components=1"]);
+  // Use paths relative to the pack directory. GNU tar on a Windows PATH interprets C: as a remote archive host.
+  run("tar", ["-xzf", tgz, "-C", "node_modules/pi-durable-subagents", "--strip-components=1"], { cwd: root });
   // The listing is compared below as `/`-separated package paths whichever separator the platform's tar prints.
-  const files = run("tar", ["-tzf", join(root, tgz)]).split(/\r?\n/).map(line => line.trim().replace(/\\/g, "/")).filter(Boolean);
+  const files = run("tar", ["-tzf", tgz], { cwd: root }).split(/\r?\n/).map(line => line.trim().replace(/\\/g, "/")).filter(Boolean);
   for (const bad of files.filter(f => /\/(src|test|design)\/|\.ts$/.test(f) && !f.endsWith(".d.ts"))) throw new Error(`unexpected file in package: ${bad}`);
   for (const need of ["package/index.js", "package/dist/agent/extension.js", "package/dist/orchestrator/main.js", "package/dist/evaluator/worker.js", "package/dist/cli/main.js", "package/agents/worker.md", "package/LICENSE", "package/README.md"])
     if (!files.includes(need)) throw new Error(`missing from package: ${need}`);
