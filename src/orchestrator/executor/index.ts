@@ -54,7 +54,7 @@ import { availableMemory } from "./memory.ts";
 import { reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 import { indexSweep, seededSweep, recordFenceFailure, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "./sweep.ts";
 import { gateRetired } from "./effects/gate.ts";
-import { WorktreeIndex, worktreeCalls, worktreeLabel, worktreePair, worktreeRoots, type WorktreeWrite } from "./worktree.ts";
+import { WorktreeIndex, isWorktreeConflict, worktreeCalls, worktreeLabel, worktreePair, worktreeRoots, type WorktreeWrite } from "./worktree.ts";
 import { failedModel, modelFailures, MODEL_RETRY_MS, parentPinned, spillCandidates } from "./pool.ts";
 import { PENDING_NOTE, UNDELIVERED_FOLLOW_UP } from "../notes.ts";
 import { COMMAND_LOG, exitMeaning, readExitRecord, readTail, spawnCommand, type SpawnedCommand } from "../../platform/command.ts";
@@ -460,6 +460,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     await resolveWorktrees(call);
     for (const { item } of attentionEntries(journal.entries())) {
       if (item.kind === "finished" || item.id === `unknown:${call}` || item.id.startsWith("fence:")) continue;
+      // P32: the identity-conflict note reports what a kept worktree holds; the call ending repairs nothing, so a seal or a
+      // recovery leaves it open for the person to see and act on.
+      if (isWorktreeConflict(item.id, call)) continue;
       if (item.call === call && !journal.entries().some(r => r.type === JT.attentionResolved && r.id === item.id && r.rev === item.rev))
         await journal.append(JT.attentionResolved, { id: item.id, rev: item.rev, resolution: "retired" });
     }

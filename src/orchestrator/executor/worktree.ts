@@ -41,6 +41,12 @@ export function worktreeRoots() {
 
 /** Pair identity is durable; it also lets readers and seal recovery identify both participants. */
 export const worktreePair = (a: string, b: string): string => `worktree:${[a, b].sort().join("|")}`;
+/** P32: The id of the one durable note a successful call's kept worktree records when its path holds another identity
+ *  (effects/prepare.ts writes it; the seal's retirement, the recovery predicate and the digest read it). */
+export const worktreeConflictId = (call: string): string => `worktree-conflict:${call}`;
+/** P32: Whether an attention id is exactly `call`'s identity-conflict note. That note reports what the kept path holds
+ *  for a person; the call ending does not settle it (nothing was repaired), so only its repair does. */
+export const isWorktreeConflict = (id: string, call: string): boolean => id === worktreeConflictId(call);
 export const worktreeCalls = (id: string): string[] => id.startsWith("worktree:") ? id.slice(9).split("|") : [];
 export const worktreeLabel = (call: string): string => call.replace(/@\d+\//, "/").replace(/@\d+$/, "");
 

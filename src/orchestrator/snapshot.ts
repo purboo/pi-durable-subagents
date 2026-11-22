@@ -15,7 +15,7 @@ import { type LedgerState } from "./ledger.ts";
 import { awaitingRuns, readerHold, readerLedger, readerLedgerIdentity, type AwaitingRun, type ReaderLedger } from "./reader-ledger.ts";
 import type { Exhaustion } from "./providers.ts";
 import { packageVersion } from "../version.ts";
-import { worktreeCalls, worktreeLabel } from "./executor/worktree.ts";
+import { worktreeCalls, worktreeLabel, isWorktreeConflict } from "./executor/worktree.ts";
 import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
 import { labelsOf } from "../events/derive.ts";
 import { PENDING_NOTE, generationRids, UNDELIVERED_FOLLOW_UP } from "./notes.ts";
@@ -626,10 +626,12 @@ export function pendingRecovery(wid: string, entries: readonly Entry[]): boolean
       if (seals.has(call) && !hasAttention(`finished:${call}`)) return true;
     }
   }
-  // Retirement, fence repair, and cross-workflow conflict resolution can still close these items.
+  // Retirement, fence repair, and cross-workflow conflict resolution can still close these items. A call's
+  // identity-conflict note (a kept worktree) is like `unknown:<call>`: a durable diagnostic of a sealed call that it writes
+  // once and never retires, so an open one is no recovery work due and does not hold the digest back.
   for (const { item } of attention) if (!resolved.has(JSON.stringify([item.id, item.rev]))) {
     if (item.id.startsWith("fence:") || item.kind === "conflict") return true;
-    if (item.call && seals.has(item.call) && item.kind !== "finished" && item.id !== `unknown:${item.call}`) return true;
+    if (item.call && seals.has(item.call) && item.kind !== "finished" && item.id !== `unknown:${item.call}` && !isWorktreeConflict(item.id, item.call)) return true;
   }
   return false;
 }

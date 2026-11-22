@@ -55,6 +55,16 @@ function identityConflict(t: CallTicket, path: string, branch: string, head: str
   return `Worktree identity conflict: ${t.callId} (workflow ${t.wid}) needs its worktree ${path} on ${branch}${head ? ` at ${head}` : ""}, ` +
     `but the path holds ${holdText(tree)}`;
 }
+/** P32: What to advise a person. It names the path and the branch but never spells out a shell command: either may hold
+ *  spaces or characters a shell would interpret, so the operator repairs the path with their own quoting. */
+function repairAdvice(path: string, branch: string, kept: boolean): string {
+  const inspect = `Check what ${path} holds and keep anything you need`;
+  return kept
+    ? `${inspect}. The worktree and its branch were kept, nothing was removed, and this call's sealed result is unchanged; ` +
+      `restore the path on ${branch} (or remove that worktree once its changes are preserved) and this note is no longer needed`
+    : `${inspect}. The call failed and the path, its files and its branches were left untouched: restore the path on ${branch}, ` +
+      `or remove that worktree once its changes are preserved, and run the call again`;
+}
 /** P32: Commit creation intent and reconcile Git's worktree registry and branch identity. */
 export async function prepareWorktree(t: CallTicket): Promise<string> {
   if (t.spec.isolation !== "worktree") return t.cwd;
@@ -81,8 +91,7 @@ export async function prepareWorktree(t: CallTicket): Promise<string> {
     // A path someone else moved fails this call only, before anything runs: the worktree is never re-created or moved
     // over what it holds (its files and branch stay for the person to repair).
     if (tree.branch !== `refs/heads/${branch}` || tree.HEAD !== head) throw new Error(`${identityConflict(t, path, branch, head, tree)}. ` +
-      `The call failed and the path, its files and its branches were left untouched: check the path out on ${branch} ` +
-      `(git -C ${path} checkout ${branch}), or remove it (git worktree remove ${path}), and run the call again`);
+      `${repairAdvice(path, branch, false)}`);
   } else {
     if (head) {
       const known = t.journal.entries().some(e => e.type === "wt-created" && t.journal.entries().some(i => i.type === "wt-intent" && i.call === e.call && i.branch === branch));
@@ -108,8 +117,7 @@ export async function cleanWorktree(t: CallTicket): Promise<void> {
     // holds, while throwing here would fail this call's recovery on every start. The note is an `unknown` item (like a
     // dirty keep), not a `conflict` reminder: no cross-call contention is open, so it does not hold the workflow open.
     await attention(t, "worktree-conflict", `${identityConflict(t, path, String(intent.branch), head, tree)}. ` +
-      `The worktree and its branch were kept, nothing was removed, and this call's sealed result is unchanged; check the ` +
-      `path out or remove it (git worktree remove ${path}) when it is no longer needed`);
+      `${repairAdvice(path, String(intent.branch), true)}`);
     await t.journal.append("wt-kept", { call: t.callId }); return;
   }
   if (await git(path, "status", "--porcelain", "--untracked-files=all")) {
