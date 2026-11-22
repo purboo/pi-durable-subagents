@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.1
+
+- A worktree on an unexpected branch or detached HEAD can no longer block unrelated workflows during startup recovery. If the call already succeeded, recovery keeps its result and files and records one notice that survives restarts. The notice identifies the call, path, expected branch and actual checkout (#10).
+
 ## 1.5.0
 
 - The `durable-subagents:activity` event includes `costUsd`, the sum of recorded costs for the session's retained workflows, including finished runs. Status bars receive a new event when spend changes (#6).
