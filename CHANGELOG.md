@@ -32,6 +32,17 @@
   path the intent recorded is what the call returns and what every message names, so one worktree is never created twice
   and the cleanup and the gate use the directory Git registered. An intent recorded by an earlier version outside its
   workflow is refused at preparation and never created, inspected or removed.
+- The `chaos` scenario wrote `config.json` as `providers: { "dsa-chaos": 3 }`, which the orchestrator rejects
+  (`providers.<name>.slots must be a nonnegative integer`): the whole file — three provider slots, `trackerMs`
+  100/`checkpointMs` 200, `idleExitMs` 2 s — never applied, so every scenario ran on default settings. It now
+  writes `{ slots: 3 }`, both diagnostic commands keep their settings in one exported value, and a unit test
+  runs the orchestrator's own `configProblem` over each.
+- A detached orchestrator's own output can be kept: `DSA_ORCHESTRATOR_LOG=<file>` appends its stdout and stderr
+  there (discarded by default, and an unusable path never fails the start). The `chaos` scenario, the `failover`
+  drill and the real-pi e2e cases set it inside their temp root, and `scripts/diagnose-e2e.mjs`
+  (`npm run diagnose:e2e`) replays the smallest real-pi cases in order and prints, for the first failing one, the
+  orchestrator's start/recovery/exit, each workflow's journal tail and that log, redacted — so a stalled case
+  names its stage instead of only a timeout. A failing Windows Node 24 run keeps the state as an artifact.
 
 ## 1.5.1
 

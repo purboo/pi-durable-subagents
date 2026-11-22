@@ -25,6 +25,9 @@ export async function until<T>(get: () => T | Promise<T>, label: string, ms = 60
 }
 /** Encode a script carried by a real task or main-session prompt. */
 export function script(steps: unknown[]): string { return `#chaos: ${JSON.stringify(steps)}`; }
+/** The scenario's own settings: three provider slots, and a tracker/checkpoint cadence tight enough to observe a child
+ *  that exits right after its first answer. `providers` maps a name to `{ slots }` (orchestrator/config.ts). */
+export const chaosConfig = { providers: { "dsa-chaos": { slots: 3 } }, k: { trackerMs: 100, checkpointMs: 200, idleExitMs: 2000 } };
 /** Start an isolated real pi main, retaining RPC and diagnostic evidence. */
 export function stack(root: string, inherited: NodeJS.ProcessEnv) {
   const home = join(root, "dsa"), cwd = join(root, "work"), agent = join(root, "agent"), session = join(root, "main.jsonl");
@@ -32,10 +35,13 @@ export function stack(root: string, inherited: NodeJS.ProcessEnv) {
   const sibling = (name: string) => fileURLToPath(new URL(name + (import.meta.url.endsWith(".ts") ? ".ts" : ".js"), import.meta.url));
   writeFileSync(join(agent, "settings.json"), JSON.stringify({ extensions: [sibling("./provider"), sibling("../../agent/extension"), sibling("./observer")],
     defaultProvider: "dsa-chaos", defaultModel: "scripted", retry: { enabled: false }, compaction: { enabled: false }, defaultProjectTrust: "always" }));
-  writeFileSync(join(home, "config.json"), JSON.stringify({ providers: { "dsa-chaos": 3 }, k: { trackerMs: 100, checkpointMs: 200, idleExitMs: 2000 } }));
+  writeFileSync(join(home, "config.json"), JSON.stringify(chaosConfig));
   for (const name of ["writer", "reviewer", "integrator"]) writeFileSync(join(cwd, `.pi/agents/${name}.md`), `---\nname: ${name}\ndescription: Chaos ${name}\nmodel: dsa-chaos/scripted\ntools: bash, ask\n---\nFollow the scripted task.\n`);
   const env = { PATH: inherited.PATH, HOME: join(root, "home"), TMPDIR: root, PI_CODING_AGENT_DIR: agent,
-    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", JITI_FS_CACHE: "false", DSA_HOME: home, DSA_CHAOS_ROOT: root, DSA_ORCHESTRATOR_ENTRY: sibling("./host") };
+    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", JITI_FS_CACHE: "false", DSA_HOME: home, DSA_CHAOS_ROOT: root, DSA_ORCHESTRATOR_ENTRY: sibling("./host"),
+    // The orchestrator this scenario starts through pi is detached and has no terminal: keep what it says with the rest
+    // of the evidence (--keep, or a failure) instead of discarding it.
+    DSA_ORCHESTRATOR_LOG: join(root, "orchestrator.log") };
   const instances: { child: ChildProcessWithoutNullStreams; events: any[]; prompt(steps: unknown[]): Promise<void> }[] = [];
   function launch() {
     let child!: ChildProcessWithoutNullStreams, events: any[] = [], buffer = "", error: Error | undefined, requestId = 0, ready = false;

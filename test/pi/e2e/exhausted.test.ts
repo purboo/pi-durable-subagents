@@ -42,7 +42,8 @@ test("XP1 HTTP-200 quota answers fail over without contaminating the next reques
   await writeFile(join(home, "config.json"), JSON.stringify({ pools: { top: ["qa/m", "qb/m"] },
     providers: Object.fromEntries(names.map(provider => [provider, { slots: 1, ...(provider !== "qunset" ? { exhaustedPatterns: [quota] } : {}) }])) }));
   const env: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, HOME: root, DSA_HOME: home,
-    PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" };
+    PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0",
+    DSA_ORCHESTRATOR_LOG: join(root, "orchestrator.log") };
   const cli = (args: string[]) => new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
     const child = spawn(process.execPath, [join(REPO, "src/cli/main.ts"), ...args], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "", err = ""; child.stdout.on("data", d => { out += d; }); child.stderr.on("data", d => { err += d; });

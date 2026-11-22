@@ -46,7 +46,10 @@ export function startPi(opts: { root: string; name: string; extensions?: string[
   for (const d of ["agent", "work", "sessions"]) fs.mkdirSync(path.join(dir, d), { recursive: true });
   const env: Record<string, string | undefined> = {
     ...process.env, PROBE_DIR: dir, PI_CODING_AGENT_DIR: path.join(dir, "agent"),
-    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", ...opts.env,
+    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0",
+    // The orchestrator this session starts is detached without a terminal: its own output stays in the temp dir, where
+    // DSA_KEEP (or the caller) can read it instead of losing the only explanation of a stalled workflow.
+    DSA_ORCHESTRATOR_LOG: path.join(dir, "orchestrator.log"), ...opts.env,
   };
   delete env.PI_SESSION_FILE; delete env.PI_SESSION_ID;
   const extArgs = [FAUX, ...(opts.extensions ?? [])].flatMap(e => ["-e", e]);

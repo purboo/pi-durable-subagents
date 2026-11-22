@@ -154,3 +154,14 @@ test("slotsView names the holders per workflow origin when more than one origin 
   await orch.append("hold", { pool: "memory", slot: 0, exec: "W1@1/k1@1#1.1" });
   assert.deepEqual(slotsView(home).slots, ["a 5/5 (3 cli:alice@host, 2 session 01a11a3b)", "b 1/2"]);
 });
+
+test("the diagnostic commands' own config.json is one the orchestrator accepts", async () => {
+  const { chaosConfig } = await import("../../../src/cli/chaos/stack.ts");
+  const { drillConfig } = await import("../../../src/cli/drill/index.ts");
+  // Both write config.json themselves before starting a real orchestrator: a rejected file would silently run the drill
+  // or scenario on default settings (cadence, provider slots, probe interval) instead of the ones it documents.
+  assert.equal(configProblem(chaosConfig), undefined, JSON.stringify(chaosConfig));
+  assert.equal(configProblem(drillConfig()), undefined, JSON.stringify(drillConfig()));
+  assert.equal(configProblem({ providers: { "dsa-chaos": 3 } }), "providers.dsa-chaos.slots must be a nonnegative integer",
+    "the shape the chaos stack used to write");
+});

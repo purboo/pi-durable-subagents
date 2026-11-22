@@ -26,7 +26,8 @@ test("E2E failover: a pool run on a used-up provider finishes on the next candid
   await writeFile(join(home, "config.json"), JSON.stringify({ pools: { top: ["qa/m", "qb/m"] } }));
   await writeFile(join(root, "qa-exhausted"), ""); // qa refuses every request with `503 … No available accounts`
   const env: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, HOME: root, DSA_HOME: home,
-    PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root };
+    PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root,
+    DSA_ORCHESTRATOR_LOG: join(root, "orchestrator.log") };
   const cli = (args: string[]) => new Promise<Result>((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "", err = "";

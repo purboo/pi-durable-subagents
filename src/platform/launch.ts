@@ -7,7 +7,7 @@
 //   end it. Without lingering the user manager stops its scopes at logout, while a plain detached process survives it
 //   (KillUserProcesses=no, the usual default): it starts as a plain detached process then.
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
 import { userInfo } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join } from "node:path";
 import { comspec, IS_WINDOWS } from "./windows.ts";
@@ -164,6 +164,20 @@ function started(child: ChildProcess): Promise<void> {
   return new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
 }
 
+/** What the detached orchestrator's stdio is: discarded, unless DSA_ORCHESTRATOR_LOG names a file to append its stdout
+ *  and stderr to. The orchestrator has no terminal, so without the log a start that fails before it records anything
+ *  (`orchestrator` entry, `orchestrator-exit` reason) leaves no trace at all; the diagnostics of a failover drill,
+ *  chaos scenario or a CI e2e case need it. An unusable path never fails the start: it falls back to "discarded". */
+function orchestratorStdio(env: NodeJS.ProcessEnv): { stdio: SpawnOptions["stdio"]; fds: number[] } {
+  const log = env.DSA_ORCHESTRATOR_LOG;
+  if (!log) return { stdio: "ignore", fds: [] };
+  try {
+    mkdirSync(dirname(log), { recursive: true });
+    const out = openSync(log, "a"), err = openSync(log, "a");
+    return { stdio: ["ignore", out, err], fds: [out, err] };
+  } catch { return { stdio: "ignore", fds: [] }; }
+}
+
 /** The variables the executor sets for one call's processes (a subagent, a command call, a gate). An orchestrator
  *  started from inside a call (its CLI, a command that runs `start`) never carries them: with the call's DSA_EXEC it
  *  would be one of that call's processes, and the call's fence (its end, a stop) would kill it. */
@@ -184,16 +198,21 @@ export async function launchOrchestrator(entry: string, env: NodeJS.ProcessEnv, 
   const childEnv: NodeJS.ProcessEnv = { ...orchestratorEnv(env), DSA_HOME: options.home, ...(pi.path ? { DSA_PI_BIN: pi.path } : {}) };
   const node = options.node ?? process.execPath, run = options.spawn ?? spawn;
   const runner = await scopeRunner(env, options);
-  if (runner) {
-    try {
-      const child = run(runner, [...SCOPE_ARGS, "--description", "pi-durable-subagents orchestrator", "--", node, entry], { detached: true, stdio: "ignore", env: childEnv });
-      await started(child);
-      child.unref();
-      return { pid: child.pid!, scope: true, ...(pi.path ? { pi: pi.path } : {}) };
-    } catch { /* fall back to a plain detached process */ }
-  }
-  const child = run(node, [entry], { detached: true, stdio: "ignore", env: childEnv });
-  await started(child);
-  child.unref();
-  return { pid: child.pid!, scope: false, ...(pi.path ? { pi: pi.path } : {}) };
+  const diagnostic = orchestratorStdio(childEnv);
+  // The child holds its own copies of the descriptors; ours are closed once it has started (a failed start closes them).
+  const close = () => { for (const fd of diagnostic.fds) { try { closeSync(fd); } catch { /* already closed */ } } };
+  try {
+    if (runner) {
+      try {
+        const child = run(runner, [...SCOPE_ARGS, "--description", "pi-durable-subagents orchestrator", "--", node, entry], { detached: true, stdio: diagnostic.stdio, env: childEnv });
+        await started(child);
+        child.unref();
+        return { pid: child.pid!, scope: true, ...(pi.path ? { pi: pi.path } : {}) };
+      } catch { /* fall back to a plain detached process */ }
+    }
+    const child = run(node, [entry], { detached: true, stdio: diagnostic.stdio, env: childEnv });
+    await started(child);
+    child.unref();
+    return { pid: child.pid!, scope: false, ...(pi.path ? { pi: pi.path } : {}) };
+  } finally { close(); }
 }

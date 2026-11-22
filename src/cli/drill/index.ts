@@ -30,6 +30,10 @@ const STEPS = [
   `the third call (the probe) starts on ${A} and ends ok there`,
 ];
 
+/** The drill's own settings: its two offline providers as one pool, and the probe interval the machine must meet
+ *  (orchestrator/config.ts validates both). */
+export const drillConfig = (probeMs: number = DRILL_PROBE_MS) => ({ pools: { [POOL]: [`${A}/m`, `${B}/m`] }, k: { probeMs } });
+
 /** Validate drill arguments before allocating a temporary root or starting anything. */
 export function parseDrill(args: string[]): DrillOptions {
   if (args[0] !== "failover") throw new Error(`Invalid drill: ${args[0] ?? "(none)"}; use: drill failover [--keep] [--json]`);
@@ -57,10 +61,13 @@ export async function drill(args: string[], inherited: NodeJS.ProcessEnv = proce
     // pi's retries stay on (a used-up window is noticed while pi retries, as on a real setup), with a short backoff.
     retry: { enabled: true, baseDelayMs: 200 }, compaction: { enabled: false }, defaultProjectTrust: "always" }));
   writeFileSync(join(cwd, ".pi/agents/worker.md"), "---\nname: worker\ndescription: Failover drill worker\ntools: bash\n---\nAnswer the task.\n");
-  writeFileSync(join(home, "config.json"), JSON.stringify({ pools: { [POOL]: [`${A}/m`, `${B}/m`] }, k: { probeMs: DRILL_PROBE_MS } }));
+  writeFileSync(join(home, "config.json"), JSON.stringify(drillConfig()));
   writeFileSync(join(root, "a-exhausted"), "");
   const env: NodeJS.ProcessEnv = { PATH: inherited.PATH, HOME: join(root, "home"), TMPDIR: root, PI_CODING_AGENT_DIR: agent,
-    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", DSA_HOME: home, DSA_DRILL_ROOT: root };
+    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", DSA_HOME: home, DSA_DRILL_ROOT: root,
+    // The drill exists to be diagnosable: keep what the detached orchestrator it starts says, for --keep and for a
+    // step that fails (the report names the root).
+    DSA_ORCHESTRATOR_LOG: join(root, "orchestrator.log") };
   const entry = sibling("../main");
 
   const cli = (argv: string[]) => new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {

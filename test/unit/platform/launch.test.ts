@@ -181,3 +181,20 @@ test("Windows: pi resolves through PATHEXT (.cmd), DSA_PI_BIN is passed, and the
   assert.match(file!.content, /set "DSA_HOME=C:\\state"/);
   assert.ok(file!.content.includes(`set "DSA_PI_BIN=${pi}"`), file!.content);
 });
+
+test("a detached orchestrator's own output is kept when DSA_ORCHESTRATOR_LOG names a file; an unusable path never fails the start", { timeout: 30_000 }, async t => {
+  const dir = await root(t), log = join(dir, "logs", "orchestrator.log"), entry = join(dir, "entry.mjs");
+  await writeFile(entry, "console.log('started');\nconsole.error('warning from the orchestrator');\n");
+  const launched = await launchOrchestrator(entry, { PATH: process.env.PATH, DSA_ORCHESTRATOR_LOG: log }, { home: join(dir, "h") });
+  assert.ok(launched.pid > 0, "the orchestrator started");
+  // The child is detached: wait for it to write its two streams into the one file and exit.
+  for (let i = 0; i < 200 && !(existsSync(log) && readFileSync(log, "utf8").includes("warning from the orchestrator")); i++) await delay(50);
+  const text = readFileSync(log, "utf8");
+  assert.match(text, /^started$/m, "stdout of the detached orchestrator");
+  assert.match(text, /^warning from the orchestrator$/m, "its stderr, appended to the same file");
+  // A log path that cannot be created (its parent is a file) falls back to discarded output: the start still happens.
+  const blocker = join(dir, "blocker"); await writeFile(blocker, "not a directory");
+  const fallback = await launchOrchestrator(entry, { PATH: process.env.PATH, DSA_ORCHESTRATOR_LOG: join(blocker, "logs", "orchestrator.log") },
+    { home: join(dir, "h2") });
+  assert.ok(fallback.pid > 0, "an unusable DSA_ORCHESTRATOR_LOG is not a failed start");
+});

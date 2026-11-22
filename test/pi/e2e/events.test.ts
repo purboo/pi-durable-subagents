@@ -25,7 +25,10 @@ async function stack(t: TestContext, config?: unknown) {
   await writeFile(join(cwd, ".pi/agents/echo.md"), "---\nname: echo\ndescription: echo\ntools: bash\n---\nYou echo.\n");
   if (config) await writeFile(join(home, "config.json"), JSON.stringify(config));
   const base: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, HOME: root, DSA_HOME: home,
-    PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root };
+    PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root,
+    // The orchestrator this CLI starts is detached and has no terminal: its own output stays with the temp root, so a
+    // failure here can name the stage instead of only timing out.
+    DSA_ORCHESTRATOR_LOG: join(root, "orchestrator.log") };
   const cli = (args: string[]) => new Promise<Result>((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], { cwd, env: base, stdio: ["ignore", "pipe", "pipe"] });
     let out = "", err = "";
