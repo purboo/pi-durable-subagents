@@ -44,6 +44,7 @@ test("a Windows helper keeps the caller's own values and adds only missing syste
   // the system variables themselves (no credential, no token, no session variable).
   assert.equal(env.PATH, isolated.PATH);
   assert.equal(env.HOME, isolated.HOME);
+  assert.equal(helperEnv({ TEMP: "first", TMP: "second" }).TMP, "second");
   assert.equal(env.TMPDIR, isolated.TMPDIR);
   assert.deepEqual(Object.keys(env).sort(), [...Object.keys(isolated), "APPDATA", "ComSpec", "LOCALAPPDATA", "PATHEXT", "PSModulePath",
     "SystemDrive", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "windir"].sort());

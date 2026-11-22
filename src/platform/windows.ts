@@ -36,7 +36,7 @@ export function helperEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Process
     ComSpec: base.ComSpec || base.COMSPEC || join(system32, "cmd.exe"),
     PATHEXT: base.PATHEXT || ".COM;.EXE;.BAT;.CMD",
     PSModulePath: base.PSModulePath || join(system32, "WindowsPowerShell", "v1.0", "Modules"),
-    TEMP: temp, TMP: temp, USERPROFILE: home,
+    TEMP: base.TEMP || temp, TMP: base.TMP || temp, USERPROFILE: home,
     APPDATA: base.APPDATA || join(home, "AppData", "Roaming"),
     LOCALAPPDATA: base.LOCALAPPDATA || join(home, "AppData", "Local"),
     ...(base.PATH ? {} : { PATH: [system32, root].join(";") }) };

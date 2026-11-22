@@ -8,10 +8,10 @@
 // powershell.exe, writes nothing and changes no state.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { IS_WINDOWS, helperEnv, powershellPath } from "../src/platform/windows.ts";
+import { IS_WINDOWS, PROCESS_ROWS_SCRIPT, helperEnv, parseProcessRows, powershellPath } from "../src/platform/windows.ts";
 
 const exec = promisify(execFile);
-const SCAN = "Get-CimInstance Win32_Process | Measure-Object | ForEach-Object { $_.Count }";
+const SCAN = `$ErrorActionPreference = 'Stop'; ${PROCESS_ROWS_SCRIPT}`;
 const FLAGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", SCAN];
 const TIMEOUT = 20_000, ROUNDS = 2;
 
@@ -26,10 +26,11 @@ async function scan(env) {
   const started = Date.now();
   try {
     const { stdout } = await exec(powershellPath(), FLAGS, { env, timeout: TIMEOUT, windowsHide: true, maxBuffer: 1 << 20 });
-    return `${Date.now() - started} ms, ${stdout.trim()} processes`;
+    const rows = parseProcessRows(stdout);
+    return `${Date.now() - started} ms, ${rows.length} processes, observer parent visible=${rows.some(p => p.pid === process.pid)}`;
   } catch (error) {
     const detail = String(error?.stderr || error?.message || error).trim().replace(/\s+/g, " ").slice(0, 300);
-    return `${Date.now() - started} ms FAILED: ${detail}`;
+    return `${Date.now() - started} ms FAILED killed=${error.killed} signal=${error.signal} code=${error.code}: ${detail}`;
   }
 }
 
