@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
+import { shimScript } from "../platform/launch.ts";
+import { comspec } from "../platform/windows.ts";
 import { cacheDir, dsaHome } from "../paths.ts";
 
 export interface AgentDefinition {
@@ -27,11 +29,15 @@ export interface NpmRootOptions {
   cacheFile?: string | null;
   /** Asks npm; default `npm root -g` (5 s timeout). */
   run?: () => string;
+  /** The platform whose PATH, npm layout and command processor apply; default `process.platform`. Tests use it to
+   *  exercise Windows discovery on another host. */
+  platform?: NodeJS.Platform;
 }
 const stamp = (p: string | undefined) => { if (!p) return null; try { const s = fs.statSync(p); return `${p}@${s.mtimeMs}:${s.size}`; } catch { return `${p}@-`; } };
-/** The first `name` on PATH, resolved, with its stamp: what execFileSync would start. */
-function onPath(name: string, env: NodeJS.ProcessEnv): string | null {
-  const exts = process.platform === "win32" ? (env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";").filter(Boolean).concat("") : [""];
+/** The first `name` on PATH, resolved, with its stamp: what execFileSync would start. Windows has no extensionless
+ *  executable (`npm` beside `npm.cmd` is a POSIX script, which Node refuses to run), so only PATHEXT names count. */
+function onPath(name: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string | null {
+  const exts = platform === "win32" ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
   for (const dir of (env.PATH ?? env.Path ?? "").split(path.delimiter)) {
     if (!dir) continue;
     for (const ext of exts) {
@@ -40,19 +46,45 @@ function onPath(name: string, env: NodeJS.ProcessEnv): string | null {
   }
   return null;
 }
+/** What `npm` on PATH is. POSIX: the npm program itself, or a version manager's shim (asdf, mise, Volta). Windows:
+ *  `npm` is `npm.cmd`, a batch file Node cannot start as a program, which runs the npm package's CLI (`cli`). Only the
+ *  npm install layout is `fixed` — `<dir>/npm.cmd` with `<dir>/node_modules/npm/bin/npm-cli.js` beside it, the node
+ *  directory itself or a version manager's link to one, so a switched node changes the resolved path; a shim elsewhere
+ *  on PATH (asdf, mise) names a CLI but picks a node per directory, and `npm.exe` stubs (Volta) are shims too. */
+interface NpmLayout { cli?: string; builtin?: string; fixed: boolean }
+function npmLayout(npm: string, platform: NodeJS.Platform): NpmLayout {
+  if (platform !== "win32") return { builtin: path.join(path.dirname(path.dirname(npm)), "npmrc"), fixed: /[\\/]npm[\\/]bin[\\/]npm(-cli\.js)?$/.test(npm) };
+  if (!/\.(?:cmd|bat)$/i.test(npm)) return { fixed: false };
+  const install = path.join(path.dirname(npm), "node_modules", "npm", "bin", "npm-cli.js");
+  const fixed = fs.existsSync(install);
+  const cli = fixed ? install : shimScript(npm);
+  return { cli, builtin: cli ? path.join(path.dirname(path.dirname(cli)), "npmrc") : undefined, fixed };
+}
+/** The `npm root -g` process. POSIX runs `npm` from PATH. Windows runs the script behind `npm.cmd` under the node PATH
+ *  selects (npm takes its global prefix from the node running it, exactly as npm.cmd's own node would), else a PE
+ *  `npm.exe`; a batch file that names no npm package script (a generated `npm.cmd` shim) runs through the command
+ *  processor as a shell would, in the `"..."` form cmd /s unquotes at either end. */
+function npmCommand(npm: string, node: string | null, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): { command: string; args: string[]; verbatim?: boolean } {
+  if (platform !== "win32") return { command: "npm", args: ["root", "-g"] };
+  const { cli } = npmLayout(npm, platform);
+  if (cli) return { command: node ?? process.execPath, args: [cli, "root", "-g"] };
+  if (!/\.(?:cmd|bat)$/i.test(npm)) return { command: npm, args: ["root", "-g"] };
+  return { command: comspec(env), args: ["/d", "/s", "/c", `""${npm}" root -g"`], verbatim: true };
+}
 /** Everything `npm root -g` reads to decide its answer, except npm's own code: which npm and node PATH selects, the
  *  prefix environment, and the user, global and builtin npmrc files. -g ignores the project's .npmrc, so cwd is not
  *  part of it, unless `npm` is a version manager's shim (asdf, mise, Volta) rather than npm itself: the shim picks a
  *  node per directory from files this key does not see, so its answer is only `fixed` for a few seconds. */
-function npmRootKey(env: NodeJS.ProcessEnv): { key: string; npm: string | null; fixed: boolean } {
-  const npm = onPath("npm", env), node = onPath("node", env);
+function npmRootKey(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): { key: string; npm: string | null; node: string | null; fixed: boolean } {
+  const npm = onPath("npm", env, platform), node = onPath("node", env, platform);
+  const layout = npm ? npmLayout(npm, platform) : undefined;
   const vars = Object.keys(env).filter(k => /^(npm_config_(prefix|userconfig|globalconfig)|PREFIX|DESTDIR)$/i.test(k)).sort().map(k => `${k}=${env[k]}`);
   const userconfig = Object.entries(env).find(([k]) => /^npm_config_userconfig$/i.test(k))?.[1] ?? path.join(env.HOME || env.USERPROFILE || homedir(), ".npmrc");
-  const prefix = env.PREFIX ?? (node ? (process.platform === "win32" ? path.dirname(node) : path.dirname(path.dirname(node))) : undefined);
+  const prefix = env.PREFIX ?? (node ? (platform === "win32" ? path.dirname(node) : path.dirname(path.dirname(node))) : undefined);
   const globalconfig = Object.entries(env).find(([k]) => /^npm_config_globalconfig$/i.test(k))?.[1] ?? (prefix && path.join(prefix, "etc", "npmrc"));
-  const builtin = npm ? path.join(path.dirname(path.dirname(npm)), "npmrc") : undefined;
-  const fixed = !!npm && /[\\/]npm[\\/]bin[\\/]npm(-cli\.js)?$/.test(npm);
-  return { npm, fixed, key: JSON.stringify([stamp(npm ?? undefined), stamp(node ?? undefined), vars, stamp(userconfig), stamp(globalconfig), stamp(builtin), process.platform === "win32" ? null : stamp("/etc/npmrc"), fixed ? null : process.cwd()]) };
+  const builtin = layout?.builtin;
+  const fixed = layout?.fixed ?? false;
+  return { npm, node, fixed, key: JSON.stringify([stamp(npm ?? undefined), stamp(node ?? undefined), vars, stamp(userconfig), stamp(globalconfig), stamp(builtin), platform === "win32" ? null : stamp("/etc/npmrc"), fixed ? null : process.cwd()]) };
 }
 const NPM_ROOT_ENTRIES = 8, NPM_ROOT_RETRY_MS = 60_000, NPM_ROOT_SHIM_MS = 10_000;
 let npmRootMemo: { key: string; root: string | null; until: number } | undefined;
@@ -60,10 +92,11 @@ let npmRootMemo: { key: string; root: string | null; until: number } | undefined
  *  a busy machine, while every pi start, run admission and CLI request discovers agents. The answer is kept in this
  *  process and in a small rebuildable cache file, keyed on npmRootKey; a changed input asks npm again. A failed answer
  *  is null and is retried after a minute, never written to disk. A shim's answer stays in this process for ten seconds
- *  and is never written to disk. No npm on PATH is null without starting anything. */
+ *  and is never written to disk. No npm on PATH is null without starting anything. Windows runs the CLI behind `npm.cmd`
+ *  under the node PATH selects, and a real npm install's answer is cached like npm itself's (npmCommand). */
 export function globalNpmRoot(options: NpmRootOptions = {}): string | null {
-  const env = options.env ?? process.env;
-  const { key, npm, fixed } = npmRootKey(env);
+  const env = options.env ?? process.env, platform = options.platform ?? process.platform;
+  const { key, npm, node, fixed } = npmRootKey(env, platform);
   if (!npm) return null;
   const now = Date.now();
   if (npmRootMemo?.key === key && npmRootMemo.until > now) return npmRootMemo.root;
@@ -75,7 +108,11 @@ export function globalNpmRoot(options: NpmRootOptions = {}): string | null {
     if (hit) { npmRootMemo = { key, root: hit.root, until: Infinity }; return hit.root; }
   }
   let root: string | null = null;
-  try { root = (options.run ?? (() => execFileSync("npm", ["root", "-g"], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], env })))().trim() || null; } catch { root = null; }
+  const ask = () => {
+    const { command, args, verbatim } = npmCommand(npm, node, env, platform);
+    return execFileSync(command, args, { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], env, ...(verbatim ? { windowsVerbatimArguments: true } : {}) });
+  };
+  try { root = (options.run ?? ask)().trim() || null; } catch { root = null; }
   npmRootMemo = { key, root, until: !fixed ? now + NPM_ROOT_SHIM_MS : root === null ? now + NPM_ROOT_RETRY_MS : Infinity };
   if (file && root !== null) {
     try {
