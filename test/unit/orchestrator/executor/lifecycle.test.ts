@@ -117,3 +117,39 @@ for (const scenario of ["custom", "inherited", "empty", "unset", "duplicate", "a
   assert.equal(result.EX3, "custom"); assert.equal(result.DSA_HOME, home); assert.equal(result.DSA_EXEC, "command:c#1"); assert.equal(result.DSA_CALL, "c");
   assert.equal(env.EX3, "custom", "spec env not mutated");
 });
+
+// A Windows environment has one variable per name: `Path` is `PATH`, `ComSpec` is `COMSPEC`. Copying the call's env over the
+// orchestrator's would leave both spellings in the block the command gets, and Windows then reads the inherited one: the
+// call's PATH (and its shim directory, prepended last) or ComSpec would silently not apply.
+test("EX3 Windows command environment: one PATH and one ComSpec whatever the call spelled, the call's values win, shim last", () => {
+  const home = join(tmpdir(), "dsa-path-win"), bin = binDir(home);
+  const env: Record<string, string> = { Path: ["C:\\custom\\a", "C:\\custom\\b", bin.toUpperCase()].join(";"),
+    COMSPEC: "D:\\Windows\\system32\\cmd.exe", dsa_call: "wrong", dsa_home: "C:\\wrong", KEEP: "1" };
+  const old = process.env.PATH, oldComSpec = process.env.ComSpec, oldHome = process.env.dsa_home;
+  process.env.PATH = ["C:\\inherited\\a", "C:\\inherited\\b"].join(";");
+  process.env.ComSpec = "C:\\Windows\\system32\\cmd.exe";
+  process.env.dsa_home = "C:\\inherited";
+  try {
+    const result = commands.commandEnvironment(home, "command:c#1", "c", env, { platform: "win32" });
+    const keys = Object.keys(result), named = (name: string) => keys.filter(k => k.toUpperCase() === name);
+    assert.deepEqual(named("PATH"), ["PATH"]);
+    assert.deepEqual(String(result.PATH).split(";"), ["C:\\custom\\a", "C:\\custom\\b", bin], "the call's Path, one shim entry (any case), shim last");
+    assert.deepEqual(named("COMSPEC"), ["COMSPEC"], "the call's COMSPEC replaces the inherited ComSpec instead of joining it");
+    assert.equal(result.COMSPEC, "D:\\Windows\\system32\\cmd.exe");
+    assert.deepEqual(named("DSA_CALL"), ["DSA_CALL"]);
+    assert.equal(result.DSA_CALL, "c", "the reserved names replace any spelling the call passed");
+    assert.deepEqual(named("DSA_HOME"), ["DSA_HOME"]);
+    assert.equal(result.DSA_HOME, home);
+    assert.equal(result.DSA_EXEC, "command:c#1");
+    assert.equal(result.KEEP, "1", "other inherited variables stay");
+    assert.equal(env.Path, ["C:\\custom\\a", "C:\\custom\\b", bin.toUpperCase()].join(";"), "spec env not mutated");
+    // The call's own PATH wins over the orchestrator's, also when the call spells it PATH beside an inherited Path.
+    const plain = commands.commandEnvironment(home, "command:c#2", "c", { PATH: "C:\\call\\bin" }, { platform: "win32" });
+    assert.deepEqual(String(plain.PATH).split(";"), ["C:\\call\\bin", bin]);
+    assert.equal(Object.keys(plain).filter(k => k.toUpperCase() === "PATH").length, 1);
+  } finally {
+    for (const [name, value] of [["PATH", old], ["ComSpec", oldComSpec], ["dsa_home", oldHome]] as const) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+});

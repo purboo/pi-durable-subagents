@@ -11,24 +11,55 @@ const exec = promisify(execFile);
 export const IS_WINDOWS = process.platform === "win32";
 
 /** The Windows directory holding powershell.exe and taskkill.exe. */
-export function systemRoot(env: NodeJS.ProcessEnv = process.env): string { return env.SystemRoot || env.windir || "C:\\Windows"; }
+export function systemRoot(env: NodeJS.ProcessEnv = process.env): string { return envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows"; }
+
+/** A variable of a Windows environment block. Names compare case-insensitively (`Path` is `PATH`, `ComSpec` is `COMSPEC`)
+ *  and the last definition wins, exactly as `process.env` behaves on Windows; the value is the key's own spelling's. */
+export function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  let value: string | undefined;
+  for (const key of Object.keys(env)) if (key.toLowerCase() === lower) value = env[key];
+  return value;
+}
+/** One environment from `base` and the overrides applied in order. An override replaces every definition of its name under
+ *  any spelling instead of adding a second one, so a block never carries `Path` beside `PATH`: Windows finds one variable
+ *  per name, and a second definition is at best ignored (the wrapper's child would see the inherited PATH, not the
+ *  command's). Keys keep the spelling of whichever definition won. */
+export function mergeEnv(base: NodeJS.ProcessEnv, ...overrides: (NodeJS.ProcessEnv | Record<string, string | undefined> | undefined)[]): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  for (const override of overrides) {
+    if (!override) continue;
+    for (const [key, value] of Object.entries(override)) {
+      if (value === undefined) continue;
+      const lower = key.toLowerCase();
+      for (const existing of Object.keys(env)) if (existing.toLowerCase() === lower) delete env[existing];
+      env[key] = value;
+    }
+  }
+  return env;
+}
+/** An environment block with one definition per name (the later spelling wins): what a Windows child reads unambiguously. */
+export const normalizeEnv = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => mergeEnv({}, env);
 
 /** Supply OS defaults to helpers launched from deliberately isolated environments. */
 export function helperEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   // A derivation that fails must not take the helper down with it: a variable that stays unset is what it had before.
   const attempt = (read: () => string, fallback: string) => { try { return read() || fallback; } catch { return fallback; } };
-  const root = systemRoot(base), temp = base.TEMP || base.TMP || attempt(tmpdir, join(root, "Temp"));
-  const home = base.USERPROFILE || attempt(homedir, join(root, "Users", "Default"));
+  const root = systemRoot(base), temp = envValue(base, "TEMP") || envValue(base, "TMP") || attempt(tmpdir, join(root, "Temp"));
+  const home = envValue(base, "USERPROFILE") || attempt(homedir, join(root, "Users", "Default"));
   const system32 = join(root, "System32");
-  return { ...base,
-    SystemRoot: root, windir: base.windir || root, SystemDrive: base.SystemDrive || root.slice(0, 2),
-    ComSpec: base.ComSpec || base.COMSPEC || join(system32, "cmd.exe"),
-    PATHEXT: base.PATHEXT || ".COM;.EXE;.BAT;.CMD",
-    PSModulePath: base.PSModulePath || join(system32, "WindowsPowerShell", "v1.0", "Modules"),
-    TEMP: base.TEMP || temp, TMP: base.TMP || temp, USERPROFILE: home,
-    APPDATA: base.APPDATA || join(home, "AppData", "Roaming"),
-    LOCALAPPDATA: base.LOCALAPPDATA || join(home, "AppData", "Local"),
-    ...(base.PATH ? {} : { PATH: [system32, root].join(";") }) };
+  /** A default for a variable the caller lacks, under one Windows name: a caller that spelled it `Path` or `COMSPEC`
+   *  keeps its own definition (and its own spelling) instead of getting a second one beside it. */
+  const missing = (name: string, value: string) => envValue(base, name) ? {} : { [name]: value };
+  return mergeEnv(base, {
+    ...missing("SystemRoot", root), ...missing("windir", root), ...missing("SystemDrive", root.slice(0, 2)),
+    ...missing("ComSpec", join(system32, "cmd.exe")),
+    ...missing("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+    ...missing("PSModulePath", join(system32, "WindowsPowerShell", "v1.0", "Modules")),
+    ...missing("TEMP", temp), ...missing("TMP", temp), ...missing("USERPROFILE", home),
+    ...missing("APPDATA", join(home, "AppData", "Roaming")),
+    ...missing("LOCALAPPDATA", join(home, "AppData", "Local")),
+    ...missing("PATH", [system32, root].join(";")) });
 }
 
 /** Windows PowerShell 5.1 by its absolute path: every supported Windows has it. */
@@ -42,7 +73,7 @@ export function taskkillPath(): string {
 }
 /** The command processor a string command runs through (`command calls` keep their shell semantics). */
 export function comspec(env: NodeJS.ProcessEnv = process.env): string {
-  return env.ComSpec || env.COMSPEC || join(systemRoot(), "System32", "cmd.exe");
+  return envValue(env, "ComSpec") || join(systemRoot(env), "System32", "cmd.exe");
 }
 
 const PS_PREAMBLE = "$ErrorActionPreference = 'Stop'; ";

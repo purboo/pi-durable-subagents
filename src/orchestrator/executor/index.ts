@@ -1547,11 +1547,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       const exactTools = t.exactMode?.mode === "exact" ? [...new Set([...(t.spec.tools ?? t.agent.tools ?? DEFAULT_TOOLS),
         ...(t.spec.schema === undefined ? ["ask"] : ["ask", "report"])])] : undefined;
       let child: Spawned;
+      // The child's environment: the orchestrator's node follows binDir, so a `#!/usr/bin/env node` pi still runs under a
+      // PATH without node (a service's). execTarget resolves a bare `pi` on this PATH too, not on the orchestrator's: the
+      // shim it must run may be the call's own.
+      const childEnv: Record<string, string> = { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(Object.keys(patterns).length ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}), ...(exactTools && t.exactCapture ? { DSA_EXACT_CAPTURE: t.exactCapture.path, DSA_EXACT_TOOLS: JSON.stringify(exactTools) } : {}) };
       try {
-        const target = execTarget(piCommand, [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}), ...(t.exactMode?.mode === "exact" ? { thinking: (await readPinnedCapture(t.exactCapture?.path))?.thinking ?? false } : {}) }), "-e", extension]);
-        child = await containment.spawn({ exec, command: target.command, args: target.args, cwd,
-          // The orchestrator's node follows binDir: a `#!/usr/bin/env node` pi runs under a PATH without node (a service's).
-          env: { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(Object.keys(patterns).length ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}), ...(exactTools && t.exactCapture ? { DSA_EXACT_CAPTURE: t.exactCapture.path, DSA_EXACT_TOOLS: JSON.stringify(exactTools) } : {}) } });
+        const target = execTarget(piCommand, [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}), ...(t.exactMode?.mode === "exact" ? { thinking: (await readPinnedCapture(t.exactCapture?.path))?.thinking ?? false } : {}) }), "-e", extension], { env: childEnv });
+        child = await containment.spawn({ exec, command: target.command, args: target.args, cwd, env: childEnv });
       } catch (error) {
         const environment = environmentSpawnError(error);
         if (environment) await serial(() => spawnEnvRecord(t, exec!, error));

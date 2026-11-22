@@ -442,7 +442,7 @@ subagents({ chain: [{ command: ["npm", "test"] }, { agent: "worker", task: "Fix 
 | `command` | An array runs a program with those arguments, never shell syntax: its first element is looked up in the command's `PATH` (exit 127 when there is none), and a shell builtin is not run as a builtin (`["exit", "7"]` looks for a program named `exit`). A string runs through `/bin/sh -c`. |
 | `cwd` | Its directory, resolved like an agent call's. |
 | `timeoutMs` | Wall-clock time from its start, including time the orchestrator was down (see the result table). |
-| `env` | Variables added to the environment (`DSA_*` names are reserved). |
+| `env` | Variables added to the environment (`DSA_*` names are reserved). On Windows a variable name is one name in any case (`Path` is `PATH`, `ComSpec` is `COMSPEC`): the call's definition replaces the orchestrator's, it is not added beside it. |
 | `rerun` | `true`: when the process vanished without an exit record (the machine restarted), start it once more instead of ending `unknown`. For idempotent commands. |
 | `writer` | `true`: take its worktree's writer lock (default `false`). |
 | `key` | Its key in `tasks`/`chain`, as for agent steps. |
@@ -470,8 +470,14 @@ the same home; it cannot force a restart. After merging `env`, the command's
 appended once as the last entry. Custom and inherited tools keep precedence,
 and the CLI shim is still found. Empty entries and earlier copies of the
 shim directory are removed; an explicitly empty PATH searches only that
-directory, not the current directory or system tools. Agent PATH is unchanged
-(the shim stays first).
+directory, not the current directory or system tools. On Windows the names
+follow the platform's rule (one variable per name, in any case): `env.Path`
+is the PATH the command gets and no second `PATH` sits beside it, an earlier
+copy of the shim directory in another case is still one entry, `env.ComSpec`
+(or `COMSPEC`) is the processor its string commands run through, and the
+program of an argv command is looked up on that same PATH — so an npm `.cmd`
+shim there is found even when the starting orchestrator's PATH lacked it.
+Agent PATH is unchanged (the shim stays first).
 
 | The command | Result |
 |---|---|

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ChildProcess } from "node:child_process";
-import { findOnPath, launchOrchestrator, PiNotFound, resolvePi, scopeRunner, SCOPE_ARGS, type Spawner } from "../../../src/platform/launch.ts";
+import { execTarget, executableFile, findOnPath, launchOrchestrator, PiNotFound, resolvePi, scopeRunner, SCOPE_ARGS, type Spawner } from "../../../src/platform/launch.ts";
 import { startOrchestrator } from "../../../src/cli/control.ts";
 import { orchLedger } from "../../../src/paths.ts";
 import { serviceFiles } from "../../../src/cli/service.ts";
@@ -197,4 +197,45 @@ test("a detached orchestrator's own output is kept when DSA_ORCHESTRATOR_LOG nam
   const fallback = await launchOrchestrator(entry, { PATH: process.env.PATH, DSA_ORCHESTRATOR_LOG: join(blocker, "logs", "orchestrator.log") },
     { home: join(dir, "h2") });
   assert.ok(fallback.pid > 0, "an unusable DSA_ORCHESTRATOR_LOG is not a failed start");
+});
+
+// execTarget is the launch path of every argv command (a command call, an agent's pi, `hold`, the smoke probe). On Windows
+// a bare name is an npm shim to unwrap: which shim depends on the PATH and PATHEXT the command runs with, never on whoever
+// happened to start the orchestrator. The Windows rules are exercised on any host (as compat/agents.ts does for `npm`).
+test("execTarget resolves a bare program on the command's own environment, with Windows rules", async t => {
+  const dir = await root(t), first = join(dir, "first"), second = join(dir, "second"), third = join(dir, "third");
+  for (const d of [first, second, third]) await mkdir(d);
+  const script = join(first, "tool.js"); await writeFile(script, "console.log('tool')\n");
+  const firstShim = join(first, "tool.cmd"), secondShim = join(second, "tool.cmd"), thirdShim = join(third, "tool.bat");
+  // Only the first shim names a node script: the others fall back to the command processor of the environment.
+  await writeFile(firstShim, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  await writeFile(secondShim, "@echo off\r\necho second\r\n");
+  await writeFile(thirdShim, "@echo off\r\necho third\r\n");
+  const windows = { platform: "win32" as const };
+  // The command's PATH decides, whatever this process's PATH says (it has no tool at all here).
+  assert.deepEqual(execTarget("tool", ["a b"], { ...windows, env: { PATH: first } }), { command: process.execPath, args: [script, "a b"] });
+  // `Path` is the same variable as `PATH`, and the search does not fall back to this process's PATH.
+  assert.deepEqual(execTarget("tool", [], { ...windows, env: { Path: first } }), { command: process.execPath, args: [script] });
+  const old = process.env.PATH;
+  process.env.PATH = second; t.after(() => { if (old === undefined) delete process.env.PATH; else process.env.PATH = old; });
+  assert.deepEqual(execTarget("tool", [], { ...windows, env: { Path: first } }), { command: process.execPath, args: [script] }, "not the parent's shim");
+  // A shim that names no node script runs through the command's ComSpec (also when it is spelled COMSPEC), not ours.
+  assert.deepEqual(execTarget("tool", ["x"], { ...windows, env: { PATH: second, COMSPEC: "D:\\Windows\\system32\\cmd.exe" } }),
+    { command: "D:\\Windows\\system32\\cmd.exe", args: ["/d", "/s", "/c", secondShim, "x"] });
+  // PATHEXT is the command's too: `.CMD` alone finds no `.bat`; `.BAT` then finds it, on the same PATH.
+  assert.deepEqual(execTarget("tool", [], { ...windows, env: { PATH: third, PATHEXT: ".CMD" } }), { command: "tool", args: [] }, "not found: the name stays as it was");
+  assert.equal(findOnPath("tool", third, { ...windows, pathext: ".CMD" }), undefined);
+  assert.equal(findOnPath("tool", third, { ...windows, pathext: ".BAT" }), thirdShim);
+  assert.equal(executableFile(thirdShim, "win32"), true);
+  const hostExec = await executable(join(dir, "host"), "tool.sh");
+  assert.equal(executableFile(hostExec), true, "the host's own rule still applies by default");
+  if (process.platform !== "win32") assert.equal(executableFile(secondShim), false, "a .cmd without an executable bit is no program on POSIX");
+  // POSIX and every other platform are untouched: argv is what the caller passed, whatever the environment.
+  assert.deepEqual(execTarget("tool", ["x"], { env: { PATH: first }, platform: "linux" }), { command: "tool", args: ["x"] });
+  assert.deepEqual(execTarget("tool", ["x"], { env: { PATH: first } }), { command: "tool", args: ["x"] });
+  // pi resolution reads the PATH and PATHEXT of the environment it is given, under the host's naming rules.
+  if (process.platform === "win32") {
+    const piShim = join(first, "pi.cmd"); await writeFile(piShim, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+    assert.deepEqual(resolvePi({ Path: first, PATHEXT: ".CMD" }), { path: piShim, source: "PATH" });
+  }
 });

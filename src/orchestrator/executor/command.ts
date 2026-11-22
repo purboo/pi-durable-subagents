@@ -3,11 +3,22 @@
 import { delimiter } from "node:path";
 import { binDir } from "../../paths.ts";
 import { JT, type Entry } from "../../types.ts";
+import { envValue, mergeEnv } from "../../platform/windows.ts";
 
-/** EX3: Custom/inherited tools win; the orchestrator's shim is the last PATH entry, never an empty entry. */
-export function commandEnvironment(home: string, id: string, call: string, env?: Record<string, string>): NodeJS.ProcessEnv {
-  const bin = binDir(home), PATH = [...(env?.PATH ?? process.env.PATH ?? "").split(delimiter).filter(p => p && p !== bin), bin].join(delimiter);
-  return { ...process.env, ...env, PATH, DSA_EXEC: id, DSA_CALL: call, DSA_HOME: home };
+/** EX3: Custom/inherited tools win; the orchestrator's shim is the last PATH entry, never an empty entry. Windows names
+ *  one variable whatever their case: a custom `Path` is the PATH the call got (not a second entry beside the inherited
+ *  one), `ComSpec`/`COMSPEC` stay one definition, and `DSA_*` here replace any spelling the call passed. `platform` names
+ *  the rules that apply (default: this process's; tests exercise the Windows rules on another host). */
+export function commandEnvironment(home: string, id: string, call: string, env?: Record<string, string>, options: { platform?: NodeJS.Platform } = {}): NodeJS.ProcessEnv {
+  const platform = options.platform ?? process.platform, windows = platform === "win32";
+  const bin = binDir(home), separator = windows ? ";" : delimiter;
+  const merged = windows ? mergeEnv(process.env, env) : { ...process.env, ...env };
+  const path = windows ? envValue(merged, "PATH") : merged.PATH;
+  // A Windows PATH compares case-insensitively too: the same shim directory under another spelling is still one entry.
+  const shim = windows ? bin.toLowerCase() : bin;
+  const PATH = [...(path ?? "").split(separator).filter(dir => dir && (windows ? dir.toLowerCase() : dir) !== shim), bin].join(separator);
+  const overlays = { PATH, DSA_EXEC: id, DSA_CALL: call, DSA_HOME: home };
+  return windows ? mergeEnv(merged, overlays) : { ...merged, ...overlays };
 }
 
 export const COMMAND_INTENT = "command-intent";

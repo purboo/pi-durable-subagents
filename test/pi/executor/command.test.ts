@@ -3,7 +3,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { tempRoot } from "../../harness/pi.ts";
@@ -122,4 +122,20 @@ test("F3: a stop recorded while the spawn prepares (its mkdir) starts no process
   assert.ok(!f.journal.entries().some(e => e.type === "command-started"), "no command-started");
   await delay(300);
   assert.ok(!existsSync(join(f.cwd, "marker")), "no side effect");
+});
+
+test("a command call finds its program on its own env PATH and carries Unicode argv, env and output", { timeout: 60_000 }, async t => {
+  const f = await setup(t);
+  // Both shims of one program, on the call's PATH only: POSIX runs the shell script, Windows unwraps the .cmd to its node
+  // script (the parent's PATH has no `greet`, so the resolution has to use the call's env).
+  const bin = join(f.cwd, "bin"), output = "你好 ✓|héllo wörld|";
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, "greet"), `#!/bin/sh\nprintf '%s\\n' "$1|$GRUSS|${"${PATH%%:*}"}"\n`);
+  await chmod(join(bin, "greet"), 0o755);
+  await writeFile(join(bin, "greet.js"), 'process.stdout.write(`${process.argv[2]}|${process.env.GRUSS}|${String(process.env.PATH).split(";")[0]}\\n`);\n');
+  await writeFile(join(bin, "greet.cmd"), `@echo off\r\n"${process.execPath}" "${join(bin, "greet.js")}" %*\r\n`);
+  const result: CallResult = await f.executor.run(f.ticket({ command: ["greet", "你好 ✓"], env: { PATH: bin, GRUSS: "héllo wörld" } }));
+  assert.equal(result.status, "ok", JSON.stringify(result));
+  assert.equal(result.output, `${output}${bin}\n`, "the program on the call's PATH, with its argv and env unchanged");
+  assert.equal((result.data as { exitCode: number }).exitCode, 0);
 });

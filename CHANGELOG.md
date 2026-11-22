@@ -13,6 +13,17 @@
   retried (the helper still holds or renames the file), a failed process-table observation is retried and never read as
   "no process left" (the executor watches again instead of calling the attempt lost), and the same retry guards the
   scans that end a stopped or timed-out attempt.
+- Windows command environments merge by variable name, not by spelling. Windows has one variable per name (`Path` is
+  `PATH`, `ComSpec` is `COMSPEC`), but `{...orchestrator, ...call}` added the call's spelling beside the inherited one, so
+  the command could read the orchestrator's PATH, ComSpec or reserved `DSA_*` value instead of its own. A command call's
+  environment is now merged case-insensitively (`envValue`/`mergeEnv`/`normalizeEnv`), the shim directory is matched and
+  appended once whatever its case, and the Windows wrapper merges the block it hands the command by name too (the
+  command's `ComSpec`/`PATHEXT` over the wrapper process's defaults), runs a string command through the call's own
+  ComSpec rather than the wrapper process's, and gives the child one definition per name.
+  The program of an argv command is resolved on the call's own PATH/PATHEXT (`execTarget` takes the environment it will
+  run with; the same lookup serves agent launches, `hold`, the smoke probe and the test harness), so an npm `.cmd` shim
+  is found where the command runs, not on the starter's PATH. PowerShell/taskkill helpers no longer receive a second PATH
+  beside a caller's `Path`, and `pi` resolution reads the environment's PATH/PATHEXT. POSIX command calls are unchanged.
 - Windows command attempts run inside a Job Object of their own: the wrapper is created suspended, assigned to the
   kernel-owned group before its first instruction, and the group's only handle (non-inherited) dies with the attempt, so
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ends every process the command left behind — when it finishes, when its wrapper

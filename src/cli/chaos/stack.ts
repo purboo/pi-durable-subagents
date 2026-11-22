@@ -46,7 +46,7 @@ export function stack(root: string, inherited: NodeJS.ProcessEnv) {
   function launch() {
     let child!: ChildProcessWithoutNullStreams, events: any[] = [], buffer = "", error: Error | undefined, requestId = 0, ready = false;
     const start = () => {
-      const target = execTarget("pi", ["--mode", "rpc", "--session", session]);
+      const target = execTarget("pi", ["--mode", "rpc", "--session", session], { env });
       child = spawn(target.command, target.args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
       events = []; buffer = ""; error = undefined; const own = child;
       child.on("error", e => { if (own === child) error = e; }); child.stdin.on("error", e => { if (own === child) error = e; });

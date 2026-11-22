@@ -56,7 +56,7 @@ export async function smoke(env: NodeJS.ProcessEnv = process.env, tty = Boolean(
       return "fsync and no-replace publication";
     });
     await check("pi-version", async () => {
-      const target = execTarget(env.DSA_PI_BIN ?? "pi", ["--version"]);
+      const target = execTarget(env.DSA_PI_BIN ?? "pi", ["--version"], { env });
       const { stdout } = await promisify(execFile)(target.command, target.args, { env: { ...env, HOME: root, PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" }, cwd: root, timeout: 10_000, maxBuffer: 64 * 1024 });
       if (!stdout.trim()) throw new Error("pi returned no version");
       return stdout.trim();
@@ -78,7 +78,7 @@ export async function smoke(env: NodeJS.ProcessEnv = process.env, tty = Boolean(
 async function probe(env: NodeJS.ProcessEnv, root: string): Promise<CapabilityReport> {
   const report = join(root, "capabilities.json");
   const extension = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../agent/extension.ts" : "../agent/extension.js", import.meta.url));
-  const target = execTarget(env.DSA_PI_BIN ?? "pi", ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extension]);
+  const target = execTarget(env.DSA_PI_BIN ?? "pi", ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extension], { env });
   const child = spawn(target.command, target.args, {
     cwd: root, stdio: ["pipe", "ignore", "pipe"], env: { ...env, DSA_PROBE: report, HOME: root, PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" } });
   let stderr = "", failed: Error | undefined; child.stderr.on("data", chunk => { stderr += chunk; });

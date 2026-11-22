@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { exitMeaning, readExitRecord, readTail, spawnCommand } from "../../../src/platform/command.ts";
+import { COMMAND_LOG, COMMAND_SPEC, COMMAND_WRAPPER_SOURCE, exitMeaning, readExitRecord, readTail, spawnCommand } from "../../../src/platform/command.ts";
+import { findOnPath } from "../../../src/platform/launch.ts";
 import { captureStart } from "../../../src/platform/proctable.ts";
 import { restartRefusal, restartToken } from "../../../src/orchestrator/restart.ts";
 import { retiredCommandAttempts, unsealedCommandCalls } from "../../../src/orchestrator/executor/command.ts";
@@ -147,6 +149,55 @@ test("restart refusal: command calls are never in the busy list or token; a refu
   assert.equal(restartRefusal(home, [], {}, false, now, 3), undefined, "only command calls: no refusal");
 });
 
+test("a command runs with Unicode in its argv and environment, under the environment it is given (nothing inherited)", { skip: unixOnly }, async t => {
+  const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = join(root, "bin"); mkdirSync(bin);
+  // A program only on the command's PATH, with a non-ASCII name: the name and the argv reach it unchanged.
+  writeFileSync(join(bin, "grüße"), '#!/bin/sh\nprintf "%s|%s\\n" "$1" "$GRUSS"\n', { mode: 0o755 });
+  const dir = join(root, "c");
+  await spawnCommand({ command: ["grüße", "你 好 ✓"], cwd: root, dir, env: { PATH: `${bin}:/usr/bin:/bin`, GRUSS: "héllo wörld" } });
+  assert.equal((await finished(dir)).status, 0);
+  assert.equal(readFileSync(join(dir, "output.log"), "utf8"), "你 好 ✓|héllo wörld\n");
+  // A string command with Unicode too: it runs through the platform shell as one command line.
+  const shellDir = join(root, "d");
+  await spawnCommand({ command: "printf '%s' 'ünïcode ✓'", cwd: root, dir: shellDir, env: { PATH: "/usr/bin:/bin" } });
+  assert.equal((await finished(shellDir)).status, 0);
+  assert.equal(readFileSync(join(shellDir, "output.log"), "utf8"), "ünïcode ✓");
+  // The command's environment is exactly the one the call gives it: this process's variables are not inherited.
+  process.env.DSA_TEST_PARENT_ONLY = "parent";
+  try {
+    const parent = join(root, "e");
+    await spawnCommand({ command: ["/bin/sh", "-c", 'printf "%s" "$DSA_TEST_PARENT_ONLY"'], cwd: root, dir: parent, env: { PATH: "/usr/bin:/bin" } });
+    assert.equal((await finished(parent)).status, 0);
+    assert.equal(readFileSync(join(parent, "output.log"), "utf8"), "");
+  } finally { delete process.env.DSA_TEST_PARENT_ONLY; }
+});
+
+test("Windows: a command finds its program on the spec env's PATH (also spelled Path) with Unicode argv, not the parent's", { skip: process.platform !== "win32" }, async t => {
+  const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
+  const first = join(root, "first"), second = join(root, "second");
+  for (const d of [first, second]) mkdirSync(d, { recursive: true });
+  const script = join(first, "tool.js");
+  writeFileSync(script, 'process.stdout.write(JSON.stringify({args: process.argv.slice(2), gruss: process.env.GRUSS, path: process.env.PATH}))\n');
+  writeFileSync(join(first, "tool.cmd"), `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  // The shim on this process's PATH: a command that read the parent's PATH would run this one instead.
+  writeFileSync(join(second, "tool.cmd"), "@echo off\r\necho second\r\n");
+  const old = process.env.PATH;
+  process.env.PATH = second; t.after(() => { if (old === undefined) delete process.env.PATH; else process.env.PATH = old; });
+  const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+  const dir = join(root, "c");
+  await spawnCommand({ command: ["tool", "你 好", "a b"], cwd: root, dir,
+    env: { Path: first, GRUSS: "héllo wörld", COMSPEC: join(systemRoot, "System32", "cmd.exe") } });
+  assert.equal((await finished(dir)).status, 0);
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, "output.log"), "utf8")), { args: ["你 好", "a b"], gruss: "héllo wörld", path: first });
+  // A string command still runs through the command processor the call names (COMSPEC is the same ComSpec as ComSpec).
+  const shellDir = join(root, "d");
+  await spawnCommand({ command: "echo done", cwd: root, dir: shellDir,
+    env: { Path: first, SystemRoot: systemRoot, COMSPEC: join(systemRoot, "System32", "cmd.exe") } });
+  assert.equal((await finished(shellDir)).status, 0);
+  assert.match(readFileSync(join(shellDir, "output.log"), "utf8"), /^done\r?\n$/);
+});
+
 test("Windows command wrapper: cmd strings, argv programs, missing programs and a .cmd shim", { skip: process.platform !== "win32" }, async t => {
   const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
   const shim = join(root, "shim.cmd");
@@ -163,4 +214,46 @@ test("Windows command wrapper: cmd strings, argv programs, missing programs and 
     assert.equal((await finished(dir)).status, status, JSON.stringify(command));
     assert.match(readFileSync(join(dir, "output.log"), "utf8"), output, JSON.stringify(command));
   }
+});
+
+// The wrapper Windows runs, exercised on a host that is not Windows: its argv branch is platform-neutral, and a POSIX
+// `sh` stands in for cmd.exe as the string command's shell. What it must get right is the environment it hands the
+// command: one definition per Windows name (ComSpec/COMSPEC, PATHEXT), the command's own definition winning over the
+// wrapper process's, and the string command running through that ComSpec.
+test("the Windows wrapper merges the command's environment by name and runs a string command through its ComSpec", { skip: unixOnly }, async t => {
+  const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
+  const wrapper = join(root, "wrapper.mjs"); writeFileSync(wrapper, COMMAND_WRAPPER_SOURCE);
+  /** Run the wrapper the way the orchestrator does: node, the attempt directory, stdout and stderr on output.log. */
+  const run = async (name: string, spec: { command: string | string[]; env: NodeJS.ProcessEnv }, wrapperEnv: NodeJS.ProcessEnv = process.env) => {
+    const dir = join(root, name); mkdirSync(dir);
+    writeFileSync(join(dir, COMMAND_SPEC), JSON.stringify({ ...spec, cwd: root }));
+    const fd = openSync(join(dir, COMMAND_LOG), "a");
+    let code: number | null;
+    try {
+      code = await new Promise<number | null>((resolve, reject) => {
+        const child = spawn(process.execPath, [wrapper, dir], { cwd: root, env: wrapperEnv, stdio: ["ignore", fd, fd] });
+        child.once("error", reject); child.once("exit", resolve);
+      });
+    } finally { closeSync(fd); }
+    assert.ok(!existsSync(join(dir, COMMAND_SPEC)), `${name}: the spec is removed before the command runs`);
+    return { code, status: (await readExitRecord(dir))?.status, output: readFileSync(join(dir, COMMAND_LOG), "utf8") };
+  };
+  // ComSpec is the command's, whatever its spelling, and the child sees one definition of it.
+  const names = 'process.stdout.write(JSON.stringify(Object.keys(process.env).filter(k => /^(comspec|pathext)$/i.test(k)).sort().map(k => [k, process.env[k]])))';
+  const merged = await run("merged", { command: [process.execPath, "-e", names],
+    env: { COMSPEC: "C:\\call\\cmd.exe", PATH: "/usr/bin:/bin", PathExt: ".CMD" } }, { ...process.env, ComSpec: "/nonexistent/parent-cmd" });
+  assert.deepEqual([merged.code, merged.status], [0, 0]);
+  assert.equal(merged.output, JSON.stringify([["ComSpec", "C:\\call\\cmd.exe"], ["PATHEXT", ".CMD"]]), "one definition each, the command's own");
+  // A string command runs through the command's ComSpec (a shell this host has), not the wrapper process's.
+  const shell = findOnPath("sh", "/bin:/usr/bin");
+  assert.ok(shell, "a POSIX sh stands in for cmd.exe");
+  const through = await run("through-comspec", { command: "printf %s ok", env: { COMSPEC: shell, PATH: "/bin:/usr/bin" } }, { ...process.env, ComSpec: "/nonexistent/parent-cmd" });
+  assert.deepEqual([through.code, through.status, through.output], [0, 0, "ok"]);
+  // A block that spells one name twice reaches the child as one variable (the later definition wins).
+  const pathNames = 'process.stdout.write(JSON.stringify(Object.keys(process.env).filter(k => /^path$/i.test(k)).map(k => [k, process.env[k]])))';
+  const collapsed = await run("collapsed", { command: [process.execPath, "-e", pathNames], env: { Path: "/one", PATH: "/two" } });
+  assert.deepEqual([collapsed.code, collapsed.status, collapsed.output], [0, 0, JSON.stringify([["PATH", "/two"]])]);
+  // A ComSpec that cannot start is 127 before the command runs, and the wrapper still records it.
+  const missing = await run("missing-comspec", { command: "printf %s no", env: { COMSPEC: "/nonexistent/call-cmd", PATH: "/bin:/usr/bin" } });
+  assert.deepEqual([missing.code, missing.status, missing.output], [127, 127, ""], "no shell, no command, but the status is recorded");
 });

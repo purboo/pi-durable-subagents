@@ -1,7 +1,7 @@
 // Command calls (CallSpec.command): the launcher. On Unix a command runs detached in its own session under a tiny
 // /bin/sh wrapper that runs it, then records its exit status atomically in the attempt directory (`exit.tmp`, renamed
 // to `exit`) and exits with the same status. Windows has no /bin/sh: the same wrapper is a short Node program (Node is
-// already the runtime), and a string command runs through cmd.exe. Its output (stdout and stderr, interleaved) is
+// already the runtime), and a string command runs through the command's `ComSpec` (cmd.exe by default). Its output (stdout and stderr, interleaved) is
 // appended to `output.log` in the same directory through a descriptor the orchestrator opens, passes and closes: no
 // pipe leads back into the orchestrator and no node process stays resident for the life of the command, so it outlives
 // the orchestrator that started it.
@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { captureStart } from "./proctable.ts";
 import { execTarget, findOnPath } from "./launch.ts";
 import { spawnInJob } from "./job.ts";
-import { comspec, IS_WINDOWS } from "./windows.ts";
+import { comspec, envValue, IS_WINDOWS, mergeEnv, normalizeEnv } from "./windows.ts";
 
 export const COMMAND_LOG = "output.log";
 export const COMMAND_EXIT = "exit";
@@ -40,7 +40,10 @@ export const OUTPUT_TAIL_BYTES = 16 * 1024;
  *  is 127 before `exec`: some shells (bash 3.2, the macOS /bin/sh) report 126 for it instead. */
 const WRAPPER = 'd="$1"; m="$2"; shift 2; ( case "$1" in (*/*) [ -e "$1" ] || { printf "%s: %s: not found\\n" "$0" "$1" >&2; exit 127; } ;; esac; exec "$@" ); s="$?"; printf "%s\\n" "$s" > "$d/exit.tmp" && "$m" -f "$d/exit.tmp" "$d/exit"; exit "$s"';
 /** Windows wrapper: `argv[2]` is the attempt directory (its command.json holds the command, cwd and environment).
- *  It runs the child with inherited output descriptors, records the status and exits with it. */
+ *  It runs the child with inherited output descriptors, records the status and exits with it. It merges the environment
+ *  by Windows name, not by spelling: `Path`/`PATH`, `ComSpec`/`COMSPEC` and `PATHEXT`/`PathExt` are one variable each, the
+ *  command's own definition wins (the wrapper process's only fills in a name the command lacks), and the block the child
+ *  gets never carries a name twice. The string command runs through the command's `ComSpec`, not this process's. */
 const WIN_WRAPPER = `import { spawn } from "node:child_process";
 import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -50,14 +53,24 @@ try { unlinkSync(join(dir, "${COMMAND_SPEC}")); } catch { /* already gone */ }
 function record(status) {
   try { writeFileSync(join(dir, "exit.tmp"), String(status)); renameSync(join(dir, "exit.tmp"), join(dir, "exit")); } catch { /* never lose the command's own result */ }
 }
-const shell = spec.env.ComSpec || spec.env.COMSPEC || process.env.ComSpec || "cmd.exe";
-const options = { cwd: spec.cwd, env: { ...spec.env, ComSpec: shell, PATHEXT: spec.env.PATHEXT || process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD" }, stdio: ["ignore", "inherit", "inherit"], windowsHide: true };
+function value(env, name) { const lower = name.toLowerCase(); let found; for (const key of Object.keys(env)) if (key.toLowerCase() === lower) found = env[key]; return found; }
+function put(env, name, val) { const lower = name.toLowerCase(); for (const key of Object.keys(env)) if (key.toLowerCase() === lower) delete env[key]; env[name] = val; }
+const shell = value(spec.env, "ComSpec") || value(process.env, "ComSpec") || "cmd.exe";
+// The command's block by name: one PATH (also when the call spelled it Path), one ComSpec, one PATHEXT.
+const env = {};
+for (const key of Object.keys(spec.env)) put(env, key, spec.env[key]);
+put(env, "ComSpec", shell);
+put(env, "PATHEXT", value(spec.env, "PATHEXT") || value(process.env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD");
+const options = { cwd: spec.cwd, env, stdio: ["ignore", "inherit", "inherit"], windowsHide: true };
 let child;
-try { child = typeof spec.command === "string" ? spawn(spec.command, { ...options, shell: true }) : spawn(spec.command[0], spec.command.slice(1), options); }
+try { child = typeof spec.command === "string" ? spawn(spec.command, { ...options, shell }) : spawn(spec.command[0], spec.command.slice(1), options); }
 catch (error) { const status = error && error.code === "ENOENT" ? 127 : 126; record(status); process.exit(status); }
 child.once("error", error => { const status = error && error.code === "ENOENT" ? 127 : 126; record(status); process.exit(status); });
 child.once("exit", (code, signal) => { const status = code === null ? (signal ? 128 : 1) : code; record(status); process.exit(status); });
 `;
+/** The wrapper's source (it is written into the attempt directory as `COMMAND_WRAPPER`): exported so its own environment
+ *  merge and exit record can be exercised on a host that is not Windows. */
+export const COMMAND_WRAPPER_SOURCE = WIN_WRAPPER;
 
 /** `mv` for the wrapper: from this process's PATH, else /bin or /usr/bin; resolved once. */
 let mvPath: string | undefined;
@@ -107,13 +120,18 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
   try {
     if (IS_WINDOWS) {
       // A command line can be long and contain anything: pass it through a file, not argv. An argv whose program is a
-      // .cmd/.bat shim is unwrapped here, before it is recorded, so the child runs the program its shim names.
-      const command = typeof spec.command === "string" ? spec.command : (() => { const target = execTarget(spec.command[0]!, spec.command.slice(1)); return [target.command, ...target.args]; })();
-      await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command, cwd: spec.cwd, env: spec.env }));
-      await writeFile(join(spec.dir, COMMAND_WRAPPER), WIN_WRAPPER);
+      // .cmd/.bat shim is unwrapped here, before it is recorded, so the child runs the program its shim names. A bare
+      // program is resolved on the command's own PATH (the spec env, with the call's shim directory), never this
+      // process's. The environment it runs with is one Windows block: one `PATH` (also when the call spelled it `Path`),
+      // one `ComSpec`, one `PATHEXT`.
+      const inherited = normalizeEnv(spec.env);
+      const env = mergeEnv(inherited, { ComSpec: envValue(inherited, "ComSpec") || comspec(inherited),
+        PATHEXT: envValue(inherited, "PATHEXT") || ".COM;.EXE;.BAT;.CMD" });
+      const command = typeof spec.command === "string" ? spec.command : (() => { const target = execTarget(spec.command[0]!, spec.command.slice(1), { env }); return [target.command, ...target.args]; })();
+      await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command, cwd: spec.cwd, env }));
+      await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
       if (spec.proceed && !spec.proceed()) return undefined;
       // The wrapper's environment as a direct spawn would give it; the command inside still gets command.json's env.
-      const env = { ...spec.env, ...(spec.env.ComSpec || spec.env.COMSPEC ? {} : { ComSpec: comspec() }) };
       return await spawnInJob(spec.dir, { exe: process.execPath, env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
         args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [`DSA_EXEC=${spec.exec}`] : [])],
         ...(spec.exec ? { exec: spec.exec } : {}) });

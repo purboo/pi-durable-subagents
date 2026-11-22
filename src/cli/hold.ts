@@ -137,7 +137,7 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
     if (interrupted) return 128 + (constants.signals[interrupted] ?? 1);
     if (shown) say(`hold: ${args.resource} granted after ${age(ticket.grantedAt! - ticket.since)}`);
     // stdin stays attached only when it is not a terminal: a background group reading the terminal stops.
-    const target = execTarget(args.argv[0]!, args.argv.slice(1));
+    const target = execTarget(args.argv[0]!, args.argv.slice(1), { env });
     const c = spawn(target.command, target.args, { stdio: [process.stdin.isTTY ? "ignore" : "inherit", "inherit", "inherit"], detached: true,
       env: { ...env, DSA_HOLD: holdTag(ticket) }, windowsHide: true });
     child = c;

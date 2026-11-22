@@ -9,16 +9,17 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
 import { userInfo } from "node:os";
-import { delimiter, dirname, extname, isAbsolute, join } from "node:path";
-import { comspec, IS_WINDOWS } from "./windows.ts";
+import { delimiter, dirname, extname, isAbsolute, join, win32 } from "node:path";
+import { comspec, envValue, IS_WINDOWS } from "./windows.ts";
 
 const WINDOWS_EXECUTABLE = new Set([".exe", ".com", ".cmd", ".bat"]);
 /** Whether `path` is a regular file this process may execute. On Windows only a PE image or a batch file is directly
- *  executable; the extensionless `pi` (a POSIX shell script an npm install also writes) is not. */
-export function executableFile(path: string): boolean {
+ *  executable; the extensionless `pi` (a POSIX shell script an npm install also writes) is not. `platform` names the
+ *  rules that apply (default: this process's; tests exercise the Windows rules on another host). */
+export function executableFile(path: string, platform: NodeJS.Platform = process.platform): boolean {
   try {
     if (!statSync(path).isFile()) return false;
-    if (IS_WINDOWS) {
+    if (platform === "win32") {
       const ext = extname(path).toLowerCase();
       if (!WINDOWS_EXECUTABLE.has(ext)) return false;
       accessSync(path, constants.F_OK);
@@ -28,10 +29,12 @@ export function executableFile(path: string): boolean {
     return true;
   } catch { return false; }
 }
+/** An absolute path under the given platform's rules: a Windows drive or UNC root is absolute only to `win32`. */
+const absolute = (path: string, platform: NodeJS.Platform) => platform === "win32" ? isAbsolute(path) || win32.isAbsolute(path) : isAbsolute(path);
 /** PATH directories. Windows separators are `;`, but POSIX-style test setups prepend `dir:...`; split those too, without
  *  cutting a `C:` drive prefix (a colon at index 1 after a letter). */
-function pathDirs(PATH: string | undefined): string[] {
-  if (!IS_WINDOWS) return (PATH ?? "").split(delimiter);
+function pathDirs(PATH: string | undefined, platform: NodeJS.Platform): string[] {
+  if (platform !== "win32") return (PATH ?? "").split(delimiter);
   const out: string[] = [];
   for (const part of (PATH ?? "").split(";")) {
     let start = 0;
@@ -41,32 +44,51 @@ function pathDirs(PATH: string | undefined): string[] {
   }
   return out;
 }
+export interface PathLookup {
+  /** The platform whose PATH/PATHEXT/executable rules apply; default `process.platform`. */
+  platform?: NodeJS.Platform;
+  /** Windows PATHEXT of the environment the program runs with; default: this process's, then the usual `.COM;.EXE;.BAT;.CMD`. */
+  pathext?: string;
+}
 /** The first executable `name` in the directories of `PATH`, unresolved (a package-manager shim stays a shim). Windows
  *  looks through PATHEXT: `pi` resolves to `pi.cmd`/`pi.exe`, never the extensionless POSIX shim beside them. */
-export function findOnPath(name: string, PATH: string | undefined): string | undefined {
-  const exts = IS_WINDOWS && !extname(name)
-    ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").map(ext => ext.toLowerCase()).filter(ext => WINDOWS_EXECUTABLE.has(ext))
+export function findOnPath(name: string, PATH: string | undefined, options: PathLookup = {}): string | undefined {
+  const platform = options.platform ?? process.platform;
+  const exts = platform === "win32" && !extname(name)
+    ? (options.pathext ?? envValue(process.env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").map(ext => ext.toLowerCase()).filter(ext => WINDOWS_EXECUTABLE.has(ext))
     : [""];
-  for (const dir of pathDirs(PATH)) {
-    if (!dir || !isAbsolute(dir)) continue;
+  for (const dir of pathDirs(PATH, platform)) {
+    if (!dir || !absolute(dir, platform)) continue;
     for (const ext of exts) {
       const file = join(dir, name + ext);
-      if (executableFile(file)) return file;
+      if (executableFile(file, platform)) return file;
     }
   }
   return undefined;
 }
 
+export interface ExecTargetOptions {
+  /** The environment the command runs with: its PATH and PATHEXT resolve a bare name, its ComSpec runs a `.cmd` shim that
+   *  names no node script. Default: this process's. */
+  env?: NodeJS.ProcessEnv;
+  /** The platform whose rules apply; default `process.platform`. */
+  platform?: NodeJS.Platform;
+}
 /** What a spawn actually runs. An npm `.cmd` shim is not a PE image and Node cannot start it directly; the shim names
- *  the node script it runs, so that script runs under this Node instead and argv stays an argv (no shell quoting). */
-export function execTarget(command: string, args: readonly string[]): { command: string; args: string[] } {
-  if (!IS_WINDOWS) return { command, args: [...args] };
-  // A bare name is looked up through PATHEXT (`pi` → `pi.cmd`), the way a shell would find it.
-  const resolved = !isAbsolute(command) && !/[\\/]/.test(command) ? findOnPath(command, process.env.PATH) ?? command : command;
+ *  the node script it runs, so that script runs under this Node instead and argv stays an argv (no shell quoting).
+ *  A bare name is looked up on the command's own PATH (`options.env`), not this process's: the command's PATH may have
+ *  the shim the caller's has not (a call's prepended `$DSA_HOME/bin`). */
+export function execTarget(command: string, args: readonly string[], options: ExecTargetOptions = {}): { command: string; args: string[] } {
+  const platform = options.platform ?? process.platform, env = options.env ?? process.env;
+  if (platform !== "win32") return { command, args: [...args] };
+  // A bare name is looked up through PATHEXT (`pi` → `pi.cmd`), the way the command's own shell would find it.
+  const resolved = !isAbsolute(command) && !/[\\/]/.test(command)
+    ? findOnPath(command, envValue(env, "PATH"), { platform, pathext: envValue(env, "PATHEXT") }) ?? command
+    : command;
   if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args] };
   const script = shimScript(resolved);
   if (script) return { command: process.execPath, args: [script, ...args] };
-  return { command: comspec(), args: ["/d", "/s", "/c", resolved, ...args] };
+  return { command: comspec(env), args: ["/d", "/s", "/c", resolved, ...args] };
 }
 /** The node script a generated `.cmd`/`.bat` shim runs, when it names one (`%dp0%` is the shim's directory). */
 export function shimScript(file: string): string | undefined {
@@ -86,6 +108,10 @@ export function shellTarget(command: string, exec?: string): { command: string; 
   return IS_WINDOWS ? { command: exec ? `set DSA_EXEC=${exec}&& ${command}` : command, args: [], shell: true } : { command: "/bin/sh", args: ["-c", command] };
 }
 
+/** The PATH (and PATHEXT) of an environment under this platform's naming rules: a Windows environment spells it `Path`
+ *  as often as `PATH`, and both are the one variable. POSIX reads `PATH` exactly. */
+const envPath = (env: NodeJS.ProcessEnv) => IS_WINDOWS ? envValue(env, "PATH") : env.PATH;
+
 export interface PiResolution { path?: string; source?: "DSA_PI_BIN" | "PATH"; problem?: string }
 /** The `pi` the orchestrator launches subagents with: DSA_PI_BIN when set (it must be an executable file), else the
  *  first `pi` on PATH. `problem` says why there is none. */
@@ -95,8 +121,8 @@ export function resolvePi(env: NodeJS.ProcessEnv): PiResolution {
     if (isAbsolute(given) && executableFile(given)) return { path: given, source: "DSA_PI_BIN" };
     return { problem: `DSA_PI_BIN=${given} is not an absolute path to an executable file` };
   }
-  const found = findOnPath("pi", env.PATH);
-  return found ? { path: found, source: "PATH" } : { problem: `pi was not found on PATH (${env.PATH || "unset"}) and DSA_PI_BIN is not set` };
+  const PATH = envPath(env), found = findOnPath("pi", PATH, { pathext: IS_WINDOWS ? envValue(env, "PATHEXT") : undefined });
+  return found ? { path: found, source: "PATH" } : { problem: `pi was not found on PATH (${PATH || "unset"}) and DSA_PI_BIN is not set` };
 }
 
 /** The starter cannot start an orchestrator that could launch no subagent. */

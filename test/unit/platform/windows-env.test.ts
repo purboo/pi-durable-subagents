@@ -7,7 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { helperEnv, systemRoot } from "../../../src/platform/windows.ts";
+import { helperEnv, mergeEnv, normalizeEnv, envValue, systemRoot } from "../../../src/platform/windows.ts";
 
 const isolated: NodeJS.ProcessEnv = { PATH: "C:\\iso\\bin;C:\\Windows\\System32", HOME: "C:\\iso\\home", TMPDIR: "C:\\iso\\tmp" };
 /** The defaults the helper derives, with this platform's separator (the module runs on Windows, where join is `\`). */
@@ -59,4 +59,37 @@ test("systemRoot reads the environment it is given, and defaults to the Windows 
   assert.equal(systemRoot({ windir: "E:\\WinNT" }), "E:\\WinNT");
   assert.equal(systemRoot({}), "C:\\Windows");
   assert.equal(systemRoot({ SystemRoot: "D:\\Windows", windir: "E:\\WinNT" }), "D:\\Windows");
+  assert.equal(systemRoot({ WINDIR: "E:\\WinNT" }), "E:\\WinNT", "names compare case-insensitively");
+});
+
+// Windows has one variable per name: `Path` and `PATH` are the same variable, and so are `ComSpec` and `COMSPEC`. A block
+// carrying both (what `{...inherited, ...call}` produces when their spellings differ) leaves it to Windows which definition
+// a child reads, so a call's own PATH or ComSpec would silently not apply.
+test("environment names on Windows are one name whatever their case, and the last definition wins", () => {
+  assert.equal(envValue({ Path: "C:\\a" }, "PATH"), "C:\\a");
+  assert.equal(envValue({ PATH: "C:\\a", Path: "C:\\b" }, "PATH"), "C:\\b", "the later definition wins, as process.env does");
+  assert.equal(envValue({ PATH: "C:\\a" }, "ComSpec"), undefined);
+  const merged = mergeEnv({ Path: "C:\\inherited", ComSpec: "C:\\inherited\\cmd.exe", KEEP: "1" },
+    { PATH: "C:\\call", COMSPEC: "D:\\cmd.exe", dsa_home: "C:\\wrong" }, { PATH: "C:\\last", DSA_HOME: "/h" });
+  const named = (name: string) => Object.keys(merged).filter(key => key.toUpperCase() === name);
+  assert.deepEqual(named("PATH"), ["PATH"]);
+  assert.equal(merged.PATH, "C:\\last");
+  assert.equal(merged.Path, undefined, "the inherited spelling is gone, not a second definition");
+  assert.deepEqual(named("COMSPEC"), ["COMSPEC"]);
+  assert.equal(merged.COMSPEC, "D:\\cmd.exe");
+  assert.equal(merged.KEEP, "1", "other variables stay as they were");
+  assert.deepEqual(named("DSA_HOME"), ["DSA_HOME"]);
+  assert.equal(merged.dsa_home, undefined);
+  assert.equal(merged.DSA_HOME, "/h");
+  // normalizeEnv is mergeEnv without overrides: one definition per name, the later spelling winning.
+  assert.deepEqual(normalizeEnv({ Path: "a", PATH: "b", PathExt: ".CMD" }), { PATH: "b", PathExt: ".CMD" });
+  assert.equal(Object.keys(mergeEnv({}, { Path: "x" }))[0], "Path", "an unambiguous spelling is kept as given");
+});
+
+test("a Windows helper keeps the caller's own spelling of a shared name (PATH/Path, ComSpec/COMSPEC)", () => {
+  const env = helperEnv({ Path: "C:\\iso\\bin", COMSPEC: "D:\\Windows\\system32\\cmd.exe", HOME: "C:\\iso\\home" });
+  assert.deepEqual(Object.keys(env).filter(key => key.toUpperCase() === "PATH"), ["Path"], "no second PATH beside the caller's Path");
+  assert.equal(env.Path, "C:\\iso\\bin");
+  assert.deepEqual(Object.keys(env).filter(key => key.toUpperCase() === "COMSPEC"), ["COMSPEC"]);
+  assert.equal(env.COMSPEC, "D:\\Windows\\system32\\cmd.exe");
 });
