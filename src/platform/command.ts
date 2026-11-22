@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { captureStart } from "./proctable.ts";
 import { execTarget, findOnPath } from "./launch.ts";
 import { prepareJob, spawnInJob, type JobPrep } from "./job.ts";
-import { DWORD_MAX, comspec, envValue, IS_WINDOWS, mergeEnv, normalizeEnv, winTagArg } from "./windows.ts";
+import { DWORD_MAX, comspec, envValue, helperEnv, IS_WINDOWS, mergeEnv, normalizeEnv, systemRoot, winTagArg } from "./windows.ts";
 
 export const COMMAND_LOG = "output.log";
 export const COMMAND_EXIT = "exit";
@@ -158,7 +158,7 @@ export async function prepareCommand(spec: CommandSpawn): Promise<CommandPrep | 
   const plan = windowsPlan(spec);
   await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env }));
   await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
-  return prepareJob(spec.dir, { exe: process.execPath, env: plan.env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
+  return prepareJob(spec.dir, { exe: process.execPath, env: helperEnv({ SystemRoot: systemRoot() }), cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
     args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.signal ? { signal: spec.signal } : {}) });
 }
 
@@ -181,8 +181,8 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
     // An already revoked permission never prepares or starts; the executor's stage checks again immediately before the
     // spawn (spawnInJob), so a stop or retirement that arrived while the owner compiled still starts nothing.
     if (spec.proceed && !spec.proceed()) return undefined;
-    // The wrapper's environment as a direct spawn would give it; the command inside still gets command.json's env.
-    return await spawnInJob(spec.dir, { exe: process.execPath, env: plan.env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
+    // Start the internal Node wrapper with OS defaults. It reads the command's environment from command.json.
+    return await spawnInJob(spec.dir, { exe: process.execPath, env: helperEnv({ SystemRoot: systemRoot() }), cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
       args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.proceed ? { proceed: spec.proceed } : {}),
       ...(spec.prepared ? { prepared: spec.prepared } : {}), ...(spec.signal ? { signal: spec.signal } : {}) });
   }
