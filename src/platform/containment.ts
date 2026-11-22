@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { performance } from "node:perf_hooks";
 import type { Containment as Contract, ExecId, ProcInfo, ProcessTable as Table, Spawned, SpawnSpec } from "../types.ts";
 import { captureStart, ProcessTable } from "./proctable.ts";
-import { isOwnedWinChild, isWinStart, killTree, sameCreation, type WinProcessIdentity } from "./windows.ts";
+import { DWORD_MAX, isOwnedWinChild, isWinKillTimeout, isWinStart, KILL_BATCH_SIZE, killTree, normalizeWinTargets, sameCreation, type WinProcessIdentity } from "./windows.ts";
 
 // One table per orchestrator process, including evaluator and gate observers.
 const sharedTable = new ProcessTable();
@@ -22,8 +22,10 @@ export type FenceOptions = {
 export interface ContainmentOptions {
   platform?: NodeJS.Platform;
   captureStart?: (pid: number) => Promise<string>;
+  /** Default fence budget when a caller omits `FenceOptions.timeoutMs` (default: 15 s on Windows, 5 s on POSIX). */
+  fenceTimeoutMs?: number;
   /** Windows seam: terminate verified `(pid, start)` trees (default: handle-verified `killTree`). */
-  killWindows?: (targets: readonly WinProcessIdentity[], options?: { timeout?: number }) => Promise<void>;
+  killWindows?: (targets: readonly WinProcessIdentity[], options?: { timeout?: number; signal?: AbortSignal }) => Promise<void>;
   /** POSIX seam: signal a verified pid (default: `process.kill(pid, "SIGKILL")`). */
   killPosix?: (pid: number) => void;
 }
@@ -34,12 +36,14 @@ export class Containment implements Contract {
   private launched = new Map<ExecId, ProcInfo[]>();
   private platform: NodeJS.Platform;
   private readStart: (pid: number) => Promise<string>;
-  private killWin: (targets: readonly WinProcessIdentity[], options?: { timeout?: number }) => Promise<void>;
+  private fenceTimeoutMs?: number;
+  private killWin: (targets: readonly WinProcessIdentity[], options?: { timeout?: number; signal?: AbortSignal }) => Promise<void>;
   private killUnix?: (pid: number) => void;
   constructor(table: KnownTable = sharedTable, options: ContainmentOptions = {}) {
     this.table = table;
     this.platform = options.platform ?? process.platform;
     this.readStart = options.captureStart ?? captureStart;
+    this.fenceTimeoutMs = options.fenceTimeoutMs;
     this.killWin = options.killWindows ?? killTree;
     this.killUnix = options.killPosix;
   }
@@ -142,11 +146,12 @@ export class Containment implements Contract {
     const windows = this.platform === "win32";
     // PowerShell/CIM scans and handle-verified termination are ~0.5 s on Windows: the Unix 5 s deadline is too
     // tight under load (several workflows, parallel test files).
-    const timeout = opts.timeoutMs ?? (windows ? 15_000 : 5000);
+    const timeout = opts.timeoutMs ?? this.fenceTimeoutMs ?? (windows ? 15_000 : 5000);
     if (!Number.isFinite(timeout) || timeout < 0) throw new Error("Invalid fence timeout");
     const started = performance.now(), deadline = started + timeout;
     let recordingMs = 500;
-    const hasIdentity = (p: Pick<ProcInfo, "pid" | "start">) => p.pid > 0 && (windows ? isWinStart(p.start) : p.start !== "");
+    const hasIdentity = (p: Pick<ProcInfo, "pid" | "start">) =>
+      Number.isInteger(p.pid) && p.pid > 0 && (windows ? p.pid <= DWORD_MAX && isWinStart(p.start) : p.start !== "");
     const known = new Map(tracked.filter(hasIdentity).map(p => [identity(p), p]));
     let unverifiedPid: number | undefined;
     // F1 diagnostics: a fence that runs out of budget says what it observed -- numbers only, bounded, no process
@@ -176,25 +181,80 @@ export class Containment implements Contract {
 
       if (windows) {
         // Fail closed: never touch a target whose `(pid, start)` identity is missing or malformed.
-        const verified = targets.filter(hasIdentity);
-        if (verified.length) {
+        const verifiedProcs = targets.filter(hasIdentity);
+        const killTargets = verifiedProcs.length
+          ? normalizeWinTargets(verifiedProcs.map(p => ({ pid: p.pid, start: p.start })))
+          : [];
+        if (killTargets.length) {
           if (opts.beforeKill && recordingMs > 0) {
+            const remainingForDiag = deadline - performance.now();
+            if (remainingForDiag <= 0) throw timedOut("beforeKill diagnostics");
+            const diagBudget = Math.min(recordingMs, remainingForDiag);
+            const capsAtDeadline = remainingForDiag <= recordingMs;
             const recordingStarted = performance.now(), controller = new AbortController();
-            let timer: ReturnType<typeof setTimeout> | undefined;
+            let diagTimer: ReturnType<typeof setTimeout> | undefined, deadlineHit = false;
             try {
+              const pendingDiag = Promise.resolve().then(() => opts.beforeKill!(verifiedProcs, controller.signal)).catch(() => {});
               await Promise.race([
-                Promise.resolve().then(() => opts.beforeKill!(verified, controller.signal)),
-                new Promise<void>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(); }, recordingMs); }),
+                pendingDiag,
+                new Promise<void>(resolve => {
+                  diagTimer = setTimeout(() => {
+                    if (capsAtDeadline) deadlineHit = true;
+                    controller.abort();
+                    resolve();
+                  }, diagBudget);
+                }),
               ]);
-            } catch { /* A recording failure must never prevent termination. */ }
-            finally { clearTimeout(timer); controller.abort(); recordingMs = Math.max(0, recordingMs - (performance.now() - recordingStarted)); }
+            } finally {
+              clearTimeout(diagTimer);
+              controller.abort();
+              recordingMs = Math.max(0, recordingMs - (performance.now() - recordingStarted));
+            }
+            if (deadlineHit || performance.now() >= deadline) throw timedOut("beforeKill diagnostics");
           }
           // Handle-verified termination checks GetProcessTimes on the open kernel handle right before TerminateProcess,
-          // so exit/PID reuse during scan or beforeKill cannot touch an unrelated process.
-          kills += verified.length;
-          await this.killWin(verified.map(p => ({ pid: p.pid, start: p.start })), { timeout: Math.max(1000, Math.ceil(deadline - performance.now())) });
+          // so exit/PID reuse during scan or beforeKill cannot touch an unrelated process. Bound each batch to the
+          // remaining fence deadline and abort in-flight and later batches once the budget expires.
+          for (let i = 0; i < killTargets.length; i += KILL_BATCH_SIZE) {
+            const remainingForKill = deadline - performance.now();
+            if (remainingForKill <= 0) throw timedOut(i === 0 ? "kill round" : "kill");
+            const batch = killTargets.slice(i, i + KILL_BATCH_SIZE);
+            kills += batch.length;
+            const controller = new AbortController();
+            let killTimer: ReturnType<typeof setTimeout> | undefined, deadlineErr: Error | undefined;
+            try {
+              const pendingKill = Promise.resolve().then(() =>
+                this.killWin(batch, { timeout: Math.max(1, Math.ceil(remainingForKill)), signal: controller.signal }),
+              );
+              const timeoutKill = new Promise<never>((_, reject) => {
+                killTimer = setTimeout(() => {
+                  deadlineErr = timedOut("kill");
+                  reject(deadlineErr);
+                  controller.abort(deadlineErr);
+                }, remainingForKill);
+              });
+              void pendingKill.catch(() => {});
+              void timeoutKill.catch(() => {});
+              await Promise.race([pendingKill, timeoutKill]);
+            } catch (error) {
+              if (error === deadlineErr) throw error;
+              if (deadlineErr || isWinKillTimeout(error)) throw deadlineErr ?? timedOut("kill");
+              throw error;
+            } finally {
+              clearTimeout(killTimer);
+              controller.abort();
+            }
+          }
+          const rem = deadline - performance.now();
+          if (rem <= 0) throw timedOut("scan");
+          const pause = Math.min(20, Math.floor(rem / 4));
+          if (pause > 0) await delay(pause);
+        } else {
+          const rem = deadline - performance.now();
+          if (rem <= 0) throw timedOut("scan");
+          await delay(Math.min(20, rem));
+          if (performance.now() >= deadline) throw timedOut("scan");
         }
-        await delay(Math.min(20, Math.max(0, deadline - performance.now())));
         continue;
       }
 

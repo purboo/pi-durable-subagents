@@ -82,16 +82,35 @@ export function comspec(env: NodeJS.ProcessEnv = process.env): string {
   return envValue(env, "ComSpec") || join(systemRoot(env), "System32", "cmd.exe");
 }
 
+function winTimeoutError(message: string): NodeJS.ErrnoException {
+  const error: NodeJS.ErrnoException = new Error(message);
+  error.code = "ETIMEDOUT";
+  return error;
+}
+
+/** Whether an error from an async Windows helper/kill step represents deadline or abort expiry rather than a Win32 refusal. */
+export function isWinKillTimeout(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const e = error as { name?: string; code?: string | number | null; killed?: boolean };
+  if (e.name === "AbortError" || e.code === "ABORT_ERR" || e.code === "ETIMEDOUT") return true;
+  return e.killed === true && e.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+}
+
 const PS_PREAMBLE = "$ErrorActionPreference = 'Stop'; ";
 const PS_FLAGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
 /** Run a PowerShell script; rejects with its stderr. */
 export async function powershell(script: string, options: { signal?: AbortSignal; timeout?: number } = {}): Promise<string> {
+  options.signal?.throwIfAborted();
+  const timeout = options.timeout ?? 15_000;
+  if (!Number.isFinite(timeout) || timeout <= 0) throw winTimeoutError(`PowerShell timed out after ${timeout} ms`);
   const { stdout } = await exec(powershellPath(), [...PS_FLAGS, PS_PREAMBLE + script],
-    { signal: options.signal, timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, env: helperEnv() });
+    { signal: options.signal, timeout: Math.max(1, Math.ceil(timeout)), maxBuffer: 64 * 1024 * 1024, windowsHide: true, env: helperEnv() });
   return stdout;
 }
 export function powershellSync(script: string, options: { timeout?: number } = {}): string {
-  return execFileSync(powershellPath(), [...PS_FLAGS, PS_PREAMBLE + script], { timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8", env: helperEnv() });
+  const timeout = options.timeout ?? 15_000;
+  if (!Number.isFinite(timeout) || timeout <= 0) throw winTimeoutError(`PowerShell timed out after ${timeout} ms`);
+  return execFileSync(powershellPath(), [...PS_FLAGS, PS_PREAMBLE + script], { timeout: Math.max(1, Math.ceil(timeout)), maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8", env: helperEnv() });
 }
 
 export interface WinProcessIdentity {
@@ -227,7 +246,7 @@ export function winStartSync(pid: number): string {
 }
 /** A diagnostic command line (never evidence of identity or death). */
 export async function winCommandLine(pid: number, signal?: AbortSignal): Promise<string> {
-  if (!Number.isInteger(pid) || pid <= 0) return "";
+  if (!Number.isInteger(pid) || pid <= 0 || signal?.aborted) return "";
   try {
     const out = await powershell(processQuery("CommandLine", "$p.CommandLine", pid), { signal, timeout: 1000 });
     return out.trim().replace(/\s+/g, " ").slice(0, 200);
@@ -297,7 +316,7 @@ export interface WinKillSyncOptions {
   runSync?: (script: string, options: { timeout?: number }) => string;
 }
 
-const KILL_BATCH_SIZE = 128;
+export const KILL_BATCH_SIZE = 128;
 
 /** Validate and deduplicate Windows `(pid, start)` targets. Fails closed on any missing or malformed identity. */
 export function normalizeWinTargets(targets: WinProcessIdentity | readonly WinProcessIdentity[]): WinProcessIdentity[] {
@@ -428,27 +447,76 @@ export function buildWinKillScript(targets: readonly WinProcessIdentity[], inclu
 
 async function runWinKill(targets: WinProcessIdentity | readonly WinProcessIdentity[], includeDescendants: boolean, options: WinKillOptions = {}): Promise<void> {
   const checked = normalizeWinTargets(targets);
+  const name = includeDescendants ? "killTree" : "killProcess";
   if ((options.platform ?? process.platform) !== "win32" && !options.run) {
-    throw new Error(`${includeDescendants ? "killTree" : "killProcess"} is Windows-only`);
+    throw new Error(`${name} is Windows-only`);
   }
   if (!checked.length) return;
+  const budget = options.timeout ?? 10_000;
+  if (!Number.isFinite(budget) || budget < 0) throw new Error(`Invalid ${name} timeout`);
+  options.signal?.throwIfAborted();
+  if (budget === 0) throw winTimeoutError(`${name} timed out after 0 ms`);
+  const deadline = performance.now() + budget;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   const run = options.run ?? ((script: string, opts: { timeout?: number; signal?: AbortSignal }) => powershell(script, opts));
-  for (let i = 0; i < checked.length; i += KILL_BATCH_SIZE) {
-    const batch = checked.slice(i, i + KILL_BATCH_SIZE);
-    await run(buildWinKillScript(batch, includeDescendants), { timeout: options.timeout ?? 10_000, ...(options.signal ? { signal: options.signal } : {}) });
+  try {
+    const interrupted = new Promise<never>((_, reject) => {
+      onAbort = () => {
+        const reason = options.signal?.reason ?? new DOMException("The operation was aborted", "AbortError");
+        reject(reason);
+        controller.abort(reason);
+      };
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => {
+        const err = winTimeoutError(`${name} timed out after ${budget} ms`);
+        reject(err);
+        controller.abort(err);
+      }, budget);
+    });
+    void interrupted.catch(() => {});
+    for (let i = 0; i < checked.length; i += KILL_BATCH_SIZE) {
+      options.signal?.throwIfAborted();
+      if (controller.signal.aborted) throw controller.signal.reason;
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) {
+        const err = winTimeoutError(`${name} timed out after ${budget} ms`);
+        controller.abort(err);
+        throw err;
+      }
+      const batch = checked.slice(i, i + KILL_BATCH_SIZE);
+      const pending = Promise.resolve().then(() => run(buildWinKillScript(batch, includeDescendants), {
+        timeout: Math.max(1, Math.ceil(remaining)),
+        signal: controller.signal,
+      }));
+      void pending.catch(() => {});
+      await Promise.race([pending, interrupted]);
+    }
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+    controller.abort();
   }
 }
 
 function runWinKillSync(targets: WinProcessIdentity | readonly WinProcessIdentity[], includeDescendants: boolean, options: WinKillSyncOptions = {}): void {
   const checked = normalizeWinTargets(targets);
+  const name = includeDescendants ? "killTreeSync" : "killProcessSync";
   if ((options.platform ?? process.platform) !== "win32" && !options.runSync) {
-    throw new Error(`${includeDescendants ? "killTreeSync" : "killProcessSync"} is Windows-only`);
+    throw new Error(`${name} is Windows-only`);
   }
   if (!checked.length) return;
+  const budget = options.timeout ?? 10_000;
+  if (!Number.isFinite(budget) || budget < 0) throw new Error(`Invalid ${name} timeout`);
+  if (budget === 0) throw winTimeoutError(`${name} timed out after 0 ms`);
+  const deadline = performance.now() + budget;
   const runSync = options.runSync ?? ((script: string, opts: { timeout?: number }) => powershellSync(script, opts));
   for (let i = 0; i < checked.length; i += KILL_BATCH_SIZE) {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw winTimeoutError(`${name} timed out after ${budget} ms`);
     const batch = checked.slice(i, i + KILL_BATCH_SIZE);
-    runSync(buildWinKillScript(batch, includeDescendants), { timeout: options.timeout ?? 10_000 });
+    runSync(buildWinKillScript(batch, includeDescendants), { timeout: Math.max(1, Math.ceil(remaining)) });
   }
 }
 
