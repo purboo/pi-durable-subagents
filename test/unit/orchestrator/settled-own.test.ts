@@ -316,6 +316,8 @@ test("recovery predicates cover missing notices, forwards, fences, gates, cleanu
   }
   assert.equal(pendingRecovery("wf", entries(done.slice(0, 1))), true, "missing workflow completion notice");
   assert.equal(pendingRecovery("wf", entries([...done, { type: "wt-intent", call: "c" }, { type: JT.sealed, call: "c", result: { status: "ok" } }])), true);
+  // A kept worktree is the completed worktree step: recovery has nothing left to run for that call.
+  assert.equal(pendingRecovery("wf", entries([...done, { type: "wt-intent", call: "c" }, { type: JT.sealed, call: "c", result: { status: "ok" } }, { type: "wt-kept", call: "c" }])), false);
   assert.equal(pendingRecovery("wf", entries([...done, { type: JT.sealed, call: "c" }, { type: JT.attention, item: { id: "q", call: "c", rev: 1, kind: "question" } }])), true);
 });
 
