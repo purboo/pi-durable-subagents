@@ -47,6 +47,18 @@ async function until<T>(get: () => Promise<T | undefined> | T | undefined, what:
 }
 const live = async (pid: number) => (await winProcessRows()).some(row => row.pid === pid);
 const gone = (pid: number) => until(async () => !(await live(pid)), `pid ${pid} to end`);
+/** Wait for a launch's end while the test itself holds the event loop. The product unrefs the owner on purpose (its end
+ *  is a wake-up, never a held event loop), so a bare `await launched.exited` leaves Node with no live handle: the loop
+ *  drains, the wait never settles, and the test runner cancels the test (Node 22: `cancelledByParent`, "Promise
+ *  resolution is still pending but the event loop has already resolved"). The wait owns one bounded, ref'd timer for the
+ *  length of the wait -- and always clears it, so nothing is held once the launch has ended. */
+async function untilEnded(launched: { exited: Promise<void> }, ms = 60_000): Promise<void> {
+  let bound: NodeJS.Timeout | undefined;
+  const gaveUp = new Promise<never>((_, reject) => {
+    bound = setTimeout(() => { reject(new Error(`the launch did not end within ${ms} ms`)); }, ms);
+  });
+  try { await Promise.race([launched.exited, gaveUp]); } finally { clearTimeout(bound); }
+}
 
 /** A program that starts a detached grandchild beating into `beat`, records its pid and then keeps running itself. */
 const treeProgram = (dir: string) => {
@@ -215,6 +227,23 @@ test("a failure reason is one bounded line and never a credential", async t => {
   assert.ok(!silent.includes("PowerShell"), "no PowerShell in the launch path any more");
 });
 
+test("a test that awaits an unref'd launch holds the event loop itself, and its wait is bounded", async () => {
+  // The owner is deliberately unref'd (see the module comment in job.ts): with nothing else ref'd, Node drains the loop
+  // before the owner's exit event arrives and the awaiting test is cancelled -- the failure this file hit on Node 22
+  // (`cancelledByParent`, "Promise resolution is still pending but the event loop has already resolved"). This is that
+  // same wait, with a detached unref'd child and an exit promise nothing else holds: the wait's own ref'd timer is the
+  // only thing keeping the test alive until the exit event arrives.
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 250)"], { detached: true, stdio: "ignore", windowsHide: true });
+  const exited = new Promise<void>(resolve => { child.once("exit", () => { resolve(); }); });
+  child.unref();
+  const started = Date.now();
+  await untilEnded({ exited });
+  assert.ok(Date.now() - started >= 200, "the wait ended with the child, not with a drained event loop");
+  // Bounded: a launch that never ends fails the wait with its own message instead of holding the file's whole timeout,
+  // and the timer is cleared so nothing outlives the wait (a leaked timer would hold the event loop after the test).
+  await assert.rejects(untilEnded({ exited: new Promise<void>(() => {}) }, 60), /the launch did not end within 60 ms/);
+});
+
 test("a job group runs a program with its argv, its output and its exit status", { skip: windowsOnly, timeout: 120_000 }, async t => {
   const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
   const program = join(dir, "args.mjs");
@@ -235,7 +264,7 @@ test("a job group runs a program with its argv, its output and its exit status",
     assert.ok(launched.group.pid !== launched.pid, "the owner is not the wrapper");
     assert.ok(launched.start, "a wrapper that is still running has an observed identity");
   }
-  await launched.exited;
+  await untilEnded(launched);
   assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 4);
   assert.equal(readFileSync(join(dir, "output.log"), "utf8").trim(), JSON.stringify(argv));
   assert.ok(!existsSync(join(dir, JOB_ERROR)), "no failure was recorded");
@@ -262,7 +291,7 @@ test("a program's stdout and stderr both land in one log, neither overwriting th
   const launched = await spawnInJob(dir, { exe: process.execPath, args: [program], cwd: dir,
     log: join(dir, "output.log"), env: { ...process.env } });
   assert.ok(launched);
-  await launched.exited;
+  await untilEnded(launched);
   const log = readFileSync(join(dir, "output.log"), "utf8");
   const lines = log.trimEnd().split(/\r?\n/).sort();
   const expected = Array.from({ length: 40 }, (_, at) => `line-${at}`).sort();
@@ -281,7 +310,7 @@ test("a Unicode and curly-quoted attempt directory, argv, cwd and environment ar
   const launched = await spawnInJob(dir, { exe: process.execPath, args: [program, ...argv], cwd: dir,
     log: join(dir, "output.log"), env: { ...process.env, DSA_UNICODE: "v\u00e4l\u00fce \u2019x\u2019" } });
   assert.ok(launched);
-  await launched.exited;
+  await untilEnded(launched);
   const seen = JSON.parse(readFileSync(join(dir, "output.log"), "utf8").trim()) as { argv: string[]; cwd: string; env: string };
   assert.deepEqual(seen.argv, argv);
   assert.equal(seen.cwd, dir);
@@ -337,7 +366,7 @@ test("a spec field keeps an unpaired surrogate: the owner creates the path the c
   const launched = await spawnInJob(dir, { exe: process.execPath, args: [program], cwd: dir, log: join(dir, "out-\ud800.log"),
     env: { ...process.env } });
   assert.ok(launched, "a path with an unpaired surrogate is one Win32 accepts");
-  await launched.exited;
+  await untilEnded(launched);
   assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0, "the wrapper ran and ended");
   assert.ok(!existsSync(join(dir, JOB_ERROR)), "nothing failed in this host");
   assert.ok(!existsSync(join(dir, "out-\ufffd.log")), "the name on disk is the exact code unit, not its replacement");
@@ -351,7 +380,7 @@ test("a wrapper status above 0x7fffffff stays the wrapper's status", { skip: win
   const launched = await spawnInJob(dir, { exe: process.execPath, args: [program], cwd: dir,
     log: join(dir, "output.log"), env: { ...process.env } });
   assert.ok(launched, "the wrapper started, so this is not a host failure");
-  await launched.exited;
+  await untilEnded(launched);
   assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, status, "the record carries the whole DWORD");
   assert.ok(!existsSync(join(dir, JOB_ERROR)), "nothing failed in this host");
   // The owner's own exit is the same DWORD: 125 would mean this host's failure and would be indistinguishable from it.
@@ -395,7 +424,7 @@ test("the wrapper's own death takes its descendants with it", { skip: windowsOnl
   // detached grandchild with it -- otherwise the next attempt starts beside surviving processes of this one.
   process.kill(launched.pid, "SIGKILL");
   await gone(grandchild);
-  await launched.exited;
+  await untilEnded(launched);
   const size = readFileSync(beat, "utf8").length;
   await delay(400);
   assert.equal(readFileSync(beat, "utf8").length, size, "the grandchild stops acting");
@@ -411,7 +440,7 @@ test("a normal end closes the group too: a descendant left behind does not outli
   assert.ok(launched);
   const grandchild = Number(await until(() => existsSync(pidFile) ? readFileSync(pidFile, "utf8") : undefined, "the grandchild pid"));
   await until(() => existsSync(beat) && readFileSync(beat, "utf8").length > 0, "the grandchild to beat").catch(() => undefined);
-  await launched.exited;
+  await untilEnded(launched);
   await gone(grandchild);
   await gone(launched.pid);
   assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0);
@@ -514,7 +543,7 @@ test("two launches in one directory never share a compiled owner", { skip: windo
     const launched = await spawnInJob(dir, { exe: process.execPath, args: [program], cwd: dir,
       log: join(dir, `output-${n}.log`), env: { ...process.env } });
     assert.ok(launched);
-    await launched.exited;
+    await untilEnded(launched);
     assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0);
     assert.match(readFileSync(join(dir, `output-${n}.log`), "utf8"), /run/);
   }
@@ -702,7 +731,7 @@ test("a staged owner is the one the start runs, and the start checks the gate wi
   } });
   assert.ok(launched);
   assert.equal(gateSaw, JOB_SPEC_HEADER, "the gate runs with the spec written and the owner compiled");
-  await launched.exited;
+  await untilEnded(launched);
   assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0);
   assert.match(readFileSync(join(dir, "output.log"), "utf8"), /staged/);
   assert.equal(readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX)).length, 1, "the staged owner was used, not a second one");
