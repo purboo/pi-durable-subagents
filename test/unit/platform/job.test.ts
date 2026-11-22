@@ -54,10 +54,9 @@ test("the helper script is self-contained, ASCII, and takes its directory from t
   assert.match(JOB_HELPER, /JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE/);
   assert.match(JOB_HELPER, /CREATE_SUSPENDED/);
   assert.match(JOB_HELPER, /AssignProcessToJobObject/);
-  // The directory is argv, never text in the script: nothing to quote, nothing to case-fold, no $PSScriptRoot.
+  // The attempt directory comes from the script location, including Unicode path components.
   assert.match(JOB_HELPER, /^\$Dir = \$PSScriptRoot\n/);
   assert.ok(!JOB_HELPER.includes("@@DIR@@"));
-  assert.ok(!JOB_HELPER.includes("$PSScriptRoot"));
   // PowerShell 5.1 decodes a script with no byte order mark in the ANSI code page: only ASCII text is unambiguous.
   assert.match(JOB_HELPER, /^[\t\n\r\x20-\x7e]*$/, "the helper script is ASCII only");
   // job.json is UTF-8 and its bytes are decoded as such, whatever the code page says.
