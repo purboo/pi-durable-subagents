@@ -455,7 +455,14 @@ is created suspended, assigned to the group before its first instruction, and
 the group's only handle dies with the attempt, so every process the command
 starts is in the group and cannot outlive it (a wrapper crash or a killed job
 helper ends the group; a command that is still running keeps running when the
-orchestrator stops). The command sees the orchestrator's environment plus `env`,
+orchestrator stops). The attempt's tag is also spelled in that helper's own
+command line, so a successor that finds a recorded intent while the helper is
+still compiling -- before the group record and the wrapper exist -- still finds
+the attempt and starts nothing else. Only a confirmed retirement lets a start
+fail: when the handshake cannot be completed and the helper cannot be shown to
+have ended, the attempt is adopted and tracked (its identity is recorded, and a
+scan that finds it gone is what lets another attempt start), never reported
+failed while it may still act. The command sees the orchestrator's environment plus `env`,
 `DSA_CALL` (its call id), `DSA_EXEC` (its attempt) and `DSA_HOME`, so a
 `pi-durable-subagents` command inside it (`hold`, `run`, `send`) addresses
 the same home; it cannot force a restart. After merging `env`, the command's

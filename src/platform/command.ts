@@ -9,7 +9,9 @@
 // On Windows the wrapper also runs inside a Windows Job Object of its own (platform/job.ts): the wrapper is the group's
 // root, created suspended and assigned before its first instruction, and the group's only handle dies with the helper.
 // A command attempt therefore cannot leave descendants behind, and a scan that finds the wrapper gone finds the group
-// closed: no second attempt starts while processes of the first can still act.
+// closed: no second attempt starts while processes of the first can still act. The attempt's `exec` tag goes into the
+// helper's own command line as well, so the attempt is findable while the helper is still compiling -- the window between
+// the recorded intent and the group record, where the wrapper does not exist yet.
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, stat, open, writeFile } from "node:fs/promises";
@@ -84,6 +86,9 @@ export interface SpawnedCommand {
   /** Windows: the job helper that owns the attempt's kernel group. Its identity is tracked with the wrapper's, so a scan
    *  finds the whole group and its absence proves the group is closed (see platform/job.ts). */
   group?: { pid: number; start: string };
+  /** Windows: the attempt was started but its helper could not be confirmed retired (platform/job.ts). `pid`/`start` are
+   *  then the helper's identity; the attempt must be watched until a scan confirms it retired, never started again. */
+  uncertain?: string;
   /** Resolves when the wrapper ends while this process runs (a wake-up only: the exit record is the outcome). */
   exited: Promise<void>;
 }
@@ -110,7 +115,8 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
       // The wrapper's environment as a direct spawn would give it; the command inside still gets command.json's env.
       const env = { ...spec.env, ...(spec.env.ComSpec || spec.env.COMSPEC ? {} : { ComSpec: comspec() }) };
       return await spawnInJob(spec.dir, { exe: process.execPath, env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
-        args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [`DSA_EXEC=${spec.exec}`] : [])] });
+        args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [`DSA_EXEC=${spec.exec}`] : [])],
+        ...(spec.exec ? { exec: spec.exec } : {}) });
     }
     const mv = resolveMv(), argv = commandArgv(spec.command);
     if (spec.proceed && !spec.proceed()) return undefined;

@@ -46,7 +46,7 @@ const treeProgram = (dir: string) => {
   return { program, beatScript, beat: join(dir, "beat"), pidFile: join(dir, "grandchild.pid") };
 };
 
-test("the helper script is self-contained, ASCII, and takes the attempt directory as its argument", () => {
+test("the helper script is self-contained, ASCII, and takes its directory from the script location", () => {
   // No Windows needed: the shipped source must carry the whole helper (there is no separate file to forget in the
   // package) and must not carry the attempt directory, an encoding or a quoting rule that PowerShell 5.1 would get wrong.
   assert.ok(JOB_HELPER.includes(JOB_HELPER_MARKER));
@@ -55,7 +55,7 @@ test("the helper script is self-contained, ASCII, and takes the attempt director
   assert.match(JOB_HELPER, /CREATE_SUSPENDED/);
   assert.match(JOB_HELPER, /AssignProcessToJobObject/);
   // The directory is argv, never text in the script: nothing to quote, nothing to case-fold, no $PSScriptRoot.
-  assert.match(JOB_HELPER, /^param\(\[string\]\$Dir\)\n/);
+  assert.match(JOB_HELPER, /^\$Dir = \$PSScriptRoot\n/);
   assert.ok(!JOB_HELPER.includes("@@DIR@@"));
   assert.ok(!JOB_HELPER.includes("$PSScriptRoot"));
   // PowerShell 5.1 decodes a script with no byte order mark in the ANSI code page: only ASCII text is unambiguous.

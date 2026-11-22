@@ -12,9 +12,10 @@
 // pi or its interpreter missing or not executable); the call stays queued and launches again after a backoff.
 // Command calls (CallSpec.command) record no exec/tracked/fenced entries (nothing that handles agent executions picks them
 // up): command-intent{call,id,n} before the spawn (id = command:<call>#<n> is the attempt and its process tag DSA_EXEC;
-// n is 1, or 2 for the single rerun); command-started{call,id,pid,start,dir,group?} after it (the wrapper's identity, the
+// n is 1, or 2 for the single rerun); command-started{call,id,pid,start,dir,group?,uncertain?} after it (the wrapper's identity, the
 // attempt directory, and on Windows {pid,start} of the job helper that owns the attempt's kernel group; its ts starts the
-// wall-clock timeout); command-spawn-failed{call,id,error}: the command could not
+// wall-clock timeout; `uncertain` means the start could not be confirmed -- the helper was adopted with pid/start of the
+// helper itself, and only a scan that finds it gone may let another attempt start); command-spawn-failed{call,id,error}: the command could not
 // start (it seals failed, never reruns); command-timeout{call,id}: the deadline passed, recorded before the process tree
 // is ended (as stop-intent is for a stop), so a crash during that fence still seals timeout; command-withdrawn{call,id}:
 // the intent was recorded but no process started (a retirement or the orchestrator's exit came first): a later start
@@ -1061,6 +1062,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   }
   // ---- Command calls: no model, slot, usage, hibernation or budget; the process outlives the orchestrator. ----
   const commandTick = () => Math.min(config.k?.trackerMs ?? 1000, 1000);
+  /** Attempts whose process table read failed (logged once: a broken observer would otherwise fill the log). */
+  const unobserved = new Set<string>();
   const hasStopIntent = (journal: JournalHandle, call: string) => entriesFor(journal, call).some(e => e.type === "stop-intent");
   /** The attempt's known identities (from its latest command-started): the wrapper and, on Windows, the job helper that
    *  owns its kernel group (whose descendants are the whole attempt), for scans and fences. */
@@ -1073,14 +1076,27 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       known.push({ pid: Number(group.pid), ppid: 0, start: group.start });
     return known;
   };
-  /** The processes of an attempt: tagged with its id, the wrapper while it lives, and their live descendants. */
-  async function commandProcesses(id: string, known: ProcInfo[]): Promise<ProcInfo[]> {
-    return (await containment.scan(new Map([[id, known]]), { fresh: true })).get(id) ?? [];
+  /** The processes of an attempt: tagged with its id, the wrapper while it lives, and their live descendants. A scan that
+   *  fails transiently is not an empty result (`undefined`): an attempt is never called gone because the observer failed. */
+  async function commandProcesses(id: string, known: ProcInfo[]): Promise<ProcInfo[] | undefined> {
+    try { return (await containment.scan(new Map([[id, known]]), { fresh: true })).get(id) ?? []; }
+    catch (error) { if (closed) throw error; return undefined; }
+  }
+  /** The same, for a decision that may not proceed on an unobserved attempt: retried until the table answers (the fence
+   *  retries a failed retirement the same way; the orchestrator's exit ends it). */
+  async function observedCommandProcesses(id: string, known: ProcInfo[]): Promise<ProcInfo[]> {
+    for (;;) {
+      const live = await commandProcesses(id, known);
+      if (live) { unobserved.delete(id); return live; }
+      if (!unobserved.has(id)) { unobserved.add(id); console.error(`durable-subagents: the processes of ${id} could not be observed; retrying`); }
+      if (closed) throw shutdownError();
+      await delay(commandTick());
+    }
   }
   /** End an attempt's whole process tree: SIGTERM, a grace period, then the fence (SIGKILL until a rescan finds none).
    *  A failing fence is retried until it works; the orchestrator's exit interrupts it (the next start fences again). */
   async function endCommand(id: string, known: ProcInfo[]) {
-    let live = await commandProcesses(id, known);
+    let live = await observedCommandProcesses(id, known);
     if (!live.length) return;
     for (const p of live) {
       if (p.start !== "" && await captureStart(p.pid).catch(() => "") !== p.start) continue;
@@ -1089,7 +1105,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const graceUntil = Date.now() + COMMAND_GRACE_MS;
     while (Date.now() < graceUntil) {
       await delay(100);
-      live = await commandProcesses(id, known);
+      live = await observedCommandProcesses(id, known);
       if (!live.length) return;
     }
     for (;;) {
@@ -1192,7 +1208,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       return undefined;
     }
     await serial(() => t.journal.append(COMMAND_STARTED, { call: t.callId, id, pid: spawned.pid, start: spawned.start, dir,
-      ...(spawned.group ? { group: spawned.group } : {}) }));
+      ...(spawned.group ? { group: spawned.group } : {}), ...(spawned.uncertain ? { uncertain: spawned.uncertain } : {}) }));
     return spawned;
   }
   /** Run, adopt or settle a command call (see the journal records at the top). One attempt runs at a time; a lost first
@@ -1275,7 +1291,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           return await sealCommand(journal, t, id, { status: "timeout" }, dir);
         }
         const wrapper = !!started?.start && await captureStart(Number(started.pid)).catch(() => "") === started.start;
-        if (!wrapper && !(await commandProcesses(id, known)).length) {
+        // A failed observation is not a loss: the attempt stays tracked and is watched again (never started over).
+        const live = wrapper ? undefined : await commandProcesses(id, known);
+        if (!wrapper && live !== undefined && !live.length) {
           // The wrapper may have written its record just before it ended.
           const late = await readExitRecord(dir);
           if (!late) return "lost";

@@ -30,12 +30,22 @@
 // helper never resumes the child unless CreateJobObject, SetInformationJobObject, CreateProcess, AssignProcessToJobObject
 // and IsProcessInJob all succeeded, and it writes `start-error` when they did not. The helper's own identity is recorded
 // with the attempt, so its absence from the process table proves the group is closed.
+//
+// The handshake has two windows a crash or a slow machine can cut into, and both must keep a second attempt from starting
+// while the first can still act. The first is the helper's own startup (PowerShell parsing the script and compiling the
+// C#): no group record and no wrapper exist yet, so the attempt is found by the tag in the helper's command line
+// (`DSA_EXEC=<id>`, the same tag a POSIX command carries in its environment) -- the helper is passed it in its argv, never
+// only in an environment a Windows process table cannot read. The second is the failure path: a handshake that cannot be
+// completed ends the helper and reports a refusal only once the helper has ended (its exit closes the group's only handle,
+// so nothing of the attempt can act); when the end cannot be confirmed -- the kill failed, or the helper is still there at
+// the deadline -- the attempt is adopted instead (JobSpawned.uncertain), its identity travels to the orchestrator, and the
+// call keeps the attempt tracked, so nothing starts a second attempt until a scan finds the first one gone.
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, existsSync, openSync } from "node:fs";
 import { open, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { helperEnv, killTree, powershellPath, winProcessRows } from "./windows.ts";
+import { helperEnv, killTree, powershellPath, winProcessRows, type WinProcessRow } from "./windows.ts";
 
 /** The helper type: exported for the packaging check (the script is compiled into dist/platform/job.js, never a file). */
 export const JOB_HELPER_MARKER = "DsaJob";
@@ -64,6 +74,10 @@ const EVIDENCE_LIMIT = 200;
 const REASON_LIMIT = 300;
 /** Add-Type plus process creation on a loaded runner; a helper that has not reported a group by then started nothing. */
 const JOB_START_TIMEOUT_MS = 30_000;
+/** How long a helper that cannot be confirmed retired is given to end before its attempt is adopted instead. */
+const JOB_HELPER_END_MS = 5_000;
+/** Caps the retries of a failed process-table observation: past it the attempt is adopted rather than refused. */
+const JOB_OBSERVE_MS = 10_000;
 
 const C_SHARP = `
 using System;
@@ -341,7 +355,7 @@ public static class DsaJob
  *  attempt directory as its only argument (`-File <script> <dir>`, bound to `$Dir`): the directory is never written into
  *  the script, so a Unicode or curly-quoted path needs no quoting and the script stays ASCII -- see the module comment.
  *  Exit codes are the launcher's evidence: 125 is a failure the script recorded, 126 is a missing attempt directory. */
-export const JOB_HELPER = `param([string]$Dir)
+export const JOB_HELPER = `$Dir = $PSScriptRoot
 if (-not $Dir) { exit 126 }
 $ErrorActionPreference = 'Stop'
 $status = 125
@@ -424,6 +438,9 @@ export interface JobLaunch {
   log: string;
   /** Its complete environment. */
   env: NodeJS.ProcessEnv;
+  /** The attempt's tag (`DSA_EXEC=<exec>`): spelled in the helper's own argv, so a scan still finds the attempt while the
+   *  helper compiles, before the group record exists. */
+  exec?: string;
 }
 export interface JobSpawned {
   /** The program's pid (from the group record, not from this process's child). */
@@ -432,13 +449,65 @@ export interface JobSpawned {
   start: string;
   /** The helper that owns the group: its identity proves the group is still open (absent from the process table: closed). */
   group?: { pid: number; start: string };
+  /** Set when the attempt could not be refused: the helper did not end, so it was adopted instead of reported failed --
+   *  `pid`/`start` are then the helper's identity (the group's only handle holder) and the value is the reason. The
+   *  attempt must be watched until a scan confirms it retired: no second attempt may start while this one can act. */
+  uncertain?: string;
   /** Resolves when the helper ends (a wake-up only: the exit record is the outcome). */
   exited: Promise<void>;
 }
+export interface JobOptions {
+  /** The handshake deadline (the group record): a helper that reported none by then started nothing. */
+  timeoutMs?: number;
+  /** How long a failed process-table observation is retried before the attempt is adopted (default JOB_OBSERVE_MS). */
+  observeMs?: number;
+  /** How long a helper that cannot be confirmed retired is given to end before its attempt is adopted (default
+   *  JOB_HELPER_END_MS). */
+  endMs?: number;
+  /** Test seam: one process-table observation (default: the real one). */
+  observe?: () => Promise<WinProcessRow[]>;
+  /** Test seam: end the helper (default: `taskkill /T`); rejects when the end is not confirmed. */
+  endHelper?: (pid: number) => Promise<void>;
+}
+
+/** The helper's argv: the script it runs, then the attempt's tag. PowerShell binds the extra argument to `$args`, which
+ *  the script ignores; the tag is what a scan finds while the helper compile is still under way. */
+export function jobHelperArgv(script: string, exec?: string): string[] {
+  return ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script,
+    ...(exec ? [`DSA_EXEC=${exec}`] : [])];
+}
+/** A read that failed because the helper holds the file for a moment (or is renaming it onto the name): not a failure. */
+export function transientRead(error: unknown): boolean {
+  return ["EBUSY", "EPERM", "EACCES", "EAGAIN", "EMFILE", "ENFILE"].includes((error as NodeJS.ErrnoException | undefined)?.code ?? "");
+}
+const absent = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+
+/** The group record's pid: undefined while the helper has not written it yet (missing, or not readable for a moment). */
+async function groupPid(dir: string): Promise<number | undefined> {
+  let text: string;
+  try { text = await readFile(join(dir, JOB_GROUP), "utf8"); }
+  catch (error) { if (absent(error) || transientRead(error)) return undefined; throw error; }
+  let recorded: unknown;
+  try { recorded = (JSON.parse(text) as { pid?: unknown }).pid; }
+  catch { throw new Error(`the command job group record cannot be read: ${text.slice(0, 200)}`); }
+  if (!Number.isInteger(recorded) || (recorded as number) <= 0) throw new Error(`the command job group record is not a pid: ${text.slice(0, 200)}`);
+  return recorded as number;
+}
+/** One process-table observation, retried for a while: a PowerShell/CIM read fails transiently on a loaded machine, and
+ *  a failed observation must never be read as "no process" (that would let a second attempt start). */
+async function observeWithin(observe: () => Promise<WinProcessRow[]>, budgetMs: number): Promise<WinProcessRow[]> {
+  const end = Date.now() + Math.max(250, budgetMs);
+  for (;;) {
+    try { return await observe(); }
+    catch (error) { if (Date.now() + 250 >= end) throw error; await delay(250); }
+  }
+}
 
 /** Start `launch` inside a new Windows Job Object (see the module comment). Rejects -- with no attempt started -- when
- *  the helper cannot create the group, assign the suspended child before it runs, or report it back in time. */
-export async function spawnInJob(dir: string, launch: JobLaunch, options: { timeoutMs?: number } = {}): Promise<JobSpawned> {
+ *  the helper cannot create the group, assign the suspended child before it runs, or report it back in time, and its end
+ *  is confirmed. When an attempt cannot be refused (the helper did not end), it resolves with JobSpawned.uncertain: the
+ *  attempt was started and is adopted, never silently dropped. */
+export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOptions = {}): Promise<JobSpawned> {
   // Evidence of an earlier attempt in the same directory must never be read as this attempt's.
   for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_HELPER_EXIT, JOB_HELPER_LOG]) await rm(join(dir, name), { force: true });
   const script = join(dir, JOB_SCRIPT);
@@ -448,8 +517,7 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: { time
   const errors = openSync(join(dir, JOB_HELPER_LOG), "a");
   let helper: ChildProcess;
   try {
-    // Not detached, and the attempt directory as the script's argument: see the module comment for both.
-    helper = spawn(powershellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, dir],
+    helper = spawn(powershellPath(), jobHelperArgv(script, launch.exec),
       { detached: true, stdio: ["ignore", "ignore", errors], windowsHide: true, env: helperEnv() });
   } finally { closeSync(errors); }
   let ended = false;
@@ -464,33 +532,43 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: { time
     helper.once("exit", (code, signal) => { void done(asciiJson({ code, signal })); });
     helper.once("error", error => { void done(asciiJson({ error: String((error as Error)?.message ?? error) })); });
   });
-  /** Fail closed: end the group (killing the helper closes it), reap it, and report why nothing may be attempted. */
-  const refuse = async (reason: string): Promise<never> => {
-    if (!ended) {
-      await killTree(helper.pid ?? 0).catch(() => {});
-      await Promise.race([exited, delay(5000)]);
+  const observe = options.observe ?? (() => winProcessRows()), endHelper = options.endHelper ?? killTree,
+    endMs = options.endMs ?? JOB_HELPER_END_MS, observeMs = options.observeMs ?? JOB_OBSERVE_MS;
+  const helperPid = helper.pid;
+  /** Refuse only with a confirmed retirement; otherwise adopt the attempt (see the module comment). The helper is this
+   *  process's own child, so while it has not ended its pid cannot have been reused: nothing is killed by a bare pid. */
+  const refuse = async (reason: string): Promise<JobSpawned> => {
+    let failure = "";
+    if (!ended && helperPid !== undefined) {
+      try { await endHelper(helperPid); }
+      catch (error) { failure = `; ending the helper failed (${String((error as Error)?.message ?? error)})`; }
     }
-    throw new Error(`${reason}${await startError(dir)}`);
+    if (!ended) await Promise.race([exited, delay(endMs)]);
+    const detail = `${reason}${await startError(dir)}${failure}`;
+    // The helper ended: its exit closed the group's only handle, so nothing of this attempt can act. Run none of it.
+    if (ended) throw new Error(detail);
+    // Not confirmed: the helper may still create the group and run the wrapper. Adopt it instead, with its identity when
+    // one observation can read it (its tag in argv finds it otherwise), so the attempt is tracked and never duplicated.
+    let start = "";
+    try { start = helperPid === undefined ? "" : (await observe()).find(row => row.pid === helperPid)?.start ?? ""; }
+    catch { /* unobservable: the attempt's tag in the helper's argv still finds it */ }
+    // The helper outlives this process by design (the command must): its end is a wake-up, never a held event loop.
+    helper.unref();
+    return { pid: helperPid ?? 0, start, uncertain: detail, exited };
   };
   try {
     await new Promise<void>((resolve, reject) => { helper.once("spawn", resolve); helper.once("error", reject); });
   } catch (error) {
     return refuse(`the command job helper could not start (${String((error as Error)?.message ?? error)})`);
   }
+  // The handshake: the group record appears before the wrapper may run, and a file the helper holds for a moment is not a
+  // failure -- it is still compiling or renaming the record onto its name.
   const timeoutMs = options.timeoutMs ?? JOB_START_TIMEOUT_MS, deadline = Date.now() + timeoutMs;
   let pid = 0;
   try {
     for (;;) {
-      const text = await readFile(join(dir, JOB_GROUP), "utf8")
-        .catch(error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; });
-      if (text !== undefined) {
-        let recorded: unknown;
-        try { recorded = (JSON.parse(text) as { pid?: unknown }).pid; }
-        catch { throw new Error(`the command job group record cannot be read: ${text.slice(0, 200)}`); }
-        if (!Number.isInteger(recorded) || (recorded as number) <= 0) throw new Error(`the command job group record is not a pid: ${text.slice(0, 200)}`);
-        pid = recorded as number;
-        break;
-      }
+      const recorded = await groupPid(dir);
+      if (recorded !== undefined) { pid = recorded; break; }
       if (ended) throw new Error("the command job helper ended before the command could start");
       if (Date.now() >= deadline) throw new Error(`the command job helper reported no group within ${timeoutMs} ms`);
       await delay(10);
@@ -498,16 +576,16 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: { time
   } catch (error) {
     return refuse(String((error as Error)?.message ?? error));
   }
-  // One process-table observation for both identities. It is the only evidence that the attempt can be fenced later, so
-  // an unobservable attempt is not recorded: the group is ended and the call fails instead of running unfenced. A missing
-  // row is a retired process (the group record already proved the wrapper started), never a guess at its identity.
+  // One process-table observation for both identities. The group record already proves the wrapper started, so a missing
+  // row is a retired process, never a guess at its identity. A read that cannot be completed is retried and then adopted
+  // (the record's pid is known, the identity is found again by the tag): it never counts as proof that nothing runs.
   let starts: Map<number, string>;
-  try { starts = new Map((await winProcessRows()).map(row => [row.pid, row.start])); }
+  try { starts = new Map((await observeWithin(observe, Math.min(observeMs, deadline - Date.now()))).map(row => [row.pid, row.start])); }
   catch (error) { return refuse(`the command job group could not be observed (${String((error as Error)?.message ?? error)})`); }
   const start = starts.get(pid) ?? "";
   // The helper is the group's only handle holder: its row means the group is open, its absence means the kernel closed it.
-  const helperPid = helper.pid, helperStart = helperPid === undefined ? "" : starts.get(helperPid) ?? "";
-  helper.unref();
+  const helperStart = helperPid === undefined ? "" : starts.get(helperPid) ?? "";
+  helper.unref(); // the helper outlives this process by design: its end is a wake-up, never a held event loop
   return { pid, start, ...(helperPid !== undefined && helperStart ? { group: { pid: helperPid, start: helperStart } } : {}), exited };
 }
 

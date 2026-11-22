@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Command attempt recovery across the window before the group record: the attempt's `DSA_EXEC` tag is now spelled in the
+  job helper's own command line (previously only a Windows-unreadable environment carried it for the helper), so a
+  successor that finds a durable `command-intent` while the helper is still compiling finds the attempt by scanning and
+  starts no second one; the wrapper keeps its tag too. A handshake that cannot be completed no longer reports the attempt
+  failed while it may still act: the helper is ended and a refusal is raised only when its end is confirmed (its exit
+  closes the group's only handle), otherwise the attempt is adopted — its identity is recorded in `command-started` (with
+  the reason as `uncertain`) and the call keeps watching it, so no rerun, retirement or stop can start a second attempt
+  until a scan finds it gone, and nothing is killed by a bare pid. A sharing failure while reading the group record is
+  retried (the helper still holds or renames the file), a failed process-table observation is retried and never read as
+  "no process left" (the executor watches again instead of calling the attempt lost), and the same retry guards the
+  scans that end a stopped or timed-out attempt.
 - Windows command attempts run inside a Job Object of their own: the wrapper is created suspended, assigned to the
   kernel-owned group before its first instruction, and the group's only handle (non-inherited) dies with the attempt, so
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ends every process the command left behind — when it finishes, when its wrapper
