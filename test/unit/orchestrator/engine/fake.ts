@@ -8,7 +8,7 @@ import type { CallTicket, Executor, Ledgers } from '../../../../src/orchestrator
 /** P9, P14: Seal synthetic outcomes and model retirement without launching pi. */
 /** forwards: a follow-up is recorded as a real `forward` and, never delivered, retired at the seal as the executor does. */
 /** recovered: every call counts as recovered (Executor.recovered), so settled workflows get settled records. */
-export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => number; hold?: string; forwards?: boolean; recovered?: boolean } = {}): Executor {
+export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => number; finishWhen?: (ticket: CallTicket) => Promise<void> | undefined; hold?: string; forwards?: boolean; recovered?: boolean } = {}): Executor {
   if (process.env.DSA_FAKE_CRASH_WINDOW === 'admitted') {
     const append = ledgers.orch.append.bind(ledgers.orch);
     ledgers.orch.append = async (type, fields) => {
@@ -40,7 +40,7 @@ export function fakeExecutor(ledgers: Ledgers, opts: { delay?: (key: string) => 
       while (paused) await new Promise<void>(resolve => { unpaused.add(resolve); });
       live.add(ticket.callId);
       await ticket.journal.append('fake-run', { call: ticket.callId, key: ticket.key });
-      const ready = new Promise<string>(resolve => {
+      const ready = opts.finishWhen?.(ticket)?.then(() => 'ready') ?? new Promise<string>(resolve => {
         if (ticket.key !== opts.hold) timer = setTimeout(() => resolve('ready'), opts.delay?.(ticket.key) ?? 0);
       });
       const reason = await Promise.race([ended, ready]);

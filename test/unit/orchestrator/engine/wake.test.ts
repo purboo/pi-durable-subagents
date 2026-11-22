@@ -30,14 +30,15 @@ async function until<T>(get: () => T, what = 'condition'): Promise<NonNullable<T
   const end = Date.now() + (process.platform === 'win32' ? 30_000 : 5000);
   for (;;) { const value = get(); if (value) return value as NonNullable<T>; if (Date.now() > end) throw new Error(`timeout: ${what}`); await delay(5); }
 }
-async function fixture(t: test.TestContext) {
+async function fixture(t: test.TestContext, firstSlowCall?: Promise<void>) {
   const home = await mkdtemp(join(tmpdir(), 'dsa-wake-')), cwd = join(home, 'project');
   await mkdir(join(cwd, '.pi/agents'), { recursive: true });
   await writeFile(join(cwd, '.pi/agents/test.md'), '---\nname: test\ndescription: test\n---\nTest.');
   let current: { engine: Engine; ledgers: Ledgers; evaluator: Evaluator } | undefined, seq = 0;
   const start = async () => {
     const ledgers: Ledgers = { home, orch: await openJournal(orchLedger(home)), config: {} }, evaluator = new Evaluator();
-    const engine = new Engine(ledgers, fakeExecutor(ledgers, { forwards: true, recovered: true, delay: key => key === 'slow' ? 250 : 0 }),
+    const engine = new Engine(ledgers, fakeExecutor(ledgers, { forwards: true, recovered: true, delay: key => key === 'slow' ? 250 : 0,
+      finishWhen: ticket => ticket.key === 'slow' && ticket.gen === 1 ? firstSlowCall : undefined }),
       { evaluator, discovery: { home, agentDir: join(home, 'agent'), globalNpmRoot: null } });
     current = { engine, ledgers, evaluator }; await engine.recover();
   };
@@ -99,11 +100,14 @@ test('wake: a sealed caller opens one generation with the pinned bounded message
 });
 
 test('wake: running caller receives a forward and reopens when that follow-up is undelivered', async t => {
-  const f = await fixture(t), caller = await f.caller('slow', false), { wid } = await f.child(caller, 'slow');
+  let finishCaller!: () => void;
+  const pending = new Promise<void>(resolve => { finishCaller = resolve; });
+  const f = await fixture(t, pending), caller = await f.caller('slow', false), { wid } = await f.child(caller, 'slow');
   await f.finish(wid!);
   await until(() => f.log(caller).some(e => e.type === 'forward'));
   assert.equal(f.log(caller).filter(e => e.type === 'forward').length, 1);
   assert.equal(outcome(f.log(wid!))?.state, 'applied');
+  finishCaller();
   const opened = await until(() => f.log(caller).find(e => e.type === 'generation'));
   assert.equal(opened.gen, 2); assert.match((opened.opening as { message: string }).message, /--wake caller finished: done/);
 });

@@ -20,7 +20,7 @@ import type { CallTicket } from "../../../src/orchestrator/contract.ts";
 import createExecutor from "../../../src/orchestrator/executor/index.ts";
 import { serialContainment } from "../../../src/orchestrator/executor/sweep.ts";
 import { Containment as PlatformContainment } from "../../../src/platform/containment.ts";
-import type { CommandPrep, CommandSpawn } from "../../../src/platform/command.ts";
+import { prepareCommand, type CommandPrep, type CommandSpawn } from "../../../src/platform/command.ts";
 import { JobPrepareCancelled } from "../../../src/platform/job.ts";
 
 const agent = { name: "", description: "", body: "", sourcePath: "", source: "project" as const, systemPromptMode: "append" as const, inheritProjectContext: false, inheritSkills: false };
@@ -79,7 +79,10 @@ const intents = (journal: JournalHandle) => journal.entries().filter(e => e.type
 
 test("the preparation runs before the durable intent: the journal shows no attempt while it is in flight", { timeout: 60_000 }, async t => {
   const held = heldPrepare();
-  const f = await setup(t, held.prepare);
+  const f = await setup(t, async spec => {
+    await held.prepare(spec);
+    return prepareCommand(spec);
+  });
   const marker = join(f.cwd, "ran.log");
   const run = f.executor.run(f.ticket({ command: acting(marker) }));
   await until(() => held.state.started > 0, "the preparation to run");
