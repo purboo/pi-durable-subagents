@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FAUX, PI_BIN, REPO, script, tempRoot } from "../../harness/pi.ts";
@@ -60,13 +60,14 @@ for (const detached of [false, true]) test(`EX1 real pi ends a background sleep$
 
 test("EX3 command call finds the real shim with custom PATH lacking dsa (no version dependency)", { timeout: 30_000 }, async t => {
   const f = await setup(t);
-  const root = process.env.SystemRoot ?? "C:\Windows";
+  const root = process.env.SystemRoot ?? "C:\\Windows";
   f.ticket.spec = { ...f.ticket.spec,
     command: process.platform === "win32" ? ["cmd", "/d", "/s", "/c", "where pi-durable-subagents.cmd"] : ["/bin/sh", "-c", "command -v pi-durable-subagents"],
     env: { PATH: process.platform === "win32" ? `${join(root, "System32")};${root}` : "/usr/bin:/bin" } };
   const result = await f.executor.run(f.ticket);
   assert.equal(result.status, "ok", JSON.stringify(result));
   assert.equal((result.data as { exitCode: number }).exitCode, 0);
-  assert.equal(result.output.trim(), join(binDir(f.home), process.platform === "win32" ? "pi-durable-subagents.cmd" : "pi-durable-subagents"));
+  const shim = join(binDir(f.home), process.platform === "win32" ? "pi-durable-subagents.cmd" : "pi-durable-subagents");
+  assert.equal(await realpath(result.output.trim()), await realpath(shim));
   assert.ok(!f.journal.entries().some(e => e.type === "ended"), "command fences remain out of scope");
 });
