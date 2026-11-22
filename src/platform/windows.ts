@@ -165,12 +165,44 @@ export function winCommandLineSync(pid: number): string {
       .trim().replace(/\s+/g, " ").slice(0, 200);
   } catch { return ""; }
 }
-/** A tag carried in a command line (`DSA_EXEC=<id>`), the Windows substitute for an unreadable environment: a launcher
- *  we control writes it into its own argv so a crash before the identity is journaled still finds the process. */
+/** Prefix of versioned Windows command-line tags: base64url UTF-8 so spaces, quotes, `&`, `%` and arbitrary Unicode
+ *  travel as one unquoted ASCII token and cannot collide with legacy ids or `DSA_HOLD` (`<resource>:<seq>`). */
+export const WIN_TAG_PREFIX = "v1~";
+
+/** Encode `<name>=<value>` as one ASCII command-line token safe for CreateProcess argv and cmd.exe without quoting. */
+export function winTagArg(name: string, value: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`Invalid Windows tag name: ${name}`);
+  if (!value) throw new Error(`Invalid Windows tag value for ${name}`);
+  return `${name}=${WIN_TAG_PREFIX}${Buffer.from(value, "utf8").toString("base64url")}`;
+}
+
+function decodeWinTag(raw: string): string | undefined {
+  const payload = raw.slice(WIN_TAG_PREFIX.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(payload)) return undefined;
+  const bytes = Buffer.from(payload, "base64url");
+  if (!bytes.length || bytes.toString("base64url") !== payload) return undefined;
+  const decoded = bytes.toString("utf8");
+  return decoded && Buffer.from(decoded, "utf8").equals(bytes) ? decoded : undefined;
+}
+
+/** A tag carried in a command line (`DSA_EXEC=v1~<base64url>`, with legacy `DSA_EXEC=<id>` read compatibility), the
+ *  Windows substitute for an unreadable environment: a launcher we control writes it into its own argv so a crash
+ *  before the identity is journaled still finds the process. */
 export function winTag(command: string | undefined, name: string): string | undefined {
-  if (!command) return undefined;
-  const match = new RegExp(`(?:^|\\s)${name}=([^\\s&"']+)`).exec(command);
-  return match?.[1];
+  if (!command || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return undefined;
+  const pattern = new RegExp(`(?:^|\\s)"?${name}=([^\\s&"')]+)`, "g");
+  const versioned = new Set<string>(), legacy = new Set<string>();
+  let sawVersioned = false;
+  for (const match of command.matchAll(pattern)) {
+    const raw = match[1]!;
+    if (raw.startsWith(WIN_TAG_PREFIX)) {
+      sawVersioned = true;
+      const decoded = decodeWinTag(raw);
+      if (decoded !== undefined) versioned.add(decoded);
+    } else legacy.add(raw);
+  }
+  if (sawVersioned) return versioned.size === 1 ? versioned.values().next().value : undefined;
+  return legacy.size === 1 ? legacy.values().next().value : undefined;
 }
 
 /** How taskkill reports that the target is already gone. */

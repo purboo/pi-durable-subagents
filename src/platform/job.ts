@@ -51,7 +51,7 @@ import { closeSync, existsSync, openSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { helperEnv, killTree, systemRoot, winProcessRows, type WinProcessRow } from "./windows.ts";
+import { helperEnv, killTree, systemRoot, winProcessRows, winTag, winTagArg, type WinProcessRow } from "./windows.ts";
 
 /** The owner type: exported for the packaging check (the compiled name carries it; nothing separate is shipped). */
 export const JOB_HOST_MARKER = "DsaJob";
@@ -583,9 +583,9 @@ function compilerFailure(compiler: string, error: unknown, stdout?: string, stde
 }
 
 /** The owner's argv: the attempt directory whose records and spec it uses (an argument, not a script path or a written-in
- *  path), then the attempt's tag, which the C# ignores and a process-table scan reads while the owner is still starting. */
+ *  path), then the attempt's versioned tag, which the C# ignores and a process-table scan reads while the owner starts. */
 export function jobHostArgv(dir: string, exec?: string): string[] {
-  return [dir, ...(exec ? [`DSA_EXEC=${exec}`] : [])];
+  return [dir, ...(exec ? [winTagArg("DSA_EXEC", exec)] : [])];
 }
 
 export interface JobLaunch {
@@ -642,16 +642,52 @@ export function transientRead(error: unknown): boolean {
 }
 const absent = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 
-/** The group record's pid: undefined while the owner has not written it yet (missing, or not readable for a moment). */
-async function groupPid(dir: string): Promise<number | undefined> {
+export interface GroupRecord {
+  pid: number;
+  start?: string;
+  group?: { pid: number; start: string };
+}
+
+/** Whether an observed process-table start token names the same process instance as a handle-recorded creation time.
+ *  Both are .NET local ticks; WMI's DMTF CreationDate carries whole microseconds (10 ticks), so up to 10 ticks of
+ *  rounding is the same kernel timestamp while any reused pid is created strictly later. */
+export function sameCreation(observed: string, recorded: string): boolean {
+  if (!observed || !recorded) return false;
+  if (observed === recorded) return true;
+  if (!/^\d+$/.test(observed) || !/^\d+$/.test(recorded)) return false;
+  const a = BigInt(observed), b = BigInt(recorded);
+  return (a >= b ? a - b : b - a) <= 10n;
+}
+
+/** The group record written before ResumeThread (with legacy `{"pid":<n>}` compatibility); undefined while not ready. */
+export async function readGroupRecord(dir: string): Promise<GroupRecord | undefined> {
   let text: string;
   try { text = await readFile(join(dir, JOB_GROUP), "utf8"); }
   catch (error) { if (absent(error) || transientRead(error)) return undefined; throw error; }
-  let recorded: unknown;
-  try { recorded = (JSON.parse(text) as { pid?: unknown }).pid; }
+  let parsed: { pid?: unknown; start?: unknown; group?: unknown };
+  try { parsed = JSON.parse(text) as typeof parsed; }
   catch { throw new Error(`the command job group record cannot be read: ${text.slice(0, 200)}`); }
-  if (!Number.isInteger(recorded) || (recorded as number) <= 0) throw new Error(`the command job group record is not a pid: ${text.slice(0, 200)}`);
-  return recorded as number;
+  if (!Number.isInteger(parsed.pid) || (parsed.pid as number) <= 0)
+    throw new Error(`the command job group record is not a pid: ${text.slice(0, 200)}`);
+  const start = typeof parsed.start === "string" && parsed.start ? parsed.start : undefined;
+  const rawGroup = parsed.group && typeof parsed.group === "object"
+    ? parsed.group as { pid?: unknown; start?: unknown } : undefined;
+  const group = rawGroup && Number.isInteger(rawGroup.pid) && (rawGroup.pid as number) > 0 &&
+    typeof rawGroup.start === "string" && rawGroup.start
+    ? { pid: rawGroup.pid as number, start: rawGroup.start } : undefined;
+  return { pid: parsed.pid as number, ...(start ? { start } : {}), ...(group ? { group } : {}) };
+}
+
+/** The owner's handle-recorded creation identity from `helper-begin` (undefined when absent or legacy `"begin"`). */
+export async function readBeginIdentity(dir: string): Promise<{ pid: number; start: string } | undefined> {
+  let text: string;
+  try { text = await readFile(join(dir, JOB_BEGIN), "utf8"); }
+  catch { return undefined; }
+  try {
+    const parsed = JSON.parse(text) as { pid?: unknown; start?: unknown };
+    return Number.isInteger(parsed.pid) && (parsed.pid as number) > 0 && typeof parsed.start === "string" && parsed.start
+      ? { pid: parsed.pid as number, start: parsed.start } : undefined;
+  } catch { return undefined; }
 }
 /** One process-table observation, retried for a while: a PowerShell/CIM read fails transiently on a loaded machine, and
  *  a failed observation must never be read as "no process" (that would let a second attempt start). */
@@ -687,40 +723,64 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
       { detached: true, stdio: ["ignore", "ignore", errors], windowsHide: true, env: helperEnv() });
   } finally { closeSync(errors); }
   let ended = false;
-  // The owner's end is recorded before the wake-up resolves, so a failure reason can say why nothing was attempted even
-  // when the owner itself wrote nothing.
+  let recordedExit: Promise<void> | undefined;
+  // The owner's end is durably written to JOB_HOST_EXIT before `exited` resolves, and every path that formats a
+  // failure reason awaits `exited` once `ended` is set so exit evidence never races the rejection message.
   const exited = new Promise<void>(resolve => {
-    const done = async (record: string) => {
+    const done = (record: string) => {
       ended = true;
-      await writeFile(join(dir, JOB_HOST_EXIT), record, "utf8").catch(() => {});
-      resolve();
+      recordedExit ??= (async () => {
+        const target = join(dir, JOB_HOST_EXIT), tmp = `${target}.tmp`;
+        try { await writeFile(tmp, record, "utf8"); await rename(tmp, target); }
+        catch { await writeFile(target, record, "utf8").catch(() => {}); }
+      })().finally(resolve);
     };
-    helper.once("exit", (code, signal) => { void done(asciiJson({ code, signal })); });
-    helper.once("error", error => { void done(asciiJson({ error: String((error as Error)?.message ?? error) })); });
+    helper.once("exit", (code, signal) => { done(asciiJson({ code, signal })); });
+    helper.once("error", error => { done(asciiJson({ error: String((error as Error)?.message ?? error) })); });
   });
   const observe = options.observe ?? (() => winProcessRows()), endHelper = options.endHelper ?? killTree,
     endMs = options.endMs ?? JOB_HOST_END_MS, observeMs = options.observeMs ?? JOB_OBSERVE_MS;
   const helperPid = helper.pid;
   /** Refuse only with a confirmed retirement; otherwise adopt the attempt (see the module comment). The owner is this
-   *  process's own child, so while it has not ended its pid cannot have been reused: nothing is killed by a bare pid. */
-  const refuse = async (reason: string): Promise<JobSpawned> => {
+   *  process's own child, so while it has not ended its pid cannot have been reused: nothing is killed by a bare pid,
+   *  and an exit during observation never binds a reused pid. */
+  const refuse = async (reason: string, knownGroup?: GroupRecord): Promise<JobSpawned> => {
     let failure = "";
     if (!ended && helperPid !== undefined) {
       try { await endHelper(helperPid); }
       catch (error) { failure = `; ending the owner failed (${String((error as Error)?.message ?? error)})`; }
     }
-    if (!ended) await Promise.race([exited, delay(endMs)]);
-    const detail = `${reason}${await startError(dir)}${failure}`;
+    if (ended) await exited;
+    else await Promise.race([exited, delay(endMs)]);
+    if (ended) await exited;
     // The owner ended: its exit closed the group's only handle, so nothing of this attempt can act. Run none of it.
-    if (ended) throw new Error(detail);
-    // Not confirmed: the owner may still create the group and run the wrapper. Adopt it instead, with its identity when
-    // one observation can read it (its tag in argv finds it otherwise), so the attempt is tracked and never duplicated.
-    let start = "";
-    try { start = helperPid === undefined ? "" : (await observe()).find(row => row.pid === helperPid)?.start ?? ""; }
-    catch { /* unobservable: the attempt's tag in the owner's argv still finds it */ }
+    if (ended) throw new Error(`${reason}${await startError(dir)}${failure}`);
+    // Not confirmed: the owner may still create the group and run the wrapper. Adopt it instead, with its validated or
+    // handle-persisted identity (its argv tag finds it otherwise), so the attempt is tracked and never duplicated.
+    const group = knownGroup ?? await readGroupRecord(dir).catch(() => undefined);
+    const began = group?.group ?? await readBeginIdentity(dir);
+    const expectedOwnerStart = helperPid !== undefined && began?.pid === helperPid ? began.start : undefined;
+    let rows: WinProcessRow[] | undefined;
+    try { if (helperPid !== undefined) rows = await observe(); }
+    catch { /* unobservable: fall back to the handle-recorded identity and the owner's argv tag */ }
+    if (ended) {
+      await exited;
+      throw new Error(`${reason}${await startError(dir)}${failure}`);
+    }
+    let start = expectedOwnerStart ?? "";
+    if (rows && helperPid !== undefined) {
+      const row = rows.find(item => item.pid === helperPid);
+      if (row) {
+        if (expectedOwnerStart !== undefined) {
+          start = sameCreation(row.start, expectedOwnerStart) ? row.start : expectedOwnerStart;
+        } else if (!launch.exec || winTag(row.command, "DSA_EXEC") === launch.exec) {
+          start = row.start;
+        }
+      }
+    }
     // The owner outlives this process by design (the command must): its end is a wake-up, never a held event loop.
     helper.unref();
-    return { pid: helperPid ?? 0, start, uncertain: detail, exited };
+    return { pid: helperPid ?? 0, start, uncertain: `${reason}${await startError(dir)}${failure}`, exited };
   };
   try {
     await new Promise<void>((resolve, reject) => { helper.once("spawn", resolve); helper.once("error", reject); });
@@ -730,27 +790,58 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   // The handshake: the group record appears before the wrapper may run, and a file the owner holds for a moment is not a
   // failure -- it is still starting or renaming the record onto its name.
   const timeoutMs = options.timeoutMs ?? JOB_START_TIMEOUT_MS, deadline = Date.now() + timeoutMs;
-  let pid = 0;
+  let recorded: GroupRecord | undefined;
   try {
     for (;;) {
-      const recorded = await groupPid(dir);
-      if (recorded !== undefined) { pid = recorded; break; }
-      if (ended) throw new Error("the command job host ended before the command could start");
+      recorded = await readGroupRecord(dir);
+      if (recorded !== undefined) break;
+      if (ended) {
+        await exited;
+        recorded = await readGroupRecord(dir);
+        if (recorded !== undefined) break;
+        throw new Error("the command job host ended before the command could start");
+      }
       if (Date.now() >= deadline) throw new Error(`the command job host reported no group within ${timeoutMs} ms`);
       await delay(10);
     }
   } catch (error) {
-    return refuse(String((error as Error)?.message ?? error));
+    return refuse(String((error as Error)?.message ?? error), recorded);
   }
-  // One process-table observation for both identities. The group record already proves the wrapper started, so a missing
-  // row is a retired process, never a guess at its identity. A read that cannot be completed is retried and then adopted
-  // (the record's pid is known, the identity is found again by the tag): it never counts as proof that nothing runs.
-  let starts: Map<number, string>;
-  try { starts = new Map((await observeWithin(observe, Math.min(observeMs, deadline - Date.now()))).map(row => [row.pid, row.start])); }
-  catch (error) { return refuse(`the command job group could not be observed (${String((error as Error)?.message ?? error)})`); }
-  const start = starts.get(pid) ?? "";
-  // The owner is the group's only handle holder: its row means the group is open, its absence means the kernel closed it.
-  const helperStart = helperPid === undefined ? "" : starts.get(helperPid) ?? "";
+  const pid = recorded.pid;
+  // One process-table observation for both identities, validated against the handle-recorded creation times from the
+  // owner so an early wrapper/owner exit followed by pid reuse can never bind an unrelated process.
+  let rows: WinProcessRow[];
+  try { rows = await observeWithin(observe, Math.min(observeMs, deadline - Date.now())); }
+  catch (error) { return refuse(`the command job group could not be observed (${String((error as Error)?.message ?? error)})`, recorded); }
+  if (ended) {
+    helper.unref();
+    return { pid, start: "", exited };
+  }
+  const began = recorded.group ?? await readBeginIdentity(dir);
+  const expectedOwnerStart = helperPid !== undefined && began?.pid === helperPid ? began.start : undefined;
+  const ownerRow = helperPid === undefined ? undefined : rows.find(row => row.pid === helperPid);
+  const ownerReplaced = Boolean(ownerRow && expectedOwnerStart !== undefined && !sameCreation(ownerRow.start, expectedOwnerStart));
+  let helperStart = "";
+  if (helperPid !== undefined && !ownerReplaced) {
+    if (ownerRow) {
+      if (expectedOwnerStart !== undefined) helperStart = ownerRow.start;
+      else if (!launch.exec || winTag(ownerRow.command, "DSA_EXEC") === launch.exec) helperStart = ownerRow.start;
+    } else if (expectedOwnerStart !== undefined && !existsSync(join(dir, JOB_END))) {
+      helperStart = expectedOwnerStart;
+    }
+  }
+  const childRow = ownerReplaced ? undefined : rows.find(row => row.pid === pid);
+  let start = "";
+  if (childRow) {
+    if (recorded.start !== undefined) {
+      start = sameCreation(childRow.start, recorded.start) ? childRow.start : "";
+    } else if (!existsSync(join(dir, JOB_END)) &&
+      ((helperPid !== undefined && childRow.ppid === helperPid) || (!!launch.exec && winTag(childRow.command, "DSA_EXEC") === launch.exec))) {
+      start = childRow.start;
+    }
+  } else if (!ownerReplaced && recorded.start !== undefined && !existsSync(join(dir, JOB_END))) {
+    start = recorded.start;
+  }
   helper.unref(); // the owner outlives this process by design: its end is a wake-up, never a held event loop
   return { pid, start, ...(helperPid !== undefined && helperStart ? { group: { pid: helperPid, start: helperStart } } : {}), exited };
 }

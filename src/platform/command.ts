@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { captureStart } from "./proctable.ts";
 import { execTarget, findOnPath } from "./launch.ts";
 import { spawnInJob } from "./job.ts";
-import { comspec, envValue, IS_WINDOWS, mergeEnv, normalizeEnv } from "./windows.ts";
+import { comspec, envValue, IS_WINDOWS, mergeEnv, normalizeEnv, winTagArg } from "./windows.ts";
 
 export const COMMAND_LOG = "output.log";
 export const COMMAND_EXIT = "exit";
@@ -140,7 +140,7 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
       // spawnInJob compiles the Job Object owner (bounded, foreground, no process of the attempt) and resolves undefined
       // when its post-compilation check refuses.
       return await spawnInJob(spec.dir, { exe: process.execPath, env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
-        args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [`DSA_EXEC=${spec.exec}`] : [])],
+        args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [winTagArg("DSA_EXEC", spec.exec)] : [])],
         ...(spec.exec ? { exec: spec.exec } : {}) }, spec.proceed ? { proceed: spec.proceed } : {});
     }
     const mv = resolveMv(), argv = commandArgv(spec.command);

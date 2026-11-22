@@ -10,7 +10,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
 import { userInfo } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, win32 } from "node:path";
-import { comspec, envValue, IS_WINDOWS } from "./windows.ts";
+import { comspec, envValue, IS_WINDOWS, winTagArg } from "./windows.ts";
 
 const WINDOWS_EXECUTABLE = new Set([".exe", ".com", ".cmd", ".bat"]);
 /** Whether `path` is a regular file this process may execute. On Windows only a PE image or a batch file is directly
@@ -102,10 +102,12 @@ export function shimScript(file: string): string | undefined {
   return undefined;
 }
 /** The command processor a string command/gate runs through on this platform. */
-export function shellTarget(command: string, exec?: string): { command: string; args: string[]; shell?: boolean } {
-  // A command line is readable across processes on Windows (the environment is not): the marker lets recovery find a
-  // gate whose identity was never journaled. The id is a safe token (no whitespace, `&` or quotes).
-  return IS_WINDOWS ? { command: exec ? `set DSA_EXEC=${exec}&& ${command}` : command, args: [], shell: true } : { command: "/bin/sh", args: ["-c", command] };
+export function shellTarget(command: string, exec?: string, platform: NodeJS.Platform = process.platform): { command: string; args: string[]; shell?: boolean } {
+  // A command line is readable across processes on Windows (the environment is not): the versioned ASCII marker lets
+  // recovery find a gate whose identity was never journaled, without mutating env.DSA_EXEC or breaking on `&`/quotes/Unicode.
+  return platform === "win32"
+    ? { command: exec ? `(if 0==1 echo ${winTagArg("DSA_EXEC", exec)} ) & ${command}` : command, args: [], shell: true }
+    : { command: "/bin/sh", args: ["-c", command] };
 }
 
 /** The PATH (and PATHEXT) of an environment under this platform's naming rules: a Windows environment spells it `Path`
