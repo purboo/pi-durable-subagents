@@ -2,7 +2,7 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { FAUX, REPO, script, tempRoot } from '../../harness/pi.ts';
 import { callSession, journalPath, orchLedger } from '../../../src/paths.ts';
@@ -27,7 +27,7 @@ async function stack(t: TestContext) {
   const config = async (strict: boolean) => writeFile(join(home, 'config.json'), JSON.stringify({ askRequireDecision: strict, k: { hibernateMs: 250, checkpointMs: 50 } }));
   await config(false);
   const cli = (args: string[]) => new Promise<any>((resolve, reject) => {
-    const child = spawn(process.execPath, [join(REPO, 'src/cli/main.ts'), ...args], { cwd, env: { PATH: `${join(REPO, 'node_modules/.bin')}:${process.env.PATH}`, HOME: root, DSA_HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', PI_SKIP_VERSION_CHECK: '1', PROBE_DIR: root }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [join(REPO, 'src/cli/main.ts'), ...args], { cwd, env: { PATH: `${join(REPO, 'node_modules/.bin')}${delimiter}${process.env.PATH}`, HOME: root, DSA_HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', PI_SKIP_VERSION_CHECK: '1', PROBE_DIR: root }, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = ''; const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`CLI timeout: ${args.join(' ')}`)); }, 60_000);
     child.stdout.on('data', d => { out += d; }); child.stderr.on('data', d => { err += d; });
     child.once('error', error => { clearTimeout(timer); reject(error); });

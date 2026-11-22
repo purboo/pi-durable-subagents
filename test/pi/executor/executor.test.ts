@@ -4,7 +4,7 @@ import { execFileSync, fork } from "node:child_process";
 import { once } from "node:events";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { FAUX, PI_BIN, REPO, script, settled, startPi, tempRoot, detachedSleep } from "../../harness/pi.ts";
@@ -45,7 +45,7 @@ async function setup(t: TestContext, config: OrchestratorConfig = {}, options: P
   const root = tempRoot("dsa-executor-"), home = join(root, "dsa"), cwd = join(root, "work");
   await mkdir(cwd, { recursive: true });
   const old = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PROBE_DIR: process.env.PROBE_DIR, PI_OFFLINE: process.env.PI_OFFLINE, PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK };
-  process.env.PATH = `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`;
+  process.env.PATH = `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`;
   process.env.PI_CODING_AGENT_DIR = join(root, "agent"); process.env.PROBE_DIR = root;
   process.env.PI_OFFLINE = "1"; process.env.PI_SKIP_VERSION_CHECK = "1";
   await mkdir(process.env.PI_CODING_AGENT_DIR, { recursive: true });

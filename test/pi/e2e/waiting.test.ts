@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { FAUX, REPO, script, tempRoot } from "../../harness/pi.ts";
 import { journalPath, orchLedger } from "../../../src/paths.ts";
@@ -26,7 +26,7 @@ async function stack(t: TestContext) {
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: [FAUX], defaultProvider: "probe", defaultModel: "scripted" }));
   await writeFile(join(cwd, ".pi/agents/echo.md"), "---\nname: echo\ndescription: echo\n---\nYou echo.\n");
   await writeFile(join(home, "config.json"), JSON.stringify({ providers: { probe: { slots: 1 } }, k: { waitCheckMs: 200 } }));
-  const env: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, HOME: root, DSA_HOME: home,
+  const env: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`, HOME: root, DSA_HOME: home,
     PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root };
   const cli = (args: string[]) => new Promise<Result>((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });

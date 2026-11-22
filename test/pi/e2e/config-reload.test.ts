@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { FAUX, REPO, script, tempRoot } from "../../harness/pi.ts";
 import { journalPath, orchInbox, orchLedger } from "../../../src/paths.ts";
@@ -16,7 +16,7 @@ import { statusBrief } from "../../../src/orchestrator/snapshot.ts";
 test("E2E: hibernation releases its slot visibly; a config.json change applies without a restart", { timeout: 120_000 }, async t => {
   const root = tempRoot("dsa-e2e-config-"), home = join(root, "dsa"), cwd = join(root, "work"), agentDir = join(root, "agent");
   const old = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_OFFLINE: process.env.PI_OFFLINE, PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK, PROBE_DIR: process.env.PROBE_DIR };
-  process.env.PATH = `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`;
+  process.env.PATH = `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`;
   Object.assign(process.env, { PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root });
   await mkdir(join(cwd, ".pi/agents"), { recursive: true }); await mkdir(agentDir, { recursive: true }); await mkdir(home, { recursive: true });
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: [FAUX], defaultProvider: "probe", defaultModel: "scripted" }));

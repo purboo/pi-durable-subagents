@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { FAUX, REPO, script, tempRoot } from '../../harness/pi.ts';
 import { callSession, journalPath, orchInbox, orchLedger } from '../../../src/paths.ts';
@@ -20,7 +20,7 @@ async function until<T>(get: () => T | Promise<T>, what: string): Promise<NonNul
 
 test('wake caller E2E: a real child bash starts a command that survives its turn, appears in awaiting and opens generation 2 with exit and output', { timeout: 120_000, skip: process.platform === 'win32' ? 'POSIX bash tool command and an inherited-process tree' : false }, async t => {
   const root = tempRoot('dsa-e2e-wake-'), home = join(root, 'dsa'), cwd = join(root, 'work'), agentDir = join(root, 'agent');
-  const values = { HOME: root, DSA_HOME: home, PATH: `${join(REPO, 'node_modules/.bin')}:${process.env.PATH}`, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', PI_SKIP_VERSION_CHECK: '1', PROBE_DIR: root };
+  const values = { HOME: root, DSA_HOME: home, PATH: `${join(REPO, 'node_modules/.bin')}${delimiter}${process.env.PATH}`, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', PI_SKIP_VERSION_CHECK: '1', PROBE_DIR: root };
   const old = Object.fromEntries(Object.keys(values).map(k => [k, process.env[k]]));
   Object.assign(process.env, values);
   await mkdir(join(cwd, '.pi/agents'), { recursive: true }); await mkdir(agentDir, { recursive: true });

@@ -1,7 +1,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FAUX, PI_BIN, REPO, script, tempRoot } from "../../harness/pi.ts";
 import { openJournal, readJournalSnapshot } from "../../../src/kernel/journal.ts";
@@ -19,7 +19,7 @@ async function setup(t: TestContext) {
     PI_OFFLINE: process.env.PI_OFFLINE, PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK };
   process.env.PI_CODING_AGENT_DIR = join(root, "agent"); process.env.PROBE_DIR = root;
   process.env.PI_OFFLINE = "1"; process.env.PI_SKIP_VERSION_CHECK = "1";
-  process.env.PATH = `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`;
+  process.env.PATH = `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`;
   await mkdir(process.env.PI_CODING_AGENT_DIR, { recursive: true });
   await writeFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), JSON.stringify({ extensions: [FAUX], defaultProvider: "probe", defaultModel: "scripted" }));
   writeShim(binDir(home), process.execPath, fileURLToPath(new URL("../../../src/cli/main.ts", import.meta.url)));

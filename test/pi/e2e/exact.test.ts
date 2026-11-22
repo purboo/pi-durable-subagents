@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { REPO, tempRoot } from "../../harness/pi.ts";
 import { orchLedger } from "../../../src/paths.ts";
@@ -64,7 +64,7 @@ test("EX2 an exact run splices the pinned capture into the child's provider requ
   // A second session without a capture: an exact run of it cannot be exact.
   await writeFile(join(agentDir, "sessions/proj/20260101_000100_parent2.jsonl"), JSON.stringify({ type: "session", id: "parent2" }) + "\n" +
     JSON.stringify({ type: "message", id: "m2", parentId: null, message: { role: "user", content: [{ type: "text", text: "parent question" }] } }) + "\n");
-  const env: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, HOME: root, DSA_HOME: home,
+  const env: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`, HOME: root, DSA_HOME: home,
     PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0",
     DSA_ORCHESTRATOR_LOG: join(root, "orchestrator.log") };
   const cli = (args: string[]) => new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {

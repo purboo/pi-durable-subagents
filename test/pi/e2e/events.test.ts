@@ -6,7 +6,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { FAUX, REPO, script, tempRoot } from "../../harness/pi.ts";
 import { journalPath, orchInbox, orchLedger } from "../../../src/paths.ts";
@@ -24,7 +24,7 @@ async function stack(t: TestContext, config?: unknown) {
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: [FAUX], defaultProvider: "probe", defaultModel: "scripted" }));
   await writeFile(join(cwd, ".pi/agents/echo.md"), "---\nname: echo\ndescription: echo\ntools: bash\n---\nYou echo.\n");
   if (config) await writeFile(join(home, "config.json"), JSON.stringify(config));
-  const base: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, HOME: root, DSA_HOME: home,
+  const base: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`, HOME: root, DSA_HOME: home,
     PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root,
     // The orchestrator this CLI starts is detached and has no terminal: its own output stays with the temp root, so a
     // failure here can name the stage instead of only timing out.

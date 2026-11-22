@@ -3,7 +3,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { FAUX, REPO, script, tempRoot } from "../../harness/pi.ts";
 import { callSession, journalPath, orchLedger } from "../../../src/paths.ts";
@@ -23,7 +23,7 @@ async function setup(t: TestContext, config: OrchestratorConfig = {}) {
   const root = tempRoot("dsa-notify-"), home = join(root, "dsa"), cwd = join(root, "work");
   await mkdir(cwd, { recursive: true });
   const old = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PROBE_DIR: process.env.PROBE_DIR, PI_OFFLINE: process.env.PI_OFFLINE, PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK };
-  process.env.PATH = `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`;
+  process.env.PATH = `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`;
   process.env.PI_CODING_AGENT_DIR = join(root, "agent"); process.env.PROBE_DIR = root;
   process.env.PI_OFFLINE = "1"; process.env.PI_SKIP_VERSION_CHECK = "1";
   await mkdir(process.env.PI_CODING_AGENT_DIR, { recursive: true });

@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { FAUX, REPO, tempRoot } from "../../harness/pi.ts";
 import { journalPath, orchInbox, orchLedger, pinnedDir } from "../../../src/paths.ts";
@@ -21,7 +21,7 @@ const text = (m: any): string => typeof m.content === "string" ? m.content : (m.
 
 test("FC1 E2E: a fork child's first request carries the origin's compaction summary, kept and later messages only", { timeout: 120000 }, async t => {
   const root = tempRoot("dsa-fork-context-"), home = join(root, "dsa"), cwd = join(root, "work"), agentDir = join(root, "agent");
-  const values = { PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}`, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root };
+  const values = { PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root };
   const old = Object.fromEntries(Object.keys(values).map(k => [k, process.env[k]]));
   Object.assign(process.env, values);
   await mkdir(join(cwd, ".pi/agents"), { recursive: true }); await mkdir(agentDir, { recursive: true });

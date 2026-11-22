@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import { rm } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
@@ -13,7 +13,7 @@ import { REPO } from "../../harness/pi.ts";
 
 const exec = promisify(execFile);
 test("drill failover --json: every step passes and the temporary root is removed", { timeout: 150_000 }, async t => {
-  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}` };
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}` };
   for (const key of ["DSA_EXEC", "DSA_CALL", "DSA_HOME", "DSA_JOURNAL", "DSA_INBOX", "DSA_MODEL"]) delete env[key];
   const { stdout, stderr } = await exec(process.execPath, [join(REPO, "src/cli/main.ts"), "drill", "failover", "--json"], { env, cwd: REPO, timeout: 140_000 });
   assert.equal(stderr, "");
@@ -26,7 +26,7 @@ test("drill failover --json: every step passes and the temporary root is removed
   assert.equal(report.evidence, undefined);
 });
 test("drill failover --keep prints each step, the kept root and one summary line", { timeout: 150_000 }, async t => {
-  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}` };
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}` };
   for (const key of ["DSA_EXEC", "DSA_CALL", "DSA_HOME", "DSA_JOURNAL", "DSA_INBOX", "DSA_MODEL"]) delete env[key];
   const { stdout } = await exec(process.execPath, [join(REPO, "src/cli/main.ts"), "drill", "failover", "--keep"], { env, cwd: REPO, timeout: 140_000 });
   t.diagnostic(stdout);
@@ -38,7 +38,7 @@ test("drill failover --keep prints each step, the kept root and one summary line
 });
 for (const [signal, keep, code] of [["SIGINT", false, 130], ["SIGTERM", true, 143]] as const)
   test(`drill failover interrupted by ${signal}${keep ? " with --keep" : ""}: stops its orchestrator, ${keep ? "keeps and prints" : "removes"} the root, exits ${code}`, { timeout: 90_000, skip: process.platform === "win32" ? "Windows cannot deliver SIGINT/SIGTERM to a detached process with process.kill" : false }, async t => {
-    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}:${process.env.PATH}` };
+    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}` };
     for (const key of ["DSA_EXEC", "DSA_CALL", "DSA_HOME", "DSA_JOURNAL", "DSA_INBOX", "DSA_MODEL"]) delete env[key];
     const child = spawn(process.execPath, [join(REPO, "src/cli/main.ts"), "drill", "failover", ...(keep ? ["--keep"] : [])], { env, cwd: REPO, stdio: ["ignore", "pipe", "pipe"] });
     let out = ""; child.stdout.on("data", d => { out += d; }); child.stderr.on("data", d => { out += d; });
