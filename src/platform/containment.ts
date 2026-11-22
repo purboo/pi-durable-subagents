@@ -144,26 +144,35 @@ export class Containment implements Contract {
     // tight under load (several workflows, parallel test files).
     const timeout = opts.timeoutMs ?? (windows ? 15_000 : 5000);
     if (!Number.isFinite(timeout) || timeout < 0) throw new Error("Invalid fence timeout");
-    const deadline = performance.now() + timeout;
+    const started = performance.now(), deadline = started + timeout;
     let recordingMs = 500;
     const hasIdentity = (p: Pick<ProcInfo, "pid" | "start">) => p.pid > 0 && (windows ? isWinStart(p.start) : p.start !== "");
     const known = new Map(tracked.filter(hasIdentity).map(p => [identity(p), p]));
     let unverifiedPid: number | undefined;
-    const timeoutReason = () => unverifiedPid === undefined ? `Fence timeout: ${exec}` : `Fence timeout: ${exec} (unverified identity for pid ${unverifiedPid})`;
+    // F1 diagnostics: a fence that runs out of budget says what it observed -- numbers only, bounded, no process
+    // detail -- so a stall on a loaded runner is attributable: a scan that never answered (0 scans completed), targets
+    // that kept appearing after kills, or identities that stayed unconfirmed and were never signalled.
+    let scans = 0, slowestScan = 0, seen = 0, kills = 0, skipped = 0;
+    const timedOut = (phase: string) => new Error(`Fence timeout: ${exec} after ${Math.round(performance.now() - started)} ms of ${timeout} ms ` +
+      `(${scans} scan(s) completed, slowest ${Math.round(slowestScan)} ms, ${seen} process(es) at the last scan, ` +
+      `${kills} kill(s), ${skipped} skipped for an unconfirmed identity; waiting on the ${phase}${unverifiedPid === undefined ? "" : `, unverified identity for pid ${unverifiedPid}`})`);
     for (;;) {
       const remaining = deadline - performance.now();
       let timer: ReturnType<typeof setTimeout> | undefined;
+      const scanStarted = performance.now();
+      const pending = this.scan(new Map([[exec, [...known.values()]]]), { fresh: true });
       const live = await Promise.race([
-        this.scan(new Map([[exec, [...known.values()]]]), { fresh: true }),
-        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(timeoutReason())), Math.max(0, remaining)); }),
+        pending.then(live => { scans++; slowestScan = Math.max(slowestScan, performance.now() - scanStarted); return live; }),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(timedOut("scan")), Math.max(0, remaining)); }),
       ]).finally(() => clearTimeout(timer));
       const targets = live.get(exec) ?? [];
+      seen = targets.length;
       if (!targets.length) { this.launched.delete(exec); return; }
       for (const p of targets) {
         if (hasIdentity(p)) known.set(identity(p), p);
-        else if (windows) unverifiedPid = p.pid;
+        else if (windows) { unverifiedPid = p.pid; skipped++; }
       }
-      if (performance.now() >= deadline) throw new Error(timeoutReason());
+      if (performance.now() >= deadline) throw timedOut("kill round");
 
       if (windows) {
         // Fail closed: never touch a target whose `(pid, start)` identity is missing or malformed.
@@ -182,6 +191,7 @@ export class Containment implements Contract {
           }
           // Handle-verified termination checks GetProcessTimes on the open kernel handle right before TerminateProcess,
           // so exit/PID reuse during scan or beforeKill cannot touch an unrelated process.
+          kills += verified.length;
           await this.killWin(verified.map(p => ({ pid: p.pid, start: p.start })), { timeout: Math.max(1000, Math.ceil(deadline - performance.now())) });
         }
         await delay(Math.min(20, Math.max(0, deadline - performance.now())));
@@ -189,13 +199,14 @@ export class Containment implements Contract {
       }
 
       const signalUnix = (pid: number) => {
+        kills++;
         try { if (this.killUnix) this.killUnix(pid); else process.kill(pid, "SIGKILL"); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       };
       const killing: ProcInfo[] = [];
       for (const p of targets) {
         // C3: the pid may have exited and been reused since the scan; kill only if it still has the scanned start.
-        if (p.start !== "" && await this.readStart(p.pid) !== p.start) continue;
+        if (p.start !== "" && await this.readStart(p.pid) !== p.start) { skipped++; continue; }
         if (!opts.beforeKill) signalUnix(p.pid);
         else killing.push(p);
       }
@@ -212,7 +223,7 @@ export class Containment implements Contract {
       }
       for (const p of killing) {
         // Diagnostic I/O was asynchronous: revalidate identity again before signalling.
-        if (opts.beforeKill && p.start !== "" && await this.readStart(p.pid) !== p.start) continue;
+        if (opts.beforeKill && p.start !== "" && await this.readStart(p.pid) !== p.start) { skipped++; continue; }
         signalUnix(p.pid);
       }
       await delay(Math.min(20, Math.max(0, deadline - performance.now())));

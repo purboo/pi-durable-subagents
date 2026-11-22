@@ -107,8 +107,23 @@ test("scan discovers untagged descendants and ignores mismatched start tokens", 
 
 test("fence rejects when process-table evidence does not arrive; spawn errors reject", { timeout: 5000 }, async () => {
   const c = new Containment({ list: () => new Promise(() => {}) });
-  await assert.rejects(c.fence("missing", [], { timeoutMs: 30 }), /Fence timeout/);
+  // The rejection names where the budget went: a scan that never answered is not a process that survived a kill.
+  await assert.rejects(c.fence("missing", [], { timeoutMs: 30 }), (error: Error) => {
+    assert.match(error.message, /^Fence timeout: missing after \d+ ms of 30 ms \(0 scan\(s\) completed, .*waiting on the scan\)$/);
+    return true;
+  });
   await assert.rejects(new Containment().spawn(spec(randomUUID(), "/nonexistent-dsa-command", [])), /ENOENT/);
+});
+
+test("a fence that only ever skips unconfirmed identities says so instead of blaming a kill", { timeout: 5000 }, async () => {
+  // The listed process never confirms its start token (a reused pid, or a probe that cannot answer): nothing is
+  // signalled, so the timeout must not read as "processes survived SIGKILL".
+  const c = new Containment({ list: async () => [{ pid: 999_999, ppid: 1, start: "s" }] });
+  await assert.rejects(c.fence("w@1/a@1#1.1", [{ pid: 999_999, ppid: 1, start: "s" }], { timeoutMs: 60 }), (error: Error) => {
+    assert.match(error.message, /^Fence timeout: w@1\/a@1#1\.1 after \d+ ms of 60 ms/);
+    assert.match(error.message, /\d+ scan\(s\) completed, slowest \d+ ms, 1 process\(es\) at the last scan, 0 kill\(s\), \d+ skipped for an unconfirmed identity/);
+    return true;
+  });
 });
 
 const lockModule = pathToFileURL(join(process.cwd(), "src/platform/lock.ts")).href;

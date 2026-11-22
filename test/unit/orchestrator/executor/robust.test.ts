@@ -424,6 +424,21 @@ test("F2 a failing sweep is logged and retried; it never poisons later dispatch"
   assert.equal(result.status, "failed"); assert.match(String(result.error), /Spawn failed: .*no processes/);
 });
 
+test("F1 a fence that fails once is retried by a prompt sweep, not at the sweep interval", { timeout: 20000 }, async t => {
+  // A transient fence failure (a scan stall on a loaded runner) parks the call, and the sweep is the only retry. It must
+  // start at once instead of waiting out the ordinary interval (30 s in production), which no caller can wait for.
+  const f = await fixture(t, {}, { sweepMs: 20_000 }), a = f.ticket("a"), ea = `${a.callId}#1.1`;
+  await f.journal.append(JT.exec, { call: a.callId, exec: ea });
+  await f.session("a", [execLine(ea), report(ea)]);
+  let attempts = 0;
+  t.mock.method(f.containment, "fence", async (exec: string) => { if (exec === ea && attempts++ === 0) throw new Error(`Fence timeout: ${exec}`); });
+  const result = await within(f.executor.run(a), 5000);
+  assert.equal(result.status, "ok"); assert.deepEqual(result.data, { exec: ea });
+  assert.equal(attempts, 2, "the failure was retried by a sweep, once");
+  assert.equal(count(f.journal.entries(), e => e.type === "fence-failed" && e.exec === ea), 1);
+  assert.ok(f.journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${ea}` && e.resolution === "fenced"));
+});
+
 test("F1 a stuck fence parks only its call with one unknown attention; a later sweep resumes it", { timeout: 10000 }, async t => {
   const f = await fixture(t), a = f.ticket("a"), b = f.ticket("b"), ea = `${a.callId}#1.1`, eb = `${b.callId}#1.1`;
   await f.journal.append(JT.exec, { call: a.callId, exec: ea }); await f.journal.append(JT.exec, { call: b.callId, exec: eb });

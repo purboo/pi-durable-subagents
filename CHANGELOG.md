@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- A fence that runs out of its budget now says where the budget went, in the timeout it throws: how many scans
+  completed and how slow the slowest was, how many processes the last scan still listed, how many kills were issued and
+  how many targets were skipped because their identity was never confirmed. The same text reaches the console line, the
+  durable `fence-failed` record and the unknown attention item, so a fence that timed out on a loaded runner can be read
+  without a reproducer: zero completed scans is a process table that never answered, kills without retirement is a
+  process that survived, and skips without kills is an identity that was never proven. Nothing is added to a fence that
+  succeeds, the numbers are bounded, and no command line or environment is copied into them.
+- A fence failure now asks for one immediate sweep instead of waiting for the next sweep interval. The sweep is the only
+  retry of a parked call, so a fence that failed on a transient stall (a PowerShell/CIM scan that missed the Windows
+  budget) used to keep its call parked for up to the 30 s interval plus the retry's own fence; the call now resumes as
+  soon as a sweep proves retirement. A sweep's own fence failure never asks again -- the interval stays its retry -- so a
+  process that really survives is retried at the same bounded rate as before, and the record and attention behaviour of
+  `F1` is unchanged.
+
 - A wrapper that exited without the host's `group-end` keeps the creation identity its host recorded from the live
   process handle before resuming it: the attempt is no longer left without a wrapper identity when a process-table row
   for that pid belongs to another process -- a recycled pid is never bound and its ticks never replace the recorded ones.

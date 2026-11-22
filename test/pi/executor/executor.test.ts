@@ -910,8 +910,12 @@ test("V1 pool chooses first free candidate without holding another provider", { 
   await f.executor.stop({ wid: f.wid }); assert.equal((await pending).status, "stopped");
 });
 
-test("V1 pending X to Y switch rejects a return to held X before Y is observed", { timeout: 30000 }, async t => {
-  const f = await setup(t, { providers: { probe: { slots: 1 }, "switch-probe": { slots: 1 } } });
+test("V1 pending X to Y switch rejects a return to held X before Y is observed", { timeout: 45000 }, async t => {
+  // The child's own run ends with a fence; when one stalls on this runner (a PowerShell/CIM scan that misses the 15 s
+  // Windows budget) the call parks until a sweep proves retirement. The first retry is immediate, and the interval is
+  // pinned so that a second stall is still retried inside this test's budget: neither cadence is part of the switch
+  // contract checked here, and no assertion changes.
+  const f = await setup(t, { providers: { probe: { slots: 1 }, "switch-probe": { slots: 1 } } }, { sweepMs: 1000 });
   await writeFile(join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({ extensions: [FAUX, fileURLToPath(new URL("switch-provider.ts", import.meta.url))] }));
   const ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 2" } }, { text: "must switch" }]));
   const pending = f.executor.run(ticket), exec = `${ticket.callId}#1.1`;
@@ -1336,7 +1340,10 @@ test("X1 memory refusal holds nothing and rechecks headroom before spawn", { tim
 });
 
 test("P29 a burst of dispatches cannot over-commit memory: children admitted in the last 30 s are reserved", { timeout: 60000 }, async t => {
-  const f = await setup(t, { k: { trackerMs: 30 }, memory: { reserveMb: 1000, perChildMb: 300 } }, { memory: async () => 1000 + 600 + 1 });
+  // A fence that stalls on this runner (a PowerShell/CIM scan that misses the 15 s Windows budget) parks the call until
+  // a sweep proves retirement. The first retry is immediate, and the interval is pinned so a second stall is retried
+  // inside this test's budget; the reservation window (30 s) and the assertions are unchanged.
+  const f = await setup(t, { k: { trackerMs: 30 }, memory: { reserveMb: 1000, perChildMb: 300 } }, { memory: async () => 1000 + 600 + 1, sweepMs: 1000 });
   const runs = ["a", "b", "c"].map(key => f.executor.run(f.ticket(key, script([{ delayMs: 1500, text: key }]))));
   let peak = 0;
   const watch = setInterval(() => { const held = new Map<string, string>(); for (const e of f.orch.entries()) if (e.pool === "memory") { if (e.type === "hold") held.set(String(e.slot), String(e.exec)); else if (e.type === "release") held.delete(String(e.slot)); } peak = Math.max(peak, held.size); }, 20);

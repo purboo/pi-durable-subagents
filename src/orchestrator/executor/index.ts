@@ -209,11 +209,23 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   // F2: a sweep error is transient: report it and retry at the next K1; it never blocks dispatch.
   /** The sweep state of settled journals not decoded (recover with `settled`). */
   const seeds = new WeakMap<JournalHandle, ReturnType<typeof seededSweep>>();
-  const sweepTimer = setInterval(() => {
-    if (!sweeping) sweeping = sweepExecutions([...journals.values()].filter(j => !j.closed), containment, { failing: exec => failing.has(exec), fenced: swept, failed: fenceFailed, seeded: journal => seeds.get(journal) })
+  const sweep = () => {
+    if (!sweeping) sweeping = sweepExecutions([...journals.values()].filter(j => !j.closed), containment, { failing: exec => failing.has(exec), fenced: swept, seeded: journal => seeds.get(journal),
+      // A sweep's own failure never schedules another sweep: the interval is its retry.
+      failed: (journal, exec, call, error) => fenceFailed(journal, exec, call, error, false) })
       .catch(error => console.error(`durable-subagents: sweep failed, retrying in K1: ${String(error)}`)).finally(() => { sweeping = undefined; });
-  }, options.sweepMs ?? 30000);
+  };
+  const sweepTimer = setInterval(sweep, options.sweepMs ?? 30000);
   sweepTimer.unref();
+  // F1: a failed fence parks its call, and the sweep is the only retry. A transient stall (a PowerShell/CIM scan that
+  // misses the Windows budget) must not keep the call parked for a whole sweep interval: one prompt sweep is requested
+  // per fence failure that did not come from a sweep, so a probe that keeps failing is retried at the interval, as before.
+  let sweepSoon: ReturnType<typeof setTimeout> | undefined;
+  const sweepNow = () => {
+    if (sweepSoon || sweeping || closed) return;
+    sweepSoon = setTimeout(() => { sweepSoon = undefined; if (!closed) sweep(); }, 0);
+    sweepSoon.unref();
+  };
   const waiters = new Set<() => void>();
   const inbox = (call: string) => { const a = address(call); return callInbox(home, a.wid, a.key, a.gen); };
   const outbox = Outbox.open(outboxRoot(home), "orch", inbox);
@@ -276,11 +288,13 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await resolveFenceAttention(journal, exec);
     });
   }
-  /** F1: A fence timeout is recorded once with one unknown attention item for the origin; any failure parks the exec. */
-  async function fenceFailed(journal: JournalHandle, exec: string, call: string, error: unknown) {
+  /** F1: A fence timeout is recorded once with one unknown attention item for the origin; any failure parks the exec.
+   *  `prompt` asks for one immediate sweep, which is the only retry of a parked call (a sweep never asks itself). */
+  async function fenceFailed(journal: JournalHandle, exec: string, call: string, error: unknown, prompt = true) {
     if (!failing.has(exec)) console.error(`durable-subagents: fence of ${exec} failed: ${String(error)}`);
     failing.add(exec);
     if (/Fence timeout/.test(String(error))) await serial(() => recordFenceFailure(journal, exec, call, error));
+    if (prompt) sweepNow();
   }
   async function parked(a: Active, journal: JournalHandle, exec: string) {
     a.parking = exec;
@@ -2100,6 +2114,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     async shutdown() {
       if (closed) return;
       closed = true; clearInterval(sweepTimer);
+      if (sweepSoon) { clearTimeout(sweepSoon); sweepSoon = undefined; }
       try {
         await this.suspend();
         // Command watchers end at once (their processes keep running; the next start adopts them), also when an
