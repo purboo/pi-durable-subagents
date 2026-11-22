@@ -12,7 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Containment } from "../../../src/platform/containment.ts";
 import { readExitRecord, spawnCommand } from "../../../src/platform/command.ts";
 import {
-  JOB_BEGIN, JOB_END, JOB_GROUP, frameworkCompiler, jobHostArgv, readBeginIdentity, readGroupRecord, sameCreation,
+  JOB_BEGIN, JOB_END, JOB_GROUP, JOB_HOST_EXIT, frameworkCompiler, jobHostArgv, readBeginIdentity, readGroupRecord, sameCreation,
   spawnInJob, transientRead,
 } from "../../../src/platform/job.ts";
 import { shellTarget } from "../../../src/platform/launch.ts";
@@ -25,10 +25,21 @@ async function until<T>(get: () => Promise<T | undefined | false> | T | undefine
   for (;;) { const value = await get(); if (value) return value; if (Date.now() > end) throw new Error(`timeout: ${what}`); await delay(25); }
 }
 const live = async (pid: number) => (await winProcessRows()).some(row => row.pid === pid);
+/** Waits for a launch's end through one bounded timer that is always cleared: an uncleared 30 s timer would hold the
+ *  event loop long after the test, and an owner that never ends fails this wait with its own message instead of the
+ *  file's whole timeout. */
 async function ended(launched: { exited: Promise<void> }, ms = 30_000): Promise<void> {
-  await Promise.race([launched.exited, delay(ms).then(() => { throw new Error("the owner did not end"); })]);
+  let bound: NodeJS.Timeout | undefined;
+  const gaveUp = new Promise<never>((_, reject) => { bound = setTimeout(() => reject(new Error("the owner did not end")), ms); });
+  try { await Promise.race([launched.exited, gaveUp]); } finally { clearTimeout(bound); }
 }
 const gone = (pid: number) => until(async () => !(await live(pid)), `pid ${pid} to end`);
+
+/** The evidence files the stub owner plans are published in plan order -- begin, group and, only when the plan has one,
+ *  group-end -- and this marker is written last. An observation that waits for it therefore sees the same files on every
+ *  run: whether the wrapper's end was recorded is a fact of the plan, never of how fast the test polled the directory. */
+const STUB_PUBLISHED = "stub-published";
+const stubPublished = (dir: string) => until(() => existsSync(join(dir, STUB_PUBLISHED)), "the stub owner to publish its evidence");
 
 /** A deterministic gate-controlled Node program: writes `ready`, waits for `gate` (bounded), prints `text` and exits `code`. */
 function gatedProgram(dir: string, name: string, text: string, code: number) {
@@ -76,6 +87,7 @@ function stubCompiler(): string {
       "    if (lines[2].StartsWith(\"legacy:\")) Atomic(Path.Combine(d, \"group\"), \"{\\\"pid\\\":\" + lines[2].Substring(7) + \"}\");",
       "    else if (lines[2].StartsWith(\"full:\")) { string[] p = lines[2].Split(':'); Atomic(Path.Combine(d, \"group\"), \"{\\\"pid\\\":\" + p[1] + \",\\\"start\\\":\\\"\" + p[2] + \"\\\",\\\"group\\\":{\\\"pid\\\":\" + pid + \",\\\"start\\\":\\\"\" + p[3] + \"\\\"}}\"); }",
       "    if (lines[3].Length > 0) Atomic(Path.Combine(d, \"group-end\"), \"{\\\"status\\\":\" + lines[3] + \"}\");",
+      "    Atomic(Path.Combine(d, \"stub-published\"), \"yes\");",
       "    if (lines[4].Length > 0) { for (int i = 0; i < 1000 && !File.Exists(lines[4]); i++) Thread.Sleep(10); }",
       "    return Int32.Parse(lines[5], CultureInfo.InvariantCulture);",
       "  }",
@@ -110,6 +122,7 @@ function stubCompiler(): string {
     "if (lines[2]?.startsWith('legacy:')) atomic('group', JSON.stringify({ pid: Number(lines[2].slice(7)) }));",
     "else if (lines[2]?.startsWith('full:')) { const [, cPid, cStart, oStart] = lines[2].split(':'); atomic('group', JSON.stringify({ pid: Number(cPid), start: cStart, group: { pid: process.pid, start: oStart } })); }",
     "if (lines[3]) atomic('group-end', JSON.stringify({ status: Number(lines[3]) }));",
+    "atomic('stub-published', 'yes');",
     "const code = Number(lines[5] || 0);",
     "if (!lines[4]) process.exit(code);",
     "const started = Date.now(), t = setInterval(() => { if (existsSync(lines[4]) || Date.now() - started > 10_000) { clearInterval(t); process.exit(code); } }, 10);",
@@ -214,9 +227,10 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
     const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
     writePlan(dir, { begin: "639000000000000010", group: "full:424242:639000000000000020:639000000000000010", endStatus: "0", exitCode: 0 });
     const launched = await spawnInJob(dir, { exe: process.execPath, args: ["-e", ""], cwd: dir, log: join(dir, "output.log"), env: {}, exec: "command:W@1/reuse@1#1" },
-      { compiler, observe: async () => { await delay(60); return [{ pid: 424242, ppid: 1, start: "639000000000999999" }]; } });
+      { compiler, observe: async () => { await stubPublished(dir); return [{ pid: 424242, ppid: 1, start: "639000000000999999" }]; } });
     assert.ok(launched);
     assert.equal(launched.pid, 424242);
+    assert.ok(existsSync(join(dir, JOB_END)), "the wrapper's end was recorded before the sample");
     assert.equal(launched.start, "", "never bind an unrelated process that reused the wrapper pid");
     assert.equal(launched.group, undefined, "closed group omits owner identity");
   }
@@ -227,6 +241,7 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
     const launched = await spawnInJob(dir, { exe: process.execPath, args: ["-e", ""], cwd: dir, log: join(dir, "output.log"), env: {}, exec: "command:W@1/wrap-reuse@1#1" }, {
       compiler,
       observe: async () => {
+        await stubPublished(dir);
         const rec = await readGroupRecord(dir);
         return [
           { pid: rec!.group!.pid, ppid: process.pid, start: "639000000000000010" },
@@ -235,10 +250,13 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
       },
     });
     assert.ok(launched);
-    assert.equal(launched.start, "", "mismatched wrapper creation ticks are rejected");
-    assert.equal(launched.group?.start, "639000000000000010", "matching live owner identity is preserved");
+    // The identity above is fixed by the plan's recorded end, so this stub is released before asserting: a failing assert
+    // must not leave it polling its gate.
     writeFileSync(release, "done");
     await ended(launched);
+    assert.ok(existsSync(join(dir, JOB_END)), "the wrapper's end was recorded before the sample");
+    assert.equal(launched.start, "", "mismatched wrapper creation ticks are rejected");
+    assert.equal(launched.group?.start, "639000000000000010", "matching live owner identity is preserved");
   }
   // 3. If the owner row at helperPid already has another creation time before Node delivers 'exit', neither row is bound.
   {
@@ -247,6 +265,7 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
     const launched = await spawnInJob(dir, { exe: process.execPath, args: ["-e", ""], cwd: dir, log: join(dir, "output.log"), env: {} }, {
       compiler,
       observe: async () => {
+        await stubPublished(dir);
         const rec = await readGroupRecord(dir);
         return [
           { pid: rec!.group!.pid, ppid: 1, start: "639000000000555555" },
@@ -255,10 +274,10 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
       },
     });
     assert.ok(launched);
-    assert.equal(launched.group, undefined, "replaced owner pid is never bound");
-    assert.equal(launched.start, "", "wrapper row is not trusted once owner pid is replaced");
     writeFileSync(release, "done");
     await ended(launched);
+    assert.equal(launched.group, undefined, "replaced owner pid is never bound");
+    assert.equal(launched.start, "", "wrapper row is not trusted once owner pid is replaced");
   }
   // 4. Legacy group record without creation ticks still rejects an unrelated pid once group-end exists or ppid mismatches.
   {
@@ -266,12 +285,13 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
     writePlan(dir, { begin: "legacy", group: "legacy:424242", endStatus: "0", waitGate: release, exitCode: 0 });
     const launched = await spawnInJob(dir, { exe: process.execPath, args: ["-e", ""], cwd: dir, log: join(dir, "output.log"), env: {} }, {
       compiler,
-      observe: async () => [{ pid: 424242, ppid: 1, start: "639000000000777777" }],
+      observe: async () => { await stubPublished(dir); return [{ pid: 424242, ppid: 1, start: "639000000000777777" }]; },
     });
     assert.ok(launched);
-    assert.equal(launched.start, "", "legacy group record never binds an unrelated pid");
     writeFileSync(release, "done");
     await ended(launched);
+    assert.ok(existsSync(join(dir, JOB_END)), "the wrapper's end was recorded before the sample");
+    assert.equal(launched.start, "", "legacy group record never binds an unrelated pid");
   }
   // 5. Refuse path: handle-recorded start is persisted when observe fails, never overwritten by a reused helperPid row,
   //    legacy untagged rows are rejected when exec was given, and owner exit during observe rejects with exit evidence.
@@ -284,14 +304,16 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
       endHelper: async () => { throw new Error("kill denied"); },
       observe: async () => {
         if (++calls === 1) throw new Error("table down");
+        await stubPublished(dir);
         const rec = await readGroupRecord(dir);
         return [{ pid: rec!.group!.pid, ppid: 1, start: "639999999999999999" }];
       },
     });
-    assert.ok(adopted && adopted.uncertain);
-    assert.equal(adopted.start, "639000000000000010", "reused row at helperPid cannot overwrite handle-recorded start");
+    assert.ok(adopted);
     writeFileSync(release, "done");
     await ended(adopted);
+    assert.ok(adopted.uncertain);
+    assert.equal(adopted.start, "639000000000000010", "reused row at helperPid cannot overwrite handle-recorded start");
 
     const legacyDir = dirOf(), gateLegacy = join(legacyDir, "release");
     t.after(() => rm(legacyDir, { recursive: true, force: true }));
@@ -299,22 +321,30 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
     const legacyAdopted = await spawnInJob(legacyDir, { exe: process.execPath, args: ["-e", ""], cwd: legacyDir, log: join(legacyDir, "output.log"), env: {}, exec: "command:W@1/k@1#1" }, {
       compiler, timeoutMs: 40, endMs: 20,
       endHelper: async () => { throw new Error("kill denied"); },
-      observe: async () => [{ pid: Number(readFileSync(join(legacyDir, "stub-pid"), "utf8")), ppid: 1, start: "639999999999999999", command: "C:\\other.exe" }],
+      observe: async () => { await stubPublished(legacyDir); return [{ pid: Number(readFileSync(join(legacyDir, "stub-pid"), "utf8")), ppid: 1, start: "639999999999999999", command: "C:\\other.exe" }]; },
     });
-    assert.ok(legacyAdopted && legacyAdopted.uncertain);
-    assert.equal(legacyAdopted.start, "", "legacy refuse without handle ticks falls back to argv tag rather than untagged row");
+    assert.ok(legacyAdopted);
     writeFileSync(gateLegacy, "done");
     await ended(legacyAdopted);
+    assert.ok(legacyAdopted.uncertain);
+    assert.equal(legacyAdopted.start, "", "legacy refuse without handle ticks falls back to argv tag rather than untagged row");
 
     const exitDuringObserve = dirOf(), gate2 = join(exitDuringObserve, "release");
     t.after(() => rm(exitDuringObserve, { recursive: true, force: true }));
     writePlan(exitDuringObserve, { begin: "639000000000000010", waitGate: gate2, exitCode: 125 });
+    // The owner is ended while the observe() of the refuse path runs. The gate is opened there and the wait is for the
+    // owner's own exit record -- written by the exit handler before `exited` resolves -- never for a fixed delay: the exit
+    // has certainly happened when refuse() formats its reason, so this is a refusal with exit evidence on every run.
     const rejected = await spawnInJob(exitDuringObserve, { exe: process.execPath, args: ["-e", ""], cwd: exitDuringObserve, log: join(exitDuringObserve, "output.log"), env: {} }, {
       compiler, timeoutMs: 40, endMs: 20,
       endHelper: async () => { throw new Error("kill denied"); },
-      observe: async () => { writeFileSync(gate2, "done"); await delay(80); return [{ pid: 1, ppid: 1, start: "639999999999999999" }]; },
+      observe: async () => {
+        writeFileSync(gate2, "done");
+        await until(() => existsSync(join(exitDuringObserve, JOB_HOST_EXIT)), "the owner's exit to be recorded");
+        return [{ pid: 1, ppid: 1, start: "639999999999999999" }];
+      },
     }).then(() => "", (err: Error) => err.message);
-    assert.match(rejected, /exited with code 125/, "owner exiting during refuse observe rejects cleanly with exit evidence");
+    assert.match(rejected, /the job host exited with code 125/, "owner exiting during refuse observe rejects cleanly with exit evidence");
   }
 });
 
@@ -326,36 +356,39 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
 test("a wrapper that exited without group-end keeps its handle-recorded identity, never a recycled pid's", { timeout: 60_000 }, async t => {
   const compiler = stubCompiler();
   const wrapperStart = "639311245471234560", ownerStart = "639311245471230000";
-  /** One launch of the stub owner: group written, no group-end (unless `endStatus`), gate held, then exit 0. */
+  /** One launch of the stub owner: group written, group-end only when the plan carries an end status, gate held, then
+   *  exit 0. Both runs wait for the stub's publication marker inside observe() and release the gate here, so whether the
+   *  end was recorded is a fact of the plan rather than of poll timing, and no failing assertion leaves the stub running. */
   const run = async (options: { endStatus?: string; rows: () => Promise<{ pid: number; ppid: number; start: string }[]> }) => {
     const dir = dirOf(), release = join(dir, "release");
     t.after(() => rm(dir, { recursive: true, force: true }));
     writePlan(dir, { begin: ownerStart, group: `full:424242:${wrapperStart}:${ownerStart}`, ...(options.endStatus ? { endStatus: options.endStatus } : {}), waitGate: release, exitCode: 0 });
     const launched = await spawnInJob(dir, { exe: process.execPath, args: ["-e", ""], cwd: dir, log: join(dir, "output.log"), env: {} },
-      { compiler, observe: options.rows });
+      { compiler, observe: async () => { await stubPublished(dir); return options.rows(); } });
     assert.ok(launched);
-    return { dir, launched, release };
+    writeFileSync(release, "done");
+    await ended(launched);
+    return { dir, launched };
   };
   // 1. The wrapper is gone from the table and the owner never recorded its end: the handle-recorded identity is kept.
   {
-    const { dir, launched, release } = await run({ rows: async () => [] });
+    const { dir, launched } = await run({ rows: async () => [] });
+    assert.ok(!existsSync(join(dir, JOB_END)), "the owner recorded no end");
     assert.equal(launched.start, wrapperStart, "the identity the owner took from the wrapper's handle before resuming it");
     assert.equal(launched.group?.start, ownerStart, "the owner's own handle identity travels with the attempt");
-    assert.ok(!existsSync(join(dir, JOB_END)), "the owner recorded no end");
-    writeFileSync(release, "done"); await ended(launched);
   }
   // 2. A row at the wrapper pid whose ticks are another instance: that identity is rejected and the recorded one stands.
   {
-    const { launched, release } = await run({ rows: async () => [{ pid: 424242, ppid: 1, start: "639311245471999999" }] });
+    const { dir, launched } = await run({ rows: async () => [{ pid: 424242, ppid: 1, start: "639311245471999999" }] });
+    assert.ok(!existsSync(join(dir, JOB_END)), "the owner recorded no end");
     assert.equal(launched.start, wrapperStart, "the recycled pid's ticks are never bound");
     assert.notEqual(launched.start, "639311245471999999");
-    writeFileSync(release, "done"); await ended(launched);
   }
   // 3. With group-end the wrapper ended normally and its identity is history: an unrelated row is still never bound.
   {
-    const { launched, release } = await run({ endStatus: "0", rows: async () => [{ pid: 424242, ppid: 1, start: "639311245471999999" }] });
+    const { dir, launched } = await run({ endStatus: "0", rows: async () => [{ pid: 424242, ppid: 1, start: "639311245471999999" }] });
+    assert.ok(existsSync(join(dir, JOB_END)), "the owner recorded the wrapper's end before the sample");
     assert.equal(launched.start, "", "a recorded end needs no identity, and an unrelated row supplies none");
-    writeFileSync(release, "done"); await ended(launched);
   }
 });
 
