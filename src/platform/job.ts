@@ -18,12 +18,16 @@
 //
 // Each launch compiles into its own private directory inside the attempt directory (a fresh random name), so a stale
 // executable from an earlier attempt can never be picked up, and nothing is shared between attempts or calls. The
-// compilation runs in the foreground and is bounded: until it finishes, the attempt directory holds only inert files (a
-// source file, an executable, the spec); no command is started, so an orchestrator that dies during compilation leaves
-// nothing that can act. The executor's proceed/stop gate is then called once more, after the compilation and
-// immediately before the spawn (no await between the two), so a revocation during the compilation starts nothing. A
-// missing compiler, a compiler failure or a missing executable fails the start closed: no group, no wrapper, no command,
-// and the recorded reason travels with the attempt -- kill-on-close and the single-rerun semantics are never weakened.
+// compilation is the expensive part of a command start, so it is staged (prepareJob) *before* the attempt's durable
+// intent is recorded: bounded and cancellable, and until it finishes the attempt directory holds only inert files (a source
+// file, an executable, the spec) and the journal holds no intent, so an orchestrator that dies while the compiler runs
+// leaves nothing that can act and an attempt that is unambiguously prelaunch. A stop, a retirement or the orchestrator's
+// exit during the compilation cancels it (the compiler process is ended and what it wrote is removed) and is never
+// recorded as a failure of the attempt. The executor's proceed/stop gate is still called once more, after the
+// preparation and immediately before the spawn (no await between the two), so a revocation during the compilation starts
+// nothing. A missing compiler, a compiler failure or a missing executable fails the start closed: no group, no wrapper,
+// no command, and the recorded reason travels with the attempt -- kill-on-close and the single-rerun semantics are never
+// weakened.
 //
 // The spec is ASCII lines of base64-encoded UTF-16LE fields (jobSpecText), so no code page, quoting rule, BOM or unpaired
 // surrogate can change a Unicode path, a curly quote or an environment value; the owner decodes it with
@@ -505,6 +509,10 @@ const EVIDENCE_LIMIT = 200;
 const REASON_LIMIT = 300;
 /** Compiling the owner on a loaded runner: bounded, in the foreground, and finished before anything is started. */
 export const JOB_COMPILE_TIMEOUT_MS = 60_000;
+/** Publishing the compiler's output under its final name: a scanner or indexer may hold the fresh file for a moment, so a
+ *  transient rename failure is retried for this long before it is reported. */
+const JOB_PUBLISH_MS = 5_000;
+const JOB_PUBLISH_RETRY_MS = 100;
 /** Process creation plus the owner's startup on a loaded runner; an owner that has not reported a group by then started
  *  nothing. Measured after the spawn, so the compilation is not part of it. */
 const JOB_START_TIMEOUT_MS = 30_000;
@@ -607,12 +615,57 @@ export function jobHostPaths(dir: string): JobHostPaths {
   return { dir: host, exe: join(host, JOB_HOST_EXE), source: join(host, JOB_HOST_SOURCE_FILE) };
 }
 
+/** A preparation cancelled while it ran: a stop, a retirement, a suspension or the orchestrator's exit arrived during the
+ *  compilation. Nothing of the attempt exists (no group, no wrapper, no command) and nothing of it was recorded, so this is
+ *  not a failure of the attempt and must never be sealed as one. */
+export class JobPrepareCancelled extends Error {
+  constructor() { super("the command job host preparation was cancelled"); this.name = "JobPrepareCancelled"; }
+}
+/** Whether `error` is such a cancellation (the caller decides what canceled it: a stop seals stopped, a retirement or an
+ *  exit ends the run and the call resumes on recovery). */
+export const prepareCancelled = (error: unknown): boolean =>
+  error instanceof JobPrepareCancelled || (error as { name?: unknown } | undefined)?.name === "JobPrepareCancelled";
+
+/** A launch's preparation, staged before the attempt's durable intent: the owner is compiled and the spec written, and
+ *  nothing has been started. `release` removes what it wrote (idempotent; there is no process to end). */
+export interface JobPrep {
+  /** The launch's private owner directory. */
+  host: JobHostPaths;
+  /** The attempt directory the owner reads its spec and records from. */
+  dir: string;
+  release(): Promise<void>;
+}
+
+/** Prepare one launch without starting anything: clear an earlier attempt's evidence from the directory, compile the owner
+ *  (bounded and cancellable: a crash or a cancellation leaves only inert files, and a cancellation removes even those),
+ *  and write the spec the owner reads. A rejection is either fail-closed (`JOB_ERROR` recorded, the attempt cannot start)
+ *  or a {@link JobPrepareCancelled} (nothing was recorded and nothing stays). */
+export async function prepareJob(dir: string, launch: JobLaunch,
+  options: { compiler?: string; compileMs?: number; signal?: AbortSignal } = {}): Promise<JobPrep> {
+  // Evidence of an earlier attempt in the same directory must never be read as this attempt's.
+  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
+  const host = await compileJobHost(dir, { ...(options.compiler ? { compiler: options.compiler } : {}),
+    ...(options.compileMs ? { timeoutMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}) });
+  const release = async () => { await rm(host.dir, { recursive: true, force: true }); await rm(join(dir, JOB_SPEC), { force: true }); };
+  if (options.signal?.aborted) { await release(); throw new JobPrepareCancelled(); }
+  await writeFile(join(dir, JOB_SPEC), jobSpecText(launch));
+  return { host, dir, release };
+}
+
 /** Compile the owner into the launch's private directory with the Windows framework compiler: foreground and bounded (no
  *  command is started, so a starter that dies here leaves only inert files), and fail-closed (a missing compiler, a
- *  compiler failure or a missing executable throws before anything of the attempt exists). */
-export async function compileJobHost(dir: string, options: { compiler?: string; timeoutMs?: number } = {}): Promise<JobHostPaths> {
-  const paths = jobHostPaths(dir);
+ *  compiler failure or a missing executable throws before anything of the attempt exists). `signal` cancels it: the
+ *  compiler is ended, what it wrote is removed and the rejection is a {@link JobPrepareCancelled}, which is not a failure
+ *  of the attempt (nothing of it exists, and it is never recorded as one). */
+export async function compileJobHost(dir: string, options: { compiler?: string; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<JobHostPaths> {
+  const paths = jobHostPaths(dir), signal = options.signal;
   await mkdir(paths.dir, { recursive: true });
+  /** A cancelled preparation leaves nothing behind: no compiled owner, no source, no reason (nothing failed). */
+  const cancelled = async (): Promise<JobPrepareCancelled> => {
+    await rm(paths.dir, { recursive: true, force: true }).catch(() => {});
+    return new JobPrepareCancelled();
+  };
+  if (signal?.aborted) throw await cancelled();
   await writeFile(paths.source, JOB_HOST_SOURCE, "utf8");
   const compiler = options.compiler ?? frameworkCompiler(), timeoutMs = options.timeoutMs ?? JOB_COMPILE_TIMEOUT_MS;
   // Only ASCII relative names reach the compiler, and it runs in the launch's own directory: the attempt directory (which
@@ -620,23 +673,53 @@ export async function compileJobHost(dir: string, options: { compiler?: string; 
   // argument needs a code-page conversion. The output is built beside the final name and renamed only after the compiler
   // exits cleanly, so a killed or failed compiler can never leave a half-written executable that a later start would run.
   const build = "DsaJob.build.exe";
+  let stdout = "", stderr = "";
   try {
-    await new Promise<void>((resolve, reject) => {
-      execFile(compiler, ["/nologo", "/codepage:65001", "/target:winexe", `/out:${build}`, JOB_HOST_SOURCE_FILE],
-        { cwd: paths.dir, timeout: timeoutMs, windowsHide: true, env: helperEnv(), maxBuffer: 1024 * 1024, encoding: "utf8" },
-        (error, stdout, stderr) => error ? reject(new Error(compilerFailure(compiler, error, stdout, stderr))) : resolve());
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        execFile(compiler, ["/nologo", "/codepage:65001", "/target:winexe", `/out:${build}`, JOB_HOST_SOURCE_FILE],
+          { cwd: paths.dir, timeout: timeoutMs, windowsHide: true, env: helperEnv(), maxBuffer: 1024 * 1024, encoding: "utf8",
+            ...(signal ? { signal } : {}) },
+          (error, out, err) => { stdout = String(out ?? ""); stderr = String(err ?? ""); if (error) reject(error); else resolve(); });
+      });
+    } catch (error) {
+      // A compiler this process ended because the start was cancelled wrote nothing that counts, and the start was never
+      // recorded: this is not the attempt's failure, so it is not written to the attempt either.
+      if (signal?.aborted || prepareCancelled(error)) throw await cancelled();
+      throw new Error(compilerFailure(compiler, error, stdout, stderr));
+    }
+    if (signal?.aborted) throw await cancelled();
     // The executable is the one just produced: the directory is new, so this cannot be a stale binary (a compiler that
     // reports success without writing it is a failure, never a reason to look elsewhere).
-    try { await rename(join(paths.dir, build), paths.exe); }
-    catch { throw new Error(`the Windows .NET Framework compiler wrote no executable for ${paths.exe}`); }
+    await publishBuild(join(paths.dir, build), paths.exe);
     if (!existsSync(paths.exe)) throw new Error(`the Windows .NET Framework compiler wrote no executable at ${paths.exe}`);
   } catch (error) {
+    if (prepareCancelled(error)) throw error;
     const reason = String((error as Error)?.message ?? error);
     await writeFile(join(dir, JOB_ERROR), clip(oneLine(reason), REASON_LIMIT), "utf8").catch(() => {});
     throw new Error(reason);
   }
   return paths;
+}
+
+/** Publish the compiler's output under its final name: the rename is atomic, so a retry can never expose a half-written
+ *  executable, and Windows scanners and indexers hold a fresh file for a moment (a transient code). A failure that stays
+ *  is reported with its own reason, and only a build file that is genuinely absent reads as "wrote no executable" --
+ *  reporting every rename failure that way hides the real cause. `renameFile` and the timings are test seams. */
+export async function publishBuild(build: string, exe: string,
+  options: { timeoutMs?: number; retryMs?: number; renameFile?: (from: string, to: string) => Promise<void> } = {}): Promise<void> {
+  const renameFile = options.renameFile ?? rename, retryMs = options.retryMs ?? JOB_PUBLISH_RETRY_MS,
+    budgetMs = options.timeoutMs ?? JOB_PUBLISH_MS, end = Date.now() + budgetMs;
+  for (;;) {
+    try { await renameFile(build, exe); return; }
+    catch (error) {
+      const reason = String((error as Error)?.message ?? error);
+      if (absent(error)) throw new Error(`the Windows .NET Framework compiler wrote no executable for ${exe}`);
+      if (!transientRead(error)) throw new Error(`the Windows .NET Framework compiler output could not be published as ${exe}: ${reason}`);
+      if (Date.now() + retryMs >= end) throw new Error(`the Windows .NET Framework compiler output could not be published as ${exe} within ${budgetMs} ms: ${reason}`);
+      await delay(retryMs);
+    }
+  }
 }
 
 /** What a failed compiler run says: its bounded own words, whether it timed out, and its exit status. */
@@ -682,9 +765,14 @@ export interface JobSpawned {
   exited: Promise<void>;
 }
 export interface JobOptions {
-  /** The executor's last check (see command.ts): called once, after the compilation and immediately before the spawn. A
+  /** The executor's last check (see command.ts): called once, after the preparation and immediately before the spawn. A
    *  false answer starts no process and makes spawnInJob resolve undefined. */
   proceed?: () => boolean;
+  /** A staged preparation (prepareJob, called before the attempt's durable intent): the owner is compiled and the spec
+   *  written, so the only steps left before the spawn are the last check and the spawn itself. */
+  prepared?: JobPrep;
+  /** Cancels a preparation this call stages itself (a staged one was already prepared under its own signal). */
+  signal?: AbortSignal;
   /** Test seam: the compiler to run instead of the discovered framework one. */
   compiler?: string;
   /** Test seam: how long the foreground compilation may take (default JOB_COMPILE_TIMEOUT_MS). */
@@ -765,24 +853,23 @@ async function observeWithin(observe: () => Promise<WinProcessRow[]>, budgetMs: 
   }
 }
 
-/** Start `launch` inside a new Windows Job Object (see the module comment). Compiles the owner first (bounded, no process
- *  of the attempt exists until it finishes; a compiler failure throws, fail-closed), then calls `proceed` once more and
- *  spawns the owner immediately. Resolves undefined when `proceed` refuses after the compilation. Rejects -- with no
- *  attempt started -- when the owner cannot create the group, assign the suspended child before it runs, or report it back
- *  in time, and its end is confirmed. When an attempt cannot be refused (the owner did not end), it resolves with
- *  JobSpawned.uncertain: the attempt was started and is adopted, never silently dropped. */
+/** Start `launch` inside a new Windows Job Object (see the module comment). Prepares the owner first (a staged preparation
+ *  is used as given; otherwise it is staged here: bounded, no process of the attempt exists until it finishes; a compiler
+ *  failure throws, fail-closed), then calls `proceed` once more and spawns the owner immediately. Resolves undefined when
+ *  `proceed` refuses after the preparation. Rejects -- with no attempt started -- when the owner cannot create the group,
+ *  assign the suspended child before it runs, or report it back in time, and its end is confirmed. When an attempt cannot
+ *  be refused (the owner did not end), it resolves with JobSpawned.uncertain: the attempt was started and is adopted,
+ *  never silently dropped. */
 export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOptions = {}): Promise<JobSpawned | undefined> {
-  // Evidence of an earlier attempt in the same directory must never be read as this attempt's.
-  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
-  // Foreground and bounded: nothing of this attempt runs until the owner exists (a starter that dies here leaves only
-  // inert files), and a missing or failing compiler refuses the start instead of weakening the group.
-  const host = await compileJobHost(dir, { ...(options.compiler ? { compiler: options.compiler } : {}), ...(options.compileMs ? { timeoutMs: options.compileMs } : {}) });
-  await writeFile(join(dir, JOB_SPEC), jobSpecText(launch));
+  // A staged preparation was made before the attempt's durable intent (prepareJob clears the earlier evidence and writes
+  // the spec); one this call stages itself does the same here.
+  const host = (options.prepared ?? await prepareJob(dir, launch, { ...(options.compiler ? { compiler: options.compiler } : {}),
+    ...(options.compileMs ? { compileMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}) })).host;
   // The owner's stderr is a file, not a pipe: it outlives this process and nothing drains it.
   const errors = openSync(join(dir, JOB_HOST_LOG), "a");
   let helper: ChildProcess;
   try {
-    // The executor's last check, after the compilation and immediately before the spawn: no await follows it, so a stop
+    // The executor's last check, after the preparation and immediately before the spawn: no await follows it, so a stop
     // or retirement that revoked the permission during the compilation starts no process.
     if (options.proceed && !options.proceed()) return undefined;
     helper = spawn(host.exe, jobHostArgv(dir, launch.exec),

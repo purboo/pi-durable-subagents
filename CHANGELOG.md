@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The Windows job host's compilation is staged before a command attempt's durable intent, and the whole preparation is
+  cancellable: a crash or a stop while the compiler runs now leaves no `command-intent`, so that cut is unambiguously
+  prelaunch (nothing started, nothing to adopt, nothing to rerun) instead of looking like an attempt whose start record
+  never came. A stop, a retirement, a suspension or the orchestrator's exit during the preparation ends the compiler
+  process, removes what it wrote and records nothing — an interrupted compilation is never a failure of the attempt (no
+  `command-spawn-failed`, no failed seal), while a compiler that is missing or fails on its own still refuses the start
+  closed with its own reason. The proceed/stop gate is still checked again after the preparation, immediately before the
+  spawn, and the stage is released when nothing starts with it. A journal written by an earlier version (compilation after
+  the intent) keeps its ambiguous post-intent handling. Publishing the compiler's output retries the transient rename a
+  scanner or indexer causes, and a failure that stays now reports the actual cause instead of "wrote no executable".
 - Command attempt recovery across the window before the group record: the attempt's `DSA_EXEC` tag is now spelled in the
   job host's own command line (previously only a Windows-unreadable environment carried it for the owner), so a
   successor that finds a durable `command-intent` while the host is still starting finds the attempt by scanning and

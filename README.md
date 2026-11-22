@@ -463,10 +463,14 @@ this package compiles per launch -- in a fresh private directory -- with the
 C# compiler of the framework every supported Windows ships
 (`%SystemRoot%\Microsoft.NET\Framework64|Framework\v4.0.30319\csc.exe`, with
 the 32-bit framework as fallback). The compilation is foreground and bounded,
-starts no command, and finishes before the wrapper exists; the orchestrator
-rechecks its proceed/stop decision after it, immediately before the spawn. If
-the compiler is missing or fails, the start is refused closed: no group, no
-command, and the reason is recorded with the attempt. The attempt's tag is
+starts no command, and is staged before the attempt's durable intent (its
+`command-intent` record), so a crash or a stop while the compiler runs leaves
+no attempt at all: that cut is unambiguously prelaunch, and an interrupted
+compilation is ended, what it wrote is removed and it is never recorded as a
+failure of the attempt or sealed as one. The orchestrator rechecks its
+proceed/stop decision again after the preparation, immediately before the
+spawn. If the compiler is missing or fails on its own, the start is refused
+closed: no group, no command, and the reason is recorded with the attempt. The attempt's tag is
 also spelled in the owner's own command line, so a successor that finds a
 recorded intent while the owner is still starting -- before the group record
 and the wrapper exist -- still finds the attempt and starts nothing else. Only

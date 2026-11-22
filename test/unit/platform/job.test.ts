@@ -7,8 +7,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { chmod, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -16,11 +17,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   JOB_BEGIN, JOB_END, JOB_ERROR, JOB_GROUP, JOB_HOST_EXE, JOB_HOST_EXIT, JOB_HOST_LOG, JOB_HOST_MARKER, JOB_HOST_PREFIX,
   JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, asciiJson, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
-  jobHostPaths, jobSpecText, spawnInJob, startError,
+  jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, spawnInJob, startError,
 } from "../../../src/platform/job.ts";
 import { winProcessRows } from "../../../src/platform/windows.ts";
 
 const windowsOnly = process.platform === "win32" ? false : "a Windows Job Object (Win32)";
+/** A compiler stand-in is a script the compiler slot runs, which needs a POSIX shebang: the compilation's surroundings
+ *  (staging, cancellation, publishing) are checked there, and with the real csc.exe on Windows. */
+const posixOnly = process.platform === "win32" ? "a POSIX shell-script compiler stand-in" : false;
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
 const dirOf = () => mkdtempSync(join(tmpdir(), "dsa-job-"));
 /** The spec text back into fields: the header, then base64 UTF-16LE lines (exe, cwd, log, args, env). */
@@ -471,4 +475,130 @@ test("two launches in one directory never share a compiled owner", { skip: windo
   const hosts = readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX));
   assert.equal(hosts.length, 2, "a fresh owner directory per launch");
   for (const host of hosts) assert.ok(existsSync(join(dir, host, JOB_HOST_EXE)));
+});
+
+/** A compiler stand-in: a script the compiler slot runs with csc.exe's own arguments, so a compilation can be staged,
+ *  cancelled or made to fail without a .NET Framework (it runs with the launch directory as its working directory). */
+async function stubCompiler(dir: string, body: string): Promise<string> {
+  const path = join(dir, `csc-${randomBytes(4).toString("hex")}.mjs`);
+  await writeFile(path, `#!/usr/bin/env node\n${body}\n`);
+  await chmod(path, 0o755);
+  return path;
+}
+const launchFor = (dir: string) => ({ exe: "/bin/sh", args: ["-c", "exit 0"], cwd: dir, log: join(dir, "output.log"),
+  env: { PATH: "/bin:/usr/bin" } });
+/** A pid that is gone (POSIX: the compiler stand-in ended). */
+async function ended(pid: number): Promise<boolean> {
+  try { process.kill(pid, 0); return false; } catch { return true; }
+}
+
+test("the owner is staged before any start: compiled, spec written, nothing started -- and released on request", { skip: posixOnly, timeout: 60_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const compiler = await stubCompiler(dir, 'import { writeFileSync } from "node:fs"; writeFileSync("DsaJob.build.exe", "MZ");');
+  const staging = await prepareJob(dir, launchFor(dir), { compiler });
+  // The preparation leaves exactly what a start needs: the compiled owner under its final name, its inert source, the spec.
+  assert.ok(existsSync(staging.host.exe), "the owner is compiled");
+  assert.equal(readFileSync(staging.host.exe, "utf8"), "MZ", "the compiler's output is published under the final name");
+  assert.ok(!existsSync(join(staging.host.dir, "DsaJob.build.exe")), "the build file is renamed onto the final name");
+  assert.ok(existsSync(staging.host.source));
+  assert.match(readFileSync(join(dir, JOB_SPEC), "utf8"), new RegExp(`^${JOB_SPEC_HEADER}\n`));
+  // And nothing that could act: no group, no owner process, no command output, no reason (nothing failed).
+  for (const name of [JOB_GROUP, JOB_END, JOB_BEGIN, JOB_HOST_EXIT, JOB_ERROR, "output.log"]) assert.ok(!existsSync(join(dir, name)), `no ${name}`);
+  assert.deepEqual(readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX)), [staging.host.dir.slice(dir.length + 1)]);
+  await staging.release();
+  assert.ok(!existsSync(staging.host.dir), "release removes the compiled owner");
+  assert.ok(!existsSync(join(dir, JOB_SPEC)), "release removes the spec (it carries the attempt's environment)");
+  await staging.release(); // idempotent: releasing twice cannot fail a start that never happened
+});
+
+test("a cancelled preparation ends the compiler, removes what it wrote and records nothing", { skip: posixOnly, timeout: 60_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const pidFile = join(dir, "csc.pid");
+  const compiler = await stubCompiler(dir, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`);
+  const controller = new AbortController();
+  const staging = prepareJob(dir, launchFor(dir), { compiler, signal: controller.signal });
+  await until(() => existsSync(pidFile), "the compiler to run");
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  assert.ok(!(await ended(pid)), "the compiler is running");
+  controller.abort();
+  const error = await staging.then(() => undefined, (reason: unknown) => reason);
+  // A cancellation is not a failure of the attempt: it is distinguishable, nothing is recorded and nothing stays.
+  assert.ok(prepareCancelled(error), `a cancelled preparation, not a failure: ${String(error)}`);
+  await until(async () => ended(pid), "the compiler to end");
+  assert.ok(!existsSync(join(dir, JOB_ERROR)), "no reason is recorded for a cancellation");
+  assert.deepEqual(readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX)), [], "what it wrote is removed");
+  assert.ok(!existsSync(join(dir, JOB_SPEC)), "no spec is left for an attempt that did not start");
+});
+
+test("an already cancelled preparation never runs the compiler and is not a compiler failure", { timeout: 30_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const controller = new AbortController();
+  controller.abort();
+  // The compiler does not exist: if the cancellation were not honoured first, this would be a fail-closed compiler error.
+  const error = await prepareJob(dir, launchFor(dir), { compiler: join(dir, "no-such-csc.exe"), signal: controller.signal })
+    .then(() => undefined, (reason: unknown) => reason);
+  assert.ok(prepareCancelled(error), `a cancellation, not a compiler error: ${String(error)}`);
+  assert.ok(!existsSync(join(dir, JOB_ERROR)), "no reason is recorded");
+  assert.deepEqual(readdirSync(dir), [], "nothing was created");
+});
+
+test("a compiler that fails is fail-closed and keeps its own words", { skip: posixOnly, timeout: 60_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const budget = join(dir, "quiet");
+  await mkdirSync(budget, { recursive: true });
+  const compiler = await stubCompiler(budget, 'process.stderr.write("error CS0518: boom\\n"); process.exit(1);');
+  const error = await prepareJob(dir, launchFor(dir), { compiler }).then(() => undefined, (reason: unknown) => reason);
+  assert.ok(!prepareCancelled(error), "a compiler failure is not a cancellation");
+  assert.match((error as Error).message, /compiler .* failed \(exit 1\): error CS0518: boom/, "the compiler's own words travel");
+  assert.match(readFileSync(join(dir, JOB_ERROR), "utf8"), /boom/, "the failure travels with the attempt");
+  // A compiler that reports success without writing the executable is a failure, never a reason to look elsewhere.
+  const silent = await stubCompiler(budget, "process.exit(0);");
+  const nothing = await prepareJob(dir, launchFor(dir), { compiler: silent }).then(() => undefined, (reason: unknown) => reason);
+  assert.match((nothing as Error).message, /wrote no executable/);
+});
+
+test("publishing the compiler's output retries a transient rename and keeps the real reason when it stays failed", async () => {
+  const busy = () => Object.assign(new Error("EBUSY: resource busy or locked, rename 'DsaJob.build.exe' -> 'DsaJob.exe'"), { code: "EBUSY" });
+  let attempts = 0;
+  await publishBuild("DsaJob.build.exe", "DsaJob.exe", { retryMs: 5, timeoutMs: 5_000,
+    renameFile: async () => { attempts += 1; if (attempts < 3) throw busy(); } });
+  assert.equal(attempts, 3, "a scanner holding the fresh file for a moment is retried, not reported");
+  // Past the budget the actual reason is reported: a blocked rename is not a compiler that wrote nothing.
+  const denial = () => Object.assign(new Error("EPERM: operation not permitted, rename 'DsaJob.build.exe' -> 'DsaJob.exe'"), { code: "EPERM" });
+  await assert.rejects(publishBuild("DsaJob.build.exe", "DsaJob.exe", { retryMs: 5, timeoutMs: 30, renameFile: async () => { throw denial(); } }),
+    (error: Error) => {
+      assert.match(error.message, /could not be published as DsaJob\.exe/);
+      assert.match(error.message, /EPERM: operation not permitted/, "the real cause is kept");
+      assert.ok(!/wrote no executable/.test(error.message), "a held file is not a compiler that wrote nothing");
+      return true;
+    });
+  // A failure no retry can fix is reported at once, with its reason.
+  let calls = 0;
+  await assert.rejects(publishBuild("DsaJob.build.exe", "DsaJob.exe", { retryMs: 5, timeoutMs: 5_000,
+    renameFile: async () => { calls += 1; throw Object.assign(new Error("EXDEV: improper link, rename"), { code: "EXDEV" }); } }), /EXDEV/);
+  assert.equal(calls, 1, "a failure that no retry can fix is not retried");
+  // Only a build file that is genuinely absent reads as "wrote no executable".
+  await assert.rejects(publishBuild("DsaJob.build.exe", "DsaJob.exe",
+    { renameFile: async () => { throw Object.assign(new Error("ENOENT: no such file or directory, rename"), { code: "ENOENT" }); } }), /wrote no executable/);
+});
+
+test("a staged owner is the one the start runs, and the start checks the gate with it already compiled", { skip: windowsOnly, timeout: 180_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const program = join(dir, "staged.mjs");
+  writeFileSync(program, "console.log('staged'); setImmediate(() => process.exit(0));\n");
+  const launch = { exe: process.execPath, args: [program], cwd: dir, log: join(dir, "output.log"), env: { ...process.env } };
+  const staging = await prepareJob(dir, launch);
+  assert.ok(existsSync(staging.host.exe), "the owner is compiled before anything starts");
+  assert.ok(!existsSync(join(dir, JOB_GROUP)), "nothing of the attempt exists yet");
+  let gateSaw = "";
+  const launched = await spawnInJob(dir, launch, { prepared: staging, proceed: () => {
+    gateSaw = readFileSync(join(dir, JOB_SPEC), "utf8").slice(0, JOB_SPEC_HEADER.length);
+    return true;
+  } });
+  assert.ok(launched);
+  assert.equal(gateSaw, JOB_SPEC_HEADER, "the gate runs with the spec written and the owner compiled");
+  await launched.exited;
+  assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0);
+  assert.match(readFileSync(join(dir, "output.log"), "utf8"), /staged/);
+  assert.equal(readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX)).length, 1, "the staged owner was used, not a second one");
 });

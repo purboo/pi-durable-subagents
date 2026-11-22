@@ -12,7 +12,11 @@
 // pi or its interpreter missing or not executable); the call stays queued and launches again after a backoff.
 // Command calls (CallSpec.command) record no exec/tracked/fenced entries (nothing that handles agent executions picks them
 // up): command-intent{call,id,n} before the spawn (id = command:<call>#<n> is the attempt and its process tag DSA_EXEC;
-// n is 1, or 2 for the single rerun); command-started{call,id,pid,start,dir,group?,uncertain?} after it (the wrapper's identity, the
+// n is 1, or 2 for the single rerun). The expensive part of a start -- on Windows the compilation of the job host, bounded
+// and cancellable -- is staged *before* that intent (under the writer lock a writer call holds), so a crash, a stop or a
+// retirement during it leaves no intent and nothing that can act: that cut is unambiguously prelaunch, and an interrupted
+// compilation is never a failure of the attempt. An intent with no command-started is still ambiguous for a journal an
+// earlier version wrote (its compilation ran after the intent) and recovery keeps treating it so; command-started{call,id,pid,start,dir,group?,uncertain?} follows the spawn (the wrapper's identity, the
 // attempt directory, and on Windows {pid,start} of the job host that owns the attempt's kernel group; its ts starts the
 // wall-clock timeout; `uncertain` means the start could not be confirmed -- the host was adopted with pid/start of the
 // host itself, and only a scan that finds it gone may let another attempt start); command-spawn-failed{call,id,error}: the command could not
@@ -60,7 +64,7 @@ import { gateRetired } from "./effects/gate.ts";
 import { WorktreeIndex, isWorktreeConflict, worktreeCalls, worktreeLabel, worktreePair, worktreeRoots, type WorktreeWrite } from "./worktree.ts";
 import { failedModel, modelFailures, MODEL_RETRY_MS, parentPinned, spillCandidates } from "./pool.ts";
 import { PENDING_NOTE, UNDELIVERED_FOLLOW_UP } from "../notes.ts";
-import { COMMAND_LOG, exitMeaning, readExitRecord, readTail, spawnCommand, type SpawnedCommand } from "../../platform/command.ts";
+import { COMMAND_LOG, exitMeaning, prepareCancelled, prepareCommand as stageCommand, readExitRecord, readTail, spawnCommand, type CommandPrep, type CommandSpawn, type SpawnedCommand } from "../../platform/command.ts";
 import { captureStart } from "../../platform/proctable.ts";
 import { heldIn } from "../snapshot.ts";
 import { COMMAND_INTENT, COMMAND_SPAWN_FAILED, COMMAND_STARTED, COMMAND_TIMEOUT, COMMAND_WITHDRAWN, commandDirName, commandEnvironment, commandId, retiredCommandAttempts } from "./command.ts";
@@ -185,11 +189,16 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   pi?: string; spawnRetryMs?: number;
   /** Tests: the directory sync of an inbox cleanup (kernel/journal.ts syncDirectory by default). */
   syncDirectory?: (dir: string) => Promise<void>;
+  /** Tests: the pre-intent preparation of a command start (platform/command.ts prepareCommand by default: the Windows
+   *  owner's compilation), so its staging lifetime can be exercised where no Windows compiler exists. */
+  prepareCommand?: (spec: CommandSpawn) => Promise<CommandPrep | undefined>;
   /** Observes each slot attempt that admitted nothing: the execution and the providers it found full. */
   attempted?: (exec: string, full: readonly string[]) => void } = {}): Executor {
   const { home, config, orch } = ledgers;
   const containment = options.containment ?? serialContainment(), effects = options.effects ?? createEffects(ledgers);
   const piCommand = options.pi ?? "pi";
+  // The command start's pre-intent preparation: the Windows owner compilation (cancellable), nothing on POSIX.
+  const prepareStart = options.prepareCommand ?? stageCommand;
   const active = new Map<string, Active>(), completed = new Map<string, Promise<CallResult>>(), journals = new Map<string, JournalHandle>();
   let queue: Promise<unknown> = Promise.resolve(), closed = false;
   let suspending: Promise<void> | undefined;
@@ -1182,8 +1191,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   const intentWithdrawn = (journal: JournalHandle, call: string, id: string, seq: number) => entriesFor(journal, call).some(e => e.type === COMMAND_WITHDRAWN && e.id === id && e.seq > seq);
   /** Start the attempt whose intent is recorded; records command-started, or command-spawn-failed when it cannot start.
    *  Rechecked synchronously right before the spawn: a stop means no process (the watch seals it stopped), a retirement or the orchestrator's exit
-   *  withdraws the intent (nothing started; the next start decides again). */
-  async function launchCommand(a: Active, id: string, dir: string): Promise<SpawnedCommand | undefined> {
+   *  withdraws the intent (nothing started; the next start decides again). `prepared` is the start's staged preparation: when
+   *  no process is started it is released (nothing started and the intent is withdrawn or the stop seals it). */
+  async function launchCommand(a: Active, id: string, dir: string, prepared?: CommandPrep): Promise<SpawnedCommand | undefined> {
     const t = a.ticket;
     let spawned: SpawnedCommand;
     try {
@@ -1197,9 +1207,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         return refused === undefined;
       };
       const result = await spawnCommand({ command: t.spec.command!, cwd: t.cwd, dir, proceed, exec: id,
-        env: commandEnvironment(home, id, t.callId, t.spec.env) });
+        ...(prepared ? { prepared } : {}), env: commandEnvironment(home, id, t.callId, t.spec.env) });
       if (!result) {
         if (refused === "withdrawn") await serial(() => t.journal.append(COMMAND_WITHDRAWN, { call: t.callId, id }));
+        // Nothing of the attempt exists: what the preparation staged is of no use.
+        await prepared?.release().catch(() => {});
         return undefined;
       }
       spawned = result;
@@ -1220,12 +1232,49 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const dirOf = (n: number) => join(callDir(home, t.wid, t.key, t.gen), commandDirName(n));
     const fail = (error: string) => sealCommand(journal, t, commandId(call, 1), { status: "failed", error });
     const latest = () => { const e = own().findLast(e => e.type === COMMAND_INTENT); return e && !intentWithdrawn(journal, call, String(e.id), e.seq) ? e : undefined; };
-    /** Start attempt `n`: the intent, then the process; undefined when it did not start (and the run goes on). */
+    /** What an attempt's start decides before its intent: the staged preparation, a blocked start, or a failure of the
+     *  preparation itself (which is fail-closed: the attempt cannot start, and it is sealed failed). */
+    type Start = { ready: true; prepared?: CommandPrep } | { blocked: "shutdown" | "stopped" | "held" } | { failure: string };
+    /** Stage the expensive part of attempt `id`'s start (the Windows owner compilation) *before* the durable intent, under
+     *  whatever fence the call already holds (the writer lock): a crash here leaves no `command-intent`, so the attempt is
+     *  unambiguously prelaunch -- nothing started, nothing to adopt, nothing to rerun. The preparation is bounded and
+     *  cancellable: a stop, retirement, suspension or exit during it ends the compiler, removes what it wrote and is never
+     *  recorded as a failure of the attempt (a stop seals stopped; anything else ends the run and the call resumes on
+     *  recovery). A preparation that fails for its own reason is fail-closed, as the compilation always was. */
+    const start = async (a: Active, id: string, dir: string): Promise<Start> => {
+      const blocked = commandBlocked(a); if (blocked) return { blocked };
+      let prepared: CommandPrep | undefined;
+      try {
+        prepared = await prepareStart({ command: t.spec.command!, cwd: t.cwd, dir, exec: id,
+          env: commandEnvironment(home, id, call, t.spec.env), signal: a.controller.signal });
+      } catch (error) {
+        if (!prepareCancelled(error)) return { failure: String(error instanceof Error ? error.message : error) };
+        // Interrupted, and nothing was recorded: a stop decides the attempt, anything else ends this run. Without a blocked
+        // state the run is being torn down anyway (a suspension or a retirement), so it is never retried here.
+        const now = commandBlocked(a);
+        return { blocked: now === "stopped" ? "stopped" : "shutdown" };
+      }
+      // An abort that arrived while the last step of the preparation ran: nothing may follow it.
+      if (a.controller.signal.aborted) {
+        await prepared?.release().catch(() => {});
+        return { blocked: commandBlocked(a) === "stopped" ? "stopped" : "shutdown" };
+      }
+      return { ready: true, ...(prepared ? { prepared } : {}) };
+    };
+    /** Start attempt `n`: the staged preparation (before the intent), the intent, then the process; undefined when it did
+     *  not start (and the run goes on). */
     const begin = async (n: number): Promise<{ spawned?: SpawnedCommand } | undefined> => {
+      const id = commandId(call, n), dir = dirOf(n);
+      const staged = await start(a, id, dir);
+      if ("blocked" in staged) {
+        if (staged.blocked === "stopped") return undefined;
+        throw shutdownError();
+      }
+      if ("failure" in staged) { await sealCommand(journal, t, id, { status: "failed", error: `Command could not start: ${staged.failure}` }); return {}; }
       const intent = await commandIntent(a, n);
-      if (intent === "stopped") return undefined;
-      if (intent === "shutdown" || intent === "held") throw shutdownError();
-      return { spawned: await launchCommand(a, String(intent.id), dirOf(n)) };
+      if (intent === "stopped") { await staged.prepared?.release().catch(() => {}); return undefined; }
+      if (intent === "shutdown" || intent === "held") { await staged.prepared?.release().catch(() => {}); throw shutdownError(); }
+      return { spawned: await launchCommand(a, String(intent.id), dir, staged.prepared) };
     };
     let spawned: SpawnedCommand | undefined;
     for (;;) {

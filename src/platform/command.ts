@@ -11,9 +11,10 @@
 // a small .NET Framework winexe compiled per launch with the framework's own csc.exe. A command attempt therefore cannot
 // leave descendants behind, and a scan that finds the wrapper gone finds the group closed: no second attempt starts
 // while processes of the first can still act. The attempt's `exec` tag goes into the owner's own command line as well,
-// so the attempt is findable while the owner is still starting -- the window between the recorded intent and the group
-// record, where the wrapper does not exist yet. The owner is compiled during the start, so `proceed` is checked again
-// after the compilation and immediately before the spawn: a stop that arrived while the compiler ran starts nothing.
+// so the attempt is findable while the owner is still starting. The owner is the expensive part of a start, so it is
+// staged (prepareCommand) before the attempt's durable intent: `proceed` is checked before the compilation and again
+// immediately before the spawn, and a stop, retirement or exit during the compilation cancels it -- nothing recorded,
+// nothing started, so that cut is unambiguously prelaunch.
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, stat, open, writeFile } from "node:fs/promises";
@@ -21,7 +22,7 @@ import { constants } from "node:os";
 import { join } from "node:path";
 import { captureStart } from "./proctable.ts";
 import { execTarget, findOnPath } from "./launch.ts";
-import { spawnInJob } from "./job.ts";
+import { prepareJob, spawnInJob, type JobPrep } from "./job.ts";
 import { comspec, envValue, IS_WINDOWS, mergeEnv, normalizeEnv, winTagArg } from "./windows.ts";
 
 export const COMMAND_LOG = "output.log";
@@ -91,9 +92,15 @@ export interface CommandSpawn {
   dir: string;
   /** The execution tag, written into the Windows wrapper's command line (its environment is unreadable elsewhere). */
   exec?: string;
+  /** Windows: the staged preparation (prepareCommand) made before the attempt's intent. The start then writes nothing and
+   *  compiles nothing: the spec and the wrapper are the ones the owner was prepared for. */
+  prepared?: CommandPrep;
+  /** Cancels a preparation this call stages itself. A staged one carries its own signal (prepareCommand). */
+  signal?: AbortSignal;
   /** The last check, synchronous, after every preparation and immediately before the spawn (no await between them):
-   *  false starts no process (spawnCommand resolves undefined). On Windows the preparation includes compiling the Job
-   *  Object owner, so the check is made twice: before the compilation and again after it, immediately before the spawn. */
+   *  false starts no process (spawnCommand resolves undefined). On Windows the expensive preparation is staged before the
+   *  intent, so the check that a stop arrived while the owner compiled is the executor's second one: it calls this after
+   *  the staging, immediately before the spawn. */
   proceed?: () => boolean;
 }
 export interface SpawnedCommand {
@@ -113,6 +120,40 @@ export interface SpawnedCommand {
 export const commandArgv = (command: string | readonly string[]): string[] =>
   typeof command === "string" ? [IS_WINDOWS ? comspec() : "/bin/sh", "-c", command] : [...command];
 
+/** What a Windows start stages before the attempt's durable intent: the compiled group owner (undefined on POSIX, which has
+ *  nothing to prepare). */
+export type CommandPrep = JobPrep;
+/** Whether `error` is a preparation cancelled by a stop, a retirement or the orchestrator's exit (never a failure of the
+ *  attempt, and never sealed as one). */
+export { prepareCancelled } from "./job.ts";
+
+/** The Windows plan of one command start: the child's environment as one block (Windows names one variable whatever their
+ *  case: one `PATH`, one `ComSpec`, one `PATHEXT`), the command the wrapper runs (an argv whose program is a .cmd/.bat shim
+ *  unwrapped to the program it names) and the wrapper's own argv. Shared by the staging and the start, so both describe the
+ *  same attempt. */
+function windowsPlan(spec: CommandSpawn): { env: NodeJS.ProcessEnv; command: string | readonly string[]; args: string[] } {
+  const inherited = normalizeEnv(spec.env);
+  const env = mergeEnv(inherited, { ComSpec: envValue(inherited, "ComSpec") || comspec(inherited),
+    PATHEXT: envValue(inherited, "PATHEXT") || ".COM;.EXE;.BAT;.CMD" });
+  const command = typeof spec.command === "string" ? spec.command : (() => { const target = execTarget(spec.command[0]!, spec.command.slice(1), { env }); return [target.command, ...target.args]; })();
+  return { env, command, args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [winTagArg("DSA_EXEC", spec.exec)] : [])] };
+}
+
+/** Stage what a Windows command start needs, before its durable intent: the command spec and the wrapper the child runs,
+ *  then the group owner compiled (bounded and cancellable: `signal` ends the compiler, removes what it wrote and rejects
+ *  with a cancelled preparation). Nothing is started, so a crash here leaves no intent and no process: the attempt is
+ *  unambiguously prelaunch. POSIX prepares nothing (the wrapper is /bin/sh). */
+export async function prepareCommand(spec: CommandSpawn): Promise<CommandPrep | undefined> {
+  if (!IS_WINDOWS) return undefined;
+  // A command line can be long and contain anything: pass it through a file, not argv.
+  await mkdir(spec.dir, { recursive: true });
+  const plan = windowsPlan(spec);
+  await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env }));
+  await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
+  return prepareJob(spec.dir, { exe: process.execPath, env: plan.env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
+    args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.signal ? { signal: spec.signal } : {}) });
+}
+
 /** Start a command (see the module comment). Rejects when it cannot start (a missing cwd, no /bin/sh); undefined when
  *  `proceed` said no. */
 export async function spawnCommand(spec: CommandSpawn & { proceed: () => boolean }): Promise<SpawnedCommand | undefined>;
@@ -122,26 +163,20 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
   const fd = openSync(join(spec.dir, COMMAND_LOG), "a");
   try {
     if (IS_WINDOWS) {
-      // A command line can be long and contain anything: pass it through a file, not argv. An argv whose program is a
-      // .cmd/.bat shim is unwrapped here, before it is recorded, so the child runs the program its shim names. A bare
-      // program is resolved on the command's own PATH (the spec env, with the call's shim directory), never this
-      // process's. The environment it runs with is one Windows block: one `PATH` (also when the call spelled it `Path`),
-      // one `ComSpec`, one `PATHEXT`.
-      const inherited = normalizeEnv(spec.env);
-      const env = mergeEnv(inherited, { ComSpec: envValue(inherited, "ComSpec") || comspec(inherited),
-        PATHEXT: envValue(inherited, "PATHEXT") || ".COM;.EXE;.BAT;.CMD" });
-      const command = typeof spec.command === "string" ? spec.command : (() => { const target = execTarget(spec.command[0]!, spec.command.slice(1), { env }); return [target.command, ...target.args]; })();
-      await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command, cwd: spec.cwd, env }));
-      await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
-      // An already revoked permission never compiles; spawnInJob checks again after the compilation, immediately before
-      // the spawn (a stop or retirement that arrived while the compiler ran still starts no process).
+      // A staged preparation (prepareCommand) already wrote command.json, the wrapper and the compiled owner: rewriting
+      // them would only risk a spec the owner was not prepared for, so the start reads what it staged.
+      const plan = windowsPlan(spec);
+      if (!spec.prepared) {
+        await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env }));
+        await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
+      }
+      // An already revoked permission never prepares or starts; the executor's stage checks again immediately before the
+      // spawn (spawnInJob), so a stop or retirement that arrived while the owner compiled still starts nothing.
       if (spec.proceed && !spec.proceed()) return undefined;
       // The wrapper's environment as a direct spawn would give it; the command inside still gets command.json's env.
-      // spawnInJob compiles the Job Object owner (bounded, foreground, no process of the attempt) and resolves undefined
-      // when its post-compilation check refuses.
-      return await spawnInJob(spec.dir, { exe: process.execPath, env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
-        args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [winTagArg("DSA_EXEC", spec.exec)] : [])],
-        ...(spec.exec ? { exec: spec.exec } : {}) }, spec.proceed ? { proceed: spec.proceed } : {});
+      return await spawnInJob(spec.dir, { exe: process.execPath, env: plan.env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
+        args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.proceed ? { proceed: spec.proceed } : {}),
+        ...(spec.prepared ? { prepared: spec.prepared } : {}), ...(spec.signal ? { signal: spec.signal } : {}) });
     }
     const mv = resolveMv(), argv = commandArgv(spec.command);
     if (spec.proceed && !spec.proceed()) return undefined;
