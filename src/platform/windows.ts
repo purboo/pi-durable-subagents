@@ -41,6 +41,14 @@ export function mergeEnv(base: NodeJS.ProcessEnv, ...overrides: (NodeJS.ProcessE
 /** An environment block with one definition per name (the later spelling wins): what a Windows child reads unambiguously. */
 export const normalizeEnv = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => mergeEnv({}, env);
 
+/** The whole 32-bit code of a Windows process status. Node hands the kernel's exit code back as a JS number whose bit
+ *  pattern is that DWORD, on some paths and versions as a signed int32 (0xC0000005 reads -1073741819), so every status
+ *  this package records, reads back or reports is normalized here: a negative number is not an exit status at all.
+ *  (The Windows command wrapper, a standalone file, spells the same normalization itself; `>>> 0`.) */
+export const dword = (status: number): number => status >>> 0;
+/** The largest status a Windows process can end with: its exit code is one DWORD. */
+export const DWORD_MAX = 0xffffffff;
+
 /** Supply OS defaults to helpers launched from deliberately isolated environments. */
 export function helperEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   // A derivation that fails must not take the helper down with it: a variable that stays unset is what it had before.

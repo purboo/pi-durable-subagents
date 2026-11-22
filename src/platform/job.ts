@@ -30,9 +30,10 @@
 // weakened.
 //
 // The spec is ASCII lines of base64-encoded UTF-16LE fields (jobSpecText), so no code page, quoting rule, BOM or unpaired
-// surrogate can change a Unicode path, a curly quote or an environment value; the owner decodes it with
-// System.Text.Encoding.Unicode. The C# source is ASCII-only for the same reason: csc.exe reads a file without a byte order
-// mark in the ANSI code page.
+// surrogate can change a Unicode path, a curly quote or an environment value; the owner turns every line back into its
+// exact UTF-16 code units -- each byte pair is one char, never through a decoder fallback that could substitute -- and
+// refuses a field that is not a whole number of code units, or that carries a NUL. The C# source is ASCII-only for the
+// same reason: csc.exe reads a file without a byte order mark in the ANSI code page.
 //
 // Observation is fail-closed: before a group exists the orchestrator waits for the owner's `group` record (the suspended
 // child's pid, written before the child may run) and starts no attempt when it does not arrive or cannot be read; the
@@ -55,7 +56,7 @@ import { closeSync, existsSync, openSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { helperEnv, killTree, systemRoot, winProcessRows, winTag, winTagArg, type WinProcessRow } from "./windows.ts";
+import { dword, helperEnv, killTree, systemRoot, winProcessRows, winTag, winTagArg, type WinProcessRow } from "./windows.ts";
 
 /** The owner type: exported for the packaging check (the compiled name carries it; nothing separate is shipped). */
 export const JOB_HOST_MARKER = "DsaJob";
@@ -234,8 +235,8 @@ public static class DsaJob
     }
 
     /** The attempt's spec: ASCII lines, one base64-encoded UTF-16LE field each, so no code page, quoting rule or
-     *  surrogate can change it. DSAJOB1, exe, cwd, log, argument count, arguments, environment count, NAME=value
-     *  entries. */
+     *  surrogate can change it (Field decodes each one to its exact code units). DSAJOB1, exe, cwd, log, argument count,
+     *  arguments, environment count, NAME=value entries. */
     static void ReadSpec(string dir, out string application, out string workingDirectory, out string logPath, out string[] arguments, out string[] environment)
     {
         string path = Path.Combine(dir, "job.json");
@@ -265,7 +266,16 @@ public static class DsaJob
 
     static string Field(string line)
     {
-        string value = Encoding.Unicode.GetString(Convert.FromBase64String(line));
+        byte[] bytes = Convert.FromBase64String(line);
+        // A field is a whole number of UTF-16 code units, and jobSpecText wrote each pair as the code unit itself. An
+        // odd byte count is not a string any Win32 API could receive: refuse the spec instead of keeping the even
+        // prefix (a silently truncated path or argument). Nothing has been started yet.
+        if ((bytes.Length & 1) != 0) throw new FormatException("a job spec field is not a whole number of UTF-16 code units");
+        // Each byte pair is one char, copied as such: no decoding fallback can replace an unpaired surrogate the caller
+        // meant to pass, and the field reaches Win32 exactly as the caller wrote it.
+        char[] units = new char[bytes.Length / 2];
+        if (units.Length > 0) Buffer.BlockCopy(bytes, 0, units, 0, bytes.Length);
+        string value = new string(units);
         // A NUL would end the field where a Win32 API (CreateProcess, the environment block) reads it, so a path or an
         // argument would silently become a shorter one. Refuse the spec instead: nothing has been started yet.
         if (value.IndexOf((char)0) >= 0) throw new FormatException("a job spec field contains a NUL character");
@@ -486,8 +496,9 @@ export const JOB_HOST_SOURCE_FILE = "DsaJob.cs";
 export const JOB_HOST_PREFIX = "job-host-";
 /** The owner's own stderr (its diagnostics when the program itself cannot run; empty otherwise). */
 export const JOB_HOST_LOG = "host.log";
-/** Written by this process when the owner ends: its exit code (or why it could not be spawned), for the failure reason.
- *  The owner cannot report this itself -- it is the process that ended. */
+/** Written by this process when the owner ends: its exit code -- the whole DWORD, normalized as every status here is,
+ *  so it agrees with the group record and with what a caller observes -- or why it could not be spawned, for the failure
+ *  reason. The owner cannot report this itself -- it is the process that ended. */
 export const JOB_HOST_EXIT = "host-exit";
 /** What the owner reads: the program, argv, cwd, output file and complete environment of the attempt's wrapper. */
 export const JOB_SPEC = "job.json";
@@ -543,7 +554,8 @@ export function jobEnv(env: NodeJS.ProcessEnv): string[] {
 /** The spec as text this module writes itself: the header, then one base64-encoded UTF-16LE field per line (exe, cwd,
  *  log, the argument count and arguments, the environment count and entries). Base64 is ASCII, so job.json decodes
  *  identically under any code page, and UTF-16LE carries every JS string -- a curly quote, an emoji, even an unpaired
- *  surrogate -- unchanged; the owner turns every line back with Convert.FromBase64String plus Encoding.Unicode. */
+ *  surrogate -- unchanged: the owner turns every line back with Convert.FromBase64String and takes each byte pair as one
+ *  code unit, and refuses a field that is not a whole number of them. */
 export function jobSpecText(launch: Pick<JobLaunch, "exe" | "args" | "cwd" | "log" | "env">): string {
   const env = jobEnv(launch.env);
   const lines = [JOB_SPEC_HEADER, field(launch.exe), field(launch.cwd), field(launch.log), String(launch.args.length),
@@ -888,7 +900,7 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
         catch { await writeFile(target, record, "utf8").catch(() => {}); }
       })().finally(resolve);
     };
-    helper.once("exit", (code, signal) => { done(asciiJson({ code, signal })); });
+    helper.once("exit", (code, signal) => { done(asciiJson({ code: code === null ? null : dword(code), signal })); });
     helper.once("error", error => { done(asciiJson({ error: String((error as Error)?.message ?? error) })); });
   });
   const observe = options.observe ?? (() => winProcessRows()), endHelper = options.endHelper ?? killTree,

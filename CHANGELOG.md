@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Two Win32 contract edges of a command attempt now hold end to end. The job host decodes every spec field to its exact
+  UTF-16 code units — each byte pair is one char, never through a decoder fallback — so a Unicode path, a curly quote, an
+  emoji or an unpaired surrogate still reaches Win32 unchanged, and a field that is not a whole number of code units is
+  refused before anything is created (a decoder that kept the even prefix would truncate a path or an argument without
+  saying so); the NUL refusal is unchanged and still precedes anything Win32 sees. The Windows wrapper normalizes the
+  command's status to its 32-bit code before it records it and before it exits with it: Node may hand a Windows status
+  back as a signed int32 (`0xC0000005` reads `-1073741819`), which is no exit record at all and left the attempt looking
+  like one that ended without one (`rerun` would have started a second attempt). The record, the group record, the
+  host's own exit evidence and the caller's `exitCode` are now one DWORD (`Command exited 3221225477`), and an exit
+  record is read only when it is one decimal status within that DWORD. The orchestrator also opens no `output.log`
+  descriptor on Windows any more: the group's host owns those handles, so nothing here holds an unused one across the
+  compilation and the handshake.
+
 - The Windows job host's compilation is staged before a command attempt's durable intent, and the whole preparation is
   cancellable: a crash or a stop while the compiler runs now leaves no `command-intent`, so that cut is unambiguously
   prelaunch (nothing started, nothing to adopt, nothing to rerun) instead of looking like an attempt whose start record

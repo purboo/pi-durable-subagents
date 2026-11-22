@@ -4,7 +4,9 @@
 // already the runtime), and a string command runs through the command's `ComSpec` (cmd.exe by default). Its output (stdout and stderr, interleaved) is
 // appended to `output.log` in the same directory through a descriptor the orchestrator opens, passes and closes: no
 // pipe leads back into the orchestrator and no node process stays resident for the life of the command, so it outlives
-// the orchestrator that started it.
+// the orchestrator that started it. On Windows that descriptor is not this process's: the attempt's group owner opens
+// its own two append handles for the log (platform/job.ts), so nothing here opens or holds `output.log` while the owner
+// compiles and starts.
 //
 // On Windows the wrapper also runs inside a Windows Job Object of its own (platform/job.ts): the wrapper is the group's
 // root, created suspended and assigned before its first instruction, and the group's only handle dies with the owner --
@@ -23,7 +25,7 @@ import { join } from "node:path";
 import { captureStart } from "./proctable.ts";
 import { execTarget, findOnPath } from "./launch.ts";
 import { prepareJob, spawnInJob, type JobPrep } from "./job.ts";
-import { comspec, envValue, IS_WINDOWS, mergeEnv, normalizeEnv, winTagArg } from "./windows.ts";
+import { DWORD_MAX, comspec, envValue, IS_WINDOWS, mergeEnv, normalizeEnv, winTagArg } from "./windows.ts";
 
 export const COMMAND_LOG = "output.log";
 export const COMMAND_EXIT = "exit";
@@ -53,6 +55,12 @@ import { join } from "node:path";
 const dir = process.argv[2];
 const spec = JSON.parse(readFileSync(join(dir, "${COMMAND_SPEC}"), "utf8"));
 try { unlinkSync(join(dir, "${COMMAND_SPEC}")); } catch { /* already gone */ }
+// The status of the attempt is the kernel's 32-bit exit code. Node hands a Windows status back as a number whose bit
+// pattern is that code -- on some paths as a signed int32 (0xC0000005 reads -1073741819) -- and a negative number is not
+// an exit record at all, so every status is normalized to its DWORD here before it is written. process.exit takes an
+// integer and the OS keeps its low 32 bits, so the same DWORD reaches the caller as this wrapper's own exit status: the
+// record and the observed outcome cannot disagree.
+function dword(code) { return code >>> 0; }
 function record(status) {
   try { writeFileSync(join(dir, "exit.tmp"), String(status)); renameSync(join(dir, "exit.tmp"), join(dir, "exit")); } catch { /* never lose the command's own result */ }
 }
@@ -69,7 +77,7 @@ let child;
 try { child = typeof spec.command === "string" ? spawn(spec.command, { ...options, shell }) : spawn(spec.command[0], spec.command.slice(1), options); }
 catch (error) { const status = error && error.code === "ENOENT" ? 127 : 126; record(status); process.exit(status); }
 child.once("error", error => { const status = error && error.code === "ENOENT" ? 127 : 126; record(status); process.exit(status); });
-child.once("exit", (code, signal) => { const status = code === null ? (signal ? 128 : 1) : code; record(status); process.exit(status); });
+child.once("exit", (code, signal) => { const status = code === null ? (signal ? 128 : 1) : dword(code); record(status); process.exit(status); });
 `;
 /** The wrapper's source (it is written into the attempt directory as `COMMAND_WRAPPER`): exported so its own environment
  *  merge and exit record can be exercised on a host that is not Windows. */
@@ -160,24 +168,28 @@ export async function spawnCommand(spec: CommandSpawn & { proceed: () => boolean
 export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand>;
 export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand | undefined> {
   await mkdir(spec.dir, { recursive: true });
+  if (IS_WINDOWS) {
+    // The log belongs to the attempt's group owner: it opens its own append handles for it (platform/job.ts), so this
+    // process opens none -- an unused descriptor would only be held open across the compilation and the handshake.
+    // A staged preparation (prepareCommand) already wrote command.json, the wrapper and the compiled owner: rewriting
+    // them would only risk a spec the owner was not prepared for, so the start reads what it staged.
+    const plan = windowsPlan(spec);
+    if (!spec.prepared) {
+      await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env }));
+      await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
+    }
+    // An already revoked permission never prepares or starts; the executor's stage checks again immediately before the
+    // spawn (spawnInJob), so a stop or retirement that arrived while the owner compiled still starts nothing.
+    if (spec.proceed && !spec.proceed()) return undefined;
+    // The wrapper's environment as a direct spawn would give it; the command inside still gets command.json's env.
+    return await spawnInJob(spec.dir, { exe: process.execPath, env: plan.env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
+      args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.proceed ? { proceed: spec.proceed } : {}),
+      ...(spec.prepared ? { prepared: spec.prepared } : {}), ...(spec.signal ? { signal: spec.signal } : {}) });
+  }
+  // POSIX: the wrapper's stdout and stderr are this descriptor, which it inherits and this process closes after the
+  // spawn: the command's log is never a pipe held by a process that has to outlive it.
   const fd = openSync(join(spec.dir, COMMAND_LOG), "a");
   try {
-    if (IS_WINDOWS) {
-      // A staged preparation (prepareCommand) already wrote command.json, the wrapper and the compiled owner: rewriting
-      // them would only risk a spec the owner was not prepared for, so the start reads what it staged.
-      const plan = windowsPlan(spec);
-      if (!spec.prepared) {
-        await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env }));
-        await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
-      }
-      // An already revoked permission never prepares or starts; the executor's stage checks again immediately before the
-      // spawn (spawnInJob), so a stop or retirement that arrived while the owner compiled still starts nothing.
-      if (spec.proceed && !spec.proceed()) return undefined;
-      // The wrapper's environment as a direct spawn would give it; the command inside still gets command.json's env.
-      return await spawnInJob(spec.dir, { exe: process.execPath, env: plan.env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
-        args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.proceed ? { proceed: spec.proceed } : {}),
-        ...(spec.prepared ? { prepared: spec.prepared } : {}), ...(spec.signal ? { signal: spec.signal } : {}) });
-    }
     const mv = resolveMv(), argv = commandArgv(spec.command);
     if (spec.proceed && !spec.proceed()) return undefined;
     const child = spawn("/bin/sh", ["-c", WRAPPER, "dsa-command", spec.dir, mv, ...argv],
@@ -191,20 +203,28 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
   } finally { closeSync(fd); }
 }
 
-/** The status the wrapper recorded, or undefined while there is none (the command runs, or ended without one). */
+/** The status the wrapper recorded, or undefined while there is none (the command runs, or ended without one). The record
+ *  is one exit status: on Windows the whole DWORD (a status above 0x7fffffff included), on POSIX 0..255. Anything outside
+ *  that is not a status a wrapper wrote -- a negative number a Node version reported, a corrupt or foreign file -- and is
+ *  not read as one. */
 export async function readExitRecord(dir: string): Promise<{ status: number; at: number } | undefined> {
   const path = join(dir, COMMAND_EXIT);
-  let text: string, at: number;
-  try { [text, at] = await Promise.all([readFile(path, "utf8"), stat(path).then(s => s.mtimeMs)]); }
+  let recorded: string, at: number;
+  try { [recorded, at] = await Promise.all([readFile(path, "utf8"), stat(path).then(s => s.mtimeMs)]); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
-  const status = Number(text.trim());
-  return Number.isInteger(status) && status >= 0 ? { status, at } : undefined;
+  // A wrapper writes one decimal status (and a newline): anything else in the file -- nothing, a sign, an exponent,
+  // text -- is not a status of this attempt.
+  const text = recorded.trim();
+  if (!/^\d{1,10}$/.test(text)) return undefined;
+  const status = Number(text);
+  return status <= DWORD_MAX ? { status, at } : undefined;
 }
 
 const signalNames = new Map(Object.entries(constants.signals).map(([name, n]) => [n as number, name]));
-/** How an exit status reads. The wrapper sees the status of a shell: a command killed by signal N exits 128+N. A command
- *  that itself exits with a status above 128 (`exit 130`) therefore reads as killed by that signal: the two cannot be
- *  told apart from the status alone (the shell convention). */
+/** How an exit status reads. On POSIX the wrapper sees the status of a shell: a command killed by signal N exits 128+N,
+ *  and a command that itself exits with a status above 128 (`exit 130`) therefore reads as killed by that signal -- the two
+ *  cannot be told apart from the status alone (the shell convention). A status that is not 128 plus a known signal number
+ *  reads as the status itself: a Windows DWORD, a status above 0x7fffffff included, always does. */
 export function exitMeaning(status: number): { exitCode: number | null; signal: string | null } {
   const name = status > 128 ? signalNames.get(status - 128) : undefined;
   return name ? { exitCode: null, signal: name } : { exitCode: status, signal: null };

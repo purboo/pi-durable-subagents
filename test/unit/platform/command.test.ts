@@ -6,7 +6,9 @@ import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { COMMAND_LOG, COMMAND_SPEC, COMMAND_WRAPPER_SOURCE, exitMeaning, readExitRecord, readTail, spawnCommand } from "../../../src/platform/command.ts";
+import { COMMAND_EXIT, COMMAND_LOG, COMMAND_SPEC, COMMAND_WRAPPER_SOURCE, exitMeaning, readExitRecord, readTail, spawnCommand } from "../../../src/platform/command.ts";
+import { JOB_END, JOB_HOST_EXIT } from "../../../src/platform/job.ts";
+import { dword } from "../../../src/platform/windows.ts";
 import { findOnPath } from "../../../src/platform/launch.ts";
 import { captureStart } from "../../../src/platform/proctable.ts";
 import { restartRefusal, restartToken } from "../../../src/orchestrator/restart.ts";
@@ -15,6 +17,7 @@ import type { Entry } from "../../../src/types.ts";
 
 const dirOf = () => mkdtempSync(join(tmpdir(), "dsa-command-"));
 const unixOnly = process.platform === "win32" ? "Unix /bin/sh and POSIX PATH semantics" : false;
+const windowsOnly = process.platform === "win32" ? false : "a Windows Job Object (Win32)";
 const onPath = (name: string) => (process.env.PATH ?? "").split(":").some(d => d && existsSync(join(d, name)));
 async function finished(dir: string) {
   for (let i = 0; i < 200; i++) { const r = await readExitRecord(dir); if (r) return r; await delay(25); }
@@ -27,6 +30,38 @@ test("exit statuses: 0 and plain codes stay codes; above 128 read as the signal 
   assert.deepEqual(exitMeaning(143), { exitCode: null, signal: "SIGTERM" });
   assert.deepEqual(exitMeaning(137), { exitCode: null, signal: "SIGKILL" });
   assert.deepEqual(exitMeaning(255), { exitCode: 255, signal: null }, "no signal 127");
+  // A Windows exit status is the whole DWORD: high bit included it is a status, never 128 plus a signal number.
+  assert.deepEqual(exitMeaning(0xC0000005), { exitCode: 3221225477, signal: null });
+  assert.deepEqual(exitMeaning(0xffffffff), { exitCode: 4294967295, signal: null });
+});
+
+test("a Windows status is normalized to its DWORD before it is recorded or reported", () => {
+  // Node hands a Windows status back as a number whose bit pattern is the kernel's exit code, on some paths as a signed
+  // int32: every place that records, reads back or reports one uses the same normalization.
+  for (const [raw, as] of [[0xC0000005, 3221225477], [-1073741819, 3221225477], [0, 0], [255, 255], [3221225477, 3221225477], [-1, 4294967295]] as const)
+    assert.equal(dword(raw), as, `${raw} -> ${as}`);
+  // The wrapper is a standalone file (written into the attempt directory, it imports nothing of this package), so it
+  // spells the normalization itself: the recorded status and the wrapper's own exit are the same DWORD.
+  assert.match(COMMAND_WRAPPER_SOURCE, /function dword\(code\) \{ return code >>> 0; \}/);
+  assert.match(COMMAND_WRAPPER_SOURCE, /const status = code === null \? \(signal \? 128 : 1\) : dword\(code\);/);
+  assert.match(COMMAND_WRAPPER_SOURCE, /record\(status\); process\.exit\(status\);/,
+    "the wrapper exits with the status it recorded");
+  assert.match(COMMAND_WRAPPER_SOURCE, /writeFileSync\(join\(dir, "exit\.tmp"\), String\(status\)\)/);
+  assert.ok(!/: code; record/.test(COMMAND_WRAPPER_SOURCE), "a raw status is never recorded (a negative one is no record)");
+});
+
+test("an exit record is one exit status: the whole DWORD, a negative text is not a record", async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  assert.equal(await readExitRecord(dir), undefined, "no record while the command runs");
+  for (const status of [0, 3, 255, 0xC0000005, 0xffffffff]) {
+    writeFileSync(join(dir, COMMAND_EXIT), `${status}\n`);
+    assert.equal((await readExitRecord(dir))?.status, status);
+  }
+  // What a wrapper never writes, and what a wrapper written by another program might: not a status of this attempt.
+  for (const text of ["-1073741819", "4294967296", "1e3", "0.5", "", "exit 3"]) {
+    writeFileSync(join(dir, COMMAND_EXIT), text);
+    assert.equal(await readExitRecord(dir), undefined, JSON.stringify(text));
+  }
 });
 
 test("the wrapper records the status of argv, string and builtin commands; output interleaves in output.log", { skip: unixOnly }, async t => {
@@ -214,6 +249,35 @@ test("Windows command wrapper: cmd strings, argv programs, missing programs and 
     assert.equal((await finished(dir)).status, status, JSON.stringify(command));
     assert.match(readFileSync(join(dir, "output.log"), "utf8"), output, JSON.stringify(command));
   }
+});
+
+test("a high-bit Windows status reaches the record and the caller as the same DWORD", { skip: windowsOnly, timeout: 120_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  // 0xC0000005 (an access violation): Node hands this status to the wrapper as a number whose bit pattern is that DWORD
+  // -- negative on the paths that report it as a signed int32 -- and it must reach the record, the owner's view of the
+  // wrapper's end and the caller's outcome as that one DWORD.
+  const spawned = await spawnCommand({ command: [process.execPath, "-e", "process.exit(0xC0000005)"], cwd: dir, dir, env: { ...process.env } });
+  assert.ok(spawned.pid > 0);
+  const record = await finished(dir);
+  assert.equal(record.status, 0xC0000005, "the record carries the whole DWORD, not a negative status");
+  assert.deepEqual(exitMeaning(record.status), { exitCode: 0xC0000005, signal: null }, "what the caller observes");
+  const keep = setInterval(() => {}, 1000);
+  try { await spawned.exited; } finally { clearInterval(keep); }
+  // The owner recorded the wrapper's own end from the kernel: the same DWORD, so the record and the attempt's outcome
+  // cannot disagree; the owner's end is the wrapper's status too (host-exit is normalized the same way).
+  assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0xC0000005);
+  assert.equal(JSON.parse(readFileSync(join(dir, JOB_HOST_EXIT), "utf8")).code, 0xC0000005);
+});
+
+test("a Windows start opens no log descriptor: a refused start leaves no output.log", { skip: windowsOnly, timeout: 60_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  // The attempt's log belongs to the group owner (it opens two append handles of its own), so this process opens none:
+  // nothing of the attempt's log exists when the start is refused before anything runs.
+  const launched = await spawnCommand({ command: [process.execPath, "-e", "process.exit(0)"], cwd: dir, dir, env: { ...process.env },
+    proceed: () => false });
+  assert.equal(launched, undefined, "the gate refused the start");
+  assert.ok(!existsSync(join(dir, COMMAND_LOG)), "no output.log: no descriptor was opened for one");
+  assert.ok(!existsSync(join(dir, COMMAND_EXIT)), "nothing ran");
 });
 
 // The wrapper Windows runs, exercised on a host that is not Windows: its argv branch is platform-neutral, and a POSIX

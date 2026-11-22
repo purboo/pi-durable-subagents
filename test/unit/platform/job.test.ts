@@ -16,8 +16,8 @@ import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   JOB_BEGIN, JOB_END, JOB_ERROR, JOB_GROUP, JOB_HOST_EXE, JOB_HOST_EXIT, JOB_HOST_LOG, JOB_HOST_MARKER, JOB_HOST_PREFIX,
-  JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, asciiJson, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
-  jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, spawnInJob, startError,
+  JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, asciiJson, compileJobHost, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
+  jobHostArgv, jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, spawnInJob, startError,
 } from "../../../src/platform/job.ts";
 import { winProcessRows } from "../../../src/platform/windows.ts";
 
@@ -116,6 +116,14 @@ test("the owner source is self-contained, ASCII, and carries the Win32 group con
   assert.match(JOB_HOST_SOURCE, /IndexOf\(\(char\)0\) >= 0\) throw new FormatException/);
   assert.ok(JOB_HOST_SOURCE.indexOf("a job spec field contains a NUL character") < JOB_HOST_SOURCE.indexOf("job = CreateJobObjectW"),
     "the NUL check precedes anything Win32 is handed");
+  // Every field is decoded to its exact UTF-16 code units: each byte pair becomes one char, so no decoder fallback can
+  // replace an unpaired surrogate; a field that is not a whole number of code units is refused instead of truncated.
+  assert.match(JOB_HOST_SOURCE, /char\[\] units = new char\[bytes\.Length \/ 2\];/);
+  assert.match(JOB_HOST_SOURCE, /if \(units\.Length > 0\) Buffer\.BlockCopy\(bytes, 0, units, 0, bytes\.Length\);/);
+  assert.ok(!/Encoding\.Unicode/.test(JOB_HOST_SOURCE), "no decoding fallback can replace a code unit");
+  assert.match(JOB_HOST_SOURCE, /if \(\(bytes\.Length & 1\) != 0\) throw new FormatException\("a job spec field is not a whole number of UTF-16 code units"\);/);
+  assert.ok(JOB_HOST_SOURCE.indexOf("bytes.Length & 1") < JOB_HOST_SOURCE.indexOf("a job spec field contains a NUL character"),
+    "the field shape is refused before anything is read out of it");
   // The wrapper's status is the full DWORD; 125/126 stay this host's own "nothing ran" codes.
   assert.match(JOB_HOST_SOURCE, /bool Run\(.*out uint status\)/);
   assert.match(JOB_HOST_SOURCE, /unchecked\(\(int\)status\)/);
@@ -297,6 +305,44 @@ test("a spec field with an embedded NUL is refused before Win32 sees it", { skip
   assert.match(readFileSync(join(dir, JOB_HOST_EXIT), "utf8"), /"code":125/, "a refused spec exits 125, the host's own code");
 });
 
+test("a spec field that is not a whole number of UTF-16 code units is refused before Win32 sees it", { skip: windowsOnly, timeout: 120_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const host = await compileJobHost(dir);
+  // jobSpecText writes one UTF-16 code unit per two bytes. A line that decodes to an odd number of bytes is not a string
+  // any Win32 API could receive, and a decoder that kept the even prefix would truncate the field without saying so: the
+  // owner refuses the spec instead, before it creates anything.
+  const lines = jobSpecText({ exe: process.execPath, args: ["-e", "0"], cwd: dir, log: join(dir, "output.log"),
+    env: { ...process.env } }).trimEnd().split("\n");
+  lines[3] = Buffer.from([0x41, 0x00, 0x42]).toString("base64"); // the log field: one code unit and a half
+  await writeFile(join(dir, JOB_SPEC), `${lines.join("\n")}\n`);
+  const code = await new Promise<number | null>((resolve, reject) => {
+    const run = spawn(host.exe, jobHostArgv(dir), { stdio: "ignore", windowsHide: true });
+    run.once("exit", resolve);
+    run.once("error", reject);
+  });
+  assert.equal(code, 125, "a refused spec is the host's own code, not a wrapper status");
+  assert.ok(existsSync(join(dir, JOB_BEGIN)), "the owner ran and refused the spec itself");
+  assert.match(readFileSync(join(dir, JOB_ERROR), "utf8"), /FormatException: a job spec field is not a whole number of UTF-16 code units/);
+  assert.ok(!existsSync(join(dir, JOB_GROUP)), "no group was created");
+  assert.ok(!existsSync(join(dir, JOB_END)), "no wrapper ran");
+});
+
+test("a spec field keeps an unpaired surrogate: the owner creates the path the code unit names", { skip: windowsOnly, timeout: 120_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const program = join(dir, "quiet.mjs");
+  writeFileSync(program, "process.exit(0);\n");
+  // A lone surrogate cannot be spelled through a Node path (UTF-8 has no code unit for it), so the check is which file
+  // the owner created for the log: the exact code unit, or the replacement a decoding fallback writes. existsSync spells
+  // the replacement, so it must find nothing although the log exists -- otherwise the surrogate was not preserved.
+  const launched = await spawnInJob(dir, { exe: process.execPath, args: [program], cwd: dir, log: join(dir, "out-\ud800.log"),
+    env: { ...process.env } });
+  assert.ok(launched, "a path with an unpaired surrogate is one Win32 accepts");
+  await launched.exited;
+  assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0, "the wrapper ran and ended");
+  assert.ok(!existsSync(join(dir, JOB_ERROR)), "nothing failed in this host");
+  assert.ok(!existsSync(join(dir, "out-\ufffd.log")), "the name on disk is the exact code unit, not its replacement");
+});
+
 test("a wrapper status above 0x7fffffff stays the wrapper's status", { skip: windowsOnly, timeout: 120_000 }, async t => {
   const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
   const program = join(dir, "wide.mjs");
@@ -309,8 +355,9 @@ test("a wrapper status above 0x7fffffff stays the wrapper's status", { skip: win
   assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, status, "the record carries the whole DWORD");
   assert.ok(!existsSync(join(dir, JOB_ERROR)), "nothing failed in this host");
   // The owner's own exit is the same DWORD: 125 would mean this host's failure and would be indistinguishable from it.
+  // Exit evidence is normalized like every recorded status (Node may report the same status as a signed int32).
   const code = (JSON.parse(readFileSync(join(dir, JOB_HOST_EXIT), "utf8")) as { code: number }).code;
-  assert.equal(code >>> 0, status, `the owner exits with the wrapper's status, got ${code}`);
+  assert.equal(code, status, `the owner exits with the wrapper's status, got ${code}`);
 });
 
 test("a program is in the group before it may act, and the group's crash takes its descendants with it", { skip: windowsOnly, timeout: 180_000 }, async t => {

@@ -453,7 +453,8 @@ subagents({ chain: [{ command: ["npm", "test"] }, { agent: "worker", task: "Fix 
 Other call fields (`agent`, `task`, `model`, `tools`, `schema`, `gate`, …)
 are refused in a command call, and `env`/`rerun` in an agent call. stdin is
 empty; stdout and stderr go, interleaved, to `output.log` in the attempt's
-directory. On Windows the wrapper is the root of a Job Object of its own: it
+directory (on Windows the group's host opens it, so no descriptor is held
+here). On Windows the wrapper is the root of a Job Object of its own: it
 is created suspended, assigned to the group before its first instruction, and
 the group's only handle dies with the attempt, so every process the command
 starts is in the group and cannot outlive it (a wrapper crash or a killed job
@@ -462,8 +463,13 @@ orchestrator stops). The group is held by a small .NET Framework winexe that
 this package compiles per launch -- in a fresh private directory -- with the
 C# compiler of the framework every supported Windows ships
 (`%SystemRoot%\Microsoft.NET\Framework64|Framework\v4.0.30319\csc.exe`, with
-the 32-bit framework as fallback). The compilation is foreground and bounded,
-starts no command, and is staged before the attempt's durable intent (its
+the 32-bit framework as fallback). That host receives the wrapper's program,
+arguments, working directory and environment as ASCII lines of base64 UTF-16LE
+and decodes every field to its exact code units, so a Unicode path, a curly
+quote, an emoji or an unpaired surrogate reaches Win32 unchanged; a field that
+is not a whole number of them, or that carries a NUL, is refused before
+anything is created. The compilation is foreground and bounded, starts no
+command, and is staged before the attempt's durable intent (its
 `command-intent` record), so a crash or a stop while the compiler runs leaves
 no attempt at all: that cut is unambiguously prelaunch, and an interrupted
 compilation is ended, what it wrote is removed and it is never recorded as a
@@ -504,8 +510,11 @@ Agent PATH is unchanged (the shim stays first).
 | vanished without an exit record, no `rerun` | `unknown`, error `Command ended without an exit record` |
 
 `data` is `{exitCode, signal, durationMs}` and `output` the last 16 KiB of
-`output.log`. Only `stop` controls a command call (it ends the whole process
-tree); `steer`, `follow-up`, `answer`, `model` and `notify` are refused with
+`output.log`. A Windows exit status is the whole 32-bit code: a crash such as
+`0xC0000005` reads `Command exited 3221225477`, and the record in the attempt
+directory and the wrapper's own exit carry that same DWORD. Only `stop`
+controls a command call (it ends the whole process tree); `steer`,
+`follow-up`, `answer`, `model` and `notify` are refused with
 `command call: <kind> is not supported (stop it, or start a new call)`.
 
 The deadline counts from the command's start, also while no orchestrator
