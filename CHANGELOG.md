@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A command start whose preparation was revoked (a stop, a suspension, a retirement or the orchestrator's exit) is
+  decided by that revocation and never sealed failed: the abort is what ended the preparation, so a rejection it produced
+  -- a publication cancelled on its way out, a compiler this process ended -- is not the attempt's own reason. A
+  preparation that fails on its own while the start is still permitted stays fail-closed, so a missing compiler or a
+  refused publish still seals the attempt failed with its reason.
 - A command start's preparation that is cancelled while the compiler's output is being published is a cancellation,
   never a compiler failure: the transient-rename retries end at once instead of running out the publish budget, a rename
   that was in flight when the start was revoked is not reported as its own cause, and the preparation removes what the

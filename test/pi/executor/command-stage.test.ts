@@ -27,8 +27,9 @@ const agent = { name: "", description: "", body: "", sourcePath: "", source: "pr
 
 /** A start's pre-intent preparation, held open: the journal can be read while it runs, and what cancels a real compilation
  *  (the start's `signal`) cancels it here too. `cancels: false` is a compilation that rides through the abort and finishes
- *  anyway, so only the check after it can refuse the intent. */
-function heldPrepare(options: { cancels?: boolean } = {}) {
+ *  anyway, so only the check after it can refuse the intent; `rejection` is what a cancelled preparation rejects with when
+ *  it is not the one the platform raises (a publication cancelled on its way out, say). */
+function heldPrepare(options: { cancels?: boolean; rejection?: Error } = {}) {
   const cancels = options.cancels ?? true;
   const state = { started: 0, released: 0, aborted: 0, finishes: [] as (() => void)[] };
   const prepare = async (spec: CommandSpawn): Promise<CommandPrep | undefined> => {
@@ -37,7 +38,7 @@ function heldPrepare(options: { cancels?: boolean } = {}) {
       const signal = spec.signal;
       const onAbort = () => {
         state.aborted += 1;
-        if (cancels) { state.released += 1; reject(new JobPrepareCancelled()); } // a cancelled compiler is removed by itself
+        if (cancels) { state.released += 1; reject(options.rejection ?? new JobPrepareCancelled()); } // a cancelled compiler is removed by itself
       };
       if (signal?.aborted) return onAbort();
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -132,6 +133,62 @@ test("a stop that arrives while the preparation's last step runs is honoured bef
   assert.equal(result.status, "stopped", JSON.stringify(result));
   assert.deepEqual(intents(f.journal), [], "no intent follows a stop decided before it");
   assert.equal(held.state.released, 1, "the completed stage is released (nothing started with it)");
+  await delay(300);
+  assert.equal(runs(marker), 0, "the command never acted");
+});
+
+test("a suspension during the preparation ends the run with nothing recorded and nothing sealed", { timeout: 60_000 }, async t => {
+  const held = heldPrepare();
+  const f = await setup(t, held.prepare);
+  const marker = join(f.cwd, "ran.log");
+  const call = f.ticket({ command: acting(marker), rerun: true });
+  const run = f.executor.run(call);
+  await until(() => held.state.started > 0, "the preparation to run");
+  // A drain suspends the start that has no intent yet: the compilation is cancelled and the call resumes on recovery.
+  await f.executor.suspend();
+  await assert.rejects(run, (error: Error) => error.name === "ExecutorShutdown");
+  const entries = f.journal.entries();
+  assert.deepEqual(intents(f.journal), [], "a suspended start records no intent");
+  assert.ok(!entries.some(e => e.type === "sealed"), "a suspension is not an outcome: nothing is sealed");
+  assert.ok(!entries.some(e => e.type === "command-started" || e.type === "command-spawn-failed"), "no process, no spawn failure");
+  assert.equal(held.state.aborted, 1, "the compilation was cancelled");
+  await delay(300);
+  assert.equal(runs(marker), 0, "the command never acted");
+});
+
+// The abort is what ended the preparation, so it decides the attempt: a rejection the cancellation produced (a publication
+// that was cancelled on its way out, say) is not the attempt's own reason and must never be sealed as one.
+test("a preparation abandoned by a suspension is never sealed failed, whatever it rejects with", { timeout: 60_000 }, async t => {
+  const held = heldPrepare({ rejection: new Error("the Windows .NET Framework compiler output could not be published as DsaJob.exe: EBUSY") });
+  const f = await setup(t, held.prepare);
+  const marker = join(f.cwd, "ran.log");
+  const run = f.executor.run(f.ticket({ command: acting(marker), rerun: true }));
+  await until(() => held.state.started > 0, "the preparation to run");
+  await f.executor.suspend();
+  await assert.rejects(run, (error: Error) => error.name === "ExecutorShutdown");
+  const entries = f.journal.entries();
+  assert.deepEqual(intents(f.journal), [], "no intent follows the abandoned preparation");
+  assert.ok(!entries.some(e => e.type === "sealed" || e.type === "command-spawn-failed"),
+    `a suspended preparation seals nothing: ${JSON.stringify(entries.filter(e => e.type === "sealed"))}`);
+  await delay(300);
+  assert.equal(runs(marker), 0, "the command never acted");
+});
+
+test("a stop that cancelled the preparation seals stopped, never failed for what the rejection says", { timeout: 60_000 }, async t => {
+  const held = heldPrepare({ rejection: new Error("rename of DsaJob.build.exe failed: EBUSY") });
+  const f = await setup(t, held.prepare);
+  const marker = join(f.cwd, "ran.log");
+  const call = f.ticket({ command: acting(marker) });
+  const run = f.executor.run(call);
+  await until(() => held.state.started > 0, "the preparation to run");
+  await f.executor.stop({ wid: f.wid, callId: call.callId });
+  const result = await run;
+  assert.equal(result.status, "stopped", JSON.stringify(result));
+  assert.doesNotMatch(String(result.error), /rename of DsaJob\.build\.exe/);
+  const entries = f.journal.entries();
+  assert.deepEqual(intents(f.journal), [], "a stopped start records no intent");
+  assert.ok(!entries.some(e => e.type === "command-spawn-failed"), "the cancelled preparation is not a spawn failure");
+  assert.equal(entries.filter(e => e.type === "sealed").length, 1, "one seal, stopped");
   await delay(300);
   assert.equal(runs(marker), 0, "the command never acted");
 });

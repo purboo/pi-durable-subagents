@@ -1240,7 +1240,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
      *  unambiguously prelaunch -- nothing started, nothing to adopt, nothing to rerun. The preparation is bounded and
      *  cancellable: a stop, retirement, suspension or exit during it ends the compiler, removes what it wrote and is never
      *  recorded as a failure of the attempt (a stop seals stopped; anything else ends the run and the call resumes on
-     *  recovery). A preparation that fails for its own reason is fail-closed, as the compilation always was. */
+     *  recovery). A preparation that fails for its own reason is fail-closed, as the compilation always was -- but only
+     *  while the start is still permitted: once the start was revoked (a stop, a suspension, a retirement or the exit
+     *  aborted it), the revocation decides the attempt and a rejection on the way out is never sealed failed. */
     const start = async (a: Active, id: string, dir: string): Promise<Start> => {
       const blocked = commandBlocked(a); if (blocked) return { blocked };
       let prepared: CommandPrep | undefined;
@@ -1248,16 +1250,18 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         prepared = await prepareStart({ command: t.spec.command!, cwd: t.cwd, dir, exec: id,
           env: commandEnvironment(home, id, call, t.spec.env), signal: a.controller.signal });
       } catch (error) {
-        if (!prepareCancelled(error)) return { failure: String(error instanceof Error ? error.message : error) };
+        // The revocation is the cause, so it decides the attempt: the rejection cannot be told apart from one the abort
+        // produced (a cancelled publication, a compiler this process ended), and sealing it failed would report a failure
+        // of an attempt the run is only suspending, retiring or stopping (or that a stop already decided).
+        if (!prepareCancelled(error) && !a.controller.signal.aborted) return { failure: String(error instanceof Error ? error.message : error) };
         // Interrupted, and nothing was recorded: a stop decides the attempt, anything else ends this run. Without a blocked
         // state the run is being torn down anyway (a suspension or a retirement), so it is never retried here.
-        const now = commandBlocked(a);
-        return { blocked: now === "stopped" ? "stopped" : "shutdown" };
+        return { blocked: commandBlocked(a) ?? "shutdown" };
       }
       // An abort that arrived while the last step of the preparation ran: nothing may follow it.
       if (a.controller.signal.aborted) {
         await prepared?.release().catch(() => {});
-        return { blocked: commandBlocked(a) === "stopped" ? "stopped" : "shutdown" };
+        return { blocked: commandBlocked(a) ?? "shutdown" };
       }
       return { ready: true, ...(prepared ? { prepared } : {}) };
     };
