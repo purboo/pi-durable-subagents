@@ -46,6 +46,21 @@ test("process table reports identity and CPU; direct spawn fences", { timeout: 2
   } finally { await c.fence(tag, []); }
 });
 
+test("Windows: the process table answers when the caller's environment holds no system variables", { timeout: 60_000, skip: process.platform === "win32" ? false : "the PowerShell/CIM helpers are Windows-only" }, async () => {
+  // Exactly what a chaos/drill/e2e fixture, the evaluator host or a service starter hands the orchestrator: PATH and
+  // HOME, but no SystemRoot, TEMP, USERPROFILE, ComSpec or PSModulePath. powershell.exe cannot autoload Get-CimInstance
+  // from an empty %SystemRoot%, so this scan used to fail or outlast the fence budget (Fence timeout at its full 15 s).
+  const saved = process.env;
+  try {
+    process.env = { PATH: saved.PATH ?? "", HOME: saved.HOME ?? "C:\\" } as NodeJS.ProcessEnv;
+    const started = Date.now();
+    const rows = await new ProcessTable().list(new Set(), { fresh: true });
+    const ms = Date.now() - started;
+    assert.ok(rows.some(row => row.pid === process.pid), "the scan reports this process");
+    assert.ok(ms < 10_000, `an isolated environment took ${ms} ms for one process-table scan`);
+  } finally { process.env = saved; }
+});
+
 test("setsid escaped descendant is fenced by tag after parent SIGKILL", { skip: process.platform !== "linux", timeout: 10000 }, async () => {
   const tag = randomUUID(); const c = new Containment(); const table = new ProcessTable();
   try {

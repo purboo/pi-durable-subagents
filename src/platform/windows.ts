@@ -3,6 +3,7 @@
 // process identity is (pid, creation time) and process trees replace the inherited DSA_EXEC tag.
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -10,7 +11,36 @@ const exec = promisify(execFile);
 export const IS_WINDOWS = process.platform === "win32";
 
 /** The Windows directory holding powershell.exe and taskkill.exe. */
-export function systemRoot(): string { return process.env.SystemRoot || process.env.windir || "C:\\Windows"; }
+export function systemRoot(env: NodeJS.ProcessEnv = process.env): string { return env.SystemRoot || env.windir || "C:\\Windows"; }
+
+/** The system variables a Windows helper resolves its own files, its temp directory and its module path from.
+ *  An orchestrator can be handed a deliberately isolated environment — a chaos/drill/e2e fixture, the evaluator host, a
+ *  service starter — that keeps PATH and HOME but drops these. `powershell.exe` then starts with an empty
+ *  `%SystemRoot%` (its default module path becomes a drive-relative `System32\WindowsPowerShell\v1.0\Modules`, so
+ *  `Get-CimInstance` cannot autoload) and no module analysis cache under `%LOCALAPPDATA%`, so the CIM scan of the
+ *  process table either fails or outlasts its deadline: on native Windows a fence then reports `Fence timeout` at its
+ *  full 15 s budget while the sweep reports the PowerShell failure. On a native Windows runner (Node 22.19, normal
+ *  environment) the unit test that captures one identity, scans the table and fences the child — five helper calls —
+ *  takes 2.9 s, so a call costs about 0.6 s there.
+ *  Present values are kept, so nothing of the caller's environment (HOME, PATH, credentials) is replaced, and only
+ *  missing system variables are derived from the operating system: a helper gains no variable the isolated caller did
+ *  not already have. */
+export function helperEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  // A derivation that fails must not take the helper down with it: a variable that stays unset is what it had before.
+  const attempt = (read: () => string, fallback: string) => { try { return read() || fallback; } catch { return fallback; } };
+  const root = systemRoot(base), temp = base.TEMP || base.TMP || attempt(tmpdir, join(root, "Temp"));
+  const home = base.USERPROFILE || attempt(homedir, join(root, "Users", "Default"));
+  const system32 = join(root, "System32");
+  return { ...base,
+    SystemRoot: root, windir: base.windir || root, SystemDrive: base.SystemDrive || root.slice(0, 2),
+    ComSpec: base.ComSpec || base.COMSPEC || join(system32, "cmd.exe"),
+    PATHEXT: base.PATHEXT || ".COM;.EXE;.BAT;.CMD",
+    PSModulePath: base.PSModulePath || join(system32, "WindowsPowerShell", "v1.0", "Modules"),
+    TEMP: temp, TMP: temp, USERPROFILE: home,
+    APPDATA: base.APPDATA || join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: base.LOCALAPPDATA || join(home, "AppData", "Local"),
+    ...(base.PATH ? {} : { PATH: [system32, root].join(";") }) };
+}
 
 /** Windows PowerShell 5.1 by its absolute path: every supported Windows has it. */
 export function powershellPath(): string {
@@ -31,7 +61,7 @@ const PS_FLAGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
 export async function powershell(script: string, options: { signal?: AbortSignal; timeout?: number } = {}): Promise<string> {
   try {
     const { stdout } = await exec(powershellPath(), [...PS_FLAGS, script],
-      { signal: options.signal, timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true });
+      { signal: options.signal, timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, env: helperEnv() });
     return stdout;
   } catch (error) {
     // A process that vanished while it was queried is not an error: the caller reads an empty answer.
@@ -40,7 +70,7 @@ export async function powershell(script: string, options: { signal?: AbortSignal
   }
 }
 export function powershellSync(script: string, options: { timeout?: number } = {}): string {
-  return execFileSync(powershellPath(), [...PS_FLAGS, script], { timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8" });
+  return execFileSync(powershellPath(), [...PS_FLAGS, script], { timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8", env: helperEnv() });
 }
 
 export interface WinProcessRow {
@@ -135,7 +165,7 @@ export async function killTree(pid: number, options: { force?: boolean; timeout?
   if (!Number.isInteger(pid) || pid <= 0) return;
   try {
     await exec(taskkillPath(), ["/PID", String(pid), "/T", ...(options.force === false ? [] : ["/F"])],
-      { timeout: options.timeout ?? 10_000, windowsHide: true });
+      { timeout: options.timeout ?? 10_000, windowsHide: true, env: helperEnv() });
   } catch (error) { if (!gone(error)) throw error; }
 }
 export function killTreeSync(pid: number, options: { force?: boolean } = {}): void {
@@ -143,6 +173,6 @@ export function killTreeSync(pid: number, options: { force?: boolean } = {}): vo
   if (!Number.isInteger(pid) || pid <= 0) return;
   try {
     execFileSync(taskkillPath(), ["/PID", String(pid), "/T", ...(options.force === false ? [] : ["/F"])],
-      { timeout: 10_000, windowsHide: true, stdio: "ignore" });
+      { timeout: 10_000, windowsHide: true, stdio: "ignore", env: helperEnv() });
   } catch (error) { if (!gone(error)) throw error; }
 }
