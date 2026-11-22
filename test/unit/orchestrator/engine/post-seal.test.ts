@@ -12,6 +12,7 @@ import createEffects from "../../../../src/orchestrator/executor/effects/index.t
 import { JT, type Request, type RunBody, type ReviseBody } from "../../../../src/types.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 import { git } from "../effects/helpers.ts";
+import { countWorktrees, listedWorktrees, localPath } from "../worktree-list.ts";
 
 for (const revised of [false, true]) test(`P32 finished workflow recovers post-seal cleanup from ${revised ? "historical" : "current"} pins exactly once`, async t => {
   const root = await mkdtemp(join(tmpdir(), "dsa-post-seal-")), cwd = join(root, "repo"), home = join(root, "state");
@@ -70,6 +71,6 @@ for (const revised of [false, true]) test(`P32 finished workflow recovers post-s
   };
   await recover(); await recover();
   assert.equal(after, 1);
-  assert.equal((await git(cwd, "worktree", "list", "--porcelain")).includes(prepared.cwd), false);
+  assert.equal(countWorktrees(await listedWorktrees(cwd), localPath(prepared.cwd, 3)), 0);
   assert.ok(await git(cwd, "rev-parse", `dsa/${wf.wid}/a`));
 });

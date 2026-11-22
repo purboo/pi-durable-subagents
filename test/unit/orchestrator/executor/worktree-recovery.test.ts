@@ -16,6 +16,7 @@ import { journalPath, orchLedger } from "../../../../src/paths.ts";
 import { JT, type CallResult, type Containment, type Entry, type ProcInfo } from "../../../../src/types.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 import createExecutor from "../../../../src/orchestrator/executor/index.ts";
+import { countWorktrees, listedWorktrees, localPath } from "../worktree-list.ts";
 
 const git = async (cwd: string, ...args: string[]) => (await promisify(execFile)("git", args, { cwd, timeout: 10000, env: { ...process.env, HOME: cwd, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } })).stdout.trim();
 /** No child ran here (the call is sealed): the fence finds nothing and the test never touches a real process. */
@@ -78,7 +79,7 @@ for (const moved of ["branch", "detached"] as const) test(`recovery keeps a move
   // Nothing was removed or moved to make the identities agree: the files, the worktree and its branch stay.
   assert.equal(await readFile(join(f.path, "keep.txt"), "utf8"), "a person's work\n");
   assert.equal(await git(f.repo, "rev-parse", f.branch), f.base);
-  assert.ok((await git(f.repo, "worktree", "list", "--porcelain")).includes(f.path));
+  assert.equal(countWorktrees(await listedWorktrees(f.repo), localPath(f.path, 3)), 1);
   // A later start recovers the same call again: no new note, no new keep, the same result.
   const second = await f.recover();
   assert.deepEqual(second.result, f.result);

@@ -3,14 +3,14 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { publishFile } from "../../../kernel/mailbox.ts";
 import { contentHash } from "../../../kernel/ids.ts";
 import { JT, isEntry, type Entry } from "../../../types.ts";
 import type { CallTicket } from "../../contract.ts";
 import { forkEntry } from "../../origin.ts";
+import { checkKey, inside, keyBranch, keyDir, sameWorktree } from "./worktree-path.ts";
 
 const exec = promisify(execFile);
 const git = async (cwd: string, ...args: string[]) => (await exec("git", args, { cwd, timeout: 30000, maxBuffer: 4 * 1024 * 1024 })).stdout.trim();
@@ -22,28 +22,8 @@ export async function attention(t: CallTicket, kind: string, text: string): Prom
   if (!t.journal.entries().some(e => isEntry(e, JT.attention) && e.item?.id === id))
     await t.journal.append(JT.attention, { item: { id, rev: 1, kind: "unknown", text, wid: t.wid, call: t.callId } });
 }
-/** The native form of a path (`C:\x` on Windows), for a path that exists.
- *  Git lists worktrees by real path, and on Windows by its long form (macOS: /var is /private/var), so a recorded path
- *  compares to a listed one only after this: a short 8.3 spelling (`C:\Users\RUNNER~1\...`) and the long path it names
- *  are one directory, and spellings differing only in case are one directory there too. The nearest real ancestor is
- *  extended by the rest, so a path inside a worktree that does not exist yet still compares. */
-function nativePath(path: string): string {
-  let dir = path, rest = "";
-  for (;;) {
-    try { return join(realpathSync.native(dir), rest); }
-    catch { const up = dirname(dir); if (up === dir) return path; rest = join(basename(dir), rest); dir = up; }
-  }
-}
-/** Two spellings of one path on Windows: case-insensitive, and `\\?\` is the long form of a drive path (`\\?\C:\`, where
- *  `.`/`..` cannot appear, so a leading one is dropped). Elsewhere a path means exactly what it spells. */
-function samePath(a: string, b: string): boolean {
-  if (process.platform !== "win32") return a === b;
-  const normalize = (path: string) => path.replace(/^\\\\\?\\/, "").replace(/(?<=[^\\])\/(?=[^/])/g, "\\");
-  return normalize(a).toLowerCase() === normalize(b).toLowerCase();
-}
 async function worktree(cwd: string, path: string) {
-  const want = nativePath(path);
-  return (await worktrees(cwd)).find(w => w.worktree && samePath(nativePath(w.worktree), want));
+  return (await worktrees(cwd)).find(w => w.worktree && sameWorktree(w.worktree, path));
 }
 async function worktrees(cwd: string) {
   const text = await git(cwd, "worktree", "list", "--porcelain", "-z");
@@ -76,29 +56,30 @@ function repairAdvice(path: string, branch: string, kept: boolean): string {
     : `${inspect}. The call failed and the path, its files and its branches were left untouched: restore the path on ${branch}, ` +
       `or remove that worktree once its changes are preserved, and run the call again`;
 }
-/** P32: Commit creation intent and reconcile Git's worktree registry and branch identity. */
+/** P32: Commit creation intent and reconcile Git's worktree registry and branch identity. The returned cwd is always the
+ *  intent's spelling (the same string on every replay), so the call, its gate, its cleanup and every message name one
+ *  path; the registry is matched by the identity the file system gives a path (see `sameWorktree`). */
 export async function prepareWorktree(t: CallTicket): Promise<string> {
   if (t.spec.isolation !== "worktree") return t.cwd;
+  const root = resolve(t.cwd, ".dsa", t.wid);
   let intent = records(t, "wt-intent")[0];
   if (!intent) {
-    const root = resolve(t.cwd, ".dsa", t.wid), path = resolve(root, t.key);
-    // Colon keys could never create a branch in the original namespace. Give them their own namespace so
-    // existing literal keys (including percent-encoded spellings) retain their branches across upgrades.
-    const branch = t.key.includes(":")
-      ? `dsa-colon/${t.wid}/${contentHash(t.key)}`
-      : `dsa/${t.wid}/${t.key}`;
-    if (t.key.split("/").some(part => !part || part === "." || part === "..")) throw new Error("Invalid worktree key");
-    // A path must stay inside its workflow's directory: `..`, and an absolute or drive-qualified key, which `resolve`
-    // lets replace the root itself (`C:\x` on Windows). A nested key stays a nested path, as it always was.
-    const within = relative(root, path);
-    if (!within || within === ".." || within.startsWith(`..${sep}`) || resolve(root, within) !== path) throw new Error("Invalid worktree key");
+    // The key is an opaque name inside the workflow's directory, and a key Win32 cannot spell (a colon, a reserved device
+    // name, a trailing dot) is encoded instead of resolved, so it cannot replace the root or land outside it. Existing
+    // literal keys keep their paths and branches; `:` keys kept the hashed branch namespace they already had.
+    checkKey(t.key);
+    const path = resolve(root, keyDir(t.key)), branch = keyBranch(t.wid, t.key);
+    if (!inside(root, path)) throw new Error("Invalid worktree key");
     await git(t.cwd, "check-ref-format", "--branch", branch);
     const base = await git(t.cwd, "rev-parse", "HEAD");
-    const earlier = t.journal.entries().some(e => e.type === "wt-intent" && e.path === path && e.branch === branch);
+    const earlier = t.journal.entries().some(e => e.type === "wt-intent" && e.branch === branch && sameWorktree(String(e.path), path));
     if (!earlier && await branchHead(t.cwd, branch)) throw new Error(`Worktree branch already exists: ${branch}`);
     intent = await t.journal.append("wt-intent", { call: t.callId, path, branch, base });
   }
   const { path, branch, base } = intent as Entry & { path: string; branch: string; base: string };
+  // A journal from before the key rules could hold a path outside the workflow (an absolute key replaced the root then):
+  // it must not reach Git, so nothing is created, inspected, moved or removed there.
+  if (!inside(root, path)) throw new Error("Invalid worktree key");
   if (records(t, "wt-removed").length) return path;
   const tree = (await worktree(t.cwd, path)), head = await branchHead(t.cwd, branch);
   if (tree) {
@@ -114,23 +95,11 @@ export async function prepareWorktree(t: CallTicket): Promise<string> {
     } else await git(t.cwd, "worktree", "add", "-b", branch, path, base);
   }
   if (!records(t, "wt-created").length) await t.journal.append("wt-created", { call: t.callId });
-  // Git keys its worktree registry (`.git/worktrees/<id>`, and the `.git` file at the path) by the real path it listed,
-  // under Git's own case. A recorded path in another case, or through an 8.3 alias, would name a worktree Git then
-  // could not find: the call would see no worktree, create another, and be told its own directory already exists.
-  // Record the listed spelling, so this journal and Git agree on one identity (a later checkout of an old intent still
-  // resolves: the lookup above compares forms).
-  const listed = (await worktree(t.cwd, path))?.worktree;
-  if (listed && listed !== path) {
-    await t.journal.append("wt-path", { call: t.callId, path: listed });
-    return listed;
-  }
   return path;
 }
-/** The path of a call's worktree as recorded (`wt-path` after Git listed it, else the `wt-intent`), for a caller that
- *  tells a person where the call ran or reports on the directory: the same identity Git registers. */
+/** The path the journal recorded for a call's worktree (the `wt-intent` spelling, which the call returns and every message
+ *  names), for the gate or a person asking where it ran; `undefined` when the call records no worktree. */
 export function worktreePath(journal: { entries: () => readonly Entry[] }, call: string): string | undefined {
-  const listed = journal.entries().find(e => e.type === "wt-path" && e.call === call);
-  if (listed) return String(listed.path);
   const intent = journal.entries().find(e => e.type === "wt-intent" && e.call === call);
   return intent ? String(intent.path) : undefined;
 }
@@ -138,8 +107,15 @@ export function worktreePath(journal: { entries: () => readonly Entry[] }, call:
 export async function cleanWorktree(t: CallTicket): Promise<void> {
   const intent = records(t, "wt-intent")[0];
   if (!intent || records(t, "wt-removed").length || records(t, "wt-kept").length) return;
-  // The path as Git listed it when it was created, or as the intent recorded it for a journal from before that.
-  const path = String(records(t, "wt-path")[0]?.path ?? intent.path), tree = (await worktree(t.cwd, path));
+  const path = String(intent.path), root = resolve(t.cwd, ".dsa", t.wid);
+  // A journal from before the key rules could hold a path outside the workflow: Git is never asked about it, nothing is
+  // created or removed there, and the keep is recorded with one note so the cleanup does not retry on every start.
+  if (!inside(root, path)) {
+    await attention(t, "worktree-outside", `Worktree path outside its workflow: ${t.callId} (workflow ${t.wid}) records ` +
+      `${path}, which is not inside ${root}. Nothing was created, removed or moved, and this call's sealed result is unchanged`);
+    await t.journal.append("wt-kept", { call: t.callId }); return;
+  }
+  const tree = (await worktree(t.cwd, path));
   if (!tree) {
     if (records(t, "wt-remove-intent").length) await t.journal.append("wt-removed", { call: t.callId });
     return;

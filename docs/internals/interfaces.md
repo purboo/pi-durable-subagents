@@ -845,6 +845,20 @@ header comment.
   1. Commit `wt-intent{call, path, branch, base}`. The path is
      `<cwd>/.dsa/<wid>/<key>`, the branch is `dsa/<wid>/<key>`, and the base
      is `git rev-parse HEAD` in the call cwd at first prepare (recorded).
+
+  A key is an opaque name inside the workflow's directory, never a path: a
+  path-like key (`\\` separator, `..`/`.`/empty part, absolute,
+  drive-qualified or UNC) is refused on every platform before any Git call.
+  A key Win32 cannot spell (`tasks:0`, `a:0`, `CON`, a trailing dot) uses
+  `<cwd>/.dsa/<wid>/.keys/<hash>`, a namespace no literal key may name (also
+  where the file system ignores case), and the hashed branch namespace
+  (`dsa-colon/<wid>/<hash>`, as colon keys always had); POSIX keys keep their
+  literal path and branch. Reconcile with `git worktree list --porcelain` by
+  the identity the file system gives each path (8.3 short name, case, either
+  separator, `\\?\`/`\\?\UNC\` prefixes, symlinks), while the recorded path is
+  what prepare returns and what a message names. An intent recorded outside
+  the workflow is refused at preparation and never created, inspected or
+  removed.
   2. `git worktree add -b <branch> <path> <base>`.
   3. Commit `wt-created{call}`.
 

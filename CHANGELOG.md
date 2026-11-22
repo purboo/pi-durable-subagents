@@ -22,12 +22,16 @@
   ends the packaged run with its whole process tree; `ci-test.mjs` ends a timed-out run the same way and reads failing
   test files with either separator; `check-imports.mjs` resolves the repository from its own location, not the working
   directory.
-- Worktree identity on Windows: a call's path and the path Git lists are compared as Windows compares them (case,
-  `\\?\` prefix, `/` separators), and after creating a worktree the path Git listed is recorded (`wt-path`), so a
-  recorded short (8.3) or differently-cased path no longer names a second worktree, fails creation because its own
-  directory is in the way, or runs the gate and the cleanup in a directory Git does not know. Elsewhere the comparison
-  is unchanged (exact spelling, through each path's real form). A worktree key must also stay inside its workflow's
-  directory: an absolute or drive-qualified key no longer escapes `.dsa/<workflow>` on Windows.
+- Worktree keys and identity on Windows: a key is an opaque name inside its workflow's directory. A path-like key
+  (a `\` separator, `..`/`.`/empty part, an absolute, drive-qualified or UNC spelling) is refused on every platform
+  before any Git call, so no key can leave `.dsa/<workflow>` — including across drives. A key Win32 cannot spell
+  (`tasks:0`, `a:0`, `CON`, a trailing dot) is encoded on Windows into `.dsa/<wid>/.keys/<hash>` with a hashed branch;
+  that namespace is disjoint from every literal spelling, even where the file system ignores case, and POSIX keeps every
+  literal path and branch name as it was. A recorded path is compared with the path Git lists by the identity the file
+  system gives it (8.3 short name, case, `/` separators, `\\?\`/`\\?\UNC\` prefixes, a symlinked directory), while the
+  path the intent recorded is what the call returns and what every message names, so one worktree is never created twice
+  and the cleanup and the gate use the directory Git registered. An intent recorded by an earlier version outside its
+  workflow is refused at preparation and never created, inspected or removed.
 
 ## 1.5.1
 

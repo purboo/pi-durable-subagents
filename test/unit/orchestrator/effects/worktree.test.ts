@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { access, writeFile, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, writeFile, readFile, symlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { fixture, git, crash } from "./helpers.ts";
+import { countWorktrees, listedWorktrees, localPath } from "../worktree-list.ts";
 
 for (const window of ["normal", "intent", "branch", "effect", "created"]) test(`worktree creation reconciles ${window}`, async ctx => {
   const f = await fixture(ctx); f.t.spec.isolation = "worktree";
@@ -88,7 +89,7 @@ for (const moved of ["branch", "detached"] as const) test(`a sealed call keeps a
   // Nothing was removed or moved to make the identities agree, and the call's result is unchanged.
   assert.equal(await readFile(join(cwd, "keep"), "utf8"), "someone's work");
   assert.equal(await git(f.cwd, "rev-parse", `dsa/${f.t.wid}/task`), base);
-  assert.ok((await git(f.cwd, "worktree", "list", "--porcelain")).includes(cwd));
+  assert.equal(countWorktrees(await listedWorktrees(f.cwd), localPath(cwd, 3)), 1);
   assert.deepEqual(f.result, { key: "task", gen: 1, status: "ok", ok: true, output: "complete\n" });
 });
 test("a worktree that cannot be inspected still fails the cleanup: unrelated Git errors are not swallowed", async ctx => {
@@ -108,90 +109,136 @@ test("non-git cwd and foreign branches refuse isolation", async ctx => {
   await git(f.cwd, "branch", `dsa/${f.t.wid}/task`);
   await assert.rejects(f.effects().prepare(f.t, { sessionPath: f.sessionPath }), /already exists/);
 });
-test("colon fan-out keys and their literal spellings use distinct worktrees and branches", async ctx => {
+/** A directory link to `target`: a junction on Windows (no privilege needed) and a symbolic link elsewhere. It names one
+ *  directory under a second spelling, which is what an 8.3 alias, another case or a symlinked `/var` does on a real
+ *  machine: the call's recorded path and the path Git lists then differ while naming one worktree. */
+async function linkDirectory(target: string, path: string) {
+  await symlink(target, path, process.platform === "win32" ? "junction" : "dir");
+}
+
+test("colon keys and other names Win32 cannot spell use their own worktrees and branches", async ctx => {
   const f = await fixture(ctx); f.t.spec.isolation = "worktree";
   await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
-  const branches = new Set<string>();
-  for (const key of ["tasks:0", "tasks-0", "tasks%3A0", "chain:0"]) {
+  const base = await git(f.cwd, "rev-parse", "HEAD"), root = join(f.cwd, ".dsa", f.t.wid), branches = new Set<string>(), paths = new Set<string>();
+  for (const key of ["tasks:0", "tasks-0", "tasks%3A0", "chain:0", "CON"]) {
     const t = { ...f.t, key, callId: `${f.t.wid}@1/${key}@1` };
     const prepared = await f.effects().prepare(t, { sessionPath: f.sessionPath });
-    assert.equal(prepared.cwd, join(f.cwd, ".dsa", f.t.wid, key));
+    // POSIX keeps every key's literal path, so its journals and branches are unchanged. Win32 cannot create a colon or a
+    // reserved device name, so there the key lives in the encoded namespace under the workflow.
+    const encoded = process.platform === "win32" && (key.includes(":") || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i.test(key));
+    assert.equal(prepared.cwd, encoded ? join(root, ".keys", basename(prepared.cwd)) : join(root, key), key);
+    if (encoded) assert.match(basename(prepared.cwd), /^[0-9a-f]{64}$/, `${key}: the key's hash names its directory`);
+    assert.equal(await git(prepared.cwd, "rev-parse", "HEAD"), base, `${key}: its own worktree exists`);
+    assert.equal(countWorktrees(await listedWorktrees(f.cwd), localPath(prepared.cwd, 3)), 1, `${key}: one registration`);
+    assert.ok(!paths.has(prepared.cwd), `${key}: not a path another key uses`); paths.add(prepared.cwd);
     const branch = await git(prepared.cwd, "symbolic-ref", "--short", "HEAD");
-    if (!key.includes(":")) assert.equal(branch, `dsa/${f.t.wid}/${key}`);
-    assert.ok(!branches.has(branch)); branches.add(branch);
+    if (encoded || key.includes(":")) assert.ok(branch.startsWith(`dsa-colon/${f.t.wid}/`) && branch !== `dsa/${f.t.wid}/${key}`,
+      `${key}: a key no ref can spell uses the hashed namespace, never a literal branch`);
+    else assert.equal(branch, `dsa/${f.t.wid}/${key}`, `${key}: a literal key keeps its branch`);
+    assert.ok(!branches.has(branch), `${key}: not a branch another key uses`); branches.add(branch);
   }
+  assert.equal(paths.size, 5); assert.equal(branches.size, 5);
 });
 
-/** Another spelling of one absolute path: the first letter after a separator, other case. Git holds a drive letter and
- *  directory names in one form, while a Windows path may carry another; on a case-sensitive file system the other
- *  spelling is a different directory, and the test says so. */
-function recase(path: string): string {
-  return path.replace(/(^|[\\/])([^\\/])/, (_all, lead: string, first: string) =>
-    lead + (first === first.toUpperCase() ? first.toLowerCase() : first.toUpperCase()));
-}
-/** A journal whose call already has an intent for another spelling of its worktree, committed before the creation
- *  intent a real earlier attempt would have written (entries are in append order, oldest first). */
-async function earlierIntent(f: Awaited<ReturnType<typeof fixture>>, entry: { path: string; branch: string; base: string }) {
-  await f.journal.append("wt-intent", { call: f.t.callId, ...entry });
-  const entries = f.journal.entries(), intent = entries.findLast(e => e.type === "wt-intent" && e.call === f.t.callId)!;
-  // Reordered only in what a reader sees; a later append still goes to the real journal.
-  return { ...f.journal, entries: () => [intent, ...entries.filter(e => e !== intent)] };
-}
-
-/** Whether the file system ignores case, which is where two spellings of one path matter (Windows; macOS usually). */
-async function caseInsensitive(path: string): Promise<boolean> {
-  try { await access(recase(path)); return true; } catch { return false; }
-}
-
-test("a case-only spelling of a created worktree is the same worktree, not a second one", async ctx => {
+test("a key Win32 cannot spell is encoded inside the workflow; elsewhere Git's ref rules still apply", async ctx => {
   const f = await fixture(ctx); f.t.spec.isolation = "worktree";
   await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
-  if (!await caseInsensitive(f.cwd)) return; // a case-sensitive file system: the other spelling names no directory
-  const base = await git(f.cwd, "rev-parse", "HEAD"), path = join(f.cwd, ".dsa", f.t.wid, "task");
-  // The earlier intent was written for the other spelling, as a Windows path may carry it; Git registered the first.
-  const journal = await earlierIntent(f, { path: path.replace(/([\\/])task$/, "$1Task"), branch: `dsa/${f.t.wid}/task`, base });
-  const prepared = await f.effects().prepare({ ...f.t, journal }, { sessionPath: f.sessionPath });
-  // Git registers the worktree once; a lookup that missed it would create a second under the other spelling, or fail
-  // because its own directory is in the way.
-  assert.equal(prepared.cwd, path);
-  assert.equal(await git(prepared.cwd, "rev-parse", "HEAD"), base);
-  assert.equal((await git(f.cwd, "worktree", "list", "--porcelain")).split("\n").filter(line => line === `worktree ${path}`).length, 1);
-  if (process.platform === "win32") {
-    // The identity Git keys its registry by is recorded, so the cleanup and every recovery find the same working directory.
-    const recorded = f.journal.entries().filter(e => e.type === "wt-path" && e.call === f.t.callId);
-    assert.equal(recorded.length, 1);
-    assert.equal(String(recorded[0]!.path), path);
+  const root = join(f.cwd, ".dsa", f.t.wid);
+  for (const key of ["x.", "a*b"]) {
+    const t = { ...f.t, key, callId: `${f.t.wid}@1/${key}@1` };
+    if (process.platform === "win32") {
+      // Win32 drops a trailing dot and forbids `*`: the worktree is created in the encoded namespace instead.
+      const prepared = await f.effects().prepare(t, { sessionPath: f.sessionPath });
+      assert.equal(dirname(prepared.cwd), join(root, ".keys"), key);
+      assert.match(basename(prepared.cwd), /^[0-9a-f]{64}$/, key);
+    } else {
+      // Unchanged elsewhere: the literal path is possible, and the literal branch a ref cannot spell still fails.
+      await assert.rejects(f.effects().prepare(t, { sessionPath: f.sessionPath }), /check-ref-format/, key);
+      assert.equal(f.journal.entries().some(e => e.type === "wt-intent"), false, `${key}: no intent was recorded`);
+    }
   }
 });
 
-test("a key that would leave its workflow's directory is refused", async ctx => {
+test("a worktree recorded through another spelling is one worktree: not created twice, and cleaned through it", async ctx => {
+  const f = await fixture(ctx); f.t.spec.isolation = "worktree";
+  await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
+  const base = await git(f.cwd, "rev-parse", "HEAD"), via = join(f.root, "via"), suffix = `.dsa/${f.t.wid}/task`;
+  await linkDirectory(f.cwd, via);
+  // The call runs in the linked spelling, so its intent records that spelling while Git lists the directory it names.
+  const ticket = { ...f.t, cwd: via };
+  const prepared = await f.effects().prepare(ticket, { sessionPath: f.sessionPath });
+  assert.equal(prepared.cwd, join(via, ".dsa", f.t.wid, "task"), "the call gets the spelling its journal records");
+  assert.equal(await git(prepared.cwd, "rev-parse", "HEAD"), base);
+  // One worktree is registered, not a second one under the listed spelling (which would fail on its own directory).
+  assert.equal(countWorktrees(await listedWorktrees(f.cwd), suffix), 1);
+  // The fixture is not a no-op: Git names the directory by the path it resolves, not by the recorded alias.
+  assert.ok((await listedWorktrees(f.cwd)).every(path => path !== prepared.cwd), "Git lists another spelling of the path");
+  // A repeat prepares the same path and appends nothing: the identity is reconciled, not recorded again.
+  const recorded = f.journal.entries().length;
+  assert.deepEqual(await f.effects().prepare(ticket, { sessionPath: f.sessionPath }), prepared);
+  assert.equal(f.journal.entries().length, recorded);
+  // The cleanup removes that worktree through the recorded spelling and keeps its branch.
+  await f.effects().afterSeal(ticket, f.result);
+  await assert.rejects(access(prepared.cwd));
+  assert.equal(countWorktrees(await listedWorktrees(f.cwd), suffix), 0);
+  assert.equal(await git(f.cwd, "rev-parse", `dsa/${f.t.wid}/task`), base);
+});
+
+test("a moved worktree is named by the recorded spelling even where Git lists another", async ctx => {
+  const f = await fixture(ctx); f.t.spec.isolation = "worktree";
+  await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
+  const via = join(f.root, "via");
+  await linkDirectory(f.cwd, via);
+  const ticket = { ...f.t, cwd: via }, branch = `dsa/${f.t.wid}/task`;
+  const prepared = await f.effects().prepare(ticket, { sessionPath: f.sessionPath });
+  // The person moved the worktree to a detached HEAD. Preparation recognises the conflict through the other spelling and
+  // fails this call only, naming the path the journal records, so the message and the path agree.
+  await git(prepared.cwd, "checkout", "--detach");
+  await assert.rejects(f.effects().prepare(ticket, { sessionPath: f.sessionPath }), (error: Error) => {
+    const message = String(error);
+    return /Worktree identity conflict/.test(message) && message.includes(prepared.cwd) &&
+      message.includes("a detached HEAD") && message.includes(branch);
+  }, "the failure names the recorded path, not the listed one");
+  assert.equal(countWorktrees(await listedWorktrees(f.cwd), localPath(prepared.cwd, 3)), 1, "nothing was re-created");
+});
+
+test("a key that would leave its workflow's directory is refused, and nothing is recorded", async ctx => {
   const f = await fixture(ctx); f.t.spec.isolation = "worktree";
   await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
   const root = join(f.cwd, ".dsa", f.t.wid);
   // A nested key stays a nested path, as it always was.
   assert.equal((await f.effects().prepare({ ...f.t, key: "tasks/nested", callId: `${f.t.wid}@1/tasks/nested@1` }, { sessionPath: f.sessionPath })).cwd,
     join(root, "tasks", "nested"));
-  // `..` and an absolute or drive-qualified key, which `resolve` lets replace the root itself, name no worktree of this call.
-  for (const key of ["..", "a/../../b", f.cwd, join(f.cwd, "outside"), ...(process.platform === "win32" ? ["C:\\outside"] : [])]) {
+  // Traversal, a Win32 separator, an absolute path, a drive-qualified or UNC spelling: none is a name inside the workflow.
+  // The Win32 forms are refused on every platform, so a POSIX run pins the same rule the Windows run applies.
+  const keys = ["..", "a/../../b", "a/./b", "a\\b", "\\outside", f.cwd, join(f.cwd, "outside"), "C:\\outside", "C:/outside", "//server/share/x", "\\\\server\\share\\x"];
+  for (const key of keys) {
     const t = { ...f.t, key, callId: `${f.t.wid}@1/${key}@1` };
     await assert.rejects(f.effects().prepare(t, { sessionPath: f.sessionPath }), /Invalid worktree key/, key);
     assert.equal(f.journal.entries().some(e => e.type === "wt-intent" && e.call === t.callId), false, `${key}: no intent was recorded`);
   }
+  await assert.rejects(access(join(f.cwd, "outside")));
   assert.equal((await f.effects().prepare(f.t, { sessionPath: f.sessionPath })).cwd, join(root, "task"), "its own call still prepares");
 });
 
-test("a moved worktree is named through another spelling of its path instead of being re-created", async ctx => {
+test("an old intent outside its workflow creates nothing and is kept, never removed", async ctx => {
   const f = await fixture(ctx); f.t.spec.isolation = "worktree";
   await git(f.cwd, "init"); await git(f.cwd, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base");
-  const prepared = await f.effects().prepare(f.t, { sessionPath: f.sessionPath }), branch = `dsa/${f.t.wid}/task`;
-  // Someone moved the worktree to a detached HEAD: the conflict is recognised through the other spelling of the same
-  // directory too, so the call fails naming both identities instead of creating a second worktree under it.
-  await git(prepared.cwd, "checkout", "--detach");
-  const moved = await git(f.cwd, "worktree", "list", "--porcelain"), head = /HEAD ([0-9a-f]+)/.exec(moved.slice(moved.indexOf(`worktree ${prepared.cwd}`)))![1]!;
-  if (!await caseInsensitive(prepared.cwd)) return; // a case-sensitive file system: the other spelling names no directory
-  const journal = await earlierIntent(f, { path: recase(prepared.cwd.replace(/task$/, "Task")), branch, base: head });
-  await assert.rejects(f.effects().prepare({ ...f.t, journal }, { sessionPath: f.sessionPath }), error => {
-    const message = String(error);
-    return /Worktree identity conflict/.test(message) && message.includes(prepared.cwd) && message.includes("a detached HEAD") && message.includes(branch);
-  });
+  // A journal from a version that let an absolute key replace the root: its intent names a directory outside the workflow.
+  const outside = join(f.root, "outside");
+  await writeFile(outside, "not a worktree");
+  await f.journal.append("wt-intent", { call: f.t.callId, path: outside, branch: `dsa/${f.t.wid}/task`, base: "0".repeat(40) });
+  // Preparation refuses before any Git call (the cwd is not a repository either) and records nothing new.
+  const recorded = f.journal.entries().length;
+  await assert.rejects(f.effects().prepare(f.t, { sessionPath: f.sessionPath }), /Invalid worktree key/);
+  assert.equal(f.journal.entries().length, recorded);
+  // The cleanup does not inspect or remove it: the keep is recorded once with one note naming the recorded path.
+  await f.journal.append("wt-created", { call: f.t.callId });
+  await f.effects().afterSeal(f.t, f.result); await f.effects().afterSeal(f.t, f.result);
+  const notes = f.journal.entries().filter(e => e.type === "attention");
+  assert.equal(notes.length, 1);
+  assert.match(String((notes[0] as unknown as { item: { text: string } }).item.text), new RegExp("not inside"));
+  assert.equal(f.journal.entries().filter(e => e.type === "wt-kept" && e.call === f.t.callId).length, 1);
+  assert.equal(f.journal.entries().filter(e => e.type === "wt-removed").length, 0);
+  assert.equal(await readFile(outside, "utf8"), "not a worktree");
 });

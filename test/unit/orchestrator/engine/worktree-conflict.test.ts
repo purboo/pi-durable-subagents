@@ -23,6 +23,7 @@ import { pendingRecovery, unresolvedAttention, workflowDigest } from "../../../.
 import { worktreeConflictId } from "../../../../src/orchestrator/executor/worktree.ts";
 import createExecutor from "../../../../src/orchestrator/executor/index.ts";
 import createEffects from "../../../../src/orchestrator/executor/effects/index.ts";
+import { countWorktrees, listedWorktrees, localPath } from "../worktree-list.ts";
 
 /** Poll a condition of a running orchestrator; the engine dispatches on its own serial queue. */
 async function until<T>(fn: () => T | Promise<T>, what = "condition", ms = 15_000): Promise<NonNullable<T>> {
@@ -181,7 +182,7 @@ for (const { how, when } of SCENARIOS) test(`a moved worktree of an ok isolated 
     assert.deepEqual((await git(wt.path, "status", "--porcelain", "--untracked-files=all")).split("\n").filter(Boolean), ["?? work.txt"]);
     assert.equal(await git(f.project, "rev-parse", wt.branch), wt.base, "the expected branch still points at its base");
     assert.equal(await git(wt.path, "rev-parse", "--abbrev-ref", "HEAD").catch(() => ""), how === "branch" ? "moved" : "HEAD", "the path keeps the identity the person gave it");
-    assert.ok((await git(f.project, "worktree", "list", "--porcelain")).includes(wt.path), "the worktree is still registered");
+    assert.equal(countWorktrees(await listedWorktrees(f.project), localPath(wt.path, 3)), 1, "the worktree is still registered");
     // The open diagnostic is not recovery work due, so the digest still settles and keeps listing it for whoever asks.
     assert.equal(pendingRecovery(wid, log), false, `round ${round}: an open diagnostic is not recovery work due`);
     const digest = workflowDigest(b.home, wid);
