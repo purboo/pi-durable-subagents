@@ -12,8 +12,9 @@
 // pi or its interpreter missing or not executable); the call stays queued and launches again after a backoff.
 // Command calls (CallSpec.command) record no exec/tracked/fenced entries (nothing that handles agent executions picks them
 // up): command-intent{call,id,n} before the spawn (id = command:<call>#<n> is the attempt and its process tag DSA_EXEC;
-// n is 1, or 2 for the single rerun); command-started{call,id,pid,start,dir} after it (the wrapper's identity, the
-// attempt directory; its ts starts the wall-clock timeout); command-spawn-failed{call,id,error}: the command could not
+// n is 1, or 2 for the single rerun); command-started{call,id,pid,start,dir,group?} after it (the wrapper's identity, the
+// attempt directory, and on Windows {pid,start} of the job helper that owns the attempt's kernel group; its ts starts the
+// wall-clock timeout); command-spawn-failed{call,id,error}: the command could not
 // start (it seals failed, never reruns); command-timeout{call,id}: the deadline passed, recorded before the process tree
 // is ended (as stop-intent is for a stop), so a crash during that fence still seals timeout; command-withdrawn{call,id}:
 // the intent was recorded but no process started (a retirement or the orchestrator's exit came first): a later start
@@ -1061,8 +1062,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   // ---- Command calls: no model, slot, usage, hibernation or budget; the process outlives the orchestrator. ----
   const commandTick = () => Math.min(config.k?.trackerMs ?? 1000, 1000);
   const hasStopIntent = (journal: JournalHandle, call: string) => entriesFor(journal, call).some(e => e.type === "stop-intent");
-  /** The wrapper's identity of an attempt (from its latest command-started), for scans and fences. */
-  const commandKnown = (started: Entry | undefined): ProcInfo[] => started && started.start ? [{ pid: Number(started.pid), ppid: 0, start: String(started.start) }] : [];
+  /** The attempt's known identities (from its latest command-started): the wrapper and, on Windows, the job helper that
+   *  owns its kernel group (whose descendants are the whole attempt), for scans and fences. */
+  const commandKnown = (started: Entry | undefined): ProcInfo[] => {
+    if (!started) return [];
+    const known: ProcInfo[] = [];
+    if (started.start) known.push({ pid: Number(started.pid), ppid: 0, start: String(started.start) });
+    const group = started.group as { pid?: unknown; start?: unknown } | undefined;
+    if (group && typeof group.start === "string" && group.start)
+      known.push({ pid: Number(group.pid), ppid: 0, start: group.start });
+    return known;
+  };
   /** The processes of an attempt: tagged with its id, the wrapper while it lives, and their live descendants. */
   async function commandProcesses(id: string, known: ProcInfo[]): Promise<ProcInfo[]> {
     return (await containment.scan(new Map([[id, known]]), { fresh: true })).get(id) ?? [];
@@ -1181,7 +1191,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await serial(() => t.journal.append(COMMAND_SPAWN_FAILED, { call: t.callId, id, error: String(error instanceof Error ? error.message : error).slice(0, 300) }));
       return undefined;
     }
-    await serial(() => t.journal.append(COMMAND_STARTED, { call: t.callId, id, pid: spawned.pid, start: spawned.start, dir }));
+    await serial(() => t.journal.append(COMMAND_STARTED, { call: t.callId, id, pid: spawned.pid, start: spawned.start, dir,
+      ...(spawned.group ? { group: spawned.group } : {}) }));
     return spawned;
   }
   /** Run, adopt or settle a command call (see the journal records at the top). One attempt runs at a time; a lost first
@@ -1894,7 +1905,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       // executions were fenced and released, its session read, its forwards, attention and inbox settled.
       // A retired command call's processes, if any still run (an orchestrator ended during its retirement), end now.
       if (entriesOf(journal, COMMAND_INTENT).length)
-        for (const r of retiredCommandAttempts(journal.entries())) await endCommand(r.id, r.start ? [{ pid: r.pid!, ppid: 0, start: r.start }] : []);
+        for (const r of retiredCommandAttempts(journal.entries())) {
+          const known: ProcInfo[] = [];
+          if (r.start) known.push({ pid: r.pid!, ppid: 0, start: r.start });
+          if (r.group?.start) known.push({ pid: Number(r.group.pid), ppid: 0, start: r.group.start });
+          await endCommand(r.id, known);
+        }
       const complete = completeCalls(journal, wid), execs = entriesOf(journal, JT.exec).filter(e => !complete.has(String(e.call)));
       for (const e of execs) {
         // F1: an exec whose fence fails stays unfenced and holding; its call parks until a sweep retires it.

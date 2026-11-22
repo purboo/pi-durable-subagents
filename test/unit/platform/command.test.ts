@@ -121,6 +121,20 @@ test("journal questions: unsealed command calls and retired attempts", () => {
   assert.deepEqual(retiredCommandAttempts(entries), [{ call: "W@1/c@1", id: "command:W@1/c@1#1" }]);
 });
 
+test("retired command attempts carry the Windows job group identity for their fence", () => {
+  // The attempt's group (the helper that holds its Job Object) must travel with the wrapper's identity: a retired call is
+  // fenced by both, so a second attempt never starts while the first attempt's group can still act.
+  let seq = 0;
+  const e = (type: string, fields: Record<string, unknown>) => ({ seq: ++seq, ts: 0, type, ...fields }) as Entry;
+  const entries = [
+    e("command-intent", { call: "W@1/a@1", id: "command:W@1/a@1#1", n: 1 }),
+    e("command-started", { call: "W@1/a@1", id: "command:W@1/a@1#1", pid: 10, start: "s", dir: "/d", group: { pid: 9, start: "g" } }),
+    e("retired", { call: "W@1/a@1" }),
+  ];
+  assert.deepEqual(retiredCommandAttempts(entries),
+    [{ call: "W@1/a@1", id: "command:W@1/a@1#1", pid: 10, start: "s", group: { pid: 9, start: "g" } }]);
+});
+
 test("restart refusal: command calls are never in the busy list or token; a refusal names how many keep running", () => {
   const now = Date.now(), home = dirOf();
   const live = [{ wid: "W1", key: "a", gen: 1, callId: "W1@1/a@1", exec: "W1@1/a@1#1.1", since: now, phase: "child" as const }];

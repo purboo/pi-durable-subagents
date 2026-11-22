@@ -53,3 +53,14 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "24" }
       - run: node scripts/probe-win-observer.mjs
+  windows-command-job:
+    # A command attempt's Job Object: the native regression checks on their own, for a fast, unambiguous signal.
+    if: github.ref == 'refs/heads/port/windows-native-ci'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - run: npm ci
+      - run: node --test --test-force-exit test/unit/platform/job.test.ts

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Windows command attempts run inside a Job Object of their own: the wrapper is created suspended, assigned to the
+  kernel-owned group before its first instruction, and the group's only handle (non-inherited) dies with the attempt, so
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ends every process the command left behind — when it finishes, when its wrapper
+  crashes, and when the orchestrator that started it is gone. A small PowerShell helper (PowerShell 5.1 compiling the
+  Win32 calls in memory with `Add-Type`; no native binary, no npm dependency, no separate file in the package) owns the
+  group and records the suspended wrapper's pid before resuming it; the orchestrator fails closed when the group cannot
+  be created, assigned or observed. The start record keeps the wrapper's identity and adds the helper's, so a scan finds
+  the whole attempt even after its wrapper has gone and no second attempt starts while the group can still act. POSIX
+  command calls are unchanged.
 - Native Windows support: the extension enables itself on `win32` instead of refusing to load. The process layer uses
   PowerShell/CIM (`Win32_Process`, pid plus creation time), `taskkill /T` for tree fences, a Node-held lock directory
   for file exclusion, a Node command wrapper that records exit status, `cmd.exe` for string commands and gates, and

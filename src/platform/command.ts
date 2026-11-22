@@ -5,6 +5,11 @@
 // appended to `output.log` in the same directory through a descriptor the orchestrator opens, passes and closes: no
 // pipe leads back into the orchestrator and no node process stays resident for the life of the command, so it outlives
 // the orchestrator that started it.
+//
+// On Windows the wrapper also runs inside a Windows Job Object of its own (platform/job.ts): the wrapper is the group's
+// root, created suspended and assigned before its first instruction, and the group's only handle dies with the helper.
+// A command attempt therefore cannot leave descendants behind, and a scan that finds the wrapper gone finds the group
+// closed: no second attempt starts while processes of the first can still act.
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, stat, open, writeFile } from "node:fs/promises";
@@ -12,10 +17,16 @@ import { constants } from "node:os";
 import { join } from "node:path";
 import { captureStart } from "./proctable.ts";
 import { execTarget, findOnPath } from "./launch.ts";
+import { spawnInJob } from "./job.ts";
 import { comspec, IS_WINDOWS } from "./windows.ts";
 
 export const COMMAND_LOG = "output.log";
 export const COMMAND_EXIT = "exit";
+/** What the Windows wrapper reads: the command, its cwd and its complete environment (a command line can be long and
+ *  contain anything, so it is a file, not argv). */
+export const COMMAND_SPEC = "command.json";
+/** The Windows wrapper itself, written into the attempt directory before each spawn (Node runs a file, not a URL). */
+export const COMMAND_WRAPPER = "wrapper.mjs";
 /** The output a result carries: the last bytes of `output.log`. */
 export const OUTPUT_TAIL_BYTES = 16 * 1024;
 
@@ -26,14 +37,14 @@ export const OUTPUT_TAIL_BYTES = 16 * 1024;
  *  it), and its end, however it comes, never skips recording the status. A program named by a path that does not exist
  *  is 127 before `exec`: some shells (bash 3.2, the macOS /bin/sh) report 126 for it instead. */
 const WRAPPER = 'd="$1"; m="$2"; shift 2; ( case "$1" in (*/*) [ -e "$1" ] || { printf "%s: %s: not found\\n" "$0" "$1" >&2; exit 127; } ;; esac; exec "$@" ); s="$?"; printf "%s\\n" "$s" > "$d/exit.tmp" && "$m" -f "$d/exit.tmp" "$d/exit"; exit "$s"';
-/** Windows wrapper: `argv[1]` is the attempt directory (its command.json holds the command, cwd and environment).
+/** Windows wrapper: `argv[2]` is the attempt directory (its command.json holds the command, cwd and environment).
  *  It runs the child with inherited output descriptors, records the status and exits with it. */
 const WIN_WRAPPER = `import { spawn } from "node:child_process";
 import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-const dir = process.argv[1];
-const spec = JSON.parse(readFileSync(join(dir, "command.json"), "utf8"));
-try { unlinkSync(join(dir, "command.json")); } catch { /* already gone */ }
+const dir = process.argv[2];
+const spec = JSON.parse(readFileSync(join(dir, "${COMMAND_SPEC}"), "utf8"));
+try { unlinkSync(join(dir, "${COMMAND_SPEC}")); } catch { /* already gone */ }
 function record(status) {
   try { writeFileSync(join(dir, "exit.tmp"), String(status)); renameSync(join(dir, "exit.tmp"), join(dir, "exit")); } catch { /* never lose the command's own result */ }
 }
@@ -70,6 +81,9 @@ export interface CommandSpawn {
 export interface SpawnedCommand {
   /** The wrapper process (the session leader); `start` is its start token ("" when it ended before it was captured). */
   pid: number; start: string;
+  /** Windows: the job helper that owns the attempt's kernel group. Its identity is tracked with the wrapper's, so a scan
+   *  finds the whole group and its absence proves the group is closed (see platform/job.ts). */
+  group?: { pid: number; start: string };
   /** Resolves when the wrapper ends while this process runs (a wake-up only: the exit record is the outcome). */
   exited: Promise<void>;
 }
@@ -90,17 +104,13 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
       // A command line can be long and contain anything: pass it through a file, not argv. An argv whose program is a
       // .cmd/.bat shim is unwrapped here, before it is recorded, so the child runs the program its shim names.
       const command = typeof spec.command === "string" ? spec.command : (() => { const target = execTarget(spec.command[0]!, spec.command.slice(1)); return [target.command, ...target.args]; })();
-      await writeFile(join(spec.dir, "command.json"), JSON.stringify({ command, cwd: spec.cwd, env: spec.env }));
+      await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command, cwd: spec.cwd, env: spec.env }));
+      await writeFile(join(spec.dir, COMMAND_WRAPPER), WIN_WRAPPER);
       if (spec.proceed && !spec.proceed()) return undefined;
-      const child = spawn(process.execPath, ["--input-type=module", "-e", WIN_WRAPPER, spec.dir, ...(spec.exec ? [`DSA_EXEC=${spec.exec}`] : [])],
-        { cwd: spec.cwd, env: { ...spec.env, ...(spec.env.ComSpec || spec.env.COMSPEC ? {} : { ComSpec: comspec() }) },
-          detached: true, stdio: ["ignore", fd, fd], windowsHide: true });
-      const exited = new Promise<void>(resolve => { child.once("exit", () => resolve()); child.once("error", () => resolve()); });
-      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
-      child.unref();
-      const pid = child.pid!;
-      const start = child.exitCode !== null || child.signalCode !== null ? "" : await captureStart(pid).catch(() => "");
-      return { pid, start, exited };
+      // The wrapper's environment as a direct spawn would give it; the command inside still gets command.json's env.
+      const env = { ...spec.env, ...(spec.env.ComSpec || spec.env.COMSPEC ? {} : { ComSpec: comspec() }) };
+      return await spawnInJob(spec.dir, { exe: process.execPath, env, cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
+        args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [`DSA_EXEC=${spec.exec}`] : [])] });
     }
     const mv = resolveMv(), argv = commandArgv(spec.command);
     if (spec.proceed && !spec.proceed()) return undefined;

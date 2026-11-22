@@ -42,12 +42,15 @@ Windows uses native facilities, no WSL and no POSIX tools: the process table
 comes from PowerShell/CIM (`Win32_Process`, identity is pid plus creation
 time), process trees end with `taskkill /T`, file locks are a small Node
 helper holding an atomically created lock directory, command calls run through
-`cmd.exe`, and `install-service` uses Task Scheduler. Two Windows differences:
-another process's environment is unreadable, so execution identity is the
-process tree (a grandchild whose parent exited before a scan is not found by
-the `DSA_EXEC` tag the way it is on Linux), and Windows has no POSIX signals,
-so `stop`/`restart` requests are the graceful path (the legacy restart check
-and `taskkill` terminate).
+`cmd.exe` inside a Windows Job Object per attempt (a kernel-owned group: the
+wrapper is assigned before it runs, and the group's last handle dying kills
+whatever the command left behind), and `install-service` uses Task Scheduler.
+Two Windows differences: another process's environment is unreadable, so
+execution identity is the process tree (a grandchild whose parent exited
+before a scan is not found by the `DSA_EXEC` tag the way it is on Linux, while
+a command attempt's descendants stay in its group), and Windows has no POSIX
+signals, so `stop`/`restart` requests are the graceful path (the legacy restart
+check and `taskkill` terminate).
 
 The `pi-durable-subagents` command line (below) is optional. Run it without
 installing through `npx pi-durable-subagents …`, or install it once with
@@ -447,7 +450,12 @@ subagents({ chain: [{ command: ["npm", "test"] }, { agent: "worker", task: "Fix 
 Other call fields (`agent`, `task`, `model`, `tools`, `schema`, `gate`, …)
 are refused in a command call, and `env`/`rerun` in an agent call. stdin is
 empty; stdout and stderr go, interleaved, to `output.log` in the attempt's
-directory. The command sees the orchestrator's environment plus `env`,
+directory. On Windows the wrapper is the root of a Job Object of its own: it
+is created suspended, assigned to the group before its first instruction, and
+the group's only handle dies with the attempt, so every process the command
+starts is in the group and cannot outlive it (a wrapper crash or a killed job
+helper ends the group; a command that is still running keeps running when the
+orchestrator stops). The command sees the orchestrator's environment plus `env`,
 `DSA_CALL` (its call id), `DSA_EXEC` (its attempt) and `DSA_HOME`, so a
 `pi-durable-subagents` command inside it (`hold`, `run`, `send`) addresses
 the same home; it cannot force a restart. After merging `env`, the command's

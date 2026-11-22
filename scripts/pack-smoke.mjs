@@ -5,7 +5,7 @@
 // there, PATH is joined with `;` under its `Path` name, packaged modules are imported as `file:` URLs, and the run is
 // ended with its whole process tree so no pi subagent keeps the temp directory or this job's stdout.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire } from "node:module";
@@ -37,8 +37,12 @@ try {
   // The listing is compared below as `/`-separated package paths whichever separator the platform's tar prints.
   const files = run("tar", ["-tzf", tgz], { cwd: root }).split(/\r?\n/).map(line => line.trim().replace(/\\/g, "/")).filter(Boolean);
   for (const bad of files.filter(f => /\/(src|test|design)\/|\.ts$/.test(f) && !f.endsWith(".d.ts"))) throw new Error(`unexpected file in package: ${bad}`);
-  for (const need of ["package/index.js", "package/dist/agent/extension.js", "package/dist/orchestrator/main.js", "package/dist/evaluator/worker.js", "package/dist/cli/main.js", "package/agents/worker.md", "package/LICENSE", "package/README.md"])
+  for (const need of ["package/index.js", "package/dist/agent/extension.js", "package/dist/orchestrator/main.js", "package/dist/evaluator/worker.js", "package/dist/cli/main.js", "package/dist/platform/job.js", "package/agents/worker.md", "package/LICENSE", "package/README.md"])
     if (!files.includes(need)) throw new Error(`missing from package: ${need}`);
+  // The Windows command attempt's Job Object helper is source embedded in this module (no separate file to ship): the
+  // built package must carry it, or a packaged install could not start a command on Windows.
+  if (!readFileSync(join(pkg, "dist/platform/job.js"), "utf8").includes("DsaJob"))
+    throw new Error("the packaged Job Object helper source is missing from dist/platform/job.js");
   console.log(`package: ${tgz} (${files.length} files)`);
 
   const home = join(root, "dsa"), agentDir = join(root, "agent"), cwd = join(root, "work");
