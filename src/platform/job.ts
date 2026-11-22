@@ -861,8 +861,12 @@ export interface GroupRecord {
 }
 
 /** Whether an observed process-table start token names the same process instance as a handle-recorded creation time.
- *  Both are .NET local ticks; WMI's DMTF CreationDate carries whole microseconds (10 ticks), so up to 10 ticks of
- *  rounding is the same kernel timestamp while any reused pid is created strictly later. */
+ *  Both are .NET ticks of the same kernel creation timestamp, read at the precision of their own source: the owner takes it
+ *  from the wrapper's (or its own) live process handle with GetProcessTimes and keeps whole microseconds -- its 100 ns
+ *  unit truncated, `(creation / 10) * 10` in the owner -- and the process table's DMTF CreationDate carries whole
+ *  microseconds as well. The bound is that one observation unit in either direction; it is not a range that could admit a
+ *  later instance, because a reused pid is created at least a process lifetime later. No recorded token is reformatted:
+ *  the group record and the journal keep the value they were given. */
 export function sameCreation(observed: string, recorded: string): boolean {
   if (!observed || !recorded) return false;
   if (observed === recorded) return true;
@@ -1043,15 +1047,22 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
     }
   }
   const childRow = ownerReplaced ? undefined : rows.find(row => row.pid === pid);
+  // Whether the owner recorded the wrapper's end (group-end). Without it the wrapper's exit was never recorded (the owner
+  // was ended while the wrapper ran, say), so the only identity of the attempt is the creation time the owner took from
+  // the wrapper's own process handle before it resumed it (the group record).
+  const endRecorded = existsSync(join(dir, JOB_END));
   let start = "";
   if (childRow) {
     if (recorded.start !== undefined) {
-      start = sameCreation(childRow.start, recorded.start) ? childRow.start : "";
-    } else if (!existsSync(join(dir, JOB_END)) &&
+      // The observed row is the wrapper only when its ticks are the recorded instance's. A row that disagrees is another
+      // process that reused the pid: its ticks are never taken. Without an end record that row also proves the wrapper
+      // exited, so the handle-recorded identity is the attempt's -- recorded as is, never replaced by the recycled row.
+      start = sameCreation(childRow.start, recorded.start) ? childRow.start : endRecorded ? "" : recorded.start;
+    } else if (!endRecorded &&
       ((helperPid !== undefined && childRow.ppid === helperPid) || (!!launch.exec && winTag(childRow.command, "DSA_EXEC") === launch.exec))) {
       start = childRow.start;
     }
-  } else if (!ownerReplaced && recorded.start !== undefined && !existsSync(join(dir, JOB_END))) {
+  } else if (!ownerReplaced && recorded.start !== undefined && !endRecorded) {
     start = recorded.start;
   }
   helper.unref(); // the owner outlives this process by design: its end is a wake-up, never a held event loop

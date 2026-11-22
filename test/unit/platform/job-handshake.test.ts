@@ -318,6 +318,47 @@ test("pid reuse safety: spawnInJob never binds unrelated pids after wrapper or o
   }
 });
 
+// The owner writes the group record (the suspended wrapper's pid and both creation times, taken from the live handles)
+// before it resumes the wrapper, and group-end only once the wrapper ended. An owner that is ended in between leaves a
+// wrapper that exited with no end record at all: the creation time the owner already recorded is then the attempt's only
+// identity, and an observed row for that pid is another process once its ticks disagree. Neither a global tolerance nor a
+// different record format is introduced for this: the recorded value is used as it was written.
+test("a wrapper that exited without group-end keeps its handle-recorded identity, never a recycled pid's", { timeout: 60_000 }, async t => {
+  const compiler = stubCompiler();
+  const wrapperStart = "639311245471234560", ownerStart = "639311245471230000";
+  /** One launch of the stub owner: group written, no group-end (unless `endStatus`), gate held, then exit 0. */
+  const run = async (options: { endStatus?: string; rows: () => Promise<{ pid: number; ppid: number; start: string }[]> }) => {
+    const dir = dirOf(), release = join(dir, "release");
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    writePlan(dir, { begin: ownerStart, group: `full:424242:${wrapperStart}:${ownerStart}`, ...(options.endStatus ? { endStatus: options.endStatus } : {}), waitGate: release, exitCode: 0 });
+    const launched = await spawnInJob(dir, { exe: process.execPath, args: ["-e", ""], cwd: dir, log: join(dir, "output.log"), env: {} },
+      { compiler, observe: options.rows });
+    assert.ok(launched);
+    return { dir, launched, release };
+  };
+  // 1. The wrapper is gone from the table and the owner never recorded its end: the handle-recorded identity is kept.
+  {
+    const { dir, launched, release } = await run({ rows: async () => [] });
+    assert.equal(launched.start, wrapperStart, "the identity the owner took from the wrapper's handle before resuming it");
+    assert.equal(launched.group?.start, ownerStart, "the owner's own handle identity travels with the attempt");
+    assert.ok(!existsSync(join(dir, JOB_END)), "the owner recorded no end");
+    writeFileSync(release, "done"); await ended(launched);
+  }
+  // 2. A row at the wrapper pid whose ticks are another instance: that identity is rejected and the recorded one stands.
+  {
+    const { launched, release } = await run({ rows: async () => [{ pid: 424242, ppid: 1, start: "639311245471999999" }] });
+    assert.equal(launched.start, wrapperStart, "the recycled pid's ticks are never bound");
+    assert.notEqual(launched.start, "639311245471999999");
+    writeFileSync(release, "done"); await ended(launched);
+  }
+  // 3. With group-end the wrapper ended normally and its identity is history: an unrelated row is still never bound.
+  {
+    const { launched, release } = await run({ endStatus: "0", rows: async () => [{ pid: 424242, ppid: 1, start: "639311245471999999" }] });
+    assert.equal(launched.start, "", "a recorded end needs no identity, and an unrelated row supplies none");
+    writeFileSync(release, "done"); await ended(launched);
+  }
+});
+
 test("Windows: running owner and wrapper carry versioned tags for keys with spaces, quotes, & and Unicode, and scan recovers them", { skip: windowsOnly, timeout: 120_000 }, async t => {
   const dir = dirOf(), attempt = join(dir, "command-1"); t.after(() => rm(dir, { recursive: true, force: true }));
   const id = "command:W@1/tag \"a\" & 'b' ’ü’ 你好@1#1";

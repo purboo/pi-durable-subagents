@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A wrapper that exited without the host's `group-end` keeps the creation identity its host recorded from the live
+  process handle before resuming it: the attempt is no longer left without a wrapper identity when a process-table row
+  for that pid belongs to another process -- a recycled pid is never bound and its ticks never replace the recorded ones.
+  No identity tolerance or record format changed for this: the handshake's handle-versus-table comparison stays bounded
+  to one observation unit of the same kernel timestamp (the owner keeps whole microseconds from `GetProcessTimes`, the
+  table's DMTF date carries whole microseconds), and every later scan, adoption check and kill still compares start
+  tokens exactly.
 - A command start whose preparation was revoked (a stop, a suspension, a retirement or the orchestrator's exit) is
   decided by that revocation and never sealed failed: the abort is what ended the preparation, so a rejection it produced
   -- a publication cancelled on its way out, a compiler this process ended -- is not the attempt's own reason. A
