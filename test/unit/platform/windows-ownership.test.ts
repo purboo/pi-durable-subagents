@@ -299,7 +299,7 @@ test("fail-closed identity enforcement across Containment.spawn/fence, killProce
   });
   await assert.rejects(
     unverifiedFence.fence("exec-unverified", [], { timeoutMs: 40 }),
-    /Fence timeout: exec-unverified \(unverified identity for pid 6160\)/,
+    /Fence timeout: exec-unverified .*0 kill\(s\).*unverified identity for pid 6160\)/,
   );
   assert.deepEqual(fenceKillCalls, [], "never kills a tagged row without a verifiable start token");
 
@@ -327,7 +327,8 @@ test("fail-closed identity enforcement across Containment.spawn/fence, killProce
   for (const s of capturedScripts) {
     assert.ok(!/taskkill/i.test(s), "never invokes taskkill");
     assert.match(s, /GetProcessTimes/);
-    assert.match(s, /TerminateProcess/);
+    const guard = s.indexOf('::IsProcessCritical($hTerm, [ref]$critical) -or $critical) { throw');
+    assert.ok(guard >= 0 && guard < s.indexOf('::TerminateProcess($hTerm,'));
   }
   assert.ok(!capturedScripts[0]!.includes("SELECT ProcessId,ParentProcessId"), "killProcess ends only the verified target");
   assert.match(capturedScripts[0]!, new RegExp(`6400:${T_HOST}`));
