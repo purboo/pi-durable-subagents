@@ -1,45 +1,55 @@
-// Windows-only probe: how far does a PowerShell/CIM process-table scan depend on the caller's environment?
-// The orchestrator is regularly handed an isolated environment (a chaos/drill/e2e fixture, the evaluator host, a service
-// starter): PATH and HOME, no SystemRoot, TEMP, USERPROFILE, ComSpec or PSModulePath. On native Windows Node 24 that
-// environment made the fence time out at its full 15 s budget while the sweep reported a failed Get-CimInstance.
-//   node scripts/probe-win-observer.mjs
-// Prints one line per environment variant (wall time of each scan, or its failure) and one line for four concurrent
-// scans, which is what the tracker's period and several workflows ask of the observer. Read-only: it starts
-// powershell.exe, writes nothing and changes no state.
+// Run the same process-table read with selected Windows system variables. Log only timings and row counts.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { IS_WINDOWS, PROCESS_ROWS_SCRIPT, helperEnv, parseProcessRows, powershellPath } from "../src/platform/windows.ts";
 
+if (!IS_WINDOWS) process.exit(0);
 const exec = promisify(execFile);
-const SCAN = `$ErrorActionPreference = 'Stop'; ${PROCESS_ROWS_SCRIPT}`;
-const FLAGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", SCAN];
-const TIMEOUT = 20_000, ROUNDS = 2;
-
-if (!IS_WINDOWS) { console.log("probe-win-observer: Windows only; nothing to measure on " + process.platform); process.exit(0); }
-
-const isolated = { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? process.env.USERPROFILE ?? "C:\\" };
-const variants = { "as inherited (control)": process.env, "isolated (PATH + HOME)": isolated, "isolated + helperEnv": helperEnv(isolated) };
-const show = env => ["SystemRoot", "windir", "SystemDrive", "ComSpec", "PATHEXT", "PSModulePath", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA"]
-  .map(name => `${name}=${env[name] === undefined ? "(unset)" : env[name]}`).join(" ");
-
-async function scan(env) {
-  const started = Date.now();
+const groups = {
+  system: ["SystemRoot", "windir", "SystemDrive", "COMSPEC", "PATHEXT", "PSModulePath"],
+  profile: ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "HOMEDRIVE", "HOMEPATH", "USERNAME", "USERDOMAIN", "COMPUTERNAME"],
+  software: ["ProgramData", "ALLUSERSPROFILE", "PUBLIC", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432"],
+  machine: ["OS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION", "NUMBER_OF_PROCESSORS"],
+};
+const isolated = { PATH: process.env.PATH, HOME: process.env.HOME ?? process.env.USERPROFILE };
+const select = names => Object.fromEntries(names.filter(n => process.env[n] !== undefined).map(n => [n, process.env[n]]));
+const script = `$ErrorActionPreference = 'Stop'; ${PROCESS_ROWS_SCRIPT}`;
+async function query(label, env, command = script) {
+  const before = performance.now();
   try {
-    const { stdout } = await exec(powershellPath(), FLAGS, { env, timeout: TIMEOUT, windowsHide: true, maxBuffer: 1 << 20 });
-    const rows = parseProcessRows(stdout);
-    return `${Date.now() - started} ms, ${rows.length} processes, observer parent visible=${rows.some(p => p.pid === process.pid)}`;
-  } catch (error) {
-    const detail = String(error?.stderr || error?.message || error).trim().replace(/\s+/g, " ").slice(0, 300);
-    return `${Date.now() - started} ms FAILED killed=${error.killed} signal=${error.signal} code=${error.code}: ${detail}`;
+    const { stdout } = await exec(powershellPath(), ["-NoProfile", "-NonInteractive", "-Command", command], { env, timeout: 6000, windowsHide: true, maxBuffer: 8 << 20 });
+    const ok = command === script ? parseProcessRows(stdout).some(row => row.pid === process.pid) : stdout.trim() === 'ready';
+    console.log(`probe ${label}: ${ok ? 'OK' : 'INVALID'} ${Math.round(performance.now() - before)} ms`);
+    return ok;
+  } catch (e) {
+    console.log(`probe ${label}: FAILED ${Math.round(performance.now() - before)} ms killed=${e.killed} signal=${e.signal} code=${e.code}`);
+    return false;
   }
 }
-
-for (const [name, env] of Object.entries(variants)) {
-  const times = [];
-  for (let round = 0; round < ROUNDS; round++) times.push(await scan(env));
-  console.log(`${name}: ${times.join(" · ")}`);
-  console.log(`  ${show(env)}`);
+await query('inherited', process.env);
+await query('isolated-startup', isolated, "'ready'");
+await query('isolated-scan', isolated);
+await query('derived-scan', helperEnv(isolated));
+const names = Object.keys(groups);
+const envFor = selected => ({ ...isolated, ...select(selected.flatMap(key => groups[key])) });
+if (await query('os-allowlist', envFor(names))) {
+  let needed = names;
+  for (const name of names) {
+    const subset = needed.filter(n => n !== name);
+    if (await query(`groups-${subset.join('+') || 'none'}`, envFor(subset))) needed = subset;
+  }
+  let keys = needed.flatMap(g => groups[g]);
+  for (const key of [...keys]) {
+    const subset = keys.filter(k => k !== key);
+    if (await query(`drop-${key}`, { ...isolated, ...select(subset) })) keys = subset;
+  }
+  console.log(`probe retained system keys: ${keys.join(', ')}`);
+  await query('confirm-retained', { ...isolated, ...select(keys) });
+} else {
+  for (const name of names) {
+    const env = { ...process.env };
+    const drop = new Set(groups[name].map(key => key.toLowerCase()));
+    for (const key of Object.keys(env)) if (drop.has(key.toLowerCase())) delete env[key];
+    await query(`inherited-minus-${name}`, env);
+  }
 }
-// What the observer is actually asked for: the tracker's period per running call plus fences and lease readers.
-const concurrent = await Promise.all(Array.from({ length: 4 }, () => scan(helperEnv(isolated))));
-console.log(`four concurrent scans (isolated + helperEnv): ${concurrent.join(" · ")}`);

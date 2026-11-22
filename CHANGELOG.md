@@ -42,16 +42,8 @@
   drill and the real-pi e2e cases set it inside their temp root, and `scripts/diagnose-e2e.mjs`
   (`npm run diagnose:e2e`) replays the smallest real-pi cases in order and prints, for the first failing one, the
   orchestrator's start/recovery/exit, each workflow's journal tail and that log, redacted — so a stalled case
-  names its stage instead of only a timeout. A failing Windows Node 24 run keeps the state as an artifact.
-- Windows helpers get the system environment they need: `powershell.exe` and `taskkill` now run with the `SystemRoot`,
-  `ComSpec`, `PSModulePath`, `PATHEXT`, `TEMP`/`TMP`, `USERPROFILE` and `APPDATA`/`LOCALAPPDATA` that the operating
-  system answers for this process when the orchestrator was handed an isolated environment that keeps `PATH` and `HOME`
-  (a chaos/drill/e2e fixture, the evaluator host, a service starter). PowerShell could not autoload `Get-CimInstance`
-  from an empty `%SystemRoot%` and had no module analysis cache without `%LOCALAPPDATA%`, so the CIM process-table
-  scan either failed or outlasted its deadline: the first native Windows Node 24 run recorded a 15.2 s recovery and a
-  `Fence timeout` at the full 15 s budget for every workflow, while its sweeps logged the failed `Get-CimInstance`.
-  Values the caller already has are kept, so an isolated caller gains only those system variables — no credential, no
-  session variable. `scripts/probe-win-observer.mjs` measures one scan per environment variant on a Windows host.
+  names its stage instead of only a timeout. The Windows Node 24 diagnostics job prints the results in its log.
+- Windows CI measures PowerShell process-table queries under the host environment and under the isolated environment used by real-pi tests. The process-retirement timeout is under investigation.
 
 ## 1.5.1
 
