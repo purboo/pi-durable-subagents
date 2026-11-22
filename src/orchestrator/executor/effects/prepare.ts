@@ -111,7 +111,7 @@ export async function cleanWorktree(t: CallTicket): Promise<void> {
   // A journal from before the key rules could hold a path outside the workflow: Git is never asked about it, nothing is
   // created or removed there, and the keep is recorded with one note so the cleanup does not retry on every start.
   if (!inside(root, path)) {
-    await attention(t, "worktree-outside", `Worktree path outside its workflow: ${t.callId} (workflow ${t.wid}) records ` +
+    await attention(t, "worktree-conflict", `Worktree path outside its workflow: ${t.callId} (workflow ${t.wid}) records ` +
       `${path}, which is not inside ${root}. Nothing was created, removed or moved, and this call's sealed result is unchanged`);
     await t.journal.append("wt-kept", { call: t.callId }); return;
   }

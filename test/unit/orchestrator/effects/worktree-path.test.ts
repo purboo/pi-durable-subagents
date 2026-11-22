@@ -100,6 +100,9 @@ test("containment: a nested path is inside, its parent, a sibling and another dr
     ["C:\\repo\\.dsa\\W1", "C:\\repo\\.dsa\\W1", false],
     ["C:\\repo\\.dsa\\W1", "C:\\repo\\.dsa\\W10\\task", false],
     ["C:\\repo\\.dsa\\W1", "C:\\repo\\.dsa\\W1\\..\\..\\outside", false],
+    ["C:\\repo\\.dsa\\W1", "c:/repo/.dsa/w1/task", true],
+    ["C:\\repo\\.dsa\\W1", "\\\\?\\C:\\repo\\.dsa\\W1\\.keys\\task", true],
+    ["\\\\?\\UNC\\server\\share\\W1", "//server/share/w1/task", true],
     // Win32 `relative` yields the whole target for another drive or share, which is absolute and so never inside.
     ["C:\\repo\\.dsa\\W1", "D:\\outside", false],
     ["C:\\repo\\.dsa\\W1", "D:outside", false],

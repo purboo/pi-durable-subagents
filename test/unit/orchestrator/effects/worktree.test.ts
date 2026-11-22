@@ -237,7 +237,9 @@ test("an old intent outside its workflow creates nothing and is kept, never remo
   await f.effects().afterSeal(f.t, f.result); await f.effects().afterSeal(f.t, f.result);
   const notes = f.journal.entries().filter(e => e.type === "attention");
   assert.equal(notes.length, 1);
-  assert.match(String((notes[0] as unknown as { item: { text: string } }).item.text), new RegExp("not inside"));
+  const note = (notes[0] as unknown as { item: { id: string; text: string } }).item;
+  assert.equal(note.id, `worktree-conflict:${f.t.callId}`);
+  assert.match(note.text, /not inside/);
   assert.equal(f.journal.entries().filter(e => e.type === "wt-kept" && e.call === f.t.callId).length, 1);
   assert.equal(f.journal.entries().filter(e => e.type === "wt-removed").length, 0);
   assert.equal(await readFile(outside, "utf8"), "not a worktree");

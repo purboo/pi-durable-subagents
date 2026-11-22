@@ -75,7 +75,13 @@ export function sameWorktree(a: string, b: string): boolean {
  *  relative part at all (the same directory), when that part leaves `base` (`..`), or when it is absolute — which is
  *  what Win32 `relative` yields for another drive or share, so a cross-drive target is never inside. */
 export function insidePath(base: string, target: string, platform: NodeJS.Platform = process.platform): boolean {
-  const path = platform === "win32" ? win32 : posix, within = path.relative(base, target);
+  const path = platform === "win32" ? win32 : posix;
+  if (platform === "win32") {
+    if (!win32.isAbsolute(base) || !win32.isAbsolute(target)) return false;
+    base = win32Spelling(base);
+    target = win32Spelling(target);
+  }
+  const within = path.relative(base, target);
   return Boolean(within) && within !== ".." && !within.startsWith(`..${path.sep}`) && !path.isAbsolute(within) &&
     path.resolve(base, within) === target;
 }
