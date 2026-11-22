@@ -11,7 +11,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readJournalSnapshot } from "../kernel/journal.ts";
 import { journalPath, orchLedger } from "../paths.ts";
 import { PS } from "../platform/proctable.ts";
-import { winCommandLineSync } from "../platform/windows.ts";
+import { isWinStart, killProcessSync, winCommandLineSync, type WinProcessIdentity } from "../platform/windows.ts";
 import { JT, type RestartBody, type RestartInitiator } from "../types.ts";
 import { restartInputError, restartRefusal, type RestartExecution } from "../orchestrator/restart.ts";
 import { readerLedger } from "../orchestrator/reader-ledger.ts";
@@ -51,11 +51,29 @@ export function journalLiveCalls(home: string): RestartExecution[] {
   });
 }
 
+export interface LegacyRestartOptions {
+  subagent?: boolean;
+  tool?: boolean;
+  platform?: NodeJS.Platform;
+  killWinSync?: (target: WinProcessIdentity) => void;
+  killPosix?: (pid: number) => void;
+}
+
 /** Legacy has no launch gate: check immediately before SIGTERM; a launch can still slip between (documented). */
-export function legacyRestart(home: string, old: OrchestratorProcess, body: RestartBody, options: { subagent?: boolean; tool?: boolean } = {}): { applied: true } | { applied: false; reason: string } {
+export function legacyRestart(home: string, old: OrchestratorProcess, body: RestartBody, options: LegacyRestartOptions = {}): { applied: true } | { applied: false; reason: string } {
   const reason = restartInputError(body, options.subagent) ?? restartRefusal(home, journalLiveCalls(home), body, options.tool);
   if (reason) return { applied: false, reason };
-  try { process.kill(old.pid, "SIGTERM"); }
+  if ((options.platform ?? process.platform) === "win32") {
+    if (!isWinStart(old.start)) {
+      return { applied: false, reason: `cannot verify orchestrator identity for pid ${old.pid} (missing start token)` };
+    }
+    (options.killWinSync ?? killProcessSync)({ pid: old.pid, start: old.start });
+    return { applied: true };
+  }
+  try {
+    if (options.killPosix) options.killPosix(old.pid);
+    else process.kill(old.pid, "SIGTERM");
+  }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
   return { applied: true };
 }

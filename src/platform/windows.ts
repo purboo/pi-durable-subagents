@@ -1,6 +1,8 @@
-// Native Windows support: PowerShell is the only process observer Node has (Win32_Process through CIM), and
-// taskkill is its process-tree terminator. Environment variables of other processes are not readable on Windows, so
-// process identity is (pid, creation time) and process trees replace the inherited DSA_EXEC tag.
+// Native Windows support: PowerShell is the process observer (Win32_Process through CIM) and executes handle-verified
+// process termination (OpenProcess + GetProcessTimes + TerminateProcess; never bare-PID taskkill /T, which ignores
+// creation times across exit/PID reuse and non-reparented boot/system orphans). Environment variables of other processes
+// are not readable on Windows, so process identity is (pid, creation time) and live creation-ordered process trees replace
+// the inherited DSA_EXEC tag.
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -10,7 +12,7 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 export const IS_WINDOWS = process.platform === "win32";
 
-/** The Windows directory holding powershell.exe and taskkill.exe. */
+/** The Windows directory holding powershell.exe and cmd.exe. */
 export function systemRoot(env: NodeJS.ProcessEnv = process.env): string { return envValue(env, "SystemRoot") || envValue(env, "windir") || "C:\\Windows"; }
 
 /** A variable of a Windows environment block. Names compare case-insensitively (`Path` is `PATH`, `ComSpec` is `COMSPEC`)
@@ -75,10 +77,6 @@ export function powershellPath(): string {
   const local = join(systemRoot(), "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   return existsSync(local) ? local : "powershell.exe";
 }
-export function taskkillPath(): string {
-  const local = join(systemRoot(), "System32", "taskkill.exe");
-  return existsSync(local) ? local : "taskkill.exe";
-}
 /** The command processor a string command runs through (`command calls` keep their shell semantics). */
 export function comspec(env: NodeJS.ProcessEnv = process.env): string {
   return envValue(env, "ComSpec") || join(systemRoot(env), "System32", "cmd.exe");
@@ -96,6 +94,12 @@ export function powershellSync(script: string, options: { timeout?: number } = {
   return execFileSync(powershellPath(), [...PS_FLAGS, PS_PREAMBLE + script], { timeout: options.timeout ?? 15_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: "utf8", env: helperEnv() });
 }
 
+export interface WinProcessIdentity {
+  pid: number;
+  /** Creation time in .NET ticks (required to prove process ownership on Windows). */
+  start: string;
+}
+
 export interface WinProcessRow {
   pid: number;
   ppid: number;
@@ -103,6 +107,67 @@ export interface WinProcessRow {
   start: string;
   cpuMs?: number;
   command?: string;
+}
+
+const MAX_WIN_TICKS = 3155378975999999999n; // System.DateTime.MaxValue.Ticks
+
+/** Valid Windows creation-time token: positive decimal .NET ticks within DateTime range. */
+export function isWinStart(start: string | undefined): start is string {
+  if (typeof start !== "string" || !/^\d{1,19}$/.test(start)) return false;
+  const ticks = BigInt(start);
+  return ticks > 0n && ticks <= MAX_WIN_TICKS;
+}
+
+/** Whether an observed start token names the same Windows process instance as a recorded creation time.
+ *  GetProcessTimes truncates to whole microseconds ((creation / 10) * 10) and Win32_Process DMTF CreationDate carries
+ *  whole microseconds as well; they agree within one microsecond unit (10 ticks), whereas any recycled pid is created
+ *  at least a process lifetime later. Empty or malformed tokens fail closed (`false`). */
+export function sameCreation(observed: string | undefined, recorded: string | undefined): boolean {
+  if (!isWinStart(observed) || !isWinStart(recorded)) return false;
+  if (observed === recorded) return true;
+  const a = BigInt(observed), b = BigInt(recorded);
+  return (a >= b ? a - b : b - a) <= 10n;
+}
+
+/** Whether a live row `child` can be a genuine child of a live row `parent` in the same process-table snapshot.
+ *  Windows never reparents orphaned processes when their parent exits, so a recycled PID (`parent`) can match the static
+ *  `ParentProcessId` of a long-running system/user process created before `parent` existed (e.g. a critical system
+ *  process created at boot). Requiring `child.start >= parent.start` while `parent` is live excludes all pre-existing
+ *  orphans on that PID, and because `parent` is still live no later incarnation of `parent.pid` has existed yet. */
+export function isOwnedWinChild(parent: Pick<WinProcessRow, "pid" | "start">, child: Pick<WinProcessRow, "pid" | "ppid" | "start">): boolean {
+  if (child.pid === parent.pid || child.ppid !== parent.pid) return false;
+  if (!isWinStart(parent.start) || !isWinStart(child.start)) return false;
+  return BigInt(child.start) >= BigInt(parent.start);
+}
+
+/** Proven-owned live descendants of `roots` in a single snapshot `rows`. Only roots that are themselves live with a
+ *  matching creation time in `rows` may expand `ParentProcessId` edges: once a parent exits, its numeric PID can be
+ *  recycled by an unrelated process whose children share that numeric `ppid` and have later creation times. */
+export function winLiveDescendants(roots: readonly WinProcessIdentity[], rows: Iterable<WinProcessRow>): WinProcessRow[] {
+  const byPid = new Map<number, WinProcessRow>(), byParent = new Map<number, WinProcessRow[]>();
+  for (const row of rows) {
+    if (!Number.isInteger(row.pid) || row.pid <= 0 || !isWinStart(row.start)) continue;
+    byPid.set(row.pid, row);
+    const list = byParent.get(row.ppid);
+    if (list) list.push(row); else byParent.set(row.ppid, [row]);
+  }
+  const rootPids = new Set<number>(), seen = new Set<number>(), queue: WinProcessRow[] = [], out: WinProcessRow[] = [];
+  for (const root of roots) {
+    if (!Number.isInteger(root.pid) || root.pid <= 0 || !isWinStart(root.start)) continue;
+    const live = byPid.get(root.pid);
+    if (live && sameCreation(live.start, root.start) && !seen.has(live.pid)) {
+      rootPids.add(live.pid); seen.add(live.pid); queue.push(live);
+    }
+  }
+  for (let i = 0; i < queue.length; i++) {
+    const parent = queue[i]!;
+    for (const child of byParent.get(parent.pid) ?? []) {
+      if (seen.has(child.pid) || !isOwnedWinChild(parent, child)) continue;
+      seen.add(child.pid); queue.push(child);
+      if (!rootPids.has(child.pid)) out.push(child);
+    }
+  }
+  return out;
 }
 
 /** One line per process: pid, ppid, creation ticks, CPU (100ns -> ms) and command line (tabs/newlines replaced by
@@ -123,7 +188,7 @@ export function parseProcessRows(stdout: string): WinProcessRow[] {
     if (!line) continue;
     const [pid, ppid, start, cpu, ...rest] = line.split("\t");
     const id = Number(pid), parent = Number(ppid), ticks = Number(cpu);
-    if (!Number.isInteger(id) || !Number.isInteger(parent) || !start) continue;
+    if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(parent) || parent < 0 || !isWinStart(start)) continue;
     rows.push({ pid: id, ppid: parent, start, ...(Number.isFinite(ticks) ? { cpuMs: ticks / 10_000 } : {}),
       ...(rest.length ? { command: rest.join(" ") } : {}) });
   }
@@ -145,18 +210,20 @@ export function winSnapshotSync(maxAgeMs = 250): Map<number, WinProcessRow> {
   return snapshot.rows;
 }
 
-/** The creation-time token of one process ("" when it has already gone). */
+/** The creation-time token of one process ("" when it has already gone; rejects when the observer itself fails). */
 export async function winStart(pid: number, options: { signal?: AbortSignal; timeout?: number } = {}): Promise<string> {
   if (!Number.isInteger(pid) || pid <= 0) return "";
-  try {
-    const out = await powershell(processQuery("CreationDate", `if ($p.CreationDate) { ${creationTicks} }`, pid), options);
-    return out.trim();
-  } catch { return ""; }
+  const out = (await powershell(processQuery("CreationDate", `if ($p.CreationDate) { ${creationTicks} }`, pid), options)).trim();
+  if (!out) return "";
+  if (!isWinStart(out)) throw new Error(`Invalid Windows creation time for pid ${pid}: ${String(out).slice(0, 80)}`);
+  return out;
 }
 export function winStartSync(pid: number): string {
   if (!Number.isInteger(pid) || pid <= 0) return "";
-  try { return powershellSync(processQuery("CreationDate", `if ($p.CreationDate) { ${creationTicks} }`, pid)).trim(); }
-  catch { return ""; }
+  try {
+    const out = powershellSync(processQuery("CreationDate", `if ($p.CreationDate) { ${creationTicks} }`, pid)).trim();
+    return isWinStart(out) ? out : "";
+  } catch { return ""; }
 }
 /** A diagnostic command line (never evidence of identity or death). */
 export async function winCommandLine(pid: number, signal?: AbortSignal): Promise<string> {
@@ -213,26 +280,186 @@ export function winTag(command: string | undefined, name: string): string | unde
   return legacy.size === 1 ? legacy.values().next().value : undefined;
 }
 
-/** How taskkill reports that the target is already gone. */
-const gone = (error: unknown) => {
-  const e = error as { code?: number | string; status?: number; stderr?: string };
-  return e.status === 128 || e.code === 128 || /not found|not running|no running instance/i.test(String(e.stderr ?? ""));
-};
-
-/** End a process and every live descendant (`taskkill /T`). A vanished process is not an error. */
-export async function killTree(pid: number, options: { force?: boolean; timeout?: number } = {}): Promise<void> {
-  if (!IS_WINDOWS) throw new Error("killTree is Windows-only");
-  if (!Number.isInteger(pid) || pid <= 0) return;
-  try {
-    await exec(taskkillPath(), ["/PID", String(pid), "/T", ...(options.force === false ? [] : ["/F"])],
-      { timeout: options.timeout ?? 10_000, windowsHide: true, env: helperEnv() });
-  } catch (error) { if (!gone(error)) throw error; }
+export interface WinKillOptions {
+  timeout?: number;
+  signal?: AbortSignal;
+  /** Test seam: platform override (default `process.platform`). */
+  platform?: NodeJS.Platform;
+  /** Test seam: async PowerShell script runner. */
+  run?: (script: string, options: { timeout?: number; signal?: AbortSignal }) => Promise<string>;
 }
-export function killTreeSync(pid: number, options: { force?: boolean } = {}): void {
-  if (!IS_WINDOWS) throw new Error("killTreeSync is Windows-only");
-  if (!Number.isInteger(pid) || pid <= 0) return;
-  try {
-    execFileSync(taskkillPath(), ["/PID", String(pid), "/T", ...(options.force === false ? [] : ["/F"])],
-      { timeout: 10_000, windowsHide: true, stdio: "ignore", env: helperEnv() });
-  } catch (error) { if (!gone(error)) throw error; }
+
+export interface WinKillSyncOptions {
+  timeout?: number;
+  /** Test seam: platform override (default `process.platform`). */
+  platform?: NodeJS.Platform;
+  /** Test seam: synchronous PowerShell script runner. */
+  runSync?: (script: string, options: { timeout?: number }) => string;
+}
+
+const KILL_BATCH_SIZE = 128;
+
+/** Validate and deduplicate Windows `(pid, start)` targets. Fails closed on any missing or malformed identity. */
+export function normalizeWinTargets(targets: WinProcessIdentity | readonly WinProcessIdentity[]): WinProcessIdentity[] {
+  const list: readonly WinProcessIdentity[] = Array.isArray(targets) ? targets : [targets as WinProcessIdentity];
+  const deduped = new Map<string, WinProcessIdentity>();
+  for (const target of list) {
+    if (!target || !Number.isInteger(target.pid) || target.pid <= 0 || target.pid > DWORD_MAX || !isWinStart(target.start)) {
+      throw new Error(`Refusing to end Windows process without verified identity (pid=${String(target?.pid)}, start=${JSON.stringify(target?.start)})`);
+    }
+    deduped.set(`${target.pid}:${target.start}`, { pid: target.pid, start: target.start });
+  }
+  return [...deduped.values()];
+}
+
+/** Build the in-memory Win32 handle-verified termination script (never uses bare-PID `taskkill /T`).
+ *  Each target handle is verified via `GetProcessTimes` before `TerminateProcess` on that same handle, and verified
+ *  parent handles stay open until descendant discovery completes so Windows cannot recycle a parent PID mid-sweep. */
+export function buildWinKillScript(targets: readonly WinProcessIdentity[], includeDescendants: boolean): string {
+  const checked = normalizeWinTargets(targets);
+  const spec = checked.map(t => `${t.pid}:${t.start}`).join(";");
+  return [
+    "if (!('DsaWin32.Kernel' -as [type])) {",
+    "  $ab = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object System.Reflection.AssemblyName 'DsaWin32'), [System.Reflection.Emit.AssemblyBuilderAccess]::Run)",
+    "  $mb = $ab.DefineDynamicModule('DsaWin32')",
+    "  $tb = $mb.DefineType('DsaWin32.Kernel', 'Public,Abstract,Sealed')",
+    "  $ctor = [System.Runtime.InteropServices.DllImportAttribute].GetConstructor(@([string]))",
+    "  $sle = [System.Runtime.InteropServices.DllImportAttribute].GetField('SetLastError')",
+    "  $attr = New-Object System.Reflection.Emit.CustomAttributeBuilder($ctor, @('kernel32.dll'), @($sle), @($true))",
+    "  $add = { param([string]$n, [type]$r, [type[]]$p); $m = $tb.DefineMethod($n, 'Public,Static,PinvokeImpl', $r, $p); $m.SetCustomAttribute($attr) }",
+    "  & $add 'OpenProcess' ([IntPtr]) ([type[]]@([uint32], [bool], [uint32]))",
+    "  & $add 'GetProcessTimes' ([bool]) ([type[]]@([IntPtr], [int64].MakeByRefType(), [int64].MakeByRefType(), [int64].MakeByRefType(), [int64].MakeByRefType()))",
+    "  & $add 'TerminateProcess' ([bool]) ([type[]]@([IntPtr], [uint32]))",
+    "  & $add 'CloseHandle' ([bool]) ([type[]]@([IntPtr]))",
+    "  [void]$tb.CreateType()",
+    "}",
+    "$QUERY = [uint32]0x1000; $TERM = [uint32]0x1001; $selfPid = [uint32]$PID",
+    "$held = New-Object 'System.Collections.Generic.List[IntPtr]'",
+    "$seen = New-Object 'System.Collections.Generic.HashSet[uint32]'",
+    "$step = {",
+    "  param([uint32]$targetPid, [int64]$expectedTicks, [int64]$minCreationFt)",
+    "  if ($targetPid -eq 0 -or $targetPid -eq $selfPid -or $seen.Contains($targetPid)) { return $null }",
+    "  $hQuery = [DsaWin32.Kernel]::OpenProcess($QUERY, $false, $targetPid)",
+    "  if ($hQuery -eq [IntPtr]::Zero) {",
+    "    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()",
+    "    if ($err -eq 87) { return $null }",
+    "    if ($err -eq 5) {",
+    "      $rows = @(([wmisearcher]\"SELECT CreationDate FROM Win32_Process WHERE ProcessId=$targetPid\").Get())",
+    "      if ($rows.Count -eq 0) { return $null }",
+    "      foreach ($r in $rows) {",
+    "        if (!$r.CreationDate) { throw \"Unverifiable process identity for pid $targetPid (OpenProcess denied)\" }",
+    "        $wt = [int64][System.Management.ManagementDateTimeConverter]::ToDateTime($r.CreationDate).Ticks",
+    "        $wd = if ($wt -ge $expectedTicks) { $wt - $expectedTicks } else { $expectedTicks - $wt }",
+    "        if ($wd -le [int64]10) { throw \"OpenProcess denied for verified live pid $targetPid\" }",
+    "      }",
+    "      return $null",
+    "    }",
+    "    throw \"OpenProcess($targetPid) failed with Win32 error $err\"",
+    "  }",
+    "  $keepQuery = $false",
+    "  try {",
+    "    [int64]$creation = 0; [int64]$exit = 0; [int64]$k = 0; [int64]$u = 0",
+    "    if (![DsaWin32.Kernel]::GetProcessTimes($hQuery, [ref]$creation, [ref]$exit, [ref]$k, [ref]$u) -or $creation -le 0) {",
+    "      $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()",
+    "      throw \"GetProcessTimes($targetPid) failed with Win32 error $err\"",
+    "    }",
+    "    if ($minCreationFt -gt 0 -and $creation -lt $minCreationFt) { return $null }",
+    "    $obsTicks = [int64][System.DateTime]::FromFileTime($creation - ($creation % [int64]10)).Ticks",
+    "    $diff = if ($obsTicks -ge $expectedTicks) { $obsTicks - $expectedTicks } else { $expectedTicks - $obsTicks }",
+    "    if ($diff -gt [int64]10) { return $null }",
+    "    [void]$seen.Add($targetPid)",
+    "    $held.Add($hQuery); $keepQuery = $true",
+    "    $node = [pscustomobject]@{ Pid = $targetPid; CreationFt = $creation; Ticks = $obsTicks }",
+    "    if ($exit -ne 0) { return $node }",
+    "    $hTerm = [DsaWin32.Kernel]::OpenProcess($TERM, $false, $targetPid)",
+    "    if ($hTerm -eq [IntPtr]::Zero) {",
+    "      $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()",
+    "      if ($err -eq 87) { return $node }",
+    "      [int64]$c2 = 0; [int64]$e2 = 0; [int64]$k2 = 0; [int64]$u2 = 0",
+    "      if ([DsaWin32.Kernel]::GetProcessTimes($hQuery, [ref]$c2, [ref]$e2, [ref]$k2, [ref]$u2) -and $e2 -ne 0) { return $node }",
+    "      throw \"OpenProcess(PROCESS_TERMINATE, $targetPid) failed with Win32 error $err\"",
+    "    }",
+    "    try {",
+    "      [int64]$tc = 0; [int64]$te = 0; [int64]$tk = 0; [int64]$tu = 0",
+    "      if (![DsaWin32.Kernel]::GetProcessTimes($hTerm, [ref]$tc, [ref]$te, [ref]$tk, [ref]$tu) -or $tc -ne $creation) { return $null }",
+    "      if ($te -eq 0 -and ![DsaWin32.Kernel]::TerminateProcess($hTerm, [uint32]1)) {",
+    "        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()",
+    "        [int64]$c3 = 0; [int64]$e3 = 0; [int64]$k3 = 0; [int64]$u3 = 0",
+    "        if (!([DsaWin32.Kernel]::GetProcessTimes($hTerm, [ref]$c3, [ref]$e3, [ref]$k3, [ref]$u3) -and $e3 -ne 0)) {",
+    "          throw \"TerminateProcess($targetPid) failed with Win32 error $err\"",
+    "        }",
+    "      }",
+    "      return $node",
+    "    } finally { [void][DsaWin32.Kernel]::CloseHandle($hTerm) }",
+    "  } finally { if (!$keepQuery) { [void][DsaWin32.Kernel]::CloseHandle($hQuery) } }",
+    "}",
+    "try {",
+    "  $inv = [Globalization.CultureInfo]::InvariantCulture",
+    "  $parents = New-Object 'System.Collections.Generic.Dictionary[uint32, object]'",
+    `  foreach ($entry in ('${spec}' -split ';')) {`,
+    "    if (!$entry) { continue }",
+    "    $parts = $entry -split ':'",
+    "    $res = & $step ([uint32]::Parse($parts[0], $inv)) ([int64]::Parse($parts[1], $inv)) ([int64]0)",
+    "    if ($null -ne $res) { $parents[$res.Pid] = $res }",
+    "  }",
+    ...(includeDescendants ? [
+      "  while ($parents.Count -gt 0) {",
+      "    $next = New-Object 'System.Collections.Generic.Dictionary[uint32, object]'",
+      "    $scan = ([wmisearcher]'SELECT ProcessId,ParentProcessId,CreationDate FROM Win32_Process').Get()",
+      "    foreach ($p in $scan) {",
+      "      $ppid = [uint32]$p.ParentProcessId; $cpid = [uint32]$p.ProcessId",
+      "      if (!$parents.ContainsKey($ppid) -or $cpid -eq 0 -or $cpid -eq $selfPid -or $seen.Contains($cpid) -or !$p.CreationDate) { continue }",
+      "      $pInfo = $parents[$ppid]",
+      "      $ct = [int64][System.Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate).Ticks",
+      "      if ($ct + [int64]10 -lt [int64]$pInfo.Ticks) { continue }",
+      "      $res = & $step $cpid $ct ([int64]$pInfo.CreationFt)",
+      "      if ($null -ne $res) { $next[$res.Pid] = $res }",
+      "    }",
+      "    $parents = $next",
+      "  }",
+    ] : []),
+    "} finally { foreach ($h in $held) { [void][DsaWin32.Kernel]::CloseHandle($h) } }",
+  ].join("\n");
+}
+
+async function runWinKill(targets: WinProcessIdentity | readonly WinProcessIdentity[], includeDescendants: boolean, options: WinKillOptions = {}): Promise<void> {
+  const checked = normalizeWinTargets(targets);
+  if ((options.platform ?? process.platform) !== "win32" && !options.run) {
+    throw new Error(`${includeDescendants ? "killTree" : "killProcess"} is Windows-only`);
+  }
+  if (!checked.length) return;
+  const run = options.run ?? ((script: string, opts: { timeout?: number; signal?: AbortSignal }) => powershell(script, opts));
+  for (let i = 0; i < checked.length; i += KILL_BATCH_SIZE) {
+    const batch = checked.slice(i, i + KILL_BATCH_SIZE);
+    await run(buildWinKillScript(batch, includeDescendants), { timeout: options.timeout ?? 10_000, ...(options.signal ? { signal: options.signal } : {}) });
+  }
+}
+
+function runWinKillSync(targets: WinProcessIdentity | readonly WinProcessIdentity[], includeDescendants: boolean, options: WinKillSyncOptions = {}): void {
+  const checked = normalizeWinTargets(targets);
+  if ((options.platform ?? process.platform) !== "win32" && !options.runSync) {
+    throw new Error(`${includeDescendants ? "killTreeSync" : "killProcessSync"} is Windows-only`);
+  }
+  if (!checked.length) return;
+  const runSync = options.runSync ?? ((script: string, opts: { timeout?: number }) => powershellSync(script, opts));
+  for (let i = 0; i < checked.length; i += KILL_BATCH_SIZE) {
+    const batch = checked.slice(i, i + KILL_BATCH_SIZE);
+    runSync(buildWinKillScript(batch, includeDescendants), { timeout: options.timeout ?? 10_000 });
+  }
+}
+
+/** End verified Windows process(es) without touching descendants (e.g. an orchestrator host whose command calls outlive it). */
+export async function killProcess(targets: WinProcessIdentity | readonly WinProcessIdentity[], options: WinKillOptions = {}): Promise<void> {
+  await runWinKill(targets, false, options);
+}
+export function killProcessSync(targets: WinProcessIdentity | readonly WinProcessIdentity[], options: WinKillSyncOptions = {}): void {
+  runWinKillSync(targets, false, options);
+}
+
+/** End verified Windows process(es) and their proven-owned live descendants. Vanished or reused PIDs are untouched. */
+export async function killTree(targets: WinProcessIdentity | readonly WinProcessIdentity[], options: WinKillOptions = {}): Promise<void> {
+  await runWinKill(targets, true, options);
+}
+export function killTreeSync(targets: WinProcessIdentity | readonly WinProcessIdentity[], options: WinKillSyncOptions = {}): void {
+  runWinKillSync(targets, true, options);
 }

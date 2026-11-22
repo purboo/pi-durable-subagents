@@ -66,6 +66,7 @@ import { failedModel, modelFailures, MODEL_RETRY_MS, parentPinned, spillCandidat
 import { PENDING_NOTE, UNDELIVERED_FOLLOW_UP } from "../notes.ts";
 import { COMMAND_LOG, exitMeaning, prepareCancelled, prepareCommand as stageCommand, readExitRecord, readTail, spawnCommand, type CommandPrep, type CommandSpawn, type SpawnedCommand } from "../../platform/command.ts";
 import { captureStart } from "../../platform/proctable.ts";
+import { IS_WINDOWS, sameCreation } from "../../platform/windows.ts";
 import { heldIn } from "../snapshot.ts";
 import { COMMAND_INTENT, COMMAND_SPAWN_FAILED, COMMAND_STARTED, COMMAND_TIMEOUT, COMMAND_WITHDRAWN, commandDirName, commandEnvironment, commandId, retiredCommandAttempts } from "./command.ts";
 
@@ -1102,20 +1103,22 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await delay(commandTick());
     }
   }
-  /** End an attempt's whole process tree: SIGTERM, a grace period, then the fence (SIGKILL until a rescan finds none).
-   *  A failing fence is retried until it works; the orchestrator's exit interrupts it (the next start fences again). */
+  /** End an attempt's whole process tree: on POSIX, SIGTERM with a grace period before the fence; on Windows, directly
+   *  through the handle-verified fence (`process.kill` on Windows is an unverified bare-PID TerminateProcess). */
   async function endCommand(id: string, known: ProcInfo[]) {
     let live = await observedCommandProcesses(id, known);
     if (!live.length) return;
-    for (const p of live) {
-      if (p.start !== "" && await captureStart(p.pid).catch(() => "") !== p.start) continue;
-      try { process.kill(p.pid, "SIGTERM"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
-    }
-    const graceUntil = Date.now() + COMMAND_GRACE_MS;
-    while (Date.now() < graceUntil) {
-      await delay(100);
-      live = await observedCommandProcesses(id, known);
-      if (!live.length) return;
+    if (!IS_WINDOWS) {
+      for (const p of live) {
+        if (!p.start || await captureStart(p.pid).catch(() => "") !== p.start) continue;
+        try { process.kill(p.pid, "SIGTERM"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+      const graceUntil = Date.now() + COMMAND_GRACE_MS;
+      while (Date.now() < graceUntil) {
+        await delay(100);
+        live = await observedCommandProcesses(id, known);
+        if (!live.length) return;
+      }
     }
     for (;;) {
       try { await containment.fence(id, [...known, ...live]); return; }
@@ -1343,7 +1346,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           await endCommand(id, known);
           return await sealCommand(journal, t, id, { status: "timeout" }, dir);
         }
-        const wrapper = !!started?.start && await captureStart(Number(started.pid)).catch(() => "") === started.start;
+        const observedStart = started?.start ? await captureStart(Number(started.pid)).catch(() => "") : "";
+        const wrapper = !!started?.start && (IS_WINDOWS ? sameCreation(observedStart, String(started.start)) : observedStart === started.start);
         // A failed observation is not a loss: the attempt stays tracked and is watched again (never started over).
         const live = wrapper ? undefined : await commandProcesses(id, known);
         if (!wrapper && live !== undefined && !live.length) {

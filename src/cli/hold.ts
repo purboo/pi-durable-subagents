@@ -6,7 +6,7 @@ import { constants } from "node:os";
 import { dsaHome } from "../paths.ts";
 import { captureStart } from "../platform/proctable.ts";
 import { execTarget } from "../platform/launch.ts";
-import { IS_WINDOWS, killTreeSync } from "../platform/windows.ts";
+import { IS_WINDOWS, isWinStart, killTreeSync } from "../platform/windows.ts";
 import { blockers, endLeaseProcesses, enqueue, grantQueued, holdDetail, holdTag, tryGrant, leaseDir, liveTickets, orphaned, rank, removeTicket, RESOURCE, who, writeTicket, type LeaseMode, type LeaseTicket } from "../platform/lease.ts";
 
 export const HOLD_USAGE = "usage: pi-durable-subagents hold <resource> [--shared | --slots <n>] [--priority <n>] [--yield] [--expect <duration>] [--max-wait <seconds> | --no-wait] [--note <text>] -- <command> [args…]";
@@ -68,11 +68,13 @@ export interface HoldOptions { env?: NodeJS.ProcessEnv; stderr?: (line: string) 
 export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<number> {
   const env = options.env ?? process.env, home = dsaHome(env), say = options.stderr ?? (l => process.stderr.write(`${l}\n`));
   const pollMs = options.pollMs ?? 250, graceMs = options.graceMs ?? 2000;
+  const wrapperStart = (await captureStart(process.pid).catch(() => "")) || undefined;
+  if (IS_WINDOWS && !isWinStart(wrapperStart)) throw new Error(`hold: cannot verify wrapper start identity for pid ${process.pid}`);
   const request = {
     resource: args.resource, mode: args.mode, ...(args.slots !== undefined ? { slots: args.slots } : {}),
     ...(args.priority !== undefined ? { priority: args.priority } : {}), ...(args.yield ? { yield: args.yield } : {}),
     ...(args.expectMs !== undefined ? { expectMs: args.expectMs } : {}),
-    wrapper: { pid: process.pid, start: (await captureStart(process.pid)) || undefined },
+    wrapper: { pid: process.pid, start: wrapperStart },
     argv: args.argv.map(a => a.length > 200 ? `${a.slice(0, 199)}…` : a).slice(0, 32), cwd: process.cwd(),
     ...(args.note ? { note: args.note.slice(0, 300) } : {}), since: Date.now(),
     ...(env.DSA_EXEC ? { exec: env.DSA_EXEC } : {}), ...(env.DSA_CALL ? { call: env.DSA_CALL } : {}),
@@ -88,8 +90,14 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
   const ticket: LeaseTicket = granted ?? await enqueue(home, request);
   let child: ReturnType<typeof spawn> | undefined, interrupted: NodeJS.Signals | undefined, wake = () => {}, cleaned = false;
   const onSignal = (signal: NodeJS.Signals) => {
-    if (child?.pid) { try { if (IS_WINDOWS) killTreeSync(child.pid); else process.kill(-child.pid, signal); } catch { /* gone */ } }
-    else { interrupted = signal; wake(); }
+    if (child?.pid) {
+      try {
+        if (IS_WINDOWS) {
+          if (isWinStart(ticket.command?.start)) killTreeSync({ pid: ticket.command.pid, start: ticket.command.start });
+          else if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        } else process.kill(-child.pid, signal);
+      } catch { /* gone */ }
+    } else { interrupted = signal; wake(); }
   };
   for (const s of SIGNALS) process.on(s, onSignal);
   let watcher: FSWatcher | undefined;
@@ -148,9 +156,24 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
     });
     void exit.then(value => { status = value; wake(); });
     if (c.pid) {
-      ticket.command = { pid: c.pid };
-      ticket.command.start = (await captureStart(c.pid)) || undefined;
-      await writeTicket(home, ticket).catch(() => {});
+      if (IS_WINDOWS) {
+        let start = await captureStart(c.pid).catch(() => "");
+        if (!isWinStart(start) && c.exitCode === null && c.signalCode === null) {
+          await Promise.race([exit, new Promise<void>(r => setTimeout(r, 100))]);
+          if (c.exitCode === null && c.signalCode === null) start = await captureStart(c.pid).catch(() => "");
+        }
+        if (isWinStart(start)) {
+          ticket.command = { pid: c.pid, start };
+          await writeTicket(home, ticket).catch(() => {});
+        } else if (c.exitCode === null && c.signalCode === null) {
+          c.kill("SIGKILL");
+          await exit;
+          throw new Error(`hold: cannot verify command start identity for pid ${c.pid}`);
+        }
+      } else {
+        ticket.command = { pid: c.pid, start: (await captureStart(c.pid).catch(() => "")) || undefined };
+        await writeTicket(home, ticket).catch(() => {});
+      }
     }
     while (status === undefined) {
       if (args.yield) {
@@ -169,7 +192,15 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
   } finally {
     watcher?.close();
     // Also covers errors during launch/capture/write and forwarded signals followed by command exit.
-    try { if (child && !cleaned) await endLeaseProcesses(ticket, graceMs, say); }
+    try {
+      if (child && !cleaned) {
+        if (IS_WINDOWS && !isWinStart(ticket.command?.start)) {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        } else {
+          await endLeaseProcesses(ticket, graceMs, say);
+        }
+      }
+    }
     finally {
       removeTicket(home, ticket);
       for (const s of SIGNALS) process.off(s, onSignal);

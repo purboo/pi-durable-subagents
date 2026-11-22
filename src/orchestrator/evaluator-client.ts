@@ -5,8 +5,9 @@ import { appendFile, open, stat } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Containment } from '../platform/containment.ts';
+import { winTagArg } from '../platform/windows.ts';
 import { ulid } from '../kernel/ids.ts';
-import type { EvalToOrch, OrchToEval, ProcInfo, Spawned } from '../types.ts';
+import type { Containment as ContainmentContract, EvalToOrch, OrchToEval, ProcInfo, Spawned } from '../types.ts';
 import type { Ledgers } from './contract.ts';
 import { scriptLogPath } from './snapshot.ts';
 
@@ -24,7 +25,8 @@ export interface EvaluatorTransport {
 /** P10, P22: One contained evaluator host, retired before any replacement starts. */
 export class EvaluatorClient implements EvaluatorTransport {
   private ledgers: Ledgers;
-  private containment = new Containment();
+  private containment: ContainmentContract;
+  private platform: NodeJS.Platform;
   private child?: Spawned;
   private timer?: ReturnType<typeof setInterval>;
   private scan: Promise<void> = Promise.resolve();
@@ -33,7 +35,11 @@ export class EvaluatorClient implements EvaluatorTransport {
   private logSizes = new Map<string, number>();
   /** Workflows whose script the host runs now (started, not stopped, done or failed). */
   private scripts = new Set<string>();
-  constructor(ledgers: Ledgers) { this.ledgers = ledgers; }
+  constructor(ledgers: Ledgers, options: { containment?: ContainmentContract; platform?: NodeJS.Platform } = {}) {
+    this.ledgers = ledgers;
+    this.containment = options.containment ?? new Containment();
+    this.platform = options.platform ?? process.platform;
+  }
   /** P10/P11: Persist one script console line per log event; diagnostics never fail the orchestrator. */
   private log(line: string) {
     let event: { t?: unknown; wid?: unknown; ev?: unknown; level?: unknown; text?: unknown };
@@ -81,8 +87,10 @@ export class EvaluatorClient implements EvaluatorTransport {
     await this.retire();
     const exec = `eval:${ulid()}`;
     await this.ledgers.orch.append('eval-host', { exec });
+    const hostEntry = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../evaluator/host.ts' : '../evaluator/host.js', import.meta.url));
     const child = await this.containment.spawn({ exec, command: process.execPath,
-      args: [fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../evaluator/host.ts' : '../evaluator/host.js', import.meta.url))], cwd: this.ledgers.home, env: { DSA_HOME: this.ledgers.home } });
+      args: this.platform === 'win32' ? [hostEntry, winTagArg('DSA_EXEC', exec)] : [hostEntry],
+      cwd: this.ledgers.home, env: { DSA_HOME: this.ledgers.home } });
     this.child = child;
     this.stopping = false;
     const known: ProcInfo[] = child.start ? [{ pid: child.pid, ppid: process.pid, start: child.start, tag: exec }] : [];

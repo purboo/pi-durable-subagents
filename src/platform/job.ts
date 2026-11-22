@@ -56,7 +56,8 @@ import { closeSync, existsSync, openSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { dword, helperEnv, killTree, systemRoot, winProcessRows, winTag, winTagArg, type WinProcessRow } from "./windows.ts";
+import { dword, helperEnv, isWinStart, killProcess, sameCreation, systemRoot, winProcessRows, winTag, winTagArg, type WinProcessRow } from "./windows.ts";
+export { sameCreation };
 
 /** The owner type: exported for the packaging check (the compiled name carries it; nothing separate is shipped). */
 export const JOB_HOST_MARKER = "DsaJob";
@@ -844,7 +845,7 @@ export interface JobOptions {
   endMs?: number;
   /** Test seam: one process-table observation (default: the real one). */
   observe?: () => Promise<WinProcessRow[]>;
-  /** Test seam: end the owner (default: `taskkill /T`); rejects when the end is not confirmed. */
+  /** Test seam: end the owner (default: direct ChildProcess handle kill + handle-verified fallback); rejects when the end is not confirmed. */
   endHelper?: (pid: number) => Promise<void>;
 }
 
@@ -858,21 +859,6 @@ export interface GroupRecord {
   pid: number;
   start?: string;
   group?: { pid: number; start: string };
-}
-
-/** Whether an observed process-table start token names the same process instance as a handle-recorded creation time.
- *  Both are .NET ticks of the same kernel creation timestamp, read at the precision of their own source: the owner takes it
- *  from the wrapper's (or its own) live process handle with GetProcessTimes and keeps whole microseconds -- its 100 ns
- *  unit truncated, `(creation / 10) * 10` in the owner -- and the process table's DMTF CreationDate carries whole
- *  microseconds as well. The bound is that one observation unit in either direction; it is not a range that could admit a
- *  later instance, because a reused pid is created at least a process lifetime later. No recorded token is reformatted:
- *  the group record and the journal keep the value they were given. */
-export function sameCreation(observed: string, recorded: string): boolean {
-  if (!observed || !recorded) return false;
-  if (observed === recorded) return true;
-  if (!/^\d+$/.test(observed) || !/^\d+$/.test(recorded)) return false;
-  const a = BigInt(observed), b = BigInt(recorded);
-  return (a >= b ? a - b : b - a) <= 10n;
 }
 
 /** The group record written before ResumeThread (with legacy `{"pid":<n>}` compatibility); undefined while not ready. */
@@ -954,7 +940,13 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
     helper.once("exit", (code, signal) => { done(asciiJson({ code: code === null ? null : dword(code), signal })); });
     helper.once("error", error => { done(asciiJson({ error: String((error as Error)?.message ?? error) })); });
   });
-  const observe = options.observe ?? (() => winProcessRows()), endHelper = options.endHelper ?? killTree,
+  const defaultEndHelper = async (pid: number): Promise<void> => {
+    if (!ended && helper.exitCode === null && helper.signalCode === null && helper.kill("SIGKILL")) return;
+    if (ended) return;
+    const began = await readBeginIdentity(dir);
+    if (began && began.pid === pid && isWinStart(began.start)) await killProcess({ pid, start: began.start });
+  };
+  const observe = options.observe ?? (() => winProcessRows()), endHelper = options.endHelper ?? defaultEndHelper,
     endMs = options.endMs ?? JOB_HOST_END_MS, observeMs = options.observeMs ?? JOB_OBSERVE_MS;
   const helperPid = helper.pid;
   /** Refuse only with a confirmed retirement; otherwise adopt the attempt (see the module comment). The owner is this

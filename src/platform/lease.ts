@@ -11,7 +11,7 @@ import path from "node:path";
 import { replacePath, replacePathSync } from "../kernel/fsx.ts";
 import { OsLock } from "./lock.ts";
 import { ProcessTable } from "./proctable.ts";
-import { IS_WINDOWS, killTreeSync, winSnapshotSync, type WinProcessRow } from "./windows.ts";
+import { IS_WINDOWS, isWinStart, killTreeSync, sameCreation, winLiveDescendants, winSnapshotSync, type WinProcessIdentity, type WinProcessRow } from "./windows.ts";
 
 export type LeaseMode = "exclusive" | "shared" | "counted";
 export interface LeaseProcess { pid: number; start?: string }
@@ -34,20 +34,15 @@ export const leaseDir = (home: string, resource: string) => path.join(leasesRoot
 const ticketName = (seq: number) => `${String(seq).padStart(12, "0")}.json`;
 const TICKET = /^\d{12}\.json$/;
 
-/** Every live descendant of `pid` (Windows has no process groups: the command's tree is the group). Rows older than the
- *  root's creation token are never taken for its children: a reused pid has a later token. */
-function winDescendants(pid: number, after?: string): WinProcessRow[] {
-  const rows = winSnapshotSync(), out: WinProcessRow[] = [], queue = [pid];
-  const floor = after && /^\d+$/.test(after) ? BigInt(after) : undefined;
-  for (let i = 0; i < queue.length; i++)
-    for (const row of rows.values()) if (row.ppid === queue[i] && !out.some(o => o.pid === row.pid)) {
-      if (floor !== undefined && /^\d+$/.test(row.start) && BigInt(row.start) < floor) continue;
-      out.push(row); queue.push(row.pid);
-    }
-  return out;
+/** Proven-owned live descendants of `(pid, start)` in the current snapshot. Requires a valid `start` token and a live
+ *  matching parent in the snapshot: once a parent exits on Windows, its numeric PID can be reused by an unrelated
+ *  process whose children share that `ParentProcessId`, and pre-existing boot/system orphans have `child.start < start`. */
+function winDescendants(pid: number, start?: string, rows: ReadonlyMap<number, WinProcessRow> = winSnapshotSync()): WinProcessRow[] {
+  if (!isWinStart(start)) return [];
+  return winLiveDescendants([{ pid, start }], rows.values());
 }
 
-/** Whether a process still runs; on Linux the start token also tells it from a later process with the same pid. */
+/** Whether a process still runs; on Linux/Windows the start token also tells it from a later process with the same pid. */
 export function alive(p: LeaseProcess | undefined): boolean {
   if (!p) return false;
   try { process.kill(p.pid, 0); }
@@ -55,8 +50,9 @@ export function alive(p: LeaseProcess | undefined): boolean {
   if (IS_WINDOWS) {
     // Creation time is Windows' start token. A row missing from the short-lived cache is not proof of death.
     if (!p.start) return true;
+    if (!isWinStart(p.start)) return false;
     const row = winSnapshotSync().get(p.pid);
-    return row ? row.start === p.start : true;
+    return row ? sameCreation(row.start, p.start) : true;
   }
   if (!p.start || process.platform !== "linux") return true;
   try {
@@ -130,18 +126,52 @@ export const orphaned = (t: LeaseTicket) => {
 /** A ticket is live while its wrapper, command, process group or exact inherited tag can still act. */
 export const live = (t: LeaseTicket) => alive(t.wrapper) || alive(t.command) || orphaned(t);
 
+export interface EndLeaseOptions {
+  platform?: NodeJS.Platform;
+  snapshotWin?: (maxAgeMs?: number) => Map<number, WinProcessRow>;
+  killWinSync?: (targets: readonly WinProcessIdentity[]) => void;
+}
+
 /** End the group and escaped tagged descendants, rescanning for forks. Release is bounded even for unkillable tasks. */
-export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (line: string) => void): Promise<void> {
+export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (line: string) => void, options: EndLeaseOptions = {}): Promise<void> {
   const started = Date.now(), until = started + 5000;
-  if (IS_WINDOWS) {
-    // taskkill /T is the tree signal (there is no SIGTERM to deliver). The wrapper is this holder process and must
-    // outlive the cleanup: only the command's tree is ended here.
+  if ((options.platform ?? process.platform) === "win32") {
+    // Handle-verified tree termination (there is no SIGTERM to deliver). The wrapper is this holder process and must
+    // outlive the cleanup: only the command's proven-owned tree is ended here.
+    if (!t.command) return;
+    if (!isWinStart(t.command.start)) {
+      say(`hold: refusing to end pid ${t.command.pid} of ${who(t)} without verified start identity; releasing`);
+      return;
+    }
+    const snap = options.snapshotWin ?? winSnapshotSync;
+    const killWin = options.killWinSync ?? (targets => killTreeSync(targets));
+    const rootIdentity: WinProcessIdentity = { pid: t.command.pid, start: t.command.start };
+    const proven = new Map<string, WinProcessIdentity>([[`${rootIdentity.pid}:${rootIdentity.start}`, rootIdentity]]);
+    let checkedRootHandle = false;
     for (;;) {
-      if (t.command && alive(t.command)) { try { killTreeSync(t.command.pid); } catch { /* gone */ } }
-      const orphans = t.command ? winDescendants(t.command.pid, t.command.start) : [];
-      for (const row of orphans) if (!alive({ pid: row.pid, start: row.start })) continue; else { try { killTreeSync(row.pid); } catch { /* gone */ } }
-      const remaining = t.command ? winDescendants(t.command.pid, t.command.start).length : 0;
-      if (!(t.command && alive(t.command)) && !remaining) break;
+      const rows = snap(0);
+      for (const d of winLiveDescendants([...proven.values()], rows.values())) {
+        proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+      }
+      const liveTargets = [...proven.values()].filter(p => {
+        const row = rows.get(p.pid);
+        return row !== undefined && sameCreation(row.start, p.start);
+      });
+      if (!checkedRootHandle && !liveTargets.some(p => p.pid === rootIdentity.pid)) {
+        liveTargets.unshift(rootIdentity);
+      }
+      checkedRootHandle = true;
+      if (!liveTargets.length) break;
+      try { killWin(liveTargets); } catch { /* retry until deadline when a verified owned process resists termination */ }
+      const after = snap(0);
+      for (const d of winLiveDescendants([...proven.values()], after.values())) {
+        proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+      }
+      const remaining = [...proven.values()].filter(p => {
+        const row = after.get(p.pid);
+        return row !== undefined && sameCreation(row.start, p.start);
+      }).length;
+      if (!remaining) break;
       if (Date.now() >= until) { say(`hold: ${remaining} processes of ${who(t)} survived; releasing`); break; }
       await new Promise(r => setTimeout(r, 25));
     }

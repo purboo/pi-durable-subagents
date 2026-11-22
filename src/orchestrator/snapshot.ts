@@ -18,7 +18,7 @@ import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel, isWorktreeConflict } from "./executor/worktree.ts";
 import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
 import { labelsOf } from "../events/derive.ts";
-import { winSnapshotSync } from "../platform/windows.ts";
+import { isWinStart, sameCreation, winSnapshotSync } from "../platform/windows.ts";
 import { PENDING_NOTE, generationRids, UNDELIVERED_FOLLOW_UP } from "./notes.ts";
 import { readStats, type OrchestratorStats } from "./stats.ts";
 
@@ -1392,7 +1392,11 @@ export function processAlive(pid: number, start?: string): boolean {
   try { process.kill(pid, 0); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPERM") return false; }
   if (!start) return true;
-  if (process.platform === "win32") { const row = winSnapshotSync().get(pid); return row ? row.start === start : true; }
+  if (process.platform === "win32") {
+    if (!isWinStart(start)) return false;
+    const row = winSnapshotSync().get(pid);
+    return row ? sameCreation(row.start, start) : true;
+  }
   if (process.platform !== "linux") return true;
   try { const stat = readFileSync(`/proc/${pid}/stat`, "utf8"); return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] === start; }
   catch { return false; }

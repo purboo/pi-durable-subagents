@@ -12,6 +12,7 @@ import { readJournalSnapshot } from "../../kernel/journal.ts";
 import { journalPath, orchLedger } from "../../paths.ts";
 import { captureStart, ProcessTable } from "../../platform/proctable.ts";
 import { Containment } from "../../platform/containment.ts";
+import { IS_WINDOWS, isWinStart, killProcess, sameCreation } from "../../platform/windows.ts";
 import { JT } from "../../types.ts";
 
 export interface DrillOptions { keep: boolean; json: boolean }
@@ -233,12 +234,20 @@ export async function drill(args: string[], inherited: NodeJS.ProcessEnv = proce
 async function cleanup(home: string): Promise<void> {
   const ledger = () => readJournalSnapshot(orchLedger(home));
   const hosts = ledger().filter(e => e.type === "orchestrator" && e.pid).map(e => ({ pid: Number(e.pid), start: e.start ? String(e.start) : undefined }));
-  const same = async (h: { pid: number; start?: string }) => { const now = await captureStart(h.pid); return now !== "" && (h.start === undefined || now === h.start); };
-  for (const h of hosts) if (await same(h)) { try { process.kill(h.pid, "SIGTERM"); } catch {} }
-  const end = Date.now() + 15_000;
-  for (const h of hosts) {
-    while (await same(h) && Date.now() < end) await delay(100);
-    if (await same(h)) { try { process.kill(h.pid, "SIGKILL"); } catch {} }
+  if (IS_WINDOWS) {
+    // Fail closed against unverified PIDs: only end hosts with a recorded creation token, through handle verification.
+    for (const h of hosts) if (isWinStart(h.start)) await killProcess({ pid: h.pid, start: h.start }).catch(() => {});
+  } else {
+    const same = async (h: { pid: number; start?: string }) => {
+      const now = await captureStart(h.pid).catch(() => "");
+      return now !== "" && (h.start === undefined || (h.start !== "" && now === h.start));
+    };
+    for (const h of hosts) if (await same(h)) { try { process.kill(h.pid, "SIGTERM"); } catch {} }
+    const end = Date.now() + 15_000;
+    for (const h of hosts) {
+      while (await same(h) && Date.now() < end) await delay(100);
+      if (await same(h)) { try { process.kill(h.pid, "SIGKILL"); } catch {} }
+    }
   }
   const containment = new Containment(new ProcessTable());
   for (const created of ledger().filter(e => e.type === JT.created)) {

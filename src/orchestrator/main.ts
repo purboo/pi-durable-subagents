@@ -51,8 +51,9 @@ export async function main(options: MainOptions = {}): Promise<{ restart?: true 
     }
     ledgers = { home, config, orch: await openJournal(orchLedger(home)) };
     // Which version runs is visible to every pi session (status; a notice when it differs from the one pi loaded).
-    // `start` (Linux) tells this process from a later one given the same pid after a crash.
-    const start = await captureStart(process.pid).catch(() => '');
+    // `start` (Linux and Windows) tells this process from a later one given the same pid after a crash.
+    let start = await captureStart(process.pid).catch(() => '');
+    if (!start && process.platform === 'win32') start = await captureStart(process.pid).catch(() => '');
     // Partial writes of earlier starts (a full disk, say): best effort, never fails the start.
     removeStaleTemps(binDir(home), 10 * 60_000);
     // Subagents reach `pi-durable-subagents hold …` through this shim, written before the start is recorded (executor puts its directory first on PATH).

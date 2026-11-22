@@ -18,7 +18,7 @@ export interface CapabilityReport { version?: string; missing: Surface[]; execut
 
 /** The process layer (process tables and tree kill, file locks, the memory probe, command calls, service units) has a
  *  native implementation for these platforms; anywhere else every call would fail at spawn, so execution is disabled
- *  at load instead. Windows uses PowerShell/CIM for the process table and taskkill for fencing. */
+ *  at load instead. Windows uses PowerShell/CIM for the process table and handle-verified Win32 termination for fencing. */
 export const SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = ["linux", "darwin", "win32"];
 /** AC5, P21, issue #1: Check the platform and the surfaces present in pi's modules and extension API; produce exact
  *  degradation messages. */

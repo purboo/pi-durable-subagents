@@ -16,6 +16,7 @@ import { publishRequest } from '../../../src/kernel/mailbox.ts';
 import { reduceLifecycle, type DecisionRecord } from '../../../src/kernel/lifecycle.ts';
 import { journalPath, orchInbox, orchLedger } from '../../../src/paths.ts';
 import { captureStart } from '../../../src/platform/proctable.ts';
+import { isWinStart, killProcessSync } from '../../../src/platform/windows.ts';
 import { leaseDir, writeTicket } from '../../../src/platform/lease.ts';
 import { Engine } from '../../../src/orchestrator/engine.ts';
 import { restartToken, subagentRestartError } from '../../../src/orchestrator/restart.ts';
@@ -157,7 +158,12 @@ for (const body of [{ token: '0123456789ab', reason: 'upgrade' }, { force: true 
 
 test('CLI restart: refused while a call runs, --force replaces the orchestrator process and the call resumes', { timeout: process.platform === 'win32' ? 90_000 : 30_000 }, async t => {
   const request = sender(), home = await root(t), env = { ...process.env, NODE_TEST_CONTEXT: undefined, HOME: home, DSA_HOME: home, DSA_ORCHESTRATOR_ENTRY: fake, DSA_FAKE_HOLD: 'a' };
-  t.after(() => { const o = currentOrchestrator(home); if (o) process.kill(o.pid, 'SIGTERM'); });
+  t.after(() => {
+    const o = currentOrchestrator(home);
+    if (!o) return;
+    if (process.platform === 'win32') { if (isWinStart(o.start)) { try { killProcessSync({ pid: o.pid, start: o.start }); } catch {} } }
+    else { try { process.kill(o.pid, 'SIGTERM'); } catch {} }
+  });
   const out: string[] = [], write = (s: string) => { out.push(s); };
   assert.equal(await main(['restart'], { env, write }), 0);
   assert.match(out.pop()!, /^restart: no orchestrator is running/);
