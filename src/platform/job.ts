@@ -9,8 +9,21 @@
 // The helper is PowerShell 5.1 (shipped with every supported Windows; no native binary to build or ship) compiling a
 // small C# block in memory with Add-Type: Node has no Job Object API and this adds no npm dependency. Its script is
 // written into the attempt directory once per attempt (a command line would hit Windows' 32 KiB limit) and run with
-// `-File`, so no quoting of it is involved. The C# is compiled on each attempt (about a second), which a command call's
-// lifetime amortizes.
+// `-File`; the attempt directory is the script's only argument, so no path is ever written into the script and none of
+// its text is quoted or case-folded by PowerShell. The script itself is pure ASCII (a test asserts it), because
+// PowerShell 5.1 reads a file with no byte order mark in the ANSI code page: only the attempt directory, the argv and
+// the environment can be Unicode, and those travel as arguments and through job.json (see jobSpecText). The C# is
+// compiled on each attempt (about a second), which a command call's lifetime amortizes.
+//
+// The helper is spawned hidden, and this is the repair's open point: PowerShell 5.1 (and pwsh) quietly abort with
+// exit code 0, no stderr and no script run when they have no console (PowerShell#28383; Windows CI 45039418985 measured
+// it: the same script started the wrapper and recorded the group when it had a console and produced nothing at all
+// detached). DETACHED_PROCESS is exactly what a detached spawn asks for, but a non-detached child is assigned to
+// libuv's kill-with-parent job, so an attempt would die with the orchestrator -- the property this module exists for.
+// Both cannot hold from the orchestrator alone: a helper with a console of its own and no job has to be created with
+// CREATE_NO_WINDOW/CREATE_NEW_CONSOLE, which Node cannot ask for. The repair needs one of: a first helper (hidden
+// console, doomed with the orchestrator) that creates a hidden-console successor holding the group's handle, or a
+// `cmd /c start /wait /min` relay (visible minimized window), each of which changes who owns the group.
 //
 // Observation is fail-closed: before a group exists the orchestrator waits for the helper's `group` record (the suspended
 // child's pid, written before the child may run) and starts no attempt when it does not arrive or cannot be read; the
@@ -18,8 +31,8 @@
 // and IsProcessInJob all succeeded, and it writes `start-error` when they did not. The helper's own identity is recorded
 // with the attempt, so its absence from the process table proves the group is closed.
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { closeSync, existsSync, openSync } from "node:fs";
+import { open, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { helperEnv, killTree, powershellPath, winProcessRows } from "./windows.ts";
@@ -38,6 +51,17 @@ export const JOB_GROUP = "group";
 export const JOB_END = "group-end";
 /** Written (atomically) when the helper could not start the wrapper: a short reason for the failed attempt. */
 export const JOB_ERROR = "start-error";
+/** Written by the helper's first statement, before Add-Type: its absence proves the script never ran (a launcher or
+ *  PowerShell problem, not a failure of this attempt), which is what a bare "the helper ended" otherwise hides. */
+export const JOB_BEGIN = "helper-begin";
+/** Written by this process when the helper ends: its exit code (or why it could not be spawned), for the failure
+ *  reason. The helper cannot report this itself -- it is the process that ended. */
+export const JOB_HELPER_EXIT = "helper-exit";
+/** How much of an evidence file a failure reason may read; a reason is a line, never a dump. */
+const REASON_BYTES = 1000;
+/** How much of it a failure reason may quote, and how long the whole reason may get. */
+const EVIDENCE_LIMIT = 200;
+const REASON_LIMIT = 300;
 /** Add-Type plus process creation on a loaded runner; a helper that has not reported a group by then started nothing. */
 const JOB_START_TIMEOUT_MS = 30_000;
 
@@ -58,14 +82,13 @@ public static class DsaJob
     const int JobObjectExtendedLimitInformation = 9;
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     const uint GENERIC_READ = 0x80000000;
-    const uint GENERIC_WRITE = 0x40000000;
+    const uint FILE_APPEND_DATA = 0x00000004;
     const uint FILE_SHARE_READ = 0x00000001;
     const uint FILE_SHARE_WRITE = 0x00000002;
     const uint FILE_SHARE_DELETE = 0x00000004;
     const uint OPEN_EXISTING = 3;
     const uint OPEN_ALWAYS = 4;
     const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
-    const uint FILE_END = 2;
     const uint INFINITE = 0xFFFFFFFF;
     static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
 
@@ -168,13 +191,11 @@ public static class DsaJob
     static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr CreateFileW(string name, uint access, uint share, ref SECURITY_ATTRIBUTES attributes, uint disposition, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool SetFilePointerEx(IntPtr file, long distance, out long position, uint moveMethod);
 
     /** Run the wrapper inside a new group and return its exit status (negative: the helper failed, see start-error). */
     public static int Run(string dir, string application, string[] arguments, string workingDirectory, string logPath, string[] environment)
     {
-        IntPtr job = IntPtr.Zero, log = IntPtr.Zero, input = IntPtr.Zero, block = IntPtr.Zero;
+        IntPtr job = IntPtr.Zero, output = IntPtr.Zero, error = IntPtr.Zero, input = IntPtr.Zero, block = IntPtr.Zero;
         PROCESS_INFORMATION child = new PROCESS_INFORMATION();
         bool started = false;
         try
@@ -189,10 +210,14 @@ public static class DsaJob
             var inherit = new SECURITY_ATTRIBUTES();
             inherit.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
             inherit.bInheritHandle = 1;
-            log = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ref inherit, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
-            if (log == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile " + logPath, Marshal.GetLastWin32Error());
-            long end;
-            SetFilePointerEx(log, 0, out end, FILE_END);
+            // Two independent handles, one for stdout and one for stderr, each opened for append only (FILE_APPEND_DATA
+            // without FILE_WRITE_DATA): the kernel sends every write of each stream to the current end of the file, so
+            // the two streams interleave in the log without either overwriting the other. A shared handle or a seek to
+            // the end would let one stream's buffered output land on the other's (or on an earlier attempt's) bytes.
+            output = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ref inherit, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+            if (output == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile " + logPath, Marshal.GetLastWin32Error());
+            error = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ref inherit, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+            if (error == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile " + logPath, Marshal.GetLastWin32Error());
             input = CreateFileW("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, ref inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
             if (input == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile NUL", Marshal.GetLastWin32Error());
 
@@ -200,8 +225,8 @@ public static class DsaJob
             startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
             startup.dwFlags = (int)STARTF_USESTDHANDLES;
             startup.hStdInput = input;
-            startup.hStdOutput = log;
-            startup.hStdError = log;
+            startup.hStdOutput = output;
+            startup.hStdError = error;
             block = EnvironmentBlock(environment);
             uint flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
             if (!CreateProcessW(application, CommandLine(application, arguments), IntPtr.Zero, IntPtr.Zero, true, flags, block,
@@ -244,7 +269,8 @@ public static class DsaJob
             if (child.hThread != IntPtr.Zero) CloseHandle(child.hThread);
             if (child.hProcess != IntPtr.Zero) CloseHandle(child.hProcess);
             if (input != IntPtr.Zero && input != INVALID_HANDLE_VALUE) CloseHandle(input);
-            if (log != IntPtr.Zero && log != INVALID_HANDLE_VALUE) CloseHandle(log);
+            if (output != IntPtr.Zero && output != INVALID_HANDLE_VALUE) CloseHandle(output);
+            if (error != IntPtr.Zero && error != INVALID_HANDLE_VALUE) CloseHandle(error);
             if (block != IntPtr.Zero) Marshal.FreeHGlobal(block);
             // The group's only handle (non-inherited): closing it kills every process the command left behind.
             if (job != IntPtr.Zero) CloseHandle(job);
@@ -311,29 +337,83 @@ public static class DsaJob
 }
 `;
 
-/** The helper script: PowerShell 5.1 compiling {@link C_SHARP}, then running the wrapper in a new group. */
-export const JOB_HELPER = `$ErrorActionPreference = 'Stop'
-$dir = '@@DIR@@'
+/** The helper script: PowerShell 5.1 compiling {@link C_SHARP}, then running the wrapper in a new group. It takes the
+ *  attempt directory as its only argument (`-File <script> <dir>`, bound to `$Dir`): the directory is never written into
+ *  the script, so a Unicode or curly-quoted path needs no quoting and the script stays ASCII -- see the module comment.
+ *  Exit codes are the launcher's evidence: 125 is a failure the script recorded, 126 is a missing attempt directory. */
+export const JOB_HELPER = `param([string]$Dir)
+if (-not $Dir) { exit 126 }
+$ErrorActionPreference = 'Stop'
 $status = 125
 try {
+  # Before Add-Type, so its absence says the script itself never ran.
+  [System.IO.File]::WriteAllText((Join-Path $Dir '${JOB_BEGIN}'), 'begin')
   Add-Type -TypeDefinition @'
 ${C_SHARP}
 '@
-  $spec = Get-Content -LiteralPath (Join-Path $dir 'job.json') -Raw | ConvertFrom-Json
-  Remove-Item -LiteralPath (Join-Path $dir 'job.json') -Force -ErrorAction SilentlyContinue
-  $pairs = @()
-  if ($spec.env) { foreach ($p in $spec.env.psobject.Properties) { $pairs += ($p.Name + '=' + [string]$p.Value) } }
-  $status = [DsaJob]::Run($dir, [string]$spec.exe, [string[]]$spec.args, [string]$spec.cwd, [string]$spec.log, [string[]]$pairs)
+  # UTF-8 explicitly: PowerShell 5.1 decodes a file it reads without a byte order mark as ANSI, which would mangle a
+  # Unicode or curly-quoted argument.
+  $spec = [System.IO.File]::ReadAllText((Join-Path $Dir '${JOB_SPEC}'), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+  Remove-Item -LiteralPath (Join-Path $Dir '${JOB_SPEC}') -Force -ErrorAction SilentlyContinue
+  $status = [DsaJob]::Run($Dir, [string]$spec.exe, [string[]]$spec.args, [string]$spec.cwd, [string]$spec.log, [string[]]$spec.env)
 } catch {
-  try { [System.IO.File]::WriteAllText((Join-Path $dir 'start-error'), [string]$_) } catch { }
+  try { [System.IO.File]::WriteAllText((Join-Path $Dir '${JOB_ERROR}'), [string]$_) } catch { }
   $status = 125
 }
 if ($status -lt 0) { exit 125 }
 exit $status
 `;
 
-/** The helper script with the attempt directory (and only that) spelled in; a PowerShell single-quoted string. */
-export function jobHelperScript(dir: string): string { return JOB_HELPER.replace("@@DIR@@", dir.replace(/'/g, "''")); }
+/** The wrapper's environment as the helper receives it: one ordered `NAME=value` list. Windows variable names are
+ *  case-insensitive, so names that differ only in case name one variable: the first spelling wins, with its position in
+ *  the list, so the block is ordered and has no duplicates the kernel could resolve differently from the caller. A name
+ *  that cannot be written is dropped (empty, or with `=` in it) instead of corrupting the block. */
+export function jobEnv(env: NodeJS.ProcessEnv): string[] {
+  const seen = new Set<string>(), pairs: string[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (!name || name.includes("=") || value === undefined) continue;
+    const fold = name.toUpperCase();
+    if (seen.has(fold)) continue;
+    seen.add(fold);
+    pairs.push(`${name}=${value}`);
+  }
+  return pairs;
+}
+
+/** The spec as JSON text this module writes itself, every code unit outside ASCII escaped (`\uXXXX`). PowerShell 5.1
+ *  reads job.json as ANSI (see JOB_HELPER), so UTF-8 bytes of a Unicode path, a curly quote or a non-ASCII environment
+ *  value would arrive mangled; ASCII-only text decodes identically under every code page and ConvertFrom-Json turns the
+ *  escapes back into the very same UTF-16 string. */
+export function jobSpecText(launch: Pick<JobLaunch, "exe" | "args" | "cwd" | "log" | "env">): string {
+  return asciiJson({ exe: launch.exe, args: launch.args, cwd: launch.cwd, log: launch.log, env: jobEnv(launch.env) });
+}
+
+/** `value` as JSON text of ASCII bytes only: like JSON.stringify, but every code unit outside 0x20..0x7e is escaped (each
+ *  half of a surrogate pair on its own, which JSON allows and parses back into the same pair). */
+export function asciiJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") { if (!Number.isFinite(value)) throw new TypeError(`not JSON: ${value}`); return String(value); }
+  if (typeof value === "string") return asciiString(value);
+  if (Array.isArray(value)) return `[${value.map(item => asciiJson(item)).join(",")}]`;
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, item]) => item !== undefined);
+    return `{${entries.map(([name, item]) => `${asciiString(name)}:${asciiJson(item)}`).join(",")}}`;
+  }
+  throw new TypeError(`not JSON: ${typeof value}`);
+}
+
+const ASCII_ESCAPES: Record<string, string> = { '"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t" };
+function asciiString(text: string): string {
+  let out = '"';
+  for (let at = 0; at < text.length; at += 1) {
+    const unit = text.charCodeAt(at);
+    out += unit === 0x22 || unit === 0x5c ? ASCII_ESCAPES[text[at]!]!
+      : unit < 0x20 || unit > 0x7e ? `\\u${unit.toString(16).padStart(4, "0")}`
+      : text[at]!;
+  }
+  return `${out}"`;
+}
 
 export interface JobLaunch {
   /** The program to run suspended, assigned to the group, then resumed (the command's wrapper). */
@@ -360,22 +440,29 @@ export interface JobSpawned {
  *  the helper cannot create the group, assign the suspended child before it runs, or report it back in time. */
 export async function spawnInJob(dir: string, launch: JobLaunch, options: { timeoutMs?: number } = {}): Promise<JobSpawned> {
   // Evidence of an earlier attempt in the same directory must never be read as this attempt's.
-  for (const name of [JOB_GROUP, JOB_END, JOB_ERROR, JOB_HELPER_LOG]) await rm(join(dir, name), { force: true });
+  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_HELPER_EXIT, JOB_HELPER_LOG]) await rm(join(dir, name), { force: true });
   const script = join(dir, JOB_SCRIPT);
-  await writeFile(script, jobHelperScript(dir));
-  await writeFile(join(dir, JOB_SPEC), JSON.stringify(launch));
+  await writeFile(script, JOB_HELPER);
+  await writeFile(join(dir, JOB_SPEC), jobSpecText(launch));
   // The helper's stderr is a file, not a pipe: it outlives this process and nothing drains it.
   const errors = openSync(join(dir, JOB_HELPER_LOG), "a");
   let helper: ChildProcess;
   try {
-    helper = spawn(powershellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script],
+    // Not detached, and the attempt directory as the script's argument: see the module comment for both.
+    helper = spawn(powershellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, dir],
       { detached: true, stdio: ["ignore", "ignore", errors], windowsHide: true, env: helperEnv() });
   } finally { closeSync(errors); }
   let ended = false;
+  // The helper's end is recorded before the wake-up resolves, so a failure reason can say why nothing was attempted even
+  // when the helper itself wrote nothing.
   const exited = new Promise<void>(resolve => {
-    const done = () => { ended = true; resolve(); };
-    helper.once("exit", done);
-    helper.once("error", done);
+    const done = async (record: string) => {
+      ended = true;
+      await writeFile(join(dir, JOB_HELPER_EXIT), record, "utf8").catch(() => {});
+      resolve();
+    };
+    helper.once("exit", (code, signal) => { void done(asciiJson({ code, signal })); });
+    helper.once("error", error => { void done(asciiJson({ error: String((error as Error)?.message ?? error) })); });
   });
   /** Fail closed: end the group (killing the helper closes it), reap it, and report why nothing may be attempted. */
   const refuse = async (reason: string): Promise<never> => {
@@ -424,10 +511,63 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: { time
   return { pid, start, ...(helperPid !== undefined && helperStart ? { group: { pid: helperPid, start: helperStart } } : {}), exited };
 }
 
-/** The helper's reason, when it wrote one: appended to the failure the call reports. */
-async function startError(dir: string): Promise<string> {
-  const text = (await readFile(join(dir, JOB_ERROR), "utf8").catch(() => "")) +
-    (await readFile(join(dir, JOB_HELPER_LOG), "utf8").catch(() => ""));
-  const reason = text.trim().replace(/\s+/g, " ");
-  return reason ? `: ${reason.slice(0, 300)}` : "";
+/** The reason a helper left, when it left one, appended to the failure a call reports: whether its script ever ran, why
+ *  its process ended, and the bounded first line of what it wrote. Nothing to say is "".
+ *  Bounded and credential-free: an evidence file contributes one clipped line, and the value of a variable whose name
+ *  says it holds a secret is redacted -- the helper may quote what the caller handed it. */
+export async function startError(dir: string): Promise<string> {
+  const [error, log, exit, began] = await Promise.all([
+    read(join(dir, JOB_ERROR), "head"), read(join(dir, JOB_HELPER_LOG), "tail"),
+    read(join(dir, JOB_HELPER_EXIT), "head"), existsSync(join(dir, JOB_BEGIN)),
+  ]);
+  const notes: string[] = [];
+  const end = endRecord(exit);
+  if (end?.error) notes.push(`the helper could not be started (${oneLine(end.error)})`);
+  else if (end?.code !== undefined) {
+    notes.push(began ? `the helper exited with code ${end.code}` : `the helper exited with code ${end.code} before its script ran`);
+    // The one measured shape of "nothing to say": PowerShell started without a console (PowerShell#28383).
+    if (!began && end.code === 0) notes.push("PowerShell without a console runs nothing and exits 0");
+  }
+  // A recorded failure is a message (quoted from its start); the helper's own log is quoted from its end, where the
+  // newest lines are. Either way it is one clipped line, with credential-shaped values redacted: the helper may quote
+  // back what the caller handed it.
+  const evidence = clip(redact(oneLine(error || log)), EVIDENCE_LIMIT, error ? "head" : "tail");
+  const reason = [evidence, notes.join(", ")].filter(Boolean).join("; ");
+  return reason ? `: ${clip(reason, REASON_LIMIT)}` : "";
 }
+
+/** What the recorded end of the helper says (undefined when it recorded nothing readable). */
+function endRecord(text: string): { code?: number; signal?: string; error?: string } | undefined {
+  if (!text.trim()) return undefined;
+  let record: { code?: unknown; signal?: unknown; error?: unknown };
+  try { record = JSON.parse(text) as typeof record; } catch { return undefined; }
+  if (typeof record.error === "string" && record.error) return { error: record.error };
+  const code = typeof record.code === "number" && Number.isInteger(record.code) ? record.code : undefined;
+  const signal = typeof record.signal === "string" && record.signal ? record.signal : undefined;
+  return code === undefined && signal === undefined ? undefined : { code, signal };
+}
+
+/** At most {@link REASON_BYTES} of a file -- its beginning (a message) or its end (a log's newest lines) -- as UTF-8.
+ *  "" when the file is absent, so evidence never grows a reason. */
+async function read(path: string, part: "head" | "tail"): Promise<string> {
+  const file = await open(path, "r").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+  if (!file) return "";
+  try {
+    const { size } = await file.stat(), length = Math.min(size, REASON_BYTES);
+    if (length <= 0) return "";
+    const buffer = Buffer.alloc(length);
+    await file.read(buffer, 0, length, part === "head" ? 0 : size - length);
+    return buffer.toString("utf8").replace(/^\uFEFF/, "");
+  } finally { await file.close(); }
+}
+
+/** Shapes a failure reason never repeats: an assignment to a name that says it holds a secret, and user info in a URL. */
+const SECRETS: readonly (readonly [RegExp, string])[] = [
+  [/([A-Za-z0-9_.-]*(?:KEY|TOKEN|SECRET|PASS|PASSWORD|CREDENTIAL|AUTH|COOKIE|SESSION)[A-Za-z0-9_.-]*\s*[=:]\s*)(?:"[^"]*"|'[^']*'|(?:(?:bearer|basic|token|digest)\s+)?[^\s"',;]+)/gi, "$1<redacted>"],
+  [/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/@]+@/g, "$1<redacted>@"],
+];
+function redact(text: string): string { let out = text; for (const [pattern, instead] of SECRETS) out = out.replace(pattern, instead); return out; }
+const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
+/** At most `limit` characters, keeping the beginning (a message) or the end (a log's newest lines). */
+const clip = (text: string, limit: number, part: "head" | "tail" = "head"): string => text.length <= limit ? text
+  : part === "head" ? `${text.slice(0, limit - 1)}…` : `…${text.slice(-(limit - 1))}`;
