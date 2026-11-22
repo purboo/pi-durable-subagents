@@ -1,5 +1,7 @@
 // End-to-end command calls on the real stack (engine + executor + evaluator), without pi: DSA_PI_BIN is `false`, so
-// any launch of a subagent would fail. Real processes, an isolated DSA_HOME per test.
+// any launch of a subagent would fail. Real processes, an isolated DSA_HOME per test. The restart/adopt and rerun cases
+// take Node argv programs only (no shell syntax, no `sleep`): their waits are files this test opens, so the same flow --
+// a restarted orchestrator adopting a command that outlived it -- is exercised on POSIX and on native Windows.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -59,6 +61,41 @@ const outputs = (home: string) => (readdirSync(home, { recursive: true }) as str
   .map(p => `${p}: ${readFileSync(join(home, p), "utf8").slice(-2000)}`).join("\n");
 /** Live processes carrying the tag `id` (DSA_EXEC). */
 const tagged = async (id: string) => (await new ProcessTable().list(new Set([id]), { fresh: true })).filter(p => p.tag === id);
+/** A file's text, "" while it does not exist yet (an attempt that has not acted has written nothing). */
+const text = (path: string) => existsSync(path) ? readFileSync(path, "utf8") : "";
+/** A command as a Node argv array, so one fixture runs unchanged on POSIX and on native Windows: no shell syntax, no
+ *  `sleep`, no redirection -- and every wait is an event (a file this test opens), never a guessed duration. */
+const nodeProgram = (source: string): string[] => [process.execPath, "-e", source];
+/** A program that waits for the gate file (bounded, so a never-opened gate fails the attempt instead of hanging the
+ *  suite), then prints `output` and exits `status`: the two commands of a restart/adopt test differ only in that. */
+const printAfterGate = (gate: string, output: string, status = 0, ms = 60_000) => nodeProgram([
+  `const fs = require("fs");`,
+  `const gate = ${JSON.stringify(gate)}, from = Date.now();`,
+  `const timer = setInterval(() => {`,
+  `  if (!fs.existsSync(gate)) { if (Date.now() - from > ${ms}) { clearInterval(timer); console.error("gate timeout"); process.exit(90); } return; }`,
+  `  clearInterval(timer); console.log(${JSON.stringify(output)}); process.exit(${status});`,
+  `}, 25);`,
+].join("\n"));
+/** Wait until no process carries the tag `id` (bounded). A Windows observation is a PowerShell/CIM query, so the poll is
+ *  coarse: this is a comment on the cost of the check, not a duration any assertion depends on. */
+const untagged = async (id: string, ms = 60_000) => {
+  const deadline = Date.now() + ms;
+  for (;;) { if (!(await tagged(id)).length) return; if (Date.now() > deadline) throw new Error(`timeout: processes of ${id} are still live`); await delay(500); }
+};
+/** The rerun fixture's program: it appends its start, and its end unless it was killed, to `marks`. `run` counts the
+ *  starts already recorded: the first run lasts `firstMs` (this test ends it, never it the test), a rerun ends at once. */
+const rerunProgram = (marks: string, firstMs: number, againMs = 20) => nodeProgram([
+  `const fs = require("fs");`,
+  `const marks = ${JSON.stringify(marks)};`,
+  `const run = fs.existsSync(marks) ? fs.readFileSync(marks, "utf8").split("\\n").filter(line => line === "start").length : 0;`,
+  `fs.appendFileSync(marks, "start\\n");`,
+  `setTimeout(() => fs.appendFileSync(marks, "end\\n"), run === 0 ? ${firstMs} : ${againMs});`,
+].join("\n"));
+/** A program that records its start and then acts until something ends it (the fence, or the wrapper's death). */
+const startAndWait = (marks: string) => nodeProgram([
+  `require("fs").appendFileSync(${JSON.stringify(marks)}, "start\\n");`,
+  `setInterval(() => {}, 1000);`,
+].join("\n"));
 
 test("command call: ok without pi or a provider slot; the origin's finished notice; zero usage", { timeout: 60_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
   const s = await stack(t);
@@ -137,10 +174,13 @@ test("command call: stop ends the tree and seals stopped", { timeout: 60_000, sk
   assert.deepEqual(await tagged(String(first.id)), []);
 });
 
-test("command call: restarts (normal and forced) adopt the running command; one that ended meanwhile seals from its exit record", { timeout: 90_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
+test("command call: restarts (normal and forced) adopt the running command; one that ended meanwhile seals from its exit record", { timeout: 120_000, }, async t => {
   const s = await stack(t);
-  const long = await s.run({ call: { command: "sleep 4; echo survived" } });
-  const short = await s.run({ call: { command: "sleep 1; echo meanwhile; exit 5" } });
+  // Both commands are Node argv arrays (no shell): the same crash-safe flow runs on POSIX and on native Windows, and
+  // each ends only when this test opens its gate -- no assertion below waits for a duration and hopes.
+  const survived = join(s.root, "survived"), meanwhileGate = join(s.root, "meanwhile");
+  const long = await s.run({ call: { command: printAfterGate(survived, "survived", 0) } });
+  const short = await s.run({ call: { command: printAfterGate(meanwhileGate, "meanwhile", 5) } });
   const first = await s.started(long);
   await s.started(short);
   // A normal restart: nothing is live for the refusal, so it applies at once; the command keeps running.
@@ -148,8 +188,10 @@ test("command call: restarts (normal and forced) adopt the running command; one 
   assert.deepEqual(await s.orchestrator, { restart: true });
   assert.ok(s.ledger().some(e => e.type === "restart" && e.rid === normal.rid && e.force === false));
   assert.ok((await tagged(String(first.id))).length > 0, "the command survives the orchestrator's exit");
-  // The short command ends while no orchestrator runs.
-  await s.until(() => existsSync(join(String(of(s.journal(short), "command-started")[0]!.dir), "exit")), "short exit record");
+  // The short command ends while no orchestrator runs: its gate is opened only now, with the orchestrator down.
+  writeFileSync(meanwhileGate, "");
+  const shortDir = String(of(s.journal(short), "command-started")[0]!.dir);
+  await s.until(() => existsSync(join(shortDir, "exit")), "short exit record");
   s.start();
   const meanwhile = await s.sealed(short);
   assert.equal(meanwhile.status, "failed");
@@ -161,6 +203,7 @@ test("command call: restarts (normal and forced) adopt the running command; one 
   assert.deepEqual(await s.orchestrator, { restart: true });
   assert.ok((await tagged(String(first.id))).length > 0, "a forced restart leaves it running");
   s.start();
+  writeFileSync(survived, "");
   const result = await s.sealed(long);
   assert.equal(result.status, "ok", JSON.stringify(result));
   assert.equal(result.output, "survived\n");
@@ -170,23 +213,26 @@ test("command call: restarts (normal and forced) adopt the running command; one 
   }
 });
 
-test("command call: a process gone without an exit record seals unknown; rerun starts it once more, never two at once", { timeout: 90_000, skip: process.platform === "win32" ? "POSIX shell command strings and process tags" : false, }, async t => {
+test("command call: a process gone without an exit record seals unknown; rerun starts it once more, never two at once", { timeout: 120_000, }, async t => {
   const s = await stack(t);
   const marks = (name: string) => join(s.root, name);
-  // Each run records its start and end; the second attempt must start after the first one's processes ended.
-  const program = (name: string) => `echo start >> '${marks(name)}'; sleep 2; echo end >> '${marks(name)}'`;
-  const lost = await s.run({ call: { command: "sleep 30" } });
-  const rerun = await s.run({ call: { command: program("rerun"), rerun: true } });
-  const twice = await s.run({ call: { command: "echo start >> '" + marks("twice") + "'; sleep 30", rerun: true } });
+  // Node argv programs: the first run is ended by this test (never by its own duration), the rerun ends at once, and
+  // every wait below is on a file or a journal record, not on a guessed duration.
+  const lost = await s.run({ call: { command: nodeProgram("setInterval(() => {}, 1000)") } });
+  const rerun = await s.run({ call: { command: rerunProgram(marks("rerun"), process.platform === "win32" ? 20_000 : 2_000), rerun: true } });
+  const twice = await s.run({ call: { command: startAndWait(marks("twice")), rerun: true } });
   const ids = await Promise.all([lost, rerun, twice].map(async wid => String((await s.started(wid)).id)));
   const wrapper = Number((await s.started(rerun)).pid);
-  await s.until(() => existsSync(marks("twice")) && existsSync(marks("rerun")), "commands started");
+  await s.until(() => text(marks("rerun")) === "start\n" && text(marks("twice")) === "start\n", "commands started");
   await s.stop();
-  // While no orchestrator runs: the whole tree of `lost` and `twice` is killed; of `rerun` only the wrapper (its
-  // command goes on without anyone to record its status).
+  // While no orchestrator runs: the whole tree of `lost` and `twice` is killed; of `rerun` only the wrapper (on POSIX its
+  // command goes on without anyone to record its status; on Windows the wrapper's death closes the group, which ends it).
   await new Containment().fence(ids[0]!, []);
   await new Containment().fence(ids[2]!, []);
   process.kill(wrapper, "SIGKILL");
+  // The wrapper's death closes the Windows group: once nothing of attempt 1 is left -- observed before the successor
+  // exists -- no rerun can start beside it (the POSIX command outlives the wrapper; the product waits for its own end).
+  if (process.platform === "win32") await untagged(ids[1]!);
   s.start();
   const unknown = await s.sealed(lost);
   assert.equal(unknown.status, "unknown");
@@ -195,17 +241,19 @@ test("command call: a process gone without an exit record seals unknown; rerun s
   await s.until(() => s.journal(lost).some(e => e.type === JT.attention && (e.item as { id: string }).id.startsWith("unknown:")), "unknown attention");
   const again = await s.sealed(rerun);
   assert.equal(again.status, "ok", JSON.stringify(again));
-  assert.equal(readFileSync(marks("rerun"), "utf8"), "start\nend\nstart\nend\n", "the rerun started after the first run ended");
+  // Two runs, and neither ever saw the other alive: on POSIX the first command outlived the wrapper and the rerun waited
+  // for its end; on Windows the wrapper's death closed its group, so the rerun ended the only run there was.
+  assert.equal(text(marks("rerun")), process.platform === "win32" ? "start\nstart\nend\n" : "start\nend\nstart\nend\n");
   assert.deepEqual(of(s.journal(rerun), "command-intent").map(e => e.n), [1, 2]);
   // `twice` reran once; lost again, it seals unknown: at most one rerun per call.
   const second = await s.started(twice, 2);
-  await s.until(() => readFileSync(marks("twice"), "utf8") === "start\nstart\n", "second start");
+  await s.until(() => text(marks("twice")) === "start\nstart\n", "second start");
   await s.stop();
   await new Containment().fence(String(second.id), []);
   s.start();
   const final = await s.sealed(twice);
   assert.equal(final.status, "unknown");
-  assert.equal(readFileSync(marks("twice"), "utf8"), "start\nstart\n");
+  assert.equal(text(marks("twice")), "start\nstart\n");
   assert.deepEqual(of(s.journal(twice), "command-intent").map(e => e.n), [1, 2]);
 });
 
