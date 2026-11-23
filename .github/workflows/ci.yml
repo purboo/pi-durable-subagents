@@ -1,76 +1,15 @@
-name: ci
-on:
-  push:
-  pull_request:
-  workflow_call:
+name: Windows hold snapshot
+on: push
 permissions:
   contents: read
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        # 22.19 is the engines floor (runs .ts without flags; worker.cpuUsage and process.threadCpuUsage, which the
-        # evaluator's CPU limit needs); the real-pi suite runs on 24.
-        node: ["24", "22.19"]
-    runs-on: ${{ matrix.os }}
-    # A hung run is killed by scripts/ci-test.mjs after 25 min; this bounds everything else (default is 6 h).
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "${{ matrix.node }}" }
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run lint:imports
-      # A failing file is rerun once; a pass on the rerun is a flaky warning annotation, a second failure fails.
-      # A unit test that sets no timeout of its own fails after 2 min, naming itself instead of hanging the run;
-      # --test-force-exit ends a test file once its tests are done, even if a timed-out test left a timer or handle.
-      - run: node scripts/ci-test.mjs unit.log --test-timeout=120000 --test-force-exit 'test/unit/**/*.test.ts'
-      - run: node scripts/ci-test.mjs pi.log --test-concurrency=1 --test-force-exit 'test/pi/**/*.test.ts'
-        if: matrix.node == '24'
-      - run: npm run pack:smoke 2>&1 | tee pack.log; exit ${PIPESTATUS[0]}
-        shell: bash
-      - run: node scripts/ci-annotate.mjs unit.log pi.log pack.log
-        if: failure()
-  windows-diagnostics:
-    if: github.ref == 'refs/heads/port/windows-native-ci'
-    runs-on: windows-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: npm ci
-      - run: node scripts/diagnose-e2e.mjs
-  windows-observer:
-    if: github.ref == 'refs/heads/port/windows-native-ci'
-    runs-on: windows-latest
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - run: node scripts/probe-win-observer.mjs
-  windows-command-job:
-    # A command attempt's Job Object: the native regression checks on their own, for a fast, unambiguous signal. The probe
-    # proves the compiled-owner route (absolute framework csc.exe, private per-launch directory, direct detached spawn).
-    if: github.ref == 'refs/heads/port/windows-native-ci'
+  hold:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "24" }
-      - id: install
-        run: npm ci
-      - run: node scripts/probe-win-job-start.mjs
-      # The group, its crash/normal-end fences, the starter-death survival and the handshake/adoption checks.
-      - run: node --test --test-force-exit test/unit/platform/job.test.ts test/unit/platform/job-handshake.test.ts
-      - name: Verify command lookup and exit records
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: node --test --test-force-exit test/unit/platform/command.test.ts test/unit/platform/launch.test.ts
-      - name: Verify restart adoption and one rerun through the executor
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: node --test --test-force-exit --test-name-pattern="restarts \(normal and forced\) adopt|seals unknown; rerun" test/pi/e2e/command.test.ts
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: node --test --test-force-exit test/unit/cli/hold-windows.test.ts

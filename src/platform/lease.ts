@@ -5,13 +5,14 @@
 // earlier request, so the old FIFO lock-free grant argument no longer applies. No lock is held while commands run or
 // their processes are ended. A ticket stays live while its wrapper, command, group or exact DSA_HOLD tag lives;
 // waiters reclaim orphaned command trees before granting the next request. No orchestrator is involved.
-import { chmodSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { replacePath, replacePathSync } from "../kernel/fsx.ts";
+import { readBeginIdentitySync, readGroupEndSync, readGroupRecordStateSync, readGroupRecordSync } from "./job.ts";
 import { OsLock } from "./lock.ts";
 import { ProcessTable } from "./proctable.ts";
-import { IS_WINDOWS, isWinStart, killTreeSync, sameCreation, winLiveDescendants, winSnapshotSync, type WinProcessIdentity, type WinProcessRow } from "./windows.ts";
+import { IS_WINDOWS, isWinStart, killProcessSync, killTreeSync, sameCreation, winLiveDescendants, winSnapshotSync, winStartSync, winTag, type WinProcessIdentity, type WinProcessRow } from "./windows.ts";
 
 export type LeaseMode = "exclusive" | "shared" | "counted";
 export interface LeaseProcess { pid: number; start?: string }
@@ -21,6 +22,8 @@ export interface LeaseTicket {
   slots?: number;
   priority?: number; yield?: true; expectMs?: number;
   wrapper: LeaseProcess; command?: LeaseProcess;
+  /** Windows: the Job Object owner process and its durable handshake directory. */
+  group?: LeaseProcess; jobDir?: string;
   /** The command as given (clipped), its working directory and an optional note. */
   argv: string[]; cwd: string; note?: string;
   since: number; grantedAt?: number;
@@ -31,8 +34,24 @@ export interface LeaseTicket {
 export const RESOURCE = /^[A-Za-z0-9._-]{1,64}$/;
 export const leasesRoot = (home: string) => path.join(home, "leases");
 export const leaseDir = (home: string, resource: string) => path.join(leasesRoot(home), resource);
+export const leaseJobDir = (home: string, resource: string, seq: number) => path.join(leaseDir(home, resource), ".jobs", String(seq).padStart(12, "0"));
 const ticketName = (seq: number) => `${String(seq).padStart(12, "0")}.json`;
 const TICKET = /^\d{12}\.json$/;
+
+export interface LeaseCheckOptions {
+  platform?: NodeJS.Platform;
+  snapshotWin?: (maxAgeMs?: number) => Map<number, WinProcessRow>;
+  startWinSync?: (pid: number) => string;
+  processAlive?: (pid: number) => boolean;
+}
+
+const checkOpts = (options?: LeaseCheckOptions): LeaseCheckOptions | undefined =>
+  options && typeof options === "object" ? options : undefined;
+
+function kernelPidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
 
 /** Proven-owned live descendants of `(pid, start)` in the current snapshot. Requires a valid `start` token and a live
  *  matching parent in the snapshot: once a parent exits on Windows, its numeric PID can be reused by an unrelated
@@ -43,18 +62,22 @@ function winDescendants(pid: number, start?: string, rows: ReadonlyMap<number, W
 }
 
 /** Whether a process still runs; on Linux/Windows the start token also tells it from a later process with the same pid. */
-export function alive(p: LeaseProcess | undefined): boolean {
+export function alive(p: LeaseProcess | undefined, options?: LeaseCheckOptions): boolean {
   if (!p) return false;
-  try { process.kill(p.pid, 0); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPERM") return false; }
-  if (IS_WINDOWS) {
-    // Creation time is Windows' start token. A row missing from the short-lived cache is not proof of death.
+  const opts = checkOpts(options);
+  const pidAlive = opts?.processAlive ?? kernelPidAlive;
+  if (!pidAlive(p.pid)) return false;
+  const platform = opts?.platform ?? (IS_WINDOWS ? "win32" : process.platform);
+  if (platform === "win32") {
+    // Creation time is Windows' start token. A row missing from the short-lived cache is checked directly by pid.
     if (!p.start) return true;
     if (!isWinStart(p.start)) return false;
-    const row = winSnapshotSync().get(p.pid);
-    return row ? sameCreation(row.start, p.start) : true;
+    const row = (opts?.snapshotWin ?? winSnapshotSync)().get(p.pid);
+    if (row) return sameCreation(row.start, p.start);
+    const direct = (opts?.startWinSync ?? winStartSync)(p.pid);
+    return direct ? sameCreation(direct, p.start) : true;
   }
-  if (!p.start || process.platform !== "linux") return true;
+  if (!p.start || platform !== "linux") return true;
   try {
     const fields = readFileSync(`/proc/${p.pid}/stat`, "utf8");
     const rest = fields.slice(fields.lastIndexOf(")") + 2).split(" ");
@@ -117,33 +140,139 @@ function leftoverGroup(t: LeaseTicket): boolean {
 const holdTable = new ProcessTable({ tagName: "DSA_HOLD" });
 export const holdTag = (t: Pick<LeaseTicket, "resource" | "seq">) => `${t.resource}:${t.seq}`;
 export const tagged = (t: Pick<LeaseTicket, "resource" | "seq">): LeaseProcess[] => holdTable.tagged(holdTag(t));
-/** An orphan may retain its tag even after its leader and entire original process group have gone. */
-export const orphaned = (t: LeaseTicket) => {
-  if (alive(t.wrapper) || alive(t.command)) return false;
-  if (IS_WINDOWS) return leftoverGroup(t) || winDescendants(t.wrapper.pid, t.wrapper.start).length > 0;
+
+const isWinJobTicket = (t: LeaseTicket) => Boolean(t.jobDir || t.group);
+
+/** Inspect a Windows Job-backed ticket after its wrapper has exited:
+ *  - "running": the Job Object owner and the command root are live (retains the lease until the command finishes);
+ *  - "orphaned": the wrapper and command root are gone (or the wrapper died mid-launch before `group`), while the
+ *    Job Object owner or a verified root is still alive (retains the lease until a waiter or the owner finishes draining);
+ *  - "dead": the Job Object owner is gone, so its non-inherited KILL_ON_JOB_CLOSE handle is closed and nothing remains. */
+function inspectWinJob(t: LeaseTicket, opts?: LeaseCheckOptions): "running" | "orphaned" | "dead" {
+  const pidAlive = opts?.processAlive ?? kernelPidAlive;
+  const snap = opts?.snapshotWin ?? winSnapshotSync;
+  const startOf = opts?.startWinSync ?? winStartSync;
+  // Fresh snapshot AFTER observing the wrapper gone, before reading the job directory: never uses a pre-spawn cache.
+  const rows = snap(0);
+  const groupState = t.jobDir ? readGroupRecordStateSync(t.jobDir) : { state: "absent" as const };
+  const groupRec = groupState.state === "ready" ? groupState.record : undefined;
+  const began = t.jobDir ? readBeginIdentitySync(t.jobDir) : undefined;
+  const groupEnded = Boolean(t.jobDir && readGroupEndSync(t.jobDir) !== undefined);
+  const recordedOwner = (groupRec?.group && isWinStart(groupRec.group.start) ? groupRec.group : undefined)
+    ?? (t.group && isWinStart(t.group.start) ? { pid: t.group.pid, start: t.group.start } : undefined)
+    ?? (began && isWinStart(began.start) ? began : undefined);
+  const tag = holdTag(t);
+  let ownerAlive = false;
+  if (recordedOwner) {
+    if (pidAlive(recordedOwner.pid)) {
+      const ownerRow = rows.get(recordedOwner.pid);
+      ownerAlive = ownerRow ? sameCreation(ownerRow.start, recordedOwner.start)
+        : sameCreation(startOf(recordedOwner.pid), recordedOwner.start);
+    }
+  } else {
+    const taggedOwner = [...rows.values()].find(r => isWinStart(r.start) && winTag(r.command, "DSA_HOLD") === tag);
+    if (taggedOwner && pidAlive(taggedOwner.pid)) ownerAlive = true;
+  }
+  const cmd = (groupRec && isWinStart(groupRec.start) ? { pid: groupRec.pid, start: groupRec.start } : undefined)
+    ?? (t.command && isWinStart(t.command.start) ? { pid: t.command.pid, start: t.command.start } : undefined);
+  let cmdAlive = false;
+  if (!groupEnded && cmd && pidAlive(cmd.pid)) {
+    const cmdRow = rows.get(cmd.pid);
+    cmdAlive = cmdRow ? sameCreation(cmdRow.start, cmd.start) : sameCreation(startOf(cmd.pid), cmd.start);
+  }
+  if (ownerAlive && (cmdAlive || groupState.state === "transient")) return "running";
+  if (ownerAlive || cmdAlive) return "orphaned";
+  return "dead";
+}
+
+/** An orphan may retain its tag or job even after its wrapper and command leader have gone. */
+export const orphaned = (t: LeaseTicket, options?: LeaseCheckOptions): boolean => {
+  const opts = checkOpts(options);
+  const platform = opts?.platform ?? (IS_WINDOWS ? "win32" : process.platform);
+  if (alive(t.wrapper, opts)) return false;
+  if (platform === "win32" && isWinJobTicket(t)) return inspectWinJob(t, opts) === "orphaned";
+  if (alive(t.command, opts)) return false;
+  if (platform === "win32") {
+    const snap = opts?.snapshotWin ?? winSnapshotSync;
+    return (t.command ? winDescendants(t.command.pid, t.command.start, snap(0)).length > 0 : false)
+      || winDescendants(t.wrapper.pid, t.wrapper.start, snap(0)).length > 0;
+  }
   return leftoverGroup(t) || tagged(t).length > 0;
 };
-/** A ticket is live while its wrapper, command, process group or exact inherited tag can still act. */
-export const live = (t: LeaseTicket) => alive(t.wrapper) || alive(t.command) || orphaned(t);
+/** A ticket is live while its wrapper, command, job/process group or exact inherited tag can still act. */
+export const live = (t: LeaseTicket, options?: LeaseCheckOptions): boolean => {
+  const opts = checkOpts(options);
+  const platform = opts?.platform ?? (IS_WINDOWS ? "win32" : process.platform);
+  if (alive(t.wrapper, opts)) return true;
+  if (platform === "win32" && isWinJobTicket(t)) return inspectWinJob(t, opts) !== "dead";
+  return alive(t.command, opts) || orphaned(t, opts);
+};
 
-export interface EndLeaseOptions {
-  platform?: NodeJS.Platform;
-  snapshotWin?: (maxAgeMs?: number) => Map<number, WinProcessRow>;
+export interface EndLeaseOptions extends LeaseCheckOptions {
   killWinSync?: (targets: readonly WinProcessIdentity[]) => void;
+  killOwnerWinSync?: (targets: readonly WinProcessIdentity[]) => void;
 }
 
 /** End the group and escaped tagged descendants, rescanning for forks. Release is bounded even for unkillable tasks. */
 export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (line: string) => void, options: EndLeaseOptions = {}): Promise<void> {
   const started = Date.now(), until = started + 5000;
   if ((options.platform ?? process.platform) === "win32") {
-    // Handle-verified tree termination (there is no SIGTERM to deliver). The wrapper is this holder process and must
-    // outlive the cleanup: only the command's proven-owned tree is ended here.
+    const snap = options.snapshotWin ?? winSnapshotSync;
+    if (isWinJobTicket(t)) {
+      // Terminating the verified Job Object owner closes the job's sole handle (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),
+      // so the kernel ends the command root and every surviving child/grandchild without walking dead parent PIDs.
+      const killOwner = options.killOwnerWinSync ?? options.killWinSync ?? (targets => killProcessSync(targets));
+      const tag = holdTag(t);
+      const proven = new Map<string, WinProcessIdentity>();
+      let checkedOwnerHandle = false;
+      for (;;) {
+        const rows = snap(0);
+        const groupRec = t.jobDir ? readGroupRecordSync(t.jobDir) : undefined;
+        const began = t.jobDir ? readBeginIdentitySync(t.jobDir) : undefined;
+        const recordedOwner = (groupRec?.group && isWinStart(groupRec.group.start) ? groupRec.group : undefined)
+          ?? (t.group && isWinStart(t.group.start) ? { pid: t.group.pid, start: t.group.start } : undefined)
+          ?? (began && isWinStart(began.start) ? began : undefined);
+        const taggedRow = recordedOwner ? undefined
+          : [...rows.values()].find(r => isWinStart(r.start) && winTag(r.command, "DSA_HOLD") === tag);
+        const owner: WinProcessIdentity | undefined = recordedOwner
+          ?? (taggedRow ? { pid: taggedRow.pid, start: taggedRow.start } : undefined);
+        const cmd: WinProcessIdentity | undefined = (groupRec && isWinStart(groupRec.start) ? { pid: groupRec.pid, start: groupRec.start } : undefined)
+          ?? (t.command && isWinStart(t.command.start) ? { pid: t.command.pid, start: t.command.start } : undefined);
+        if (owner) proven.set(`${owner.pid}:${owner.start}`, owner);
+        if (cmd) {
+          proven.set(`${cmd.pid}:${cmd.start}`, cmd);
+          for (const d of winLiveDescendants([cmd], rows.values())) {
+            proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+          }
+        }
+        const ownerLiveInRows = Boolean(owner && rows.get(owner.pid) && sameCreation(rows.get(owner.pid)!.start, owner.start));
+        const shouldKillOwner = Boolean(owner && (ownerLiveInRows || (!checkedOwnerHandle && recordedOwner !== undefined)));
+        checkedOwnerHandle = true;
+        if (shouldKillOwner && owner) {
+          try { killOwner([owner]); } catch { /* retry until deadline when a verified owner resists termination */ }
+        }
+        const checkRows = shouldKillOwner ? snap(0) : rows;
+        if (cmd) {
+          for (const d of winLiveDescendants([cmd], checkRows.values())) {
+            proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+          }
+        }
+        const remaining = [...proven.values()].filter(p => {
+          const row = checkRows.get(p.pid);
+          return row !== undefined && sameCreation(row.start, p.start);
+        }).length;
+        if (!remaining) break;
+        if (Date.now() >= until) { say(`hold: ${remaining} processes of ${who(t)} survived; releasing`); break; }
+        await new Promise(r => setTimeout(r, 25));
+      }
+      return;
+    }
+    // Legacy/non-job Windows ticket fallback: handle-verified tree termination on `t.command`.
     if (!t.command) return;
     if (!isWinStart(t.command.start)) {
       say(`hold: refusing to end pid ${t.command.pid} of ${who(t)} without verified start identity; releasing`);
       return;
     }
-    const snap = options.snapshotWin ?? winSnapshotSync;
     const killWin = options.killWinSync ?? (targets => killTreeSync(targets));
     const rootIdentity: WinProcessIdentity = { pid: t.command.pid, start: t.command.start };
     const proven = new Map<string, WinProcessIdentity>([[`${rootIdentity.pid}:${rootIdentity.start}`, rootIdentity]]);
@@ -204,11 +333,19 @@ export function readTickets(home: string, resource: string): LeaseTicket[] {
   return out;
 }
 
+function removeTicketJobDir(home: string, t: Pick<LeaseTicket, "resource" | "seq" | "jobDir">) {
+  const dir = t.jobDir || leaseJobDir(home, t.resource, t.seq);
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* still held or already gone */ }
+  try { rmdirSync(path.join(leaseDir(home, t.resource), ".jobs")); } catch { /* non-empty or absent */ }
+}
+
 /** Live tickets; dead ones are deleted (their numbers are never reused, so a stale reader cannot delete a newer one). */
-export function liveTickets(home: string, resource: string): LeaseTicket[] {
+export function liveTickets(home: string, resource: string, options?: LeaseCheckOptions): LeaseTicket[] {
+  const opts = checkOpts(options);
   return readTickets(home, resource).filter(t => {
-    if (live(t)) return true;
+    if (live(t, opts)) return true;
     try { unlinkSync(path.join(leaseDir(home, resource), ticketName(t.seq))); } catch { /* already gone */ }
+    removeTicketJobDir(home, t);
     return false;
   });
 }
@@ -252,7 +389,7 @@ export function removeStaleTemps(dir: string, maxAgeMs: number, now = Date.now()
   }
   return removed;
 }
-function writeTicketSync(home: string, t: LeaseTicket) {
+export function writeTicketSync(home: string, t: LeaseTicket) {
   replaceFileSync(path.join(leaseDir(home, t.resource), ticketName(t.seq)), JSON.stringify(t));
 }
 export async function writeTicket(home: string, t: LeaseTicket) {
@@ -260,15 +397,16 @@ export async function writeTicket(home: string, t: LeaseTicket) {
 }
 export function removeTicket(home: string, t: LeaseTicket) {
   try { unlinkSync(path.join(leaseDir(home, t.resource), ticketName(t.seq))); } catch { /* already gone */ }
+  removeTicketJobDir(home, t);
 }
 
 /** Queue a request under the same lock used by queued and no-wait grants. */
-export async function enqueue(home: string, ticket: Omit<LeaseTicket, "seq">, lock = new OsLock()): Promise<LeaseTicket> {
-  return (await numbered(home, ticket, false, lock)) as LeaseTicket;
+export async function enqueue(home: string, ticket: Omit<LeaseTicket, "seq">, lock = new OsLock(), options?: LeaseCheckOptions): Promise<LeaseTicket> {
+  return (await numbered(home, ticket, false, lock, options)) as LeaseTicket;
 }
 /** Take the lease now or not at all. Refusal never creates a waiter; the synthetic sequence ranks after equal priority. */
-export async function tryGrant(home: string, ticket: Omit<LeaseTicket, "seq" | "grantedAt">, lock = new OsLock()): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
-  return numbered(home, ticket, true, lock);
+export async function tryGrant(home: string, ticket: Omit<LeaseTicket, "seq" | "grantedAt">, lock = new OsLock(), options?: LeaseCheckOptions): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
+  return numbered(home, ticket, true, lock, options);
 }
 async function locked<T>(home: string, resource: string, lock: OsLock, action: () => Promise<T> | T): Promise<T> {
   const dir = leaseDir(home, resource);
@@ -281,21 +419,21 @@ async function locked<T>(home: string, resource: string, lock: OsLock, action: (
   try { return await action(); } finally { await handle.release(); }
 }
 /** Recheck and commit a queued grant under the resource lock. No awaits separate the final read and ticket write. */
-export async function grantQueued(home: string, t: LeaseTicket, lock = new OsLock()): Promise<LeaseTicket[]> {
+export async function grantQueued(home: string, t: LeaseTicket, lock = new OsLock(), options?: LeaseCheckOptions): Promise<LeaseTicket[]> {
   return locked(home, t.resource, lock, () => {
-    const busy = blockers(t, liveTickets(home, t.resource));
+    const busy = blockers(t, liveTickets(home, t.resource, options));
     if (!busy.length) { t.grantedAt = Date.now(); writeTicketSync(home, t); }
     return busy;
   });
 }
-async function numbered(home: string, ticket: Omit<LeaseTicket, "seq">, now: boolean, lock: OsLock): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
+async function numbered(home: string, ticket: Omit<LeaseTicket, "seq">, now: boolean, lock: OsLock, options?: LeaseCheckOptions): Promise<LeaseTicket | { busy: LeaseTicket[] }> {
   return locked(home, ticket.resource, lock, async () => {
     const dir = leaseDir(home, ticket.resource), counter = path.join(dir, ".seq");
     const last = Number.parseInt(await readFile(counter, "utf8").catch(() => "0"), 10) || 0;
     const highest = readTickets(home, ticket.resource).reduce((m, t) => Math.max(m, t.seq), last);
     const t: LeaseTicket = { ...ticket, seq: highest + 1 };
     if (now) {
-      const busy = blockers(t, liveTickets(home, ticket.resource));
+      const busy = blockers(t, liveTickets(home, ticket.resource, options));
       if (busy.length) return { busy };
       t.grantedAt = Date.now();
     }
@@ -313,11 +451,11 @@ export interface LeaseResource {
    *  and how many tickets hold the resource. */
   slots?: number; held?: number;
 }
-export function leaseState(home: string): LeaseResource[] {
+export function leaseState(home: string, options?: LeaseCheckOptions): LeaseResource[] {
   let resources: string[];
   try { resources = readdirSync(leasesRoot(home)).filter(r => RESOURCE.test(r)).sort(); } catch { return []; }
   return resources.map(resource => {
-    const tickets = liveTickets(home, resource), holders = tickets.filter(t => t.grantedAt !== undefined), waiters = tickets.filter(t => t.grantedAt === undefined).sort(rank);
+    const tickets = liveTickets(home, resource, options), holders = tickets.filter(t => t.grantedAt !== undefined), waiters = tickets.filter(t => t.grantedAt === undefined).sort(rank);
     const slots = slotCount(tickets);
     return { resource, holders, waiters, ...(slots !== undefined ? { slots, held: holders.length } : {}) };
   }).filter(r => r.holders.length || r.waiters.length);
