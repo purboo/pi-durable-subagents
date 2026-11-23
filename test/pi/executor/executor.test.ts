@@ -889,11 +889,13 @@ test("V1 real pi processes serialize provider slots; stop fences and seals exact
   const f = await setup(t, { providers: { probe: { slots: 1 } }, k: { trackerMs: 25 } });
   const a = f.ticket("a", script([{ delayMs: 60000, text: "late" }])), b = f.ticket("b", a.spec.task);
   const pa = f.executor.run(a), pb = f.executor.run(b);
-  await until(() => f.journal.entries().some(e => e.type === "tracked" && e.exec === `${a.callId}#1.1`));
+  const trackedOf = (callId: string) => f.journal.entries().some(e => e.type === "tracked" && e.exec === `${callId}#1.1`);
+  await until(() => trackedOf(a.callId) || trackedOf(b.callId));
+  const [first, pFirst, second, pSecond] = trackedOf(a.callId) ? [a, pa, b, pb] : [b, pb, a, pa];
   assert.equal(f.orch.entries().filter(e => e.type === "hold" && e.pool === "probe").length, 1);
-  await f.executor.stop({ wid: f.wid, callId: a.callId }); assert.equal((await pa).status, "stopped");
-  await until(() => f.journal.entries().some(e => e.type === "tracked" && e.exec === `${b.callId}#1.1`));
-  await f.executor.stop({ wid: f.wid, callId: b.callId }); assert.equal((await pb).status, "stopped");
+  await f.executor.stop({ wid: f.wid, callId: first.callId }); assert.equal((await pFirst).status, "stopped");
+  await until(() => trackedOf(second.callId));
+  await f.executor.stop({ wid: f.wid, callId: second.callId }); assert.equal((await pSecond).status, "stopped");
   await f.executor.stop({ wid: f.wid });
   assertSealed(f.journal, a.callId, "stopped"); assertSealed(f.journal, b.callId, "stopped");
   const holders = new Set<string>();
