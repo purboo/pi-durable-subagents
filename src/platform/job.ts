@@ -52,7 +52,7 @@
 // starts a second attempt until a scan finds the first one gone.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, existsSync, openSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -79,8 +79,14 @@ public static class DsaJob
     // inheritable handle this host happens to hold".
     const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
     const int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
+    const int JobObjectBasicAccountingInformation = 1;
     const int JobObjectExtendedLimitInformation = 9;
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    const int STD_INPUT_HANDLE = -10;
+    const int STD_OUTPUT_HANDLE = -11;
+    const int STD_ERROR_HANDLE = -12;
+    const uint DUPLICATE_SAME_ACCESS = 0x00000002;
+    const int ERROR_INVALID_HANDLE = 6;
     const uint GENERIC_READ = 0x80000000;
     const uint FILE_APPEND_DATA = 0x00000004;
     const uint FILE_SHARE_READ = 0x00000001;
@@ -175,10 +181,27 @@ public static class DsaJob
         public UIntPtr PeakJobMemoryUsed;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr CreateJobObjectW(IntPtr attributes, string name);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info, uint length, IntPtr returnLength);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateJobObject(IntPtr job, uint exitCode);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -210,6 +233,15 @@ public static class DsaJob
     static extern uint GetCurrentProcessId();
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetStdHandle(int nStdHandle, IntPtr hHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DuplicateHandle(IntPtr hSourceProcessHandle, IntPtr hSourceHandle, IntPtr hTargetProcessHandle,
+        out IntPtr lpTargetHandle, uint dwDesiredAccess, bool bInheritHandle, uint dwOptions);
+    [DllImport("kernel32.dll")]
+    static extern void Sleep(uint milliseconds);
 
     /** argv[0] is the attempt directory, argv[1] (ignored) the attempt's DSA_EXEC tag: a process-table scan finds
      *  the attempt by that tag while this host is starting, before it writes its group record. 126 means no directory,
@@ -306,17 +338,30 @@ public static class DsaJob
             SECURITY_ATTRIBUTES inherit = new SECURITY_ATTRIBUTES();
             inherit.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
             inherit.bInheritHandle = 1;
-            // Two independent handles, one for stdout and one for stderr, each opened for append only (FILE_APPEND_DATA
-            // without FILE_WRITE_DATA): the kernel sends every write of each stream to the current end of the file, so
-            // the two streams interleave in the log without either overwriting the other. A shared handle or a seek to
-            // the end would let one stream's buffered output land on the other's (or on an earlier attempt's) bytes.
-            output = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ref inherit, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
-            if (output == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile " + logPath, Marshal.GetLastWin32Error());
-            errorHandle = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ref inherit, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
-            if (errorHandle == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile " + logPath, Marshal.GetLastWin32Error());
-            // stdin is empty: the command can never read from this host's (absent) console.
-            input = CreateFileW("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, ref inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
-            if (input == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile NUL", Marshal.GetLastWin32Error());
+            if (String.IsNullOrEmpty(logPath))
+            {
+                string stepName;
+                if (!OpenInheritedOrNul(STD_INPUT_HANDLE, GENERIC_READ, ref inherit, out input, out stepName))
+                    return Fail(dir, stepName, Marshal.GetLastWin32Error());
+                if (!OpenInheritedOrNul(STD_OUTPUT_HANDLE, FILE_APPEND_DATA, ref inherit, out output, out stepName))
+                    return Fail(dir, stepName, Marshal.GetLastWin32Error());
+                if (!OpenInheritedOrNul(STD_ERROR_HANDLE, FILE_APPEND_DATA, ref inherit, out errorHandle, out stepName))
+                    return Fail(dir, stepName, Marshal.GetLastWin32Error());
+            }
+            else
+            {
+                // Two independent handles, one for stdout and one for stderr, each opened for append only (FILE_APPEND_DATA
+                // without FILE_WRITE_DATA): the kernel sends every write of each stream to the current end of the file, so
+                // the two streams interleave in the log without either overwriting the other. A shared handle or a seek to
+                // the end would let one stream's buffered output land on the other's (or on an earlier attempt's) bytes.
+                output = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ref inherit, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+                if (output == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile " + logPath, Marshal.GetLastWin32Error());
+                errorHandle = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ref inherit, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+                if (errorHandle == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile " + logPath, Marshal.GetLastWin32Error());
+                // stdin is empty: the command can never read from this host's (absent) console.
+                input = CreateFileW("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, ref inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+                if (input == INVALID_HANDLE_VALUE) return Fail(dir, "CreateFile NUL", Marshal.GetLastWin32Error());
+            }
 
             // inheritHandles is true because the wrapper needs its standard handles, so the handle list is what says
             // which: without it the child inherits every inheritable handle this host holds (the .NET runtime and the
@@ -357,6 +402,7 @@ public static class DsaJob
             CloseHandle(input); input = IntPtr.Zero;
             CloseHandle(output); output = IntPtr.Zero;
             CloseHandle(errorHandle); errorHandle = IntPtr.Zero;
+            if (String.IsNullOrEmpty(logPath)) ReleaseOwnStdHandles();
             DeleteProcThreadAttributeList(list); listReady = false;
             Marshal.FreeHGlobal(list); list = IntPtr.Zero;
             Marshal.FreeHGlobal(inheritable); inheritable = IntPtr.Zero;
@@ -383,6 +429,7 @@ public static class DsaJob
             if (WaitForSingleObject(child.hProcess, INFINITE) != 0) return Fail(dir, "WaitForSingleObject", Marshal.GetLastWin32Error());
             uint code;
             if (!GetExitCodeProcess(child.hProcess, out code)) return Fail(dir, "GetExitCodeProcess", Marshal.GetLastWin32Error());
+            DrainJob(job);
             // The record and the returned status carry the whole DWORD, above 0x7fffffff included: it is the wrapper's.
             WriteAtomic(Path.Combine(dir, "group-end"), @"{""status"":" + code.ToString(CultureInfo.InvariantCulture) + "}");
             status = code;
@@ -406,6 +453,52 @@ public static class DsaJob
             if (block != IntPtr.Zero) Marshal.FreeHGlobal(block);
             // The group's only handle (non-inherited): closing it kills every process the command left behind.
             if (job != IntPtr.Zero) CloseHandle(job);
+        }
+    }
+
+    static bool OpenInheritedOrNul(int stdWhich, uint nulAccess, ref SECURITY_ATTRIBUTES inherit, out IntPtr handle, out string stepName)
+    {
+        handle = IntPtr.Zero;
+        stepName = "DuplicateHandle";
+        IntPtr raw = GetStdHandle(stdWhich);
+        if (raw != IntPtr.Zero && raw != INVALID_HANDLE_VALUE)
+        {
+            IntPtr current = GetCurrentProcess();
+            if (DuplicateHandle(current, raw, current, out handle, 0, true, DUPLICATE_SAME_ACCESS))
+                return true;
+            int err = Marshal.GetLastWin32Error();
+            if (err != ERROR_INVALID_HANDLE) return false;
+        }
+        stepName = "CreateFile NUL";
+        handle = CreateFileW("NUL", nulAccess, FILE_SHARE_READ | FILE_SHARE_WRITE, ref inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+        return handle != INVALID_HANDLE_VALUE;
+    }
+
+    static void ReleaseOwnStdHandles()
+    {
+        IntPtr hIn = GetStdHandle(STD_INPUT_HANDLE);
+        IntPtr hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        IntPtr hErr = GetStdHandle(STD_ERROR_HANDLE);
+        SetStdHandle(STD_INPUT_HANDLE, IntPtr.Zero);
+        SetStdHandle(STD_OUTPUT_HANDLE, IntPtr.Zero);
+        SetStdHandle(STD_ERROR_HANDLE, IntPtr.Zero);
+        if (hIn != IntPtr.Zero && hIn != INVALID_HANDLE_VALUE) CloseHandle(hIn);
+        if (hOut != IntPtr.Zero && hOut != INVALID_HANDLE_VALUE && hOut != hIn) CloseHandle(hOut);
+        if (hErr != IntPtr.Zero && hErr != INVALID_HANDLE_VALUE && hErr != hIn && hErr != hOut) CloseHandle(hErr);
+    }
+
+    static void DrainJob(IntPtr job)
+    {
+        TerminateJobObject(job, 1);
+        uint size = (uint)Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+        int start = Environment.TickCount;
+        for (;;)
+        {
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info;
+            if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, out info, size, IntPtr.Zero)) break;
+            if (info.ActiveProcesses == 0) break;
+            if (unchecked(Environment.TickCount - start) >= 5000) break;
+            Sleep(10);
         }
     }
 
@@ -789,9 +882,15 @@ function compilerFailure(compiler: string, error: unknown, stdout?: string, stde
 }
 
 /** The owner's argv: the attempt directory whose records and spec it uses (an argument, not a script path or a written-in
- *  path), then the attempt's versioned tag, which the C# ignores and a process-table scan reads while the owner starts. */
-export function jobHostArgv(dir: string, exec?: string): string[] {
-  return [dir, ...(exec ? [winTagArg("DSA_EXEC", exec)] : [])];
+ *  path), then the attempt's versioned tag(s), which the C# ignores and a process-table scan reads while the owner starts. */
+export function jobHostArgv(dir: string, exec?: string, hold?: string): string[] {
+  return [dir, ...(exec ? [winTagArg("DSA_EXEC", exec)] : []), ...(hold ? [winTagArg("DSA_HOLD", hold)] : [])];
+}
+
+function matchesOwnerTag(command: string | undefined, launch: Pick<JobLaunch, "exec" | "hold">): boolean {
+  if (launch.exec && winTag(command, "DSA_EXEC") !== launch.exec) return false;
+  if (launch.hold && winTag(command, "DSA_HOLD") !== launch.hold) return false;
+  return true;
 }
 
 export interface JobLaunch {
@@ -799,13 +898,16 @@ export interface JobLaunch {
   exe: string;
   args: readonly string[];
   cwd: string;
-  /** stdout and stderr of the program: one file, append (the command's output.log). */
+  /** stdout and stderr of the program: one file, append (the command's output.log), or "" to inherit the owner's stdio. */
   log: string;
   /** Its complete environment. */
   env: NodeJS.ProcessEnv;
   /** The attempt's tag (`DSA_EXEC=<exec>`): spelled in the owner's own argv, so a scan still finds the attempt while it
    *  compiles and starts, before the group record exists. */
   exec?: string;
+  /** Resource lease tag (`DSA_HOLD=<resource:seq>`): spelled in the owner's own argv so a killed hold wrapper's job
+   *  is discoverable before the group record exists. */
+  hold?: string;
 }
 export interface JobSpawned {
   /** The program's pid (from the group record, not from this process's child). */
@@ -818,9 +920,12 @@ export interface JobSpawned {
    *  `pid`/`start` are then the owner's identity (the group's only handle holder) and the value is the reason. The
    *  attempt must be watched until a scan confirms it retired: no second attempt may start while this one can act. */
   uncertain?: string;
+  /** Terminate the live owner through this process's direct ChildProcess handle (closing the Job Object). */
+  killOwner?: () => boolean;
   /** Resolves when the owner ends (a wake-up only: the exit record is the outcome). */
   exited: Promise<void>;
 }
+export type JobOwnerStdio = ["ignore" | "inherit" | number, "ignore" | "inherit" | number, "ignore" | "inherit" | number];
 export interface JobOptions {
   /** The executor's last check (see command.ts): called once, after the preparation and immediately before the spawn. A
    *  false answer starts no process and makes spawnInJob resolve undefined. */
@@ -830,6 +935,12 @@ export interface JobOptions {
   prepared?: JobPrep;
   /** Cancels a preparation this call stages itself (a staged one was already prepared under its own signal). */
   signal?: AbortSignal;
+  /** Stdio passed to the owner itself (default: ignore stdin/stdout, append stderr to host.log). */
+  stdio?: JobOwnerStdio;
+  /** Whether to unref the owner handle once started (default: true; `hold` passes false while awaiting completion). */
+  unref?: boolean;
+  /** Called immediately once the owner ChildProcess exists with a direct-handle termination callback. */
+  onOwnerSpawned?: (killOwner: () => boolean) => void;
   /** Test seam: the compiler to run instead of the discovered framework one. */
   compiler?: string;
   /** Test seam: how long the foreground compilation may take (default JOB_COMPILE_TIMEOUT_MS). */
@@ -861,11 +972,7 @@ export interface GroupRecord {
   group?: { pid: number; start: string };
 }
 
-/** The group record written before ResumeThread (with legacy `{"pid":<n>}` compatibility); undefined while not ready. */
-export async function readGroupRecord(dir: string): Promise<GroupRecord | undefined> {
-  let text: string;
-  try { text = await readFile(join(dir, JOB_GROUP), "utf8"); }
-  catch (error) { if (absent(error) || transientRead(error)) return undefined; throw error; }
+function parseGroupText(text: string): GroupRecord {
   let parsed: { pid?: unknown; start?: unknown; group?: unknown };
   try { parsed = JSON.parse(text) as typeof parsed; }
   catch { throw new Error(`the command job group record cannot be read: ${text.slice(0, 200)}`); }
@@ -880,15 +987,67 @@ export async function readGroupRecord(dir: string): Promise<GroupRecord | undefi
   return { pid: parsed.pid as number, ...(start ? { start } : {}), ...(group ? { group } : {}) };
 }
 
+/** The group record written before ResumeThread (with legacy `{"pid":<n>}` compatibility); undefined while not ready. */
+export async function readGroupRecord(dir: string): Promise<GroupRecord | undefined> {
+  let text: string;
+  try { text = await readFile(join(dir, JOB_GROUP), "utf8"); }
+  catch (error) { if (absent(error) || transientRead(error)) return undefined; throw error; }
+  return parseGroupText(text);
+}
+
+export type SyncGroupState = { state: "absent" } | { state: "transient" } | { state: "ready"; record: GroupRecord };
+
+/** Synchronous group-record reader for lease liveness checks; distinguishes transient rename locks from absence. */
+export function readGroupRecordStateSync(dir: string): SyncGroupState {
+  let text: string;
+  try { text = readFileSync(join(dir, JOB_GROUP), "utf8"); }
+  catch (error) {
+    if (absent(error)) return { state: "absent" };
+    if (transientRead(error)) return { state: "transient" };
+    return { state: "absent" };
+  }
+  try { return { state: "ready", record: parseGroupText(text) }; }
+  catch { return { state: "absent" }; }
+}
+
+export function readGroupRecordSync(dir: string): GroupRecord | undefined {
+  const s = readGroupRecordStateSync(dir);
+  return s.state === "ready" ? s.record : undefined;
+}
+
+function parseBeginText(text: string): { pid: number; start: string } | undefined {
+  try {
+    const parsed = JSON.parse(text) as { pid?: unknown; start?: unknown };
+    return Number.isInteger(parsed.pid) && (parsed.pid as number) > 0 && typeof parsed.start === "string" && parsed.start
+      ? { pid: parsed.pid as number, start: parsed.start } : undefined;
+  } catch { return undefined; }
+}
+
 /** The owner's handle-recorded creation identity from `helper-begin` (undefined when absent or legacy `"begin"`). */
 export async function readBeginIdentity(dir: string): Promise<{ pid: number; start: string } | undefined> {
   let text: string;
   try { text = await readFile(join(dir, JOB_BEGIN), "utf8"); }
   catch { return undefined; }
+  return parseBeginText(text);
+}
+
+export function readBeginIdentitySync(dir: string): { pid: number; start: string } | undefined {
+  try { return parseBeginText(readFileSync(join(dir, JOB_BEGIN), "utf8")); }
+  catch { return undefined; }
+}
+
+export function readGroupEndSync(dir: string): { status: number } | undefined {
   try {
-    const parsed = JSON.parse(text) as { pid?: unknown; start?: unknown };
-    return Number.isInteger(parsed.pid) && (parsed.pid as number) > 0 && typeof parsed.start === "string" && parsed.start
-      ? { pid: parsed.pid as number, start: parsed.start } : undefined;
+    const parsed = JSON.parse(readFileSync(join(dir, JOB_END), "utf8")) as { status?: unknown };
+    return typeof parsed.status === "number" && Number.isInteger(parsed.status) && parsed.status >= 0 && parsed.status <= 0xffffffff
+      ? { status: parsed.status } : undefined;
+  } catch { return undefined; }
+}
+
+export function readStartErrorSync(dir: string): string | undefined {
+  try {
+    const text = readFileSync(join(dir, JOB_ERROR), "utf8").trim();
+    return text || undefined;
   } catch { return undefined; }
 }
 /** One process-table observation, retried for a while: a PowerShell/CIM read fails transiently on a loaded machine, and
@@ -914,17 +1073,19 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   const host = (options.prepared ?? await prepareJob(dir, launch, { ...(options.compiler ? { compiler: options.compiler } : {}),
     ...(options.compileMs ? { compileMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}),
     ...(options.publish ? { publish: options.publish } : {}) })).host;
-  // The owner's stderr is a file, not a pipe: it outlives this process and nothing drains it.
-  const errors = openSync(join(dir, JOB_HOST_LOG), "a");
+  // The owner's stderr is a file by default (it outlives the orchestrator and nothing drains it); `hold` passes its own stdio.
+  const errors = options.stdio ? undefined : openSync(join(dir, JOB_HOST_LOG), "a");
   let helper: ChildProcess;
   try {
     // The executor's last check, after the preparation and immediately before the spawn: no await follows it, so a stop
     // or retirement that revoked the permission during the compilation starts no process.
     if (options.proceed && !options.proceed()) return undefined;
-    helper = spawn(host.exe, jobHostArgv(dir, launch.exec),
-      { detached: true, stdio: ["ignore", "ignore", errors], windowsHide: true, env: helperEnv() });
-  } finally { closeSync(errors); }
+    helper = spawn(host.exe, jobHostArgv(dir, launch.exec, launch.hold),
+      { detached: true, stdio: options.stdio ?? ["ignore", "ignore", errors!], windowsHide: true, env: helperEnv() });
+  } finally { if (errors !== undefined) closeSync(errors); }
   let ended = false;
+  const killOwner = (): boolean => !ended && helper.exitCode === null && helper.signalCode === null && helper.kill("SIGKILL");
+  options.onOwnerSpawned?.(killOwner);
   let recordedExit: Promise<void> | undefined;
   // The owner's end is durably written to JOB_HOST_EXIT before `exited` resolves, and every path that formats a
   // failure reason awaits `exited` once `ended` is set so exit evidence never races the rejection message.
@@ -981,14 +1142,14 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
       if (row) {
         if (expectedOwnerStart !== undefined) {
           start = sameCreation(row.start, expectedOwnerStart) ? row.start : expectedOwnerStart;
-        } else if (!launch.exec || winTag(row.command, "DSA_EXEC") === launch.exec) {
+        } else if (matchesOwnerTag(row.command, launch)) {
           start = row.start;
         }
       }
     }
     // The owner outlives this process by design (the command must): its end is a wake-up, never a held event loop.
-    helper.unref();
-    return { pid: helperPid ?? 0, start, uncertain: `${reason}${await startError(dir)}${failure}`, exited };
+    if (options.unref !== false) helper.unref();
+    return { pid: helperPid ?? 0, start, uncertain: `${reason}${await startError(dir)}${failure}`, killOwner, exited };
   };
   try {
     await new Promise<void>((resolve, reject) => { helper.once("spawn", resolve); helper.once("error", reject); });
@@ -1022,8 +1183,8 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   try { rows = await observeWithin(observe, Math.min(observeMs, deadline - Date.now())); }
   catch (error) { return refuse(`the command job group could not be observed (${String((error as Error)?.message ?? error)})`, recorded); }
   if (ended) {
-    helper.unref();
-    return { pid, start: "", exited };
+    if (options.unref !== false) helper.unref();
+    return { pid, start: "", killOwner, exited };
   }
   const began = recorded.group ?? await readBeginIdentity(dir);
   const expectedOwnerStart = helperPid !== undefined && began?.pid === helperPid ? began.start : undefined;
@@ -1033,7 +1194,7 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   if (helperPid !== undefined && !ownerReplaced) {
     if (ownerRow) {
       if (expectedOwnerStart !== undefined) helperStart = ownerRow.start;
-      else if (!launch.exec || winTag(ownerRow.command, "DSA_EXEC") === launch.exec) helperStart = ownerRow.start;
+      else if (matchesOwnerTag(ownerRow.command, launch)) helperStart = ownerRow.start;
     } else if (expectedOwnerStart !== undefined && !existsSync(join(dir, JOB_END))) {
       helperStart = expectedOwnerStart;
     }
@@ -1057,8 +1218,8 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   } else if (!ownerReplaced && recorded.start !== undefined && !endRecorded) {
     start = recorded.start;
   }
-  helper.unref(); // the owner outlives this process by design: its end is a wake-up, never a held event loop
-  return { pid, start, ...(helperPid !== undefined && helperStart ? { group: { pid: helperPid, start: helperStart } } : {}), exited };
+  if (options.unref !== false) helper.unref(); // the owner outlives this process by design: its end is a wake-up, never a held event loop
+  return { pid, start, ...(helperPid !== undefined && helperStart ? { group: { pid: helperPid, start: helperStart } } : {}), killOwner, exited };
 }
 
 /** The reason an owner left, when it left one, appended to the failure a call reports: whether it ever ran, why its

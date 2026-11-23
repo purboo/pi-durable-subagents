@@ -142,6 +142,21 @@ test("the owner source is self-contained, ASCII, and carries the Win32 group con
   assert.ok(!/status < 0 \? 125 : status/.test(JOB_HOST_SOURCE), "a status above 0x7fffffff is never re-read as a failure");
   assert.match(JOB_HOST_SOURCE, /status = code;/);
   assert.match(JOB_HOST_SOURCE, /static bool Fail\(/);
+  // Inherited-stdio mode (empty logPath, used by `hold`) duplicates std handles and releases the owner's own copies.
+  assert.match(JOB_HOST_SOURCE, /if \(String\.IsNullOrEmpty\(logPath\)\)/);
+  assert.match(JOB_HOST_SOURCE, /DuplicateHandle\(current, raw, current, out handle, 0, true, DUPLICATE_SAME_ACCESS\)/);
+  assert.match(JOB_HOST_SOURCE, /if \(String\.IsNullOrEmpty\(logPath\)\) ReleaseOwnStdHandles\(\);/);
+  // Surviving grandchildren are terminated and drained to ActiveProcesses == 0 before group-end is recorded.
+  const drainAt = JOB_HOST_SOURCE.indexOf("DrainJob(job);");
+  assert.ok(drainAt > JOB_HOST_SOURCE.indexOf("GetExitCodeProcess(child.hProcess, out code)"));
+  assert.ok(drainAt < JOB_HOST_SOURCE.indexOf('"group-end"'));
+  assert.match(JOB_HOST_SOURCE, /TerminateJobObject\(job, 1\);/);
+  assert.match(JOB_HOST_SOURCE, /info\.ActiveProcesses == 0/);
+  assert.deepEqual(jobHostArgv("C:\\attempt", "e1", "machine:2"), [
+    "C:\\attempt",
+    `DSA_EXEC=v1~${Buffer.from("e1", "utf8").toString("base64url")}`,
+    `DSA_HOLD=v1~${Buffer.from("machine:2", "utf8").toString("base64url")}`,
+  ]);
   // A run that never reached the program is distinguishable from one that failed inside it.
   assert.ok(JOB_HOST_SOURCE.indexOf(JOB_BEGIN) < JOB_HOST_SOURCE.indexOf("job = CreateJobObjectW"), "the begin record precedes any group");
   // No PowerShell anywhere in the launch path (the reason the previous helper could not start detached).

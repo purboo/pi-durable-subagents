@@ -71,6 +71,9 @@ jobs:
       - name: Verify command lookup and exit records
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: node --test --test-force-exit test/unit/platform/command.test.ts test/unit/platform/launch.test.ts
+      - name: Verify Windows hold Job Object leases
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: node --test --test-force-exit test/unit/cli/hold-windows.test.ts test/unit/cli/hold-windows-job.test.ts
       - name: Verify restart adoption and one rerun through the executor
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: node --test --test-force-exit --test-name-pattern="restarts \(normal and forced\) adopt|seals unknown; rerun" test/pi/e2e/command.test.ts
