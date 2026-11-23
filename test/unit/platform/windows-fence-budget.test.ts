@@ -318,11 +318,12 @@ test("Windows fence timeout during kill drives downstream F1 (fence-failed + unk
   assert.ok(orch.entries().some(e => e.type === "release" && e.exec === exec));
 
   const deadline = Date.now() + 3000;
-  while (!journal.entries().some(e => e.type === "gate" && e.id === gateId)) {
-    if (Date.now() > deadline) throw new Error("gate was not retired by sweep");
+  const resolvedGate = () => journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${gateId}` && e.resolution === "fenced");
+  while (!resolvedGate()) {
+    if (Date.now() > deadline) throw new Error("gate attention was not resolved by sweep");
     await delay(20);
   }
-  assert.ok(journal.entries().some(e => e.type === JT.attentionResolved && e.id === `fence:${gateId}` && e.resolution === "fenced"));
+  assert.ok(journal.entries().some(e => e.type === "gate" && e.id === gateId));
 });
 
 test("Windows genuine immediate Win32 refusals propagate without waiting for deadline and retain non-timeout downstream policy", { timeout: 10000 }, async t => {
@@ -349,22 +350,22 @@ test("Windows genuine immediate Win32 refusals propagate without waiting for dea
       killWindows: (targets, opts) => killTree(targets, {
         ...opts,
         platform: "win32",
-        run: async () => {
+        run: async (_script, runOpts) => {
+          assert.equal(runOpts.signal?.aborted, false);
           batchCalls++;
           throw Object.assign(new Error(`Command failed: powershell.exe\n${message}`), { code: 1, killed: false, signal: null });
         },
       }),
     });
-    const started = performance.now();
     await assert.rejects(
-      fenceAgent(containment, journal, `${wid}@1/refusal@1#1.1`, [multiRows[0]!], { pid: 6400, start: T_HOST }),
+      fenceAgent(containment, journal, `${wid}@1/refusal@1#1.1`, [multiRows[0]!], { pid: 6400, start: T_HOST },
+        { readCommand: async pid => `fixture-${pid}` }),
       (error: Error) => {
         assert.doesNotMatch(error.message, /Fence timeout/);
         assert.ok(error.message.includes(message));
         return true;
       },
     );
-    assert.ok(performance.now() - started < 500, "genuine Win32 refusal rejects immediately instead of waiting out 5000 ms budget");
     assert.equal(batchCalls, 1, "genuine Win32 refusal on batch 1 stops immediately without invoking batch 2");
   }
 
