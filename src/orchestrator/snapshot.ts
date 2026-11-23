@@ -19,7 +19,7 @@ import { packageVersion } from "../version.ts";
 import { worktreeCalls, worktreeLabel, isWorktreeConflict } from "./executor/worktree.ts";
 import { leaseCalls, leaseLines, leaseState } from "../platform/lease.ts";
 import { labelsOf } from "../events/derive.ts";
-import { isWinStart, sameCreation, winSnapshotSync } from "../platform/windows.ts";
+import { probeKernelPid, winProcessAlive, type WinProcessAliveOptions } from "../platform/windows.ts";
 import { PENDING_NOTE, generationRids, UNDELIVERED_FOLLOW_UP } from "./notes.ts";
 import { readStats, type OrchestratorStats } from "./stats.ts";
 
@@ -1389,18 +1389,20 @@ export function orchestratorView(state: LedgerState, loaded = packageVersion(), 
   const starting = orchestratorStarting(state), phase = starting ? `, starting ${age(now - starting.since)}` : "";
   return { orchestrator: `${o.version} (pid ${o.pid}${phase})${note}`, ...(o.version === loaded ? {} : { versionNote: versionNote(o.version, loaded) }) };
 }
-/** Whether the recorded orchestrator still runs. On Linux its start time also tells it from a later process given the
- *  same pid after a crash (elsewhere the pid alone is checked). */
-export function processAlive(pid: number, start?: string): boolean {
-  try { process.kill(pid, 0); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPERM") return false; }
+export interface ProcessAliveOptions extends WinProcessAliveOptions {
+  /** Test seam: platform override (default: `process.platform`). */
+  platform?: NodeJS.Platform;
+}
+
+/** Whether the recorded orchestrator still runs. On Linux and Windows its start time also tells it from a later process
+ *  given the same pid after a crash (elsewhere the pid alone is checked). */
+export function processAlive(pid: number, start?: string, options: ProcessAliveOptions = {}): boolean {
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") return winProcessAlive(pid, start, options);
+  const probe = (options.probePid ?? probeKernelPid)(pid);
+  if (probe === "dead") return false;
   if (!start) return true;
-  if (process.platform === "win32") {
-    if (!isWinStart(start)) return false;
-    const row = winSnapshotSync().get(pid);
-    return row ? sameCreation(row.start, start) : true;
-  }
-  if (process.platform !== "linux") return true;
+  if (platform !== "linux") return true;
   try { const stat = readFileSync(`/proc/${pid}/stat`, "utf8"); return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] === start; }
   catch { return false; }
 }

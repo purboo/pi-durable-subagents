@@ -1,6 +1,7 @@
 import type { Containment, JournalHandle, ProcInfo } from "../../types.ts";
 import type { FenceOptions } from "../../platform/containment.ts";
 import { commandLine } from "../../platform/cmdline.ts";
+import { scannedCommand } from "../../platform/windows.ts";
 
 export interface FenceAgentOptions {
   /** Test seam: read a target's diagnostic argv without probing host PIDs (default: `commandLine`). */
@@ -20,7 +21,10 @@ export async function fenceAgent(containment: Pick<Containment, "fence">, journa
     const others = direct ? targets.filter(p => p.pid !== direct.pid || p.start !== direct.start)
       : targets.filter(p => pids.has(p.ppid));
     if (!others.length || signal.aborted) return;
-    const procs = await Promise.all(others.slice(0, 20).map(async p => ({ pid: p.pid, command: await read(p.pid, signal) })));
+    const procs = await Promise.all(others.slice(0, 20).map(async p => {
+      const scanned = scannedCommand(p);
+      return { pid: p.pid, command: scanned !== undefined ? scanned : await read(p.pid, signal) };
+    }));
     // The timeout cancels command reads and prevents an outstanding read from appending after the kill/seal.
     if (signal.aborted) return;
     await journal.append("ended", { exec, call: exec.slice(0, exec.lastIndexOf("#")), procs,

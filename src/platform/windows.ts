@@ -220,13 +220,102 @@ export async function winProcessRows(options: { signal?: AbortSignal; timeout?: 
 }
 
 let snapshot: { at: number; rows: Map<number, WinProcessRow> } | undefined;
-/** A short-lived synchronous snapshot for lease readers and liveness checks. Missing rows are not proof of death. */
-export function winSnapshotSync(maxAgeMs = 250): Map<number, WinProcessRow> {
-  if (!snapshot || Date.now() - snapshot.at > maxAgeMs) {
-    const rows = parseProcessRows(powershellSync(PROCESS_ROWS_SCRIPT));
-    snapshot = { at: Date.now(), rows: new Map(rows.map(row => [row.pid, row])) };
+
+export interface WinSnapshotSyncOptions {
+  /** Test seam: synchronous PowerShell script runner (default: `powershellSync`). */
+  runSync?: (script: string) => string;
+  /** Test seam: wall-clock timestamp source in ms (default: `Date.now`). */
+  now?: () => number;
+}
+
+/** Test helper: clear the short-lived synchronous Windows snapshot cache. */
+export function resetWinSnapshotCache(): void {
+  snapshot = undefined;
+}
+
+function readWinSnapshotSync(maxAgeMs = 250, options?: WinSnapshotSyncOptions): { rows: Map<number, WinProcessRow>; fresh: boolean } {
+  const clock = options?.now ?? Date.now;
+  const now = clock();
+  if (!snapshot || now < snapshot.at || now - snapshot.at > maxAgeMs) {
+    const runSync = options?.runSync ?? powershellSync;
+    const rows = parseProcessRows(runSync(PROCESS_ROWS_SCRIPT));
+    snapshot = { at: clock(), rows: new Map(rows.map(row => [row.pid, row])) };
+    return { rows: snapshot.rows, fresh: true };
   }
-  return snapshot.rows;
+  return { rows: snapshot.rows, fresh: false };
+}
+
+/** A short-lived synchronous snapshot for lease readers and liveness checks. Propagates query failures instead of
+ *  returning an empty table (missing rows are not proof of death, and an error must never look like every process exited). */
+export function winSnapshotSync(maxAgeMs = 250, options?: WinSnapshotSyncOptions): Map<number, WinProcessRow> {
+  return readWinSnapshotSync(maxAgeMs, options).rows;
+}
+
+export type KernelPidProbe = "alive" | "eperm" | "dead";
+
+/** Probe whether a PID exists in the kernel while distinguishing accessible processes (`"alive"`) from protected or
+ *  cross-user processes (`"eperm"`) and absent PIDs (`"dead"`). */
+export function probeKernelPid(pid: number, kill: (pid: number, signal: 0) => void = process.kill): KernelPidProbe {
+  if (!Number.isInteger(pid) || pid <= 0) return "dead";
+  try {
+    kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM" ? "eperm" : "dead";
+  }
+}
+
+export interface WinProcessAliveOptions {
+  /** Test seam: probe whether `pid` exists in the kernel (`"alive"`, `"eperm"`, or `"dead"`). */
+  probePid?: (pid: number) => KernelPidProbe;
+  /** Test seam: read the Windows process snapshot (default: `winSnapshotSync`). */
+  snapshotWin?: (maxAgeMs?: number) => ReadonlyMap<number, WinProcessRow>;
+  /** Test seam: read one process's creation time directly when absent from a cached snapshot. */
+  startWinSync?: (pid: number) => string;
+}
+
+/** Whether a Windows process still runs, verifying `expectedStart` when provided.
+ *  - Without `expectedStart`, `"alive"` and `"eperm"` both return `true` (PID exists).
+ *  - With `expectedStart`, a protected process (`"eperm"`) absent from a successful snapshot (e.g. empty
+ *    `CreationDate` filtered out by `parseProcessRows`) fails closed (`false`) instead of assuming PID reuse matches.
+ *  - Transient snapshot query errors never crash callers or silently turn live accessible processes into dead. */
+export function winProcessAlive(pid: number, expectedStart?: string, options: WinProcessAliveOptions = {}): boolean {
+  const probe = (options.probePid ?? probeKernelPid)(pid);
+  if (probe === "dead") return false;
+  if (!expectedStart) return true;
+  if (!isWinStart(expectedStart)) return false;
+  let rows: ReadonlyMap<number, WinProcessRow>;
+  let fresh = false;
+  try {
+    if (options.snapshotWin) {
+      rows = options.snapshotWin();
+    } else {
+      const snap = readWinSnapshotSync();
+      rows = snap.rows;
+      fresh = snap.fresh;
+    }
+  } catch {
+    return probe === "alive";
+  }
+  const row = rows.get(pid);
+  if (row) return sameCreation(row.start, expectedStart);
+  if (probe === "eperm") return false;
+  if (options.startWinSync) {
+    try {
+      const direct = options.startWinSync(pid);
+      return direct ? sameCreation(direct, expectedStart) : false;
+    } catch {
+      return true;
+    }
+  }
+  if (fresh) return false;
+  try {
+    const refreshed = options.snapshotWin ? options.snapshotWin(0) : readWinSnapshotSync(0).rows;
+    const freshRow = refreshed.get(pid);
+    return freshRow ? sameCreation(freshRow.start, expectedStart) : false;
+  } catch {
+    return true;
+  }
 }
 
 /** The creation-time token of one process ("" when it has already gone; rejects when the observer itself fails). */
@@ -244,19 +333,45 @@ export function winStartSync(pid: number): string {
     return isWinStart(out) ? out : "";
   } catch { return ""; }
 }
+
+/** Normalize and bound a diagnostic Windows command line (EX1: at most 200 characters, single-spaced). */
+export function clipWinCommandLine(command: string): string {
+  return command.trim().replace(/\s+/g, " ").slice(0, 200);
+}
+
+const SCANNED_COMMAND = Symbol("dsa.win.scannedCommand");
+type WithScannedCommand = { [SCANNED_COMMAND]?: string; command?: unknown };
+
+/** Attach a diagnostic command line observed during a fresh Windows process-table scan without adding an enumerable
+ *  field (so `gate-tracked`/`eval-tracked` journal serialization and `ProcInfo` shape remain unchanged). */
+export function attachScannedCommand<T extends object>(proc: T, command: string | undefined): T {
+  if (typeof command === "string") {
+    Object.defineProperty(proc, SCANNED_COMMAND, { value: clipWinCommandLine(command), enumerable: false, configurable: true });
+  }
+  return proc;
+}
+
+/** Read a diagnostic command line already observed on a scanned process row, if present. */
+export function scannedCommand(proc: object | undefined): string | undefined {
+  if (!proc || typeof proc !== "object") return undefined;
+  const carrier = proc as WithScannedCommand;
+  if (typeof carrier[SCANNED_COMMAND] === "string") return carrier[SCANNED_COMMAND];
+  if (typeof carrier.command === "string") return clipWinCommandLine(carrier.command);
+  return undefined;
+}
+
 /** A diagnostic command line (never evidence of identity or death). */
 export async function winCommandLine(pid: number, signal?: AbortSignal): Promise<string> {
   if (!Number.isInteger(pid) || pid <= 0 || signal?.aborted) return "";
   try {
     const out = await powershell(processQuery("CommandLine", "$p.CommandLine", pid), { signal, timeout: 1000 });
-    return out.trim().replace(/\s+/g, " ").slice(0, 200);
+    return clipWinCommandLine(out);
   } catch { return ""; }
 }
 export function winCommandLineSync(pid: number): string {
   if (!Number.isInteger(pid) || pid <= 0) return "";
   try {
-    return powershellSync(processQuery("CommandLine", "$p.CommandLine", pid), { timeout: 1000 })
-      .trim().replace(/\s+/g, " ").slice(0, 200);
+    return clipWinCommandLine(powershellSync(processQuery("CommandLine", "$p.CommandLine", pid), { timeout: 1000 }));
   } catch { return ""; }
 }
 /** Prefix of versioned Windows command-line tags: base64url UTF-8 so spaces, quotes, `&`, `%` and arbitrary Unicode

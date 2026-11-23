@@ -12,7 +12,7 @@ import { replacePath, replacePathSync } from "../kernel/fsx.ts";
 import { readBeginIdentitySync, readGroupEndSync, readGroupRecordStateSync } from "./job.ts";
 import { OsLock } from "./lock.ts";
 import { ProcessTable } from "./proctable.ts";
-import { IS_WINDOWS, isWinStart, killProcessSync, killTreeSync, sameCreation, winLiveDescendants, winSnapshotSync, winStartSync, winTag, type WinProcessIdentity, type WinProcessRow } from "./windows.ts";
+import { IS_WINDOWS, isWinStart, killProcessSync, killTreeSync, probeKernelPid, sameCreation, winLiveDescendants, winProcessAlive, winSnapshotSync, winStartSync, winTag, type KernelPidProbe, type WinProcessIdentity, type WinProcessRow } from "./windows.ts";
 
 export type LeaseMode = "exclusive" | "shared" | "counted";
 export interface LeaseProcess { pid: number; start?: string }
@@ -43,40 +43,45 @@ export interface LeaseCheckOptions {
   snapshotWin?: (maxAgeMs?: number) => Map<number, WinProcessRow>;
   startWinSync?: (pid: number) => string;
   processAlive?: (pid: number) => boolean;
+  probePid?: (pid: number) => KernelPidProbe;
 }
 
 const checkOpts = (options?: LeaseCheckOptions): LeaseCheckOptions | undefined =>
   options && typeof options === "object" ? options : undefined;
 
 function kernelPidAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+  return probeKernelPid(pid) !== "dead";
+}
+
+function resolveProbePid(opts?: LeaseCheckOptions): (pid: number) => KernelPidProbe {
+  if (opts?.probePid) return opts.probePid;
+  if (opts?.processAlive) return pid => (opts.processAlive!(pid) ? "alive" : "dead");
+  return probeKernelPid;
 }
 
 /** Proven-owned live descendants of `(pid, start)` in the current snapshot. Requires a valid `start` token and a live
  *  matching parent in the snapshot: once a parent exits on Windows, its numeric PID can be reused by an unrelated
  *  process whose children share that `ParentProcessId`, and pre-existing boot/system orphans have `child.start < start`. */
-function winDescendants(pid: number, start?: string, rows: ReadonlyMap<number, WinProcessRow> = winSnapshotSync()): WinProcessRow[] {
+function winDescendants(pid: number, start?: string, rows?: ReadonlyMap<number, WinProcessRow>): WinProcessRow[] {
   if (!isWinStart(start)) return [];
-  return winLiveDescendants([{ pid, start }], rows.values());
+  const table = rows ?? winSnapshotSync();
+  return winLiveDescendants([{ pid, start }], table.values());
 }
 
 /** Whether a process still runs; on Linux/Windows the start token also tells it from a later process with the same pid. */
 export function alive(p: LeaseProcess | undefined, options?: LeaseCheckOptions): boolean {
   if (!p) return false;
   const opts = checkOpts(options);
-  const pidAlive = opts?.processAlive ?? kernelPidAlive;
-  if (!pidAlive(p.pid)) return false;
+  const probePid = resolveProbePid(opts);
   const platform = opts?.platform ?? (IS_WINDOWS ? "win32" : process.platform);
   if (platform === "win32") {
-    // Creation time is Windows' start token. A row missing from the short-lived cache is checked directly by pid.
-    if (!p.start) return true;
-    if (!isWinStart(p.start)) return false;
-    const row = (opts?.snapshotWin ?? winSnapshotSync)().get(p.pid);
-    if (row) return sameCreation(row.start, p.start);
-    const direct = (opts?.startWinSync ?? winStartSync)(p.pid);
-    return direct ? sameCreation(direct, p.start) : true;
+    return winProcessAlive(p.pid, p.start, {
+      probePid,
+      ...(opts?.snapshotWin ? { snapshotWin: opts.snapshotWin } : {}),
+      ...(opts?.startWinSync ? { startWinSync: opts.startWinSync } : {}),
+    });
   }
+  if (probePid(p.pid) === "dead") return false;
   if (!p.start || platform !== "linux") return true;
   try {
     const fields = readFileSync(`/proc/${p.pid}/stat`, "utf8");
@@ -119,7 +124,7 @@ function leftoverGroup(t: LeaseTicket): boolean {
     // The command's pid is the root of its tree, not a process group. Live leader: no leftovers (alive() checks the
     // creation token). Dead leader: its children keep the parent pid, so they are its leftovers.
     if (alive(c)) return false;
-    return winDescendants(c.pid, c.start).length > 0;
+    try { return winDescendants(c.pid, c.start).length > 0; } catch { return false; }
   }
   if (process.platform === "linux") {
     try {
@@ -149,11 +154,12 @@ const isWinJobTicket = (t: LeaseTicket) => Boolean(t.jobDir || t.group);
  *    Job Object owner or a verified root is still alive (retains the lease until a waiter or the owner finishes draining);
  *  - "dead": the Job Object owner is gone, so its non-inherited KILL_ON_JOB_CLOSE handle is closed and nothing remains. */
 function inspectWinJob(t: LeaseTicket, opts?: LeaseCheckOptions): "running" | "orphaned" | "dead" {
-  const pidAlive = opts?.processAlive ?? kernelPidAlive;
+  const probePid = resolveProbePid(opts);
   const snap = opts?.snapshotWin ?? winSnapshotSync;
   const startOf = opts?.startWinSync ?? winStartSync;
   // Fresh snapshot AFTER observing the wrapper gone, before reading the job directory: never uses a pre-spawn cache.
-  const rows = snap(0);
+  let rows: ReadonlyMap<number, WinProcessRow> | undefined;
+  try { rows = snap(0); } catch { rows = undefined; }
   const groupState = t.jobDir ? readGroupRecordStateSync(t.jobDir) : { state: "absent" as const };
   const groupRec = groupState.state === "ready" ? groupState.record : undefined;
   const began = t.jobDir ? readBeginIdentitySync(t.jobDir) : undefined;
@@ -164,21 +170,36 @@ function inspectWinJob(t: LeaseTicket, opts?: LeaseCheckOptions): "running" | "o
   const tag = holdTag(t);
   let ownerAlive = false;
   if (recordedOwner) {
-    if (pidAlive(recordedOwner.pid)) {
-      const ownerRow = rows.get(recordedOwner.pid);
-      ownerAlive = ownerRow ? sameCreation(ownerRow.start, recordedOwner.start)
-        : sameCreation(startOf(recordedOwner.pid), recordedOwner.start);
+    const ownerProbe = probePid(recordedOwner.pid);
+    if (ownerProbe !== "dead") {
+      if (!rows) {
+        ownerAlive = ownerProbe === "alive";
+      } else {
+        const ownerRow = rows.get(recordedOwner.pid);
+        ownerAlive = ownerRow ? sameCreation(ownerRow.start, recordedOwner.start)
+          : ownerProbe === "alive" && sameCreation(startOf(recordedOwner.pid), recordedOwner.start);
+      }
     }
+  } else if (!rows) {
+    return "running";
   } else {
     const taggedOwner = [...rows.values()].find(r => isWinStart(r.start) && winTag(r.command, "DSA_HOLD") === tag);
-    if (taggedOwner && pidAlive(taggedOwner.pid)) ownerAlive = true;
+    if (taggedOwner && probePid(taggedOwner.pid) !== "dead") ownerAlive = true;
   }
   const cmd = (groupRec && isWinStart(groupRec.start) ? { pid: groupRec.pid, start: groupRec.start } : undefined)
     ?? (t.command && isWinStart(t.command.start) ? { pid: t.command.pid, start: t.command.start } : undefined);
   let cmdAlive = false;
-  if (!groupEnded && cmd && pidAlive(cmd.pid)) {
-    const cmdRow = rows.get(cmd.pid);
-    cmdAlive = cmdRow ? sameCreation(cmdRow.start, cmd.start) : sameCreation(startOf(cmd.pid), cmd.start);
+  if (!groupEnded && cmd) {
+    const cmdProbe = probePid(cmd.pid);
+    if (cmdProbe !== "dead") {
+      if (!rows) {
+        cmdAlive = cmdProbe === "alive";
+      } else {
+        const cmdRow = rows.get(cmd.pid);
+        cmdAlive = cmdRow ? sameCreation(cmdRow.start, cmd.start)
+          : cmdProbe === "alive" && sameCreation(startOf(cmd.pid), cmd.start);
+      }
+    }
   }
   if (ownerAlive && (cmdAlive || groupState.state === "transient")) return "running";
   if (ownerAlive || cmdAlive) return "orphaned";
@@ -194,8 +215,11 @@ export const orphaned = (t: LeaseTicket, options?: LeaseCheckOptions): boolean =
   if (alive(t.command, opts)) return false;
   if (platform === "win32") {
     const snap = opts?.snapshotWin ?? winSnapshotSync;
-    return (t.command ? winDescendants(t.command.pid, t.command.start, snap(0)).length > 0 : false)
-      || winDescendants(t.wrapper.pid, t.wrapper.start, snap(0)).length > 0;
+    try {
+      const rows = snap(0);
+      return (t.command ? winDescendants(t.command.pid, t.command.start, rows).length > 0 : false)
+        || winDescendants(t.wrapper.pid, t.wrapper.start, rows).length > 0;
+    } catch { return false; }
   }
   return leftoverGroup(t) || tagged(t).length > 0;
 };

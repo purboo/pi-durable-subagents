@@ -6,7 +6,7 @@ import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync } 
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import type { ProcInfo, ProcessTable as Table } from "../types.ts";
-import { winProcessRows, winSnapshotSync, winStart, winTag } from "./windows.ts";
+import { attachScannedCommand, scannedCommand, winProcessRows, winSnapshotSync, winStart, winTag, type WinProcessRow } from "./windows.ts";
 
 /** `ps` by its absolute path where it has one (macOS and Linux: /bin/ps), so a minimal PATH (a service unit, a test
  *  that hides `pi`) does not take the process table away. */
@@ -65,9 +65,10 @@ export class ProcessTable implements Table {
   private ticks?: Promise<number>;
   private platform: NodeJS.Platform;
   private ps: () => Promise<string>;
+  private winRows: () => Promise<WinProcessRow[]>;
   private tagName: string;
 
-  constructor(options: { platform?: NodeJS.Platform; ps?: () => Promise<string>; tagName?: string } = {}) {
+  constructor(options: { platform?: NodeJS.Platform; ps?: () => Promise<string>; winRows?: () => Promise<WinProcessRow[]>; tagName?: string } = {}) {
     this.tagName = options.tagName ?? "DSA_EXEC";
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(this.tagName)) throw new Error("Invalid process tag name");
     this.platform = options.platform ?? process.platform;
@@ -75,6 +76,7 @@ export class ProcessTable implements Table {
       ["-axEww", "-o", "pid=,ppid=,lstart=,time=,stat=,command="],
       // The whole table with environments is large; 2 s proved too short on loaded macOS machines.
       { env: { ...process.env, LC_ALL: "C" }, timeout: 10_000, maxBuffer: 32 * 1024 * 1024 })).stdout);
+    this.winRows = options.winRows ?? (() => winProcessRows());
   }
 
   /** Synchronous liveness for lease readers. Unlike execution tracking, hold tags are reread after each exec. Windows
@@ -82,8 +84,10 @@ export class ProcessTable implements Table {
    *  nothing there). */
   tagged(tag: string): Pick<ProcInfo, "pid" | "start">[] {
     if (this.platform === "win32") {
-      return [...winSnapshotSync().values()].filter(row => winTag(row.command, this.tagName) === tag)
-        .map(row => ({ pid: row.pid, start: row.start }));
+      try {
+        return [...winSnapshotSync().values()].filter(row => winTag(row.command, this.tagName) === tag)
+          .map(row => ({ pid: row.pid, start: row.start }));
+      } catch { return []; /* snapshot unavailable: group-only fallback */ }
     }
     if (this.platform === "darwin") {
       try {
@@ -112,7 +116,8 @@ export class ProcessTable implements Table {
     const value = await this.listRaw(options);
     if (typeof value === "string") return this.mac(value, knownExecs);
     // A Windows tag comes from a command line, so a known-id filter keeps unrelated text from becoming an execution.
-    if (this.platform === "win32") return value.map(p => p.tag !== undefined && !knownExecs.has(p.tag) ? { ...p, tag: undefined } : p);
+    if (this.platform === "win32") return value.map(p => p.tag !== undefined && !knownExecs.has(p.tag)
+      ? attachScannedCommand({ ...p, tag: undefined }, scannedCommand(p)) : p);
     return value;
   }
   private async listRaw(options: { maxAgeMs?: number; fresh?: boolean }): Promise<Snapshot> {
@@ -126,9 +131,12 @@ export class ProcessTable implements Table {
     try { return await promise; } finally { if (this.pending === promise) this.pending = undefined; }
   }
   private async read(): Promise<Snapshot> {
-    if (this.platform === "win32") return (await winProcessRows()).map(row =>
-      ({ pid: row.pid, ppid: row.ppid, start: row.start, ...(row.cpuMs !== undefined ? { cpuMs: row.cpuMs } : {}),
-        ...(winTag(row.command, this.tagName) ? { tag: winTag(row.command, this.tagName) } : {}) }));
+    if (this.platform === "win32") return (await this.winRows()).map(row => {
+      const tag = winTag(row.command, this.tagName);
+      return attachScannedCommand({ pid: row.pid, ppid: row.ppid, start: row.start,
+        ...(row.cpuMs !== undefined ? { cpuMs: row.cpuMs } : {}),
+        ...(tag ? { tag } : {}) }, row.command);
+    });
     if (this.platform === "darwin") return this.ps();
     if (this.platform !== "linux") throw new Error(`C2 capability unavailable: ${this.platform}`);
     this.ticks ??= exec("getconf", ["CLK_TCK"], { timeout: 2000 }).then(({ stdout }) => {

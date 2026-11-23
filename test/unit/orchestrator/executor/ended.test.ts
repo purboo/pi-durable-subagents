@@ -18,14 +18,18 @@ const cmdline = await import("../../../../src/platform/cmdline.ts").catch(error 
   return undefined;
 });
 import { sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
+import { ProcessTable } from "../../../../src/platform/proctable.ts";
+import { attachScannedCommand, clipWinCommandLine, type WinProcessRow } from "../../../../src/platform/windows.ts";
 import type { JournalHandle, ProcInfo } from "../../../../src/types.ts";
-// Windows has no inherited environment tags and fences with taskkill, so these Linux/macOS mechanism tests (mocked
-// process.kill, /proc cmdlines) do not apply; the tree fence has its own Windows tests.
-const winTest: typeof test = ((name: string, optionsOrFn: unknown, maybeFn?: unknown) => {
+// Real-process POSIX tests (spawning `sleep`, mocking host `process.kill(..., "SIGKILL")`, inherited `DSA_EXEC` env
+// tags) only apply on Linux/macOS; pure-mock tests and Windows tree-fence tests run cross-platform on every OS.
+const posixTest: typeof test = ((name: string, optionsOrFn: unknown, maybeFn?: unknown) => {
   const fn = (typeof optionsOrFn === "function" ? optionsOrFn : maybeFn) as () => unknown;
   const options = typeof optionsOrFn === "object" && optionsOrFn ? optionsOrFn as Record<string, unknown> : {};
-  return test(name, { ...options, skip: process.platform === "win32" ? "Windows fences with taskkill/tree identity, not SIGKILL hooks" : options.skip as string | false | undefined } as never, fn as never);
+  return test(name, { ...options, skip: process.platform === "win32" ? "POSIX real-process SIGKILL/sleep/env-tag test; cross-platform and Windows tests cover ended diagnostics" : options.skip as string | false | undefined } as never, fn as never);
 }) as typeof test;
+
+const noReadCommand = { readCommand: async () => "" };
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), "dsa-ended-")), journal = await openJournal(join(root, "journal")), containment = new Containment();
@@ -34,7 +38,7 @@ async function fixture(t: TestContext) {
   return { root, journal, containment, exec };
 }
 
-winTest("EX1 records a sleep grandchild's pid/argv before SIGKILL, not the direct child", { timeout: 15_000 }, async t => {
+posixTest("EX1 records a sleep grandchild's pid/argv before SIGKILL, not the direct child", { timeout: 15_000 }, async t => {
   const f = await fixture(t);
   const child = await f.containment.spawn({ exec: f.exec, command: process.execPath,
     args: ["-e", 'const c=require("child_process").spawn("sleep",["300"],{stdio:"ignore"}); console.log(c.pid); setInterval(()=>{},1000)'], cwd: f.root, env: {} });
@@ -57,23 +61,28 @@ winTest("EX1 records a sleep grandchild's pid/argv before SIGKILL, not the direc
   await child.exited;
 });
 
-/** Fake identities with no start token only in this test: no operating-system process is ever signalled. */
+/** Fake identities with injected POSIX seams only in this test: no operating-system process is ever probed or signalled. */
 async function simulated(t: TestContext, rounds: ProcInfo[][]) {
-  const f = await fixture(t);
+  const root = await mkdtemp(join(tmpdir(), "dsa-ended-")), journal = await openJournal(join(root, "journal"));
+  const exec = `w${process.pid}@1/k@1#${Date.now()}.1`;
+  t.after(async () => { await journal.close(); await rm(root, { recursive: true, force: true }); });
   let round = 0;
-  const containment = new Containment({ list: async () => rounds[round++] ?? [] });
   const killed: number[] = [];
-  t.mock.method(process, "kill", ((pid: number) => { killed.push(pid); return true; }) as typeof process.kill);
-  return { ...f, containment, killed };
+  const containment = new Containment({ list: async () => rounds[round++] ?? [] }, {
+    platform: "linux",
+    captureStart: async () => "",
+    killPosix: pid => { killed.push(pid); },
+  });
+  return { root, journal, containment, exec, killed };
 }
 const row = (pid: number, exec: string, start = ""): ProcInfo => ({ pid, ppid: 0, start, tag: exec });
 
-winTest("EX1 caps one entry per kill round at 20 with more; matches direct child by pid AND start", async t => {
+test("EX1 caps one entry per kill round at 20 with more; matches direct child by pid AND start", async t => {
   const f = await simulated(t, []);
   const rows = Array.from({ length: 24 }, (_, i) => row(900_000 + i, f.exec));
   let scan = 0;
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? rows : []]]));
-  await fenceAgent(f.containment, f.journal, f.exec, [], { pid: rows[0]!.pid, start: "old" });
+  await fenceAgent(f.containment, f.journal, f.exec, [], { pid: rows[0]!.pid, start: "old" }, noReadCommand);
   const ended = f.journal.entries().filter(e => e.type === "ended");
   assert.equal(ended.length, 1);
   assert.deepEqual(ended[0]!.procs, rows.slice(0, 20).map(p => ({ pid: p.pid, command: "" })));
@@ -81,35 +90,51 @@ winTest("EX1 caps one entry per kill round at 20 with more; matches direct child
   assert.equal(f.killed.length, 24, "the cap only limits diagnostics");
 });
 
-winTest("EX1 produces one ended entry for each nonempty fence round", async t => {
+test("EX1 produces one ended entry for each nonempty fence round", async t => {
   const f = await simulated(t, []);
   let scan = 0;
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ < 2 ? [row(900_001 + scan, f.exec)] : []]]));
-  await fenceAgent(f.containment, f.journal, f.exec, [], { pid: 900_000, start: "direct" });
+  await fenceAgent(f.containment, f.journal, f.exec, [], { pid: 900_000, start: "direct" }, noReadCommand);
   assert.equal(f.journal.entries().filter(e => e.type === "ended").length, 2);
 });
 
-for (const directOnly of [false, true]) winTest(`EX1 writes nothing for ${directOnly ? "only the direct child" : "no targets"}`, async t => {
+for (const directOnly of [false, true]) test(`EX1 writes nothing for ${directOnly ? "only the direct child" : "no targets"}`, async t => {
   const f = await simulated(t, []);
   let scan = 0;
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, directOnly && scan++ === 0 ? [row(900_001, f.exec)] : []]]));
-  await fenceAgent(f.containment, f.journal, f.exec, [], { pid: 900_001, start: "" });
+  await fenceAgent(f.containment, f.journal, f.exec, [], { pid: 900_001, start: "" }, noReadCommand);
   assert.deepEqual(f.journal.entries(), []);
   assert.equal(f.killed.length, directOnly ? 1 : 0);
 });
 
-for (const failure of ["reject", "hang"] as const) winTest(`EX1 ${failure} recording never blocks the fence`, { timeout: 3000 }, async t => {
+for (const failure of ["reject", "hang"] as const) test(`EX1 ${failure} recording never blocks the fence`, { timeout: 3000 }, async t => {
   const f = await simulated(t, []);
   let scan = 0, recorded = 0;
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? [row(900_001, f.exec)] : []]]));
   const journal: JournalHandle = { ...f.journal, append: async () => { recorded++; if (failure === "reject") throw new Error("disk failure"); return new Promise(() => {}); } };
   const before = performance.now();
-  await fenceAgent(f.containment, journal, f.exec, [], { pid: 900_000, start: "direct" });
+  await fenceAgent(f.containment, journal, f.exec, [], { pid: 900_000, start: "direct" }, noReadCommand);
   assert.equal(recorded, 1); assert.deepEqual(f.killed, [900_001]);
   assert.ok(performance.now() - before < 800, "500 ms budget plus scan/scheduling overhead");
 });
 
-winTest("EX1 aborting slow argv reads prevents a stale append after fencing", { timeout: 3000,
+test("EX1 aborting slow readCommand prevents a stale append after fencing", { timeout: 3000 }, async t => {
+  const f = await simulated(t, []);
+  let finish!: (value: string) => void, scan = 0, aborted = false;
+  t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? [row(900_001, f.exec)] : []]]));
+  await fenceAgent(f.containment, f.journal, f.exec, [], { pid: 900_000, start: "direct" }, {
+    readCommand: async (_pid, signal) => {
+      signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+      return new Promise<string>(resolve => { finish = resolve; });
+    },
+  });
+  assert.equal(typeof finish, "function", "the diagnostic read was started");
+  assert.equal(aborted, true, "diagnostic read signal was aborted at the 500 ms budget");
+  finish("late argv"); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.journal.entries(), []); assert.deepEqual(f.killed, [900_001]);
+});
+
+posixTest("EX1 aborting slow argv reads prevents a stale append after fencing", { timeout: 3000,
   skip: process.platform !== "linux" ? "injects a stalled /proc/cmdline read; macOS uses bounded ps instead" : false }, async t => {
   const f = await simulated(t, []), fs = (await import("node:fs/promises")).default;
   const { syncBuiltinESMExports } = await import("node:module");
@@ -126,28 +151,28 @@ winTest("EX1 aborting slow argv reads prevents a stale append after fencing", { 
   } finally { fs.readFile = original; syncBuiltinESMExports(); }
 });
 
-winTest("EX1 recovery/sweep excludes the direct child using persisted identity", async t => {
+test("EX1 recovery/sweep excludes the direct child using persisted identity", async t => {
   const f = await simulated(t, []);
   await f.journal.append("exec", { exec: f.exec, call: f.exec.split("#")[0] });
   await f.journal.append("tracked", { exec: f.exec, pid: 900_001, start: "" });
   await f.journal.append("retired", { call: f.exec.split("#")[0] });
   let scan = 0;
-  t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ < 2 ? [row(900_001, f.exec), row(900_002, f.exec)] : []]]));
+  t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ < 2 ? [row(900_001, f.exec), attachScannedCommand(row(900_002, f.exec), "")] : []]]));
   await sweepExecutions([f.journal], f.containment);
   assert.deepEqual(f.journal.entries().find(e => e.type === "ended")?.procs, [{ pid: 900_002, command: "" }]);
 });
 
-winTest("EX1 recovery prefers the explicit direct-child token even when a tracker entry came first", async t => {
+test("EX1 recovery prefers the explicit direct-child token even when a tracker entry came first", async t => {
   const f = await simulated(t, []);
   await f.journal.append("tracked", { exec: f.exec, pid: 900_002, start: "" });
   await f.journal.append("tracked", { exec: f.exec, pid: 900_001, start: "", child: true });
   let scan = 0;
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? [row(900_001, f.exec), row(900_002, f.exec)] : []]]));
-  await fenceAgent(f.containment, f.journal, f.exec, []);
+  await fenceAgent(f.containment, f.journal, f.exec, [], undefined, noReadCommand);
   assert.deepEqual(f.journal.entries().find(e => e.type === "ended")?.procs, [{ pid: 900_002, command: "" }]);
 });
 
-for (const descendant of [false, true]) winTest(`EX1 R-11-3 crash before tracked: ${descendant ? "only the tagged grandchild is listed" : "a lone direct child is never listed"}`, async t => {
+for (const descendant of [false, true]) test(`EX1 R-11-3 crash before tracked: ${descendant ? "only the tagged grandchild is listed" : "a lone direct child is never listed"}`, async t => {
   const f = await simulated(t, []);
   await f.journal.append("exec", { exec: f.exec, call: f.exec.split("#")[0] });
   // Direct pi belongs to the orchestrator; orphaned descendants belong to init/a subreaper. Both are roots.
@@ -157,7 +182,7 @@ for (const descendant of [false, true]) winTest(`EX1 R-11-3 crash before tracked
   const targets = descendant ? [direct, grandchild, orphan] : [direct];
   let scan = 0;
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? targets : []]]));
-  await fenceAgent(f.containment, f.journal, f.exec, []);
+  await fenceAgent(f.containment, f.journal, f.exec, [], undefined, noReadCommand);
   assert.ok(!f.journal.entries().some(e => e.type === "tracked"), "exec committed without a persisted child identity");
   const ended = f.journal.entries().filter(e => e.type === "ended");
   if (descendant) {
@@ -169,7 +194,7 @@ for (const descendant of [false, true]) winTest(`EX1 R-11-3 crash before tracked
 });
 
 // Reproduce the reviewer's real-process probe: only exec is durable, then a fresh containment recovers the tag.
-for (const descendant of [false, true]) winTest(`EX1 R-11-3 real-process crash cut with ${descendant ? "a tagged sleep grandchild" : "only the direct child"}`, { timeout: 15_000 }, async t => {
+for (const descendant of [false, true]) posixTest(`EX1 R-11-3 real-process crash cut with ${descendant ? "a tagged sleep grandchild" : "only the direct child"}`, { timeout: 15_000 }, async t => {
   const f = await fixture(t);
   await f.journal.append("exec", { exec: f.exec, call: f.exec.split("#")[0] });
   const source = descendant
@@ -189,7 +214,7 @@ for (const descendant of [false, true]) winTest(`EX1 R-11-3 real-process crash c
   assert.equal((await recovered.scan(new Map([[f.exec, []]]), { fresh: true })).get(f.exec)?.length ?? 0, 0);
 });
 
-winTest("EX1 command and gate fences have no ended recording hook", async t => {
+test("EX1 command and gate fences have no ended recording hook", async t => {
   const f = await simulated(t, []);
   let scan = 0;
   t.mock.method(f.containment, "scan", async () => new Map([[f.exec, scan++ === 0 ? [row(900_001, f.exec)] : []]]));
@@ -197,7 +222,46 @@ winTest("EX1 command and gate fences have no ended recording hook", async t => {
   assert.deepEqual(f.journal.entries(), []); assert.deepEqual(f.killed, [900_001]);
 });
 
-winTest("EX1 command-line diagnostics are bounded and unreadable means empty", async t => {
+test("EX1 Windows reuses scanned CommandLine within the 500 ms budget without extra per-PID queries", async t => {
+  const root = await mkdtemp(join(tmpdir(), "dsa-ended-win-")), journal = await openJournal(join(root, "journal"));
+  const exec = `w${process.pid}@1/k@1#${Date.now()}.1`;
+  t.after(async () => { await journal.close(); await rm(root, { recursive: true, force: true }); });
+  const T_DIRECT = "639000000500000000";
+  const rows: WinProcessRow[] = [
+    { pid: 6400, ppid: 4212, start: T_DIRECT, command: "node.exe direct.js" },
+    ...Array.from({ length: 22 }, (_, i) => ({
+      pid: 6401 + i,
+      ppid: 6400,
+      start: String(639000000550000000n + BigInt(i * 100)),
+      command: `node.exe   child-${i}.js ${"z".repeat(220)}`,
+    })),
+  ];
+  let alive = true, readCalls = 0;
+  const table = new ProcessTable({ platform: "win32", winRows: async () => (alive ? rows : []) });
+  const containment = new Containment(table, {
+    platform: "win32",
+    killWindows: async () => { alive = false; },
+  });
+  await fenceAgent(
+    containment,
+    journal,
+    exec,
+    [{ pid: 6400, ppid: 4212, start: T_DIRECT }],
+    { pid: 6400, start: T_DIRECT },
+    { readCommand: async () => { readCalls++; return "fallback"; } },
+  );
+  assert.equal(readCalls, 0, "no per-PID winCommandLine calls when scanned rows already carry CommandLine");
+  const ended = journal.entries().filter(e => e.type === "ended");
+  assert.equal(ended.length, 1);
+  assert.equal(ended[0]!.more, 2);
+  assert.deepEqual(
+    ended[0]!.procs,
+    rows.slice(1, 21).map(r => ({ pid: r.pid, command: clipWinCommandLine(r.command!) })),
+  );
+  assert.ok((ended[0]!.procs as { command: string }[]).every(p => p.command.length === 200));
+});
+
+posixTest("EX1 command-line diagnostics are bounded and unreadable means empty", async t => {
   const f = await fixture(t);
   const child = await f.containment.spawn({ exec: f.exec, command: process.execPath, args: ["-e", "setInterval(()=>{},1000)", "x".repeat(400)], cwd: f.root, env: {} });
   assert.ok(cmdline, "the bounded command-line diagnostic is implemented");
