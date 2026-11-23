@@ -98,7 +98,7 @@ export function execTarget(command: string, args: readonly string[], options: Ex
   if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args] };
   const script = shimScript(resolved);
   if (script) {
-    const node = resolveNode(env, { platform }).path;
+    const node = resolveNode(env, { platform, peOnly: true }).path;
     if (node) return { command: node, args: [script, ...args] };
   }
   // Outer quotes satisfy `cmd.exe /s /c`, which unconditionally strips the first and last `"` from the command string,
@@ -133,14 +133,12 @@ export function shellTarget(command: string, exec?: string, platform: NodeJS.Pla
     : { command: "/bin/sh", args: ["-c", command] };
 }
 
-/** The PATH (and PATHEXT) of an environment under this platform's naming rules: a Windows environment spells it `Path`
- *  as often as `PATH`, and both are the one variable. POSIX reads `PATH` exactly. */
-const envPath = (env: NodeJS.ProcessEnv) => IS_WINDOWS ? envValue(env, "PATH") : env.PATH;
-
 const NODE_BASENAME = /^node(?:js)?(?:[-._]?v?\d[\d._-]*)?(?:\.exe)?$/i;
+const NODE_SHIM_BASENAME = /^node(?:js)?(?:[-._]?v?\d[\d._-]*)?(?:\.(?:exe|com|cmd|bat))?$/i;
+const SHIM_DISPATCHERS = new Set(["mise", "mise.exe", "volta", "volta.exe", "volta-shim", "volta-shim.exe", "asdf", "asdf.exe", "proto-shim", "proto-shim.exe", "rtx", "rtx.exe", "anyenv", "nodenv", "fnm", "fnm.exe"]);
 const basenameOf = (filePath: string) => filePath.replace(/^.*[\\/]/, "");
-const realPathOf = (filePath: string) => { try { return realpathSync(filePath); } catch { return filePath; } };
-const normFile = (filePath: string, platform: NodeJS.Platform) => platform === "win32" ? filePath.toLowerCase() : filePath;
+const realPathOf = (filePath: string) => { try { return (realpathSync.native ?? realpathSync)(filePath); } catch { return filePath; } };
+const normFile = (filePath: string, platform: NodeJS.Platform) => platform === "win32" ? win32.normalize(filePath).toLowerCase() : filePath;
 
 /** Whether this process itself is a standalone Node.js runtime (not a compiled Bun or SEA pi binary where
  *  process.execPath points to pi and running `execPath main.js` would open a recursive pi session, #11). */
@@ -153,16 +151,17 @@ export function isNodeProcess(options: { execPath?: string; versions?: Record<st
   return NODE_BASENAME.test(basenameOf(execPath));
 }
 
-/** Whether `nodePath` and `piPath` invoke the same program. Multi-call version-manager shims (mise, volta, asdf)
- *  share one realpath binary (e.g. `mise`) across `shims/node` and `shims/pi` and dispatch on argv[0], so two
- *  distinct paths whose shared target is neither `pi` nor `node` remain distinct programs. */
+/** Whether `nodePath` and `piPath` invoke the same program. Multi-call version-manager shims (mise, volta, asdf, ...)
+ *  share one realpath dispatcher binary across `shims/node` and `shims/pi` and dispatch on argv[0]; allow distinct
+ *  paths only when the shared target is a known shim dispatcher, so a symlink to a versioned `pi-real` binary is
+ *  still refused. */
 export function isSameProgram(nodePath: string, piPath: string | undefined, platform: NodeJS.Platform = process.platform): boolean {
   if (!piPath) return false;
   if (normFile(nodePath, platform) === normFile(piPath, platform)) return true;
   const realNode = realPathOf(nodePath), realPi = realPathOf(piPath);
   if (normFile(realNode, platform) !== normFile(realPi, platform)) return false;
-  const nodeName = basenameOf(nodePath), piName = basenameOf(piPath), targetName = basenameOf(realNode);
-  if (NODE_BASENAME.test(nodeName) && !NODE_BASENAME.test(piName) && normFile(targetName, platform) !== normFile(piName, platform)) return false;
+  const nodeName = basenameOf(nodePath), piName = basenameOf(piPath), targetName = basenameOf(realNode).toLowerCase();
+  if (NODE_SHIM_BASENAME.test(nodeName) && !NODE_SHIM_BASENAME.test(piName) && SHIM_DISPATCHERS.has(targetName)) return false;
   return true;
 }
 
@@ -173,17 +172,22 @@ export interface NodeResolveOptions {
   versions?: Record<string, string | undefined>;
   releaseName?: string;
   piPath?: string;
+  /** On Windows, accept only directly spawnable PE binaries (.exe/.com) instead of .cmd/.bat shims. */
+  peOnly?: boolean;
 }
 /** Resolve a Node.js executable for launching the orchestrator and JS helpers (#11):
  *  1. DSA_NODE_BIN when set (must be an absolute path to an executable file, and not pi itself);
  *  2. process.execPath when this process is a real Node.js runtime (not a compiled Bun/standalone pi binary);
- *  3. `node` (or `nodejs` on POSIX) on PATH. */
+ *  3. `node` (or `nodejs` on POSIX) on PATH, preferring PE binaries (.exe/.com) over .cmd/.bat shims on Windows. */
 export function resolveNode(env: NodeJS.ProcessEnv, options: NodeResolveOptions = {}): NodeResolution {
   const platform = options.platform ?? process.platform;
+  const isPe = (p: string) => /\.(?:exe|com)$/i.test(p);
   const given = env.DSA_NODE_BIN;
   if (given) {
     if (!absolute(given, platform) || !executableFile(given, platform))
       return { problem: `DSA_NODE_BIN=${given} is not an absolute path to an executable file` };
+    if (platform === "win32" && options.peOnly && !isPe(given))
+      return { problem: `DSA_NODE_BIN=${given} is not a Windows .exe/.com Node executable` };
     if (isSameProgram(given, options.piPath, platform))
       return { problem: `DSA_NODE_BIN=${given} resolves to the pi executable (${options.piPath})` };
     return { path: given, source: "DSA_NODE_BIN" };
@@ -194,8 +198,9 @@ export function resolveNode(env: NodeJS.ProcessEnv, options: NodeResolveOptions 
   }
   const PATH = platform === "win32" ? envValue(env, "PATH") : env.PATH;
   const pathext = platform === "win32" ? envValue(env, "PATHEXT") : undefined;
-  const found = findOnPath("node", PATH, { platform, pathext })
-    ?? (platform !== "win32" ? findOnPath("nodejs", PATH, { platform }) : undefined);
+  const found = platform === "win32"
+    ? findOnPath("node", PATH, { platform, pathext: ".EXE;.COM" }) ?? (options.peOnly ? undefined : findOnPath("node", PATH, { platform, pathext }))
+    : findOnPath("node", PATH, { platform }) ?? findOnPath("nodejs", PATH, { platform });
   if (found) {
     if (isSameProgram(found, options.piPath, platform))
       return { problem: `node on PATH (${found}) resolves to the pi executable (${options.piPath})` };
@@ -215,13 +220,14 @@ export class NodeNotFound extends Error {
 export interface PiResolution { path?: string; source?: "DSA_PI_BIN" | "PATH"; problem?: string }
 /** The `pi` the orchestrator launches subagents with: DSA_PI_BIN when set (it must be an executable file), else the
  *  first `pi` on PATH. `problem` says why there is none. */
-export function resolvePi(env: NodeJS.ProcessEnv): PiResolution {
+export function resolvePi(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): PiResolution {
   const given = env.DSA_PI_BIN;
   if (given) {
-    if (isAbsolute(given) && executableFile(given)) return { path: given, source: "DSA_PI_BIN" };
+    if (absolute(given, platform) && executableFile(given, platform)) return { path: given, source: "DSA_PI_BIN" };
     return { problem: `DSA_PI_BIN=${given} is not an absolute path to an executable file` };
   }
-  const PATH = envPath(env), found = findOnPath("pi", PATH, { pathext: IS_WINDOWS ? envValue(env, "PATHEXT") : undefined });
+  const PATH = platform === "win32" ? envValue(env, "PATH") : env.PATH;
+  const found = findOnPath("pi", PATH, { platform, pathext: platform === "win32" ? envValue(env, "PATHEXT") : undefined });
   return found ? { path: found, source: "PATH" } : { problem: `pi was not found on PATH (${PATH || "unset"}) and DSA_PI_BIN is not set` };
 }
 
@@ -320,10 +326,10 @@ export function orchestratorEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  *  the command: same environment, and the pid is the orchestrator's), else a plain detached process. */
 export async function launchOrchestrator(entry: string, env: NodeJS.ProcessEnv, options: LaunchOptions): Promise<Launched> {
   const platform = options.platform ?? process.platform;
-  const pi = resolvePi(env);
+  const pi = resolvePi(env, platform);
   if (!pi.path && options.requirePi) throw new PiNotFound(pi.problem!);
-  let node: string;
   const piPath = pi.path ?? (isNodeProcess() ? undefined : process.execPath);
+  let node: string;
   if (options.node !== undefined) {
     if (isSameProgram(options.node, piPath, platform)) throw new NodeNotFound(`orchestrator runtime ${options.node} resolves to the pi executable (${piPath})`);
     node = options.node;
@@ -347,7 +353,10 @@ export async function launchOrchestrator(entry: string, env: NodeJS.ProcessEnv, 
         return { pid: child.pid!, scope: true, ...(pi.path ? { pi: pi.path } : {}) };
       } catch { /* fall back to a plain detached process */ }
     }
-    const child = run(node, [entry], { detached: true, stdio: diagnostic.stdio, env: childEnv });
+    const target = platform === "win32" && /\.(?:cmd|bat)$/i.test(node)
+      ? execTarget(node, [entry], { env: childEnv, platform })
+      : { command: node, args: [entry] };
+    const child = run(target.command, target.args, { detached: true, stdio: diagnostic.stdio, env: childEnv, ...(target.verbatim ? { windowsVerbatimArguments: true } : {}) });
     await started(child);
     child.unref();
     return { pid: child.pid!, scope: false, ...(pi.path ? { pi: pi.path } : {}) };

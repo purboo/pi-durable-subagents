@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { CT } from "../../../../src/types.ts";
-import { receiptId, type SessionEntry } from "../../../../src/orchestrator/executor/session.ts";
+import { evidence, receiptId, type SessionEntry } from "../../../../src/orchestrator/executor/session.ts";
 import { sessionUsage } from "../../../../src/orchestrator/executor/usage.ts";
 
 test("P31 usage excludes context, predecessor generations and foreign segments across retries", () => {
@@ -23,6 +23,12 @@ test("P31 standalone usage entries (e.g. cache_warm) count inside own segments a
     { id: "w1", usage: { input: 1010, output: 1, costUsd: 0.02 } },
     { id: "w2", usage: { input: 1010, output: 1, costUsd: 0.03 } },
   ]);
+  const ev = evidence([
+    segment("W@1/a@2#1.1"),
+    { type: "message", message: { role: "assistant", usage: { input: 5, cacheRead: 20, cacheWrite: 5, output: 3, cost: { total: 0.01 } } } },
+    warm("w1", 0.02),
+  ], "W@1/a@2#1.1");
+  assert.deepEqual(ev.usage, { input: 1040, output: 4, costUsd: 0.03 });
 });
 
 test("P4 receipts cover nested messages, native custom messages and control resolutions only", () => {

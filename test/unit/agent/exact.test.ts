@@ -222,13 +222,15 @@ function childFixture(t: any, options: { capture?: Capture; allow?: string[]; ac
 
 test("EX4 the exact child replaces the request with the parent's fields and the joined conversation", async t => {
   const f = childFixture(t, {});
-  const payload = { model: "m", max_tokens: 1, system: [{ type: "text", text: "child system" }], stream: true,
+  const payload = { model: "m", max_tokens: 256, system: [{ type: "text", text: "child system" }], stream: true,
     messages: [{ role: "user", content: [{ type: "text", text: "child task" }] }] };
   const out = await f.hooks.get("before_provider_request")!({ payload }, f.ctx) as Record<string, unknown>;
   assert.deepEqual((out.messages as unknown[]).length, 2);
   assert.deepEqual(out.system, [{ type: "text", text: "parent system" }]);
   assert.equal(out.max_tokens, 4096);
   assert.deepEqual(f.hooks.get("cache_warming_decision")!({}, f.ctx), { action: "stop" }, "exact children stop cache warming so parent max_tokens is never spliced onto a warm refresh");
+  // Defense in depth: even if a 1-token cache-warming payload reaches before_provider_request, it is never spliced.
+  assert.equal(await f.hooks.get("before_provider_request")!({ payload: { ...payload, max_tokens: 1 } }, f.ctx), undefined);
 });
 
 test("EX4 the exact child refuses a request on another model without throwing", async t => {
@@ -248,7 +250,7 @@ test("EX4 the request's wire model is compared with the captured request's, not 
   const f = childFixture(t, { exec: "call#1.1", capture: wire });
   f.ctx.model = { provider: "qa", id: "M", api: "anthropic-messages" };
   await f.hooks.get("context")!({ type: "context" }, f.ctx);
-  const out = await f.hooks.get("before_provider_request")!({ payload: { model: "p/M", max_tokens: 1, stream: true,
+  const out = await f.hooks.get("before_provider_request")!({ payload: { model: "p/M", max_tokens: 256, stream: true,
     messages: [{ role: "user", content: [{ type: "text", text: "child task" }] }] } }, f.ctx) as Record<string, unknown>;
   assert.equal(f.ctx.aborted, false, "the same wire model is not a mismatch");
   assert.equal(f.history.some(e => e.customType === CT.exactMismatch), false);

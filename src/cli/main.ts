@@ -230,8 +230,12 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     if (refused) { (options.write ?? (line => console.error(line)))(refused); return 1; }
     const pi: PiResolution = command === "install-service" ? resolvePi(env) : {};
     if (command === "install-service" && !pi.path) write(`note: ${pi.problem}; the service can start an orchestrator only once DSA_PI_BIN is set in it`);
-    const node = resolveNode(env, { piPath: pi.path }).path ?? process.execPath;
-    const files = serviceFiles(env.HOME ?? homedir(), home, entry, process.platform, node, pi.path);
+    const nodeRes = resolveNode(env, { piPath: pi.path });
+    if (command === "install-service" && !nodeRes.path) {
+      (options.write ?? (line => console.error(line)))(`cannot install starter service: ${nodeRes.problem}. Set DSA_NODE_BIN to the absolute path of Node.js 22.19+, or put node on PATH`);
+      return 1;
+    }
+    const files = serviceFiles(env.HOME ?? homedir(), home, entry, process.platform, nodeRes.path ?? process.execPath, pi.path);
     await manageService(files, command === "install-service", { dryRun, runner: options.serviceRunner, write });
     files.forEach(f => write(`${command}: ${f.path}`));
     return 0;

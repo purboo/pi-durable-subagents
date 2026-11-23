@@ -67,7 +67,7 @@ function npmLayout(npm: string, platform: NodeJS.Platform): NpmLayout {
 function npmCommand(npm: string, node: string | null, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): { command: string; args: string[]; verbatim?: boolean } {
   if (platform !== "win32") return { command: "npm", args: ["root", "-g"] };
   const { cli } = npmLayout(npm, platform);
-  const runtime = node ?? resolveNode(env, { platform }).path;
+  const runtime = node ?? resolveNode(env, { platform, peOnly: true }).path;
   if (cli && runtime) return { command: runtime, args: [cli, "root", "-g"] };
   if (!/\.(?:cmd|bat)$/i.test(npm)) return { command: npm, args: ["root", "-g"] };
   return { command: comspec(env), args: ["/d", "/s", "/c", `""${npm}" root -g"`], verbatim: true };

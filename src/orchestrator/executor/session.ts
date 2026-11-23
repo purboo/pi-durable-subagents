@@ -103,7 +103,7 @@ export function evidence(entries: SessionEntry[], exec: string) {
         const value = typeof m.content === "string" ? m.content : blocks.filter(b => b.type === "text").map(b => b.text ?? "").join("");
         if (value.trim()) text = value;
       }
-      usage.input += m.usage?.input ?? 0; usage.output += m.usage?.output ?? 0; usage.costUsd += m.usage?.cost?.total ?? 0;
+      usage.input += (m.usage?.input ?? 0) + (m.usage?.cacheRead ?? 0) + (m.usage?.cacheWrite ?? 0); usage.output += m.usage?.output ?? 0; usage.costUsd += m.usage?.cost?.total ?? 0;
     } else if (e.type === "usage" && e.usage) {
       usage.input += (e.usage.input ?? 0) + (e.usage.cacheRead ?? 0) + (e.usage.cacheWrite ?? 0);
       usage.output += e.usage.output ?? 0; usage.costUsd += e.usage.cost?.total ?? 0;

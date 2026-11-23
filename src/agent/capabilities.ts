@@ -43,7 +43,7 @@ export function checkCapabilities(modules: Record<string, Record<string, unknown
   const hostIsNode = runtime.isNode ?? isNodeProcess();
   const node = hostIsNode ? (runtime.hasThreadCpuUsage ?? typeof (process as { threadCpuUsage?: unknown }).threadCpuUsage === "function") : true;
   const probeEnv = runtime.env ?? process.env;
-  const externalNode = os && !hostIsNode ? resolveNode(probeEnv, { platform, versions: { bun: "standalone" }, piPath: runtime.piPath ?? resolvePi(probeEnv).path }) : undefined;
+  const externalNode = os && !hostIsNode ? resolveNode(probeEnv, { platform, versions: { bun: "standalone" }, piPath: runtime.piPath ?? resolvePi(probeEnv, platform).path ?? process.execPath }) : undefined;
   const hasNode = hostIsNode ? node : Boolean(externalNode?.path);
   const execution = os && hasNode && !missing.some(s => s.tier === 0), ui = execution && !missing.some(s => s.tier === 2);
   const messages: string[] = [];

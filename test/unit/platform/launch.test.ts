@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ChildProcess } from "node:child_process";
-import { execTarget, executableFile, findOnPath, isNodeProcess, isSameProgram, launchOrchestrator, NodeNotFound, PiNotFound, resolveNode, resolvePi, scopeRunner, SCOPE_ARGS, type Spawner } from "../../../src/platform/launch.ts";
+import { execTarget, executableFile, findOnPath, isNodeProcess, isSameProgram, launchOrchestrator, NodeNotFound, orchestratorEnv, PiNotFound, resolveNode, resolvePi, scopeRunner, SCOPE_ARGS, type Spawner } from "../../../src/platform/launch.ts";
 import { startOrchestrator } from "../../../src/cli/control.ts";
 import { orchLedger } from "../../../src/paths.ts";
 import { serviceFiles } from "../../../src/cli/service.ts";
@@ -279,10 +279,15 @@ test("issue #11: resolveNode skips standalone Bun/pi execPath, resolves node fro
     { path: customNode, source: "DSA_NODE_BIN" });
   // Missing node on PATH with standalone binary fails clearly instead of returning pi.
   assert.match(String(resolveNode({ PATH: join(dir, "empty") }, { execPath: piBin, versions: { bun: "1.2.0" }, piPath: piBin }).problem), /node was not found on PATH/);
-  // Direct symlink to pi is refused.
+  // Direct symlink to pi is refused, including when pi itself is a symlink to a versioned target (pi -> pi-real).
   const fakeNode = join(dir, "fake-node"); await symlink(piBin, fakeNode);
   assert.equal(isSameProgram(fakeNode, piBin), true);
   assert.match(String(resolveNode({ DSA_NODE_BIN: fakeNode }, { piPath: piBin }).problem), /resolves to the pi executable/);
+  const piReal = await executable(join(dir, "store"), "pi-real");
+  const piLink = join(dir, "pi-link-dir", "pi"); await mkdir(join(dir, "pi-link-dir")); await symlink(piReal, piLink);
+  const spoofNode = join(dir, "spoof", "node"); await mkdir(join(dir, "spoof")); await symlink(piReal, spoofNode);
+  assert.equal(isSameProgram(spoofNode, piLink), true, "a node symlink to a versioned pi-real target is still refused");
+  assert.match(String(resolveNode({ DSA_NODE_BIN: spoofNode }, { piPath: piLink }).problem), /resolves to the pi executable/);
   // Multi-call version-manager shims (mise/volta/asdf): both shims symlink to the same dispatcher binary.
   const mise = await executable(join(dir, "mise-bin"), "mise");
   const shims = join(dir, "shims"); await mkdir(shims);
@@ -295,8 +300,30 @@ test("issue #11: resolveNode skips standalone Bun/pi execPath, resolves node fro
   const { spawn } = recorder();
   await assert.rejects(launchOrchestrator("/entry.js", { DSA_PI_BIN: piBin }, { home: dir, node: piBin, spawn, platform: "darwin" }),
     (e: unknown) => e instanceof NodeNotFound && /resolves to the pi executable/.test(e.message));
-  // launchOrchestrator tags child env with DSA_ORCHESTRATOR_LAUNCH=1 and strips it when inherited from caller.
+  // orchestratorEnv strips DSA_ORCHESTRATOR_LAUNCH; launchOrchestrator sets it to "1" on the spawned orchestrator.
+  assert.equal(orchestratorEnv({ DSA_ORCHESTRATOR_LAUNCH: "1", KEEP: "1" }).DSA_ORCHESTRATOR_LAUNCH, undefined);
   const r = recorder();
   await launchOrchestrator("/entry.js", { PATH: join(dir, "bin"), DSA_PI_BIN: piBin, DSA_ORCHESTRATOR_LAUNCH: "1" }, { home: dir, node: nodeBin, spawn: r.spawn, platform: "darwin" });
   assert.equal(r.calls[0]!.env.DSA_ORCHESTRATOR_LAUNCH, "1");
+});
+
+test("issue #11: Windows resolveNode prefers .exe over .cmd, normalizes slashes/case in isSameProgram, and wraps .cmd shims via cmd.exe", async t => {
+  const dir = await root(t), bin = join(dir, "bin"), cmdOnly = join(dir, "cmd-only");
+  await mkdir(bin); await mkdir(cmdOnly);
+  const nodeExe = join(bin, "node.exe"), nodeCmd = join(bin, "node.cmd"), shimCmd = join(cmdOnly, "node.cmd");
+  await writeFile(nodeExe, "MZ"); await writeFile(nodeCmd, "@echo off\r\n"); await writeFile(shimCmd, "@echo off\r\necho node\r\n");
+  const win = { platform: "win32" as const, execPath: "C:\\mise\\pi.exe", versions: { bun: "1.2.0" } };
+  // Case and slash normalization in isSameProgram on Windows.
+  assert.equal(isSameProgram("C:/Program Files/Pi/PI.EXE", "c:\\program files\\pi\\pi.exe", "win32"), true);
+  // Prefers .exe even if PATHEXT puts .CMD first.
+  assert.deepEqual(resolveNode({ Path: bin, PATHEXT: ".CMD;.EXE" }, win), { path: nodeExe, source: "PATH" });
+  // peOnly skips .cmd shims.
+  assert.equal(resolveNode({ Path: cmdOnly, PATHEXT: ".CMD;.EXE" }, { ...win, peOnly: true }).path, undefined);
+  assert.deepEqual(resolveNode({ Path: cmdOnly, PATHEXT: ".CMD;.EXE" }, win), { path: shimCmd, source: "PATH" });
+  // launchOrchestrator wraps a Windows .cmd node shim through cmd.exe instead of spawning .cmd directly.
+  const { calls, spawn } = recorder();
+  await launchOrchestrator("C:\\entry.js", { Path: cmdOnly, ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    { home: "C:\\h", node: shimCmd, spawn, platform: "win32" });
+  assert.equal(calls[0]!.command, "C:\\Windows\\System32\\cmd.exe");
+  assert.deepEqual(calls[0]!.args, ["/d", "/s", "/c", `""${shimCmd}" "C:\\entry.js""`]);
 });
