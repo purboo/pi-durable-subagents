@@ -1,5 +1,5 @@
 name: release
-# One release per tag: the full CI matrix (Linux + macOS, Node 24 and the 22.19 floor, real pi suite, packaged
+# One release per tag: the full CI matrix (Linux, macOS and Windows, Node 24 and the 22.19 floor, real pi suite, packaged
 # smoke) must pass, then the exact tagged commit is published to npm with provenance through npm trusted publishing
 # (GitHub OIDC; no npm token is stored anywhere), and a GitHub Release is created from that version's CHANGELOG
 # section. npm trusts only this workflow file in the `npm` environment of purboo/pi-durable-subagents; the

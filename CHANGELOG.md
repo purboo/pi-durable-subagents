@@ -2,158 +2,37 @@
 
 ## Unreleased
 
-- Native Windows support (Node.js 22.19+ and 24, no WSL or POSIX tools):
-  - **Kernel-released OS locks**: Windows file locks now hold an exclusive `FileShare.None` file handle via a cached
+- **Native Windows support** (Node.js 22.19+ and 24, no WSL or POSIX tools required; based on #4):
+  - **Kernel-released OS locks**: Windows file locks hold an exclusive `FileShare.None` file handle via a cached
     `.NET Framework` helper compiled into a user-private directory (`%LOCALAPPDATA%` or `DSA_HOME`, with bounded
     compile budget, self-healing and PowerShell fallback) so a killed holder releases its lock immediately in the kernel.
-  - **Windows Job Objects for commands, `hold` leases and gates**: `hold` leases and gates now run inside
-    `KILL_ON_JOB_CLOSE` Job Objects alongside command attempts, with controlled `stop`/`DrainJob` teardown on `--yield`
-    and signals, snapshot-before-kill reclamation, and atomic `MoveFileExW` exit/gate record publication with bounded
-    Windows sharing-violation retries.
-  - **64-bit lossless file identities & atomic `latest`**: Journal, cache, reader-ledger and UI readers now preserve
-    full 64-bit NTFS `FileId` values as decimal strings (never truncating at `Number.MAX_SAFE_INTEGER`), and Windows
-    `latest` pointers publish atomically without requiring symlink privileges.
-  - **Process liveness, `.cmd` shims and Task Scheduler service**: Protected-PID `EPERM` checks fail closed when a
-    verified creation timestamp is missing from the snapshot, `ended` diagnostics reuse already-scanned `CommandLine`
-    rows, non-unwrapped `.cmd`/`.bat` shims (including pnpm shims setting `NODE_PATH`/`NODE_OPTIONS`) execute with
-    verbatim `cmd.exe /d /s /c` quoting while refusing CR/LF/quote injection, and `install-service`/`uninstall-service`
-    use a hidden `wscript.exe` launcher with locale-independent `schtasks` checks.
-  - **Engine lookup performance**: `Engine.findCall`, `withdraw` and single-target routing use O(1) indexed lookups
-    instead of scanning all workflows on every request.
-- A fence that runs out of its budget now says where the budget went, in the timeout it throws: how many scans
-  completed and how slow the slowest was, how many processes the last scan still listed, how many kills were issued and
-  how many targets were skipped because their identity was never confirmed. The same text reaches the console line, the
-  durable `fence-failed` record and the unknown attention item, so a fence that timed out on a loaded runner can be read
-  without a reproducer: zero completed scans is a process table that never answered, kills without retirement is a
-  process that survived, and skips without kills is an identity that was never proven. Nothing is added to a fence that
-  succeeds, the numbers are bounded, and no command line or environment is copied into them.
-- A fence failure now asks for one immediate sweep instead of waiting for the next sweep interval. The sweep is the only
-  retry of a parked call, so a fence that failed on a transient stall (a PowerShell/CIM scan that missed the Windows
-  budget) used to keep its call parked for up to the 30 s interval plus the retry's own fence; the call now resumes as
-  soon as a sweep proves retirement. A sweep's own fence failure never asks again -- the interval stays its retry -- so a
-  process that really survives is retried at the same bounded rate as before, and the record and attention behaviour of
-  `F1` is unchanged.
-
-- A wrapper that exited without the host's `group-end` keeps the creation identity its host recorded from the live
-  process handle before resuming it: the attempt is no longer left without a wrapper identity when a process-table row
-  for that pid belongs to another process -- a recycled pid is never bound and its ticks never replace the recorded ones.
-  No identity tolerance or record format changed for this: the handshake's handle-versus-table comparison stays bounded
-  to one observation unit of the same kernel timestamp (the owner keeps whole microseconds from `GetProcessTimes`, the
-  table's DMTF date carries whole microseconds), and every later scan, adoption check and kill still compares start
-  tokens exactly.
-- A command start whose preparation was revoked (a stop, a suspension, a retirement or the orchestrator's exit) is
-  decided by that revocation and never sealed failed: the abort is what ended the preparation, so a rejection it produced
-  -- a publication cancelled on its way out, a compiler this process ended -- is not the attempt's own reason. A
-  preparation that fails on its own while the start is still permitted stays fail-closed, so a missing compiler or a
-  refused publish still seals the attempt failed with its reason.
-- A command start's preparation that is cancelled while the compiler's output is being published is a cancellation,
-  never a compiler failure: the transient-rename retries end at once instead of running out the publish budget, a rename
-  that was in flight when the start was revoked is not reported as its own cause, and the preparation removes what the
-  compiler wrote and records no failure reason (`start-error`) for it. A publication that fails on its own still reports its
-  real cause, and one that was cancelled before it began never renames at all.
-- Two Win32 contract edges of a command attempt now hold end to end. The job host decodes every spec field to its exact
-  UTF-16 code units — each byte pair is one char, never through a decoder fallback — so a Unicode path, a curly quote, an
-  emoji or an unpaired surrogate still reaches Win32 unchanged, and a field that is not a whole number of code units is
-  refused before anything is created (a decoder that kept the even prefix would truncate a path or an argument without
-  saying so); the NUL refusal is unchanged and still precedes anything Win32 sees. The Windows wrapper normalizes the
-  command's status to its 32-bit code before it records it and before it exits with it: Node may hand a Windows status
-  back as a signed int32 (`0xC0000005` reads `-1073741819`), which is no exit record at all and left the attempt looking
-  like one that ended without one (`rerun` would have started a second attempt). The record, the group record, the
-  host's own exit evidence and the caller's `exitCode` are now one DWORD (`Command exited 3221225477`), and an exit
-  record is read only when it is one decimal status within that DWORD. The orchestrator also opens no `output.log`
-  descriptor on Windows any more: the group's host owns those handles, so nothing here holds an unused one across the
-  compilation and the handshake.
-
-- The Windows job host's compilation is staged before a command attempt's durable intent, and the whole preparation is
-  cancellable: a crash or a stop while the compiler runs now leaves no `command-intent`, so that cut is unambiguously
-  prelaunch (nothing started, nothing to adopt, nothing to rerun) instead of looking like an attempt whose start record
-  never came. A stop, a retirement, a suspension or the orchestrator's exit during the preparation ends the compiler
-  process, removes what it wrote and records nothing — an interrupted compilation is never a failure of the attempt (no
-  `command-spawn-failed`, no failed seal), while a compiler that is missing or fails on its own still refuses the start
-  closed with its own reason. The proceed/stop gate is still checked again after the preparation, immediately before the
-  spawn, and the stage is released when nothing starts with it. A journal written by an earlier version (compilation after
-  the intent) keeps its ambiguous post-intent handling. Publishing the compiler's output retries the transient rename a
-  scanner or indexer causes, and a failure that stays now reports the actual cause instead of "wrote no executable".
-- Command attempt recovery across the window before the group record: the attempt's `DSA_EXEC` tag is now spelled in the
-  job host's own command line (previously only a Windows-unreadable environment carried it for the owner), so a
-  successor that finds a durable `command-intent` while the host is still starting finds the attempt by scanning and
-  starts no second one; the wrapper keeps its tag too. A handshake that cannot be completed no longer reports the attempt
-  failed while it may still act: the host is ended and a refusal is raised only when its end is confirmed (its exit
-  closes the group's only handle), otherwise the attempt is adopted — its identity is recorded in `command-started` (with
-  the reason as `uncertain`) and the call keeps watching it, so no rerun, retirement or stop can start a second attempt
-  until a scan finds it gone, and nothing is killed by a bare pid. A sharing failure while reading the group record is
-  retried (the host still holds or renames the file), a failed process-table observation is retried and never read as
-  "no process left" (the executor watches again instead of calling the attempt lost), and the same retry guards the
-  scans that end a stopped or timed-out attempt.
-- Windows command environments merge by variable name, not by spelling. Windows has one variable per name (`Path` is
-  `PATH`, `ComSpec` is `COMSPEC`), but `{...orchestrator, ...call}` added the call's spelling beside the inherited one, so
-  the command could read the orchestrator's PATH, ComSpec or reserved `DSA_*` value instead of its own. A command call's
-  environment is now merged case-insensitively (`envValue`/`mergeEnv`/`normalizeEnv`), the shim directory is matched and
-  appended once whatever its case, and the Windows wrapper merges the block it hands the command by name too (the
-  command's `ComSpec`/`PATHEXT` over the wrapper process's defaults), runs a string command through the call's own
-  ComSpec rather than the wrapper process's, and gives the child one definition per name.
-  The program of an argv command is resolved on the call's own PATH/PATHEXT (`execTarget` takes the environment it will
-  run with; the same lookup serves agent launches, `hold`, the smoke probe and the test harness), so an npm `.cmd` shim
-  is found where the command runs, not on the starter's PATH. PowerShell/taskkill helpers no longer receive a second PATH
-  beside a caller's `Path`, and `pi` resolution reads the environment's PATH/PATHEXT. POSIX command calls are unchanged.
-- Windows command attempts run inside a Job Object of their own: the wrapper is created suspended, assigned to the
-  kernel-owned group before its first instruction, and the group's only handle (non-inherited) dies with the attempt, so
-  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ends every process the command left behind — when it finishes, when its wrapper
-  crashes, and when the orchestrator that started it is gone. The group is owned by a standalone .NET Framework winexe
-  compiled from C# embedded in `src/platform/job.ts` with the framework's own `csc.exe` (the verified absolute path under
-  `%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319`, `Framework\` as the x86 fallback; no npm dependency, no native
-  addon, no file to ship): Node spawns that one executable directly, detached and hidden, with no PowerShell in the
-  detached path (PowerShell 5.1 and pwsh exit 0 without running a script when they have no console). Each launch compiles
-  into a fresh private directory inside the attempt directory, so a stale executable is never reused. The compilation is
-  foreground and bounded and starts no command: a starter that dies during it leaves only inert files, and a missing or
-  failing compiler refuses the start closed rather than weakening the group. The executor's proceed/stop gate is checked
-  again after the compilation, immediately before the spawn, so a stop that arrived while the compiler ran starts
-  nothing. The owner records the suspended wrapper's pid before resuming it, takes its argv marker
-  (`DSA_EXEC=<id>`), decodes a UTF-16LE spec (Unicode paths, curly quotes, empty stdin, two append-only output handles),
-  and its identity is recorded with the wrapper's, so a scan finds the whole attempt even after its wrapper has gone and
-  no second attempt starts while the group can still act. POSIX command calls are unchanged.
-- Native Windows support: the extension enables itself on `win32` instead of refusing to load. The process layer uses
-  PowerShell/CIM (`Win32_Process`, pid plus creation time), `taskkill /T` for tree fences, a Node-held lock directory
-  for file exclusion, a Node command wrapper that records exit status, `cmd.exe` for string commands and gates, and
-  Task Scheduler for `install-service`. No WSL or POSIX tools are required.
-- Windows filesystem semantics: directory `fsync` is skipped (EPERM), replacements retry a transient sharing violation,
-  journals and the event log use positional writes with read/write handles (append handles cannot truncate), and request
-  ids/senders that contain `:` get a file-safe name (`fileId`).
-- Windows launcher: `pi` resolves through `PATHEXT` (`.cmd`), npm shims are unwrapped to `node <script>` so argv stays an
-  argv, and subagents get both `.cmd` and POSIX shims on `PATH`.
-- Windows memory admission uses free commit (`Win32_OperatingSystem.FreeVirtualMemory`), not free physical memory, which
-  Windows keeps low in standby/cache and which made dispatch wait indefinitely.
-- Linux/macOS mechanism tests (inherited `DSA_EXEC` tags, POSIX shell scripts, `setsid`, `chmod 000`, POSIX signals) are
-  skipped on Windows with an explicit reason; Windows has equivalent process-table, lock, command-wrapper, hold and
-  launcher coverage.
-- Windows CI: the repository's own scripts run on a native Windows runner. `pack:smoke` starts npm without a shell
-  (`npm_execpath`) or through `cmd.exe` (`npm.cmd`), puts `node_modules/.bin` first on `PATH` with `;` and under the
-  single name Windows gives it, imports the packaged modules as `file:` URLs (a drive letter is not a URL scheme) and
-  ends the packaged run with its whole process tree; `ci-test.mjs` ends a timed-out run the same way and reads failing
-  test files with either separator; `check-imports.mjs` resolves the repository from its own location, not the working
-  directory.
-- Worktree keys and identity on Windows: a key is an opaque name inside its workflow's directory. A path-like key
-  (a `\` separator, `..`/`.`/empty part, an absolute, drive-qualified or UNC spelling) is refused on every platform
-  before any Git call, so no key can leave `.dsa/<workflow>` — including across drives. A key Win32 cannot spell
-  (`tasks:0`, `a:0`, `CON`, a trailing dot) is encoded on Windows into `.dsa/<wid>/.keys/<hash>` with a hashed branch;
-  that namespace is disjoint from every literal spelling, even where the file system ignores case, and POSIX keeps every
-  literal path and branch name as it was. A recorded path is compared with the path Git lists by the identity the file
-  system gives it (8.3 short name, case, `/` separators, `\\?\`/`\\?\UNC\` prefixes, a symlinked directory), while the
-  path the intent recorded is what the call returns and what every message names, so one worktree is never created twice
-  and the cleanup and the gate use the directory Git registered. An intent recorded by an earlier version outside its
-  workflow is refused at preparation and never created, inspected or removed.
-- The `chaos` scenario wrote `config.json` as `providers: { "dsa-chaos": 3 }`, which the orchestrator rejects
-  (`providers.<name>.slots must be a nonnegative integer`): the whole file — three provider slots, `trackerMs`
-  100/`checkpointMs` 200, `idleExitMs` 2 s — never applied, so every scenario ran on default settings. It now
-  writes `{ slots: 3 }`, both diagnostic commands keep their settings in one exported value, and a unit test
-  runs the orchestrator's own `configProblem` over each.
-- A detached orchestrator's own output can be kept: `DSA_ORCHESTRATOR_LOG=<file>` appends its stdout and stderr
-  there (discarded by default, and an unusable path never fails the start). The `chaos` scenario, the `failover`
-  drill and the real-pi e2e cases set it inside their temp root, and `scripts/diagnose-e2e.mjs`
-  (`npm run diagnose:e2e`) replays the smallest real-pi cases in order and prints, for the first failing one, the
-  orchestrator's start/recovery/exit, each workflow's journal tail and that log, redacted — so a stalled case
-  names its stage instead of only a timeout. The Windows Node 24 diagnostics job prints the results in its log.
-- Windows CI measures PowerShell process-table queries under the host environment and under the isolated environment used by real-pi tests. The process-retirement timeout is under investigation.
+  - **Windows Job Objects for commands, `hold` leases and gates**: Command attempts, `hold` leases and gates run inside
+    `KILL_ON_JOB_CLOSE` Job Objects owned by a per-launch `.NET Framework` winexe compiled from embedded C# with
+    `csc.exe` (no npm dependency or native addon). Compilation is staged and cancellable before durable intent; the
+    wrapper is assigned suspended before user code runs, receives exact UTF-16LE specs and normalized 32-bit DWORD exit
+    codes, publishes exit/gate records atomically with bounded sharing-violation retries, and tears down cleanly via
+    controlled `stop`/`DrainJob` on `--yield` and signals.
+  - **Handle-verified process observation and fencing**: Process discovery uses credential-isolated `System.Management`
+    `Win32_Process` snapshots with `FreeVirtualMemory` commit-based memory admission; process termination verifies
+    `GetProcessTimes` creation identity on open handles, refuses critical processes, fails closed on protected-PID
+    `EPERM` snapshot misses, reuses scanned `CommandLine` in `ended` diagnostics, reports budget breakdowns on fence
+    timeout, and triggers an immediate sweep retry on fence failure.
+  - **Filesystem, worktrees and 64-bit file identities**: Journal, cache, reader-ledger and UI readers preserve full
+    64-bit NTFS `FileId` values as decimal strings; `latest` output publishes atomically without symlink privileges;
+    worktree keys reject path-like escapes on every platform, encode Windows-unspellable names (such as `tasks:0` or
+    reserved device names) under `.dsa/<wid>/.keys/<hash>`, and match Git worktrees by file-system identity across 8.3
+    aliases, casing and path prefixes.
+  - **Launchers, environments and Task Scheduler service**: Case-insensitive environment merging (`Path`/`PATH`,
+    `ComSpec`/`COMSPEC`), `PATHEXT` resolution, safe npm shim unwrapping (keeping `NODE_PATH`/`NODE_OPTIONS` shims
+    intact via verbatim `cmd.exe /d /s /c` quoting while rejecting CR/LF/quote injection), hidden `wscript.exe` Task
+    Scheduler service management with locale-independent `schtasks` checks, and `DSA_ORCHESTRATOR_LOG=<file>` for
+    capturing detached orchestrator output.
+  - **Full 3-OS CI matrix**: Linux, macOS and Windows all run unit tests, real-`pi` E2E suites and `pack:smoke` on
+    Node.js 22.19 and 24.
+- **Engine lookup performance**: `Engine.findCall`, `withdraw` and single-target routing use O(1) indexed lookups
+  instead of scanning all workflows on every request.
+- Fixed `chaos` scenario config generation (`providers.<name>.slots`) so diagnostic scenarios apply their intended
+  concurrency and timing settings.
 
 ## 1.5.1
 
