@@ -17,7 +17,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   JOB_BEGIN, JOB_END, JOB_ERROR, JOB_GROUP, JOB_HOST_EXE, JOB_HOST_EXIT, JOB_HOST_LOG, JOB_HOST_MARKER, JOB_HOST_PREFIX,
   JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, JobPrepareCancelled, asciiJson, compileJobHost, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
-  jobHostArgv, jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, spawnInJob, startError, type PublishBuild,
+  jobHostArgv, jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, readBeginIdentity, readGroupEndSync, readGroupRecord,
+  readStartErrorSync, spawnInJob, startError, type PublishBuild,
 } from "../../../src/platform/job.ts";
 import { winProcessRows } from "../../../src/platform/windows.ts";
 
@@ -152,6 +153,13 @@ test("the owner source is self-contained, ASCII, and carries the Win32 group con
   assert.ok(drainAt < JOB_HOST_SOURCE.indexOf('"group-end"'));
   assert.match(JOB_HOST_SOURCE, /TerminateJobObject\(job, 1\);/);
   assert.match(JOB_HOST_SOURCE, /info\.ActiveProcesses == 0/);
+  // Atomic publication uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) with bounded retries on Win32 sharing conflicts
+  // (never deleting the target first or falling back to a direct target write), including for start-error.
+  assert.match(JOB_HOST_SOURCE, /MoveFileExW\(temporary, path, MOVEFILE_REPLACE_EXISTING\)/);
+  assert.ok(!/if \(File\.Exists\(path\)\) File\.Delete\(path\);/.test(JOB_HOST_SOURCE), "atomic replace never leaves a deleted-target window");
+  assert.match(JOB_HOST_SOURCE, /ERROR_SHARING_VIOLATION/);
+  assert.match(JOB_HOST_SOURCE, /ERROR_LOCK_VIOLATION/);
+  assert.match(JOB_HOST_SOURCE, /WriteAtomic\(Path\.Combine\(dir, "start-error"\), text\)/);
   assert.deepEqual(jobHostArgv("C:\\attempt", "e1", "machine:2"), [
     "C:\\attempt",
     `DSA_EXEC=v1~${Buffer.from("e1", "utf8").toString("base64url")}`,
@@ -750,4 +758,91 @@ test("a staged owner is the one the start runs, and the start checks the gate wi
   assert.equal(JSON.parse(readFileSync(join(dir, JOB_END), "utf8")).status, 0);
   assert.match(readFileSync(join(dir, "output.log"), "utf8"), /staged/);
   assert.equal(readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX)).length, 1, "the staged owner was used, not a second one");
+});
+
+test("job record readers retry Windows transient sharing conflicts and fail closed on absence or persistent locks", async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const err = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
+
+  // readGroupEndSync recovers across transient EACCES/EBUSY/EPERM, returns undefined immediately on ENOENT, and fails
+  // closed on persistent conflicts or malformed JSON.
+  {
+    const codes = ["EACCES", "EBUSY", "EPERM"];
+    let calls = 0;
+    const end = readGroupEndSync(dir, {
+      platform: "win32",
+      baseDelayMs: 1,
+      sleepSync: () => {},
+      readFile: () => {
+        calls += 1;
+        const code = codes.shift();
+        if (code) throw err(code);
+        return '{"status":3221225477}';
+      },
+    });
+    assert.deepEqual(end, { status: 0xC0000005 });
+    assert.equal(calls, 4);
+
+    let enoentCalls = 0;
+    assert.equal(readGroupEndSync(dir, {
+      platform: "win32",
+      sleepSync: () => { throw new Error("must not sleep on ENOENT"); },
+      readFile: () => { enoentCalls += 1; throw err("ENOENT"); },
+    }), undefined);
+    assert.equal(enoentCalls, 1);
+
+    let busyCalls = 0;
+    assert.equal(readGroupEndSync(dir, {
+      platform: "win32",
+      maxAttempts: 3,
+      baseDelayMs: 1,
+      sleepSync: () => {},
+      readFile: () => { busyCalls += 1; throw err("EBUSY"); },
+    }), undefined);
+    assert.equal(busyCalls, 3);
+
+    assert.equal(readGroupEndSync(dir, { platform: "win32", readFile: () => '{"status":' }), undefined, "partial JSON fails closed");
+  }
+
+  // readGroupRecord, readBeginIdentity and readStartErrorSync recover from transient sharing errors.
+  {
+    const groupErrs = ["EBUSY", "EPERM"];
+    let groupCalls = 0;
+    assert.deepEqual(await readGroupRecord(dir, {
+      platform: "win32",
+      baseDelayMs: 1,
+      sleep: async () => {},
+      readFile: async () => {
+        groupCalls += 1;
+        const code = groupErrs.shift();
+        if (code) throw err(code);
+        return JSON.stringify({ pid: 42, start: "639000000000000020" });
+      },
+    }), { pid: 42, start: "639000000000000020" });
+    assert.equal(groupCalls, 3);
+
+    const beginErrs = ["EACCES"];
+    assert.deepEqual(await readBeginIdentity(dir, {
+      platform: "win32",
+      baseDelayMs: 1,
+      sleep: async () => {},
+      readFile: async () => {
+        const code = beginErrs.shift();
+        if (code) throw err(code);
+        return JSON.stringify({ pid: 41, start: "639000000000000010" });
+      },
+    }), { pid: 41, start: "639000000000000010" });
+
+    const errCodes = ["EBUSY"];
+    assert.equal(readStartErrorSync(dir, {
+      platform: "win32",
+      baseDelayMs: 1,
+      sleepSync: () => {},
+      readFile: () => {
+        const code = errCodes.shift();
+        if (code) throw err(code);
+        return "CreateProcess failed (error 2)\n";
+      },
+    }), "CreateProcess failed (error 2)");
+  }
 });

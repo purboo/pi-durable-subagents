@@ -56,6 +56,7 @@ import { closeSync, existsSync, openSync, readFileSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { retryWinSharing, retryWinSharingSync, writeFileAtomic, type RetryWinSharingOptions } from "../kernel/fsx.ts";
 import { dword, helperEnv, isWinStart, killProcess, sameCreation, systemRoot, winProcessRows, winTag, winTagArg, type WinProcessRow } from "./windows.ts";
 export { sameCreation };
 
@@ -86,7 +87,12 @@ public static class DsaJob
     const int STD_OUTPUT_HANDLE = -11;
     const int STD_ERROR_HANDLE = -12;
     const uint DUPLICATE_SAME_ACCESS = 0x00000002;
+    const uint MOVEFILE_REPLACE_EXISTING = 0x00000001;
+    const int ERROR_ACCESS_DENIED = 5;
     const int ERROR_INVALID_HANDLE = 6;
+    const int ERROR_SHARING_VIOLATION = 32;
+    const int ERROR_LOCK_VIOLATION = 33;
+    const int ERROR_BUSY = 170;
     const uint GENERIC_READ = 0x80000000;
     const uint FILE_APPEND_DATA = 0x00000004;
     const uint FILE_SHARE_READ = 0x00000001;
@@ -240,6 +246,8 @@ public static class DsaJob
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool DuplicateHandle(IntPtr hSourceProcessHandle, IntPtr hSourceHandle, IntPtr hTargetProcessHandle,
         out IntPtr lpTargetHandle, uint dwDesiredAccess, bool bInheritHandle, uint dwOptions);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool MoveFileExW(string existingFileName, string newFileName, uint flags);
     [DllImport("kernel32.dll")]
     static extern void Sleep(uint milliseconds);
 
@@ -512,16 +520,65 @@ public static class DsaJob
     static bool Fail(string dir, string what, int code, string detail)
     {
         string text = what + " failed (error " + code.ToString(CultureInfo.InvariantCulture) + ")" + (detail == null ? "" : ": " + detail);
-        try { File.WriteAllText(Path.Combine(dir, "start-error"), text); } catch (Exception) { }
+        try { WriteAtomic(Path.Combine(dir, "start-error"), text); } catch (Exception) { }
         return false;
+    }
+
+    static bool IsTransientSharingError(int win32Error)
+    {
+        return win32Error == ERROR_ACCESS_DENIED || win32Error == ERROR_SHARING_VIOLATION ||
+            win32Error == ERROR_LOCK_VIOLATION || win32Error == ERROR_BUSY;
+    }
+
+    static bool IsTransientSharingException(Exception error)
+    {
+        if (error is UnauthorizedAccessException) return true;
+        IOException io = error as IOException;
+        if (io == null) return false;
+        int code = Marshal.GetHRForException(io) & 0xFFFF;
+        return IsTransientSharingError(code);
     }
 
     static void WriteAtomic(string path, string text)
     {
         string temporary = path + ".tmp";
-        File.WriteAllText(temporary, text);
-        if (File.Exists(path)) File.Delete(path);
-        File.Move(temporary, path);
+        int deadline = unchecked(Environment.TickCount + 2500);
+        try
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try { File.WriteAllText(temporary, text); break; }
+                catch (Exception error)
+                {
+                    if (!IsTransientSharingException(error) || attempt >= 25) throw;
+                    int left = unchecked(deadline - Environment.TickCount);
+                    if (left <= 0) throw;
+                    int wait = (attempt + 1) * 10;
+                    if (wait > 100) wait = 100;
+                    if (wait > left) wait = left;
+                    Sleep((uint)wait);
+                }
+            }
+            for (int attempt = 0; ; attempt++)
+            {
+                if (MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING)) return;
+                int err = Marshal.GetLastWin32Error();
+                if (!IsTransientSharingError(err) || attempt >= 25)
+                    throw new IOException("MoveFileExW failed (error " + err.ToString(CultureInfo.InvariantCulture) + ")");
+                int left = unchecked(deadline - Environment.TickCount);
+                if (left <= 0)
+                    throw new IOException("MoveFileExW failed (error " + err.ToString(CultureInfo.InvariantCulture) + ")");
+                int wait = (attempt + 1) * 10;
+                if (wait > 100) wait = 100;
+                if (wait > left) wait = left;
+                Sleep((uint)wait);
+            }
+        }
+        catch (Exception)
+        {
+            try { File.Delete(temporary); } catch (Exception) { }
+            throw;
+        }
     }
 
     static string ProcessStart(IntPtr process)
@@ -812,7 +869,7 @@ export async function compileJobHost(dir: string, options: { compiler?: string; 
   } catch (error) {
     if (prepareCancelled(error)) throw error;
     const reason = String((error as Error)?.message ?? error);
-    await writeFile(join(dir, JOB_ERROR), clip(oneLine(reason), REASON_LIMIT), "utf8").catch(() => {});
+    await writeFileAtomic(join(dir, JOB_ERROR), clip(oneLine(reason), REASON_LIMIT), { encoding: "utf8" }).catch(() => {});
     throw new Error(reason);
   }
   return paths;
@@ -988,9 +1045,10 @@ function parseGroupText(text: string): GroupRecord {
 }
 
 /** The group record written before ResumeThread (with legacy `{"pid":<n>}` compatibility); undefined while not ready. */
-export async function readGroupRecord(dir: string): Promise<GroupRecord | undefined> {
+export async function readGroupRecord(dir: string, options: RetryWinSharingOptions & { readFile?: (path: string) => Promise<string> } = {}): Promise<GroupRecord | undefined> {
+  const readFn = options.readFile ?? ((path: string) => readFile(path, "utf8"));
   let text: string;
-  try { text = await readFile(join(dir, JOB_GROUP), "utf8"); }
+  try { text = await retryWinSharing(() => readFn(join(dir, JOB_GROUP)), { timeoutMs: 250, maxAttempts: 6, ...options }); }
   catch (error) { if (absent(error) || transientRead(error)) return undefined; throw error; }
   return parseGroupText(text);
 }
@@ -1024,29 +1082,34 @@ function parseBeginText(text: string): { pid: number; start: string } | undefine
 }
 
 /** The owner's handle-recorded creation identity from `helper-begin` (undefined when absent or legacy `"begin"`). */
-export async function readBeginIdentity(dir: string): Promise<{ pid: number; start: string } | undefined> {
+export async function readBeginIdentity(dir: string, options: RetryWinSharingOptions & { readFile?: (path: string) => Promise<string> } = {}): Promise<{ pid: number; start: string } | undefined> {
+  const readFn = options.readFile ?? ((path: string) => readFile(path, "utf8"));
   let text: string;
-  try { text = await readFile(join(dir, JOB_BEGIN), "utf8"); }
+  try { text = await retryWinSharing(() => readFn(join(dir, JOB_BEGIN)), { timeoutMs: 500, maxAttempts: 10, ...options }); }
   catch { return undefined; }
   return parseBeginText(text);
 }
 
-export function readBeginIdentitySync(dir: string): { pid: number; start: string } | undefined {
-  try { return parseBeginText(readFileSync(join(dir, JOB_BEGIN), "utf8")); }
-  catch { return undefined; }
+export function readBeginIdentitySync(dir: string, options: RetryWinSharingOptions & { readFile?: (path: string) => string } = {}): { pid: number; start: string } | undefined {
+  try {
+    const readFn = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+    return parseBeginText(retryWinSharingSync(() => readFn(join(dir, JOB_BEGIN)), { timeoutMs: 500, maxAttempts: 10, ...options }));
+  } catch { return undefined; }
 }
 
-export function readGroupEndSync(dir: string): { status: number } | undefined {
+export function readGroupEndSync(dir: string, options: RetryWinSharingOptions & { readFile?: (path: string) => string } = {}): { status: number } | undefined {
   try {
-    const parsed = JSON.parse(readFileSync(join(dir, JOB_END), "utf8")) as { status?: unknown };
+    const readFn = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+    const parsed = JSON.parse(retryWinSharingSync(() => readFn(join(dir, JOB_END)), { timeoutMs: 1_000, maxAttempts: 15, ...options })) as { status?: unknown };
     return typeof parsed.status === "number" && Number.isInteger(parsed.status) && parsed.status >= 0 && parsed.status <= 0xffffffff
       ? { status: parsed.status } : undefined;
   } catch { return undefined; }
 }
 
-export function readStartErrorSync(dir: string): string | undefined {
+export function readStartErrorSync(dir: string, options: RetryWinSharingOptions & { readFile?: (path: string) => string } = {}): string | undefined {
   try {
-    const text = readFileSync(join(dir, JOB_ERROR), "utf8").trim();
+    const readFn = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+    const text = retryWinSharingSync(() => readFn(join(dir, JOB_ERROR)), { timeoutMs: 500, maxAttempts: 10, ...options }).trim();
     return text || undefined;
   } catch { return undefined; }
 }
@@ -1088,15 +1151,17 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   options.onOwnerSpawned?.(killOwner);
   let recordedExit: Promise<void> | undefined;
   // The owner's end is durably written to JOB_HOST_EXIT before `exited` resolves, and every path that formats a
-  // failure reason awaits `exited` once `ended` is set so exit evidence never races the rejection message.
+  // failure reason awaits `exited` once `ended` is set so exit evidence never races the rejection message. Published
+  // atomically (temp-then-rename with bounded Windows sharing retries, never a direct target write that could expose
+  // partial JSON to concurrent readers).
   const exited = new Promise<void>(resolve => {
     const done = (record: string) => {
       ended = true;
-      recordedExit ??= (async () => {
-        const target = join(dir, JOB_HOST_EXIT), tmp = `${target}.tmp`;
-        try { await writeFile(tmp, record, "utf8"); await rename(tmp, target); }
-        catch { await writeFile(target, record, "utf8").catch(() => {}); }
-      })().finally(resolve);
+      recordedExit ??= writeFileAtomic(join(dir, JOB_HOST_EXIT), record, {
+        encoding: "utf8",
+        timeoutMs: 2_500,
+        maxAttempts: 25,
+      }).catch(() => {}).finally(resolve);
     };
     helper.once("exit", (code, signal) => { done(asciiJson({ code: code === null ? null : dword(code), signal })); });
     helper.once("error", error => { done(asciiJson({ error: String((error as Error)?.message ?? error) })); });
@@ -1256,9 +1321,10 @@ function endRecord(text: string): { code?: number; signal?: string; error?: stri
 }
 
 /** At most {@link REASON_BYTES} of a file -- its beginning (a message) or its end (a log's newest lines) -- as UTF-8.
- *  "" when the file is absent, so evidence never grows a reason. */
+ *  "" when the file is absent or transiently unreadable after bounded retries, so evidence never grows a reason. */
 async function read(path: string, part: "head" | "tail"): Promise<string> {
-  const file = await open(path, "r").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+  const file = await retryWinSharing(() => open(path, "r"), { timeoutMs: 1_000, maxAttempts: 15 })
+    .catch((error: NodeJS.ErrnoException) => { if (absent(error) || transientRead(error)) return undefined; throw error; });
   if (!file) return "";
   try {
     const { size } = await file.stat(), length = Math.min(size, REASON_BYTES);

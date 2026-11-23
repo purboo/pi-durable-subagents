@@ -5,7 +5,9 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { writeFileAtomic, writeFileAtomicSync } from "../../../src/kernel/fsx.ts";
 import { COMMAND_EXIT, COMMAND_LOG, COMMAND_SPEC, COMMAND_WRAPPER_SOURCE, exitMeaning, readExitRecord, readTail, spawnCommand } from "../../../src/platform/command.ts";
 import { JOB_END, JOB_HOST_EXIT } from "../../../src/platform/job.ts";
 import { dword } from "../../../src/platform/windows.ts";
@@ -324,4 +326,250 @@ test("the Windows wrapper merges the command's environment by name and runs a st
   // A ComSpec that cannot start is 127 before the command runs, and the wrapper still records it.
   const missing = await run("missing-comspec", { command: "printf %s no", env: { COMSPEC: "/nonexistent/call-cmd", PATH: "/bin:/usr/bin" } });
   assert.deepEqual([missing.code, missing.status, missing.output], [127, 127, ""], "no shell, no command, but the status is recorded");
+});
+
+test("Windows wrapper retries transient sharing conflicts during exit publication and never writes exit directly", { timeout: 30_000 }, async t => {
+  const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
+  const wrapper = join(root, "wrapper.mjs");
+  writeFileSync(wrapper, COMMAND_WRAPPER_SOURCE);
+  // Preload script patches node:fs and syncs ESM named bindings so COMMAND_WRAPPER_SOURCE itself runs under injected
+  // transient sharing errors without altering the wrapper source.
+  const preload = join(root, "inject-fs.mjs");
+  writeFileSync(preload, [
+    'import fs from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'import { basename } from "node:path";',
+    'const plan = JSON.parse(process.env.DSA_TEST_FS_PLAN || "{}");',
+    'const tracePath = process.env.DSA_TEST_FS_TRACE;',
+    'const origWrite = fs.writeFileSync.bind(fs), origRename = fs.renameSync.bind(fs);',
+    'const trace = { writeTargets: [], renameAttempts: 0, writeAttempts: 0 };',
+    'const save = () => { if (tracePath) origWrite(tracePath, JSON.stringify(trace)); };',
+    'const err = code => Object.assign(new Error(`${code}: injected conflict`), { code });',
+    'fs.writeFileSync = function(p, data, opts) {',
+    '  const name = basename(String(p));',
+    '  if (name === "exit" || name === "exit.tmp") {',
+    '    trace.writeTargets.push(name);',
+    '    trace.writeAttempts += 1;',
+    '    save();',
+    '    const code = plan.writeErrors?.shift();',
+    '    if (code) throw err(code);',
+    '  }',
+    '  return origWrite(p, data, opts);',
+    '};',
+    'fs.renameSync = function(from, to) {',
+    '  if (basename(String(to)) === "exit") {',
+    '    trace.renameAttempts += 1;',
+    '    save();',
+    '    if (plan.alwaysRenameError) throw err(plan.alwaysRenameError);',
+    '    const code = plan.renameErrors?.shift();',
+    '    if (code) throw err(code);',
+    '  }',
+    '  return origRename(from, to);',
+    '};',
+    'syncBuiltinESMExports();',
+  ].join("\n"));
+
+  const runWithFaults = async (name: string, exitCode: number, plan: Record<string, unknown>) => {
+    const dir = join(root, name); mkdirSync(dir);
+    const tracePath = join(root, `${name}.trace.json`);
+    writeFileSync(join(dir, COMMAND_SPEC), JSON.stringify({
+      command: [process.execPath, "-e", `process.exit(${exitCode})`],
+      cwd: root,
+      env: { ...process.env },
+    }));
+    const code = await new Promise<number | null>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--import", pathToFileURL(preload).href, wrapper, dir], {
+        cwd: root,
+        env: { ...process.env, DSA_TEST_FS_PLAN: JSON.stringify(plan), DSA_TEST_FS_TRACE: tracePath },
+        stdio: "ignore",
+      });
+      child.once("error", reject);
+      child.once("exit", resolve);
+    });
+    const trace = JSON.parse(readFileSync(tracePath, "utf8")) as { writeTargets: string[]; renameAttempts: number; writeAttempts: number };
+    return { dir, code, trace, record: await readExitRecord(dir) };
+  };
+
+  // 1. Transient EBUSY/EACCES/EPERM on rename: retries rename only (never rewrites exit.tmp or writes exit directly).
+  {
+    const res = await runWithFaults("rename-transient", 7, { renameErrors: ["EBUSY", "EACCES", "EPERM"] });
+    assert.equal(res.code, 7);
+    assert.equal(res.record?.status, 7);
+    assert.deepEqual(res.trace.writeTargets, ["exit.tmp"], "only writes to exit.tmp, never directly to exit");
+    assert.equal(res.trace.renameAttempts, 4, "3 transient sharing failures followed by success");
+    assert.ok(!existsSync(join(res.dir, "exit.tmp")), "temp file was renamed away");
+  }
+
+  // 2. Transient sharing errors on both temp write and rename: both retry and publish atomically.
+  {
+    const res = await runWithFaults("write-and-rename-transient", 42, {
+      writeErrors: ["EACCES", "EBUSY"],
+      renameErrors: ["EPERM", "EBUSY"],
+    });
+    assert.equal(res.code, 42);
+    assert.equal(res.record?.status, 42);
+    assert.deepEqual(res.trace.writeTargets, ["exit.tmp", "exit.tmp", "exit.tmp"]);
+    assert.equal(res.trace.renameAttempts, 3);
+    assert.ok(!existsSync(join(res.dir, "exit.tmp")));
+  }
+
+  // 3. Non-transient error (ENOSPC) fails fast without retrying, cleans up exit.tmp, and never writes exit directly.
+  {
+    const res = await runWithFaults("non-transient", 5, { renameErrors: ["ENOSPC"] });
+    assert.equal(res.code, 5, "wrapper still exits with the command's own status");
+    assert.equal(res.record, undefined, "no exit record published on failure");
+    assert.deepEqual(res.trace.writeTargets, ["exit.tmp"], "never falls back to direct write to exit");
+    assert.equal(res.trace.renameAttempts, 1, "non-transient error is not retried");
+    assert.ok(!existsSync(join(res.dir, "exit.tmp")), "temp file is cleaned up on failure");
+  }
+
+  // 4. Persistent sharing conflict stops within bounded retries, cleans up exit.tmp, and never writes exit directly.
+  {
+    const started = Date.now();
+    const res = await runWithFaults("persistent-busy", 9, { alwaysRenameError: "EBUSY" });
+    const elapsed = Date.now() - started;
+    assert.equal(res.code, 9, "wrapper still exits with the command's own status");
+    assert.equal(res.record, undefined, "no direct-write fallback on exhaustion");
+    assert.deepEqual(res.trace.writeTargets, ["exit.tmp"]);
+    assert.ok(res.trace.renameAttempts > 1 && res.trace.renameAttempts <= 26, `bounded retries (${res.trace.renameAttempts})`);
+    assert.ok(elapsed < 10_000, `bounded retry budget completed promptly (${elapsed} ms)`);
+    assert.ok(!existsSync(join(res.dir, "exit.tmp")), "temp file is cleaned up after bounded exhaustion");
+  }
+});
+
+test("readExitRecord retries Windows transient sharing conflicts and fails closed on missing or persistent errors", async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const err = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
+
+  // 1. Missing file returns undefined immediately without sleeping or retrying.
+  let missingCalls = 0;
+  assert.equal(await readExitRecord(dir, {
+    platform: "win32",
+    sleep: async () => { throw new Error("must not sleep on ENOENT"); },
+    read: async () => { missingCalls += 1; throw err("ENOENT"); },
+  }), undefined);
+  assert.equal(missingCalls, 1);
+
+  // 2. Transient EACCES / EBUSY / EPERM on Windows recovers with the exit status and mtime.
+  const transientCodes = ["EACCES", "EBUSY", "EPERM"];
+  let calls = 0;
+  const slept: number[] = [];
+  const recovered = await readExitRecord(dir, {
+    platform: "win32",
+    baseDelayMs: 5,
+    sleep: async ms => { slept.push(ms); },
+    read: async () => {
+      calls += 1;
+      const code = transientCodes.shift();
+      if (code) throw err(code);
+      return { text: "3221225477\n", at: 123456 };
+    },
+  });
+  assert.deepEqual(recovered, { status: 0xC0000005, at: 123456 });
+  assert.equal(calls, 4);
+  assert.deepEqual(slept, [5, 10, 15]);
+
+  // 3. Persistent sharing conflict exhausts bounded retries and throws.
+  let persistentCalls = 0;
+  await assert.rejects(readExitRecord(dir, {
+    platform: "win32",
+    maxAttempts: 4,
+    baseDelayMs: 1,
+    sleep: async () => {},
+    read: async () => { persistentCalls += 1; throw err("EBUSY"); },
+  }), { code: "EBUSY" });
+  assert.equal(persistentCalls, 4);
+
+  // 4. Non-sharing error (EIO) and non-Windows sharing error fail immediately without retry.
+  let eioCalls = 0;
+  await assert.rejects(readExitRecord(dir, {
+    platform: "win32",
+    sleep: async () => { throw new Error("must not retry EIO"); },
+    read: async () => { eioCalls += 1; throw err("EIO"); },
+  }), { code: "EIO" });
+  assert.equal(eioCalls, 1);
+
+  let posixCalls = 0;
+  await assert.rejects(readExitRecord(dir, {
+    platform: "linux",
+    sleep: async () => { throw new Error("must not retry on POSIX"); },
+    read: async () => { posixCalls += 1; throw err("EACCES"); },
+  }), { code: "EACCES" });
+  assert.equal(posixCalls, 1);
+});
+
+test("writeFileAtomic and writeFileAtomicSync retry Windows sharing conflicts without direct writes or partial JSON", async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const err = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
+
+  // Async: retries temp write + rename, never writes directly to target, leaves valid JSON.
+  {
+    const target = join(dir, "host-exit"), temp = `${target}.tmp`;
+    const written: string[] = [];
+    const writeErrs = ["EACCES"], renameErrs = ["EBUSY", "EPERM"];
+    let renames = 0;
+    await writeFileAtomic(target, '{"code":0,"signal":null}', {
+      platform: "win32",
+      baseDelayMs: 1,
+      sleep: async () => {},
+      writeFile: async (p, data) => {
+        written.push(p);
+        const code = writeErrs.shift();
+        if (code) throw err(code);
+        writeFileSync(p, data);
+      },
+      rename: async (from, to) => {
+        renames += 1;
+        const code = renameErrs.shift();
+        if (code) throw err(code);
+        const content = readFileSync(from, "utf8");
+        writeFileSync(to, content);
+        await rm(from, { force: true });
+      },
+    });
+    assert.deepEqual(written, [temp, temp], "writes only to temp path, never directly to target");
+    assert.equal(renames, 3);
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { code: 0, signal: null });
+    assert.ok(!existsSync(temp));
+  }
+
+  // Async exhaustion: cleans up temp file and leaves target absent (no partial write).
+  {
+    const target = join(dir, "host-exit-fail"), temp = `${target}.tmp`;
+    let unlinked = "";
+    await assert.rejects(writeFileAtomic(target, '{"code":1}', {
+      platform: "win32",
+      maxAttempts: 3,
+      baseDelayMs: 1,
+      sleep: async () => {},
+      writeFile: async (p, data) => { writeFileSync(p, data); },
+      rename: async () => { throw err("EPERM"); },
+      unlink: async p => { unlinked = p; await rm(p, { force: true }); },
+    }), { code: "EPERM" });
+    assert.equal(unlinked, temp);
+    assert.ok(!existsSync(temp));
+    assert.ok(!existsSync(target), "target never exposed on failed publish");
+  }
+
+  // Sync: retries transient sharing conflicts cleanly and cleans up on failure.
+  {
+    const target = join(dir, "sync-exit"), temp = `${target}.tmp`;
+    const renameErrs = ["EBUSY", "EACCES"];
+    let writeCount = 0, renameCount = 0;
+    writeFileAtomicSync(target, '{"status":0}', {
+      platform: "win32",
+      baseDelayMs: 1,
+      sleepSync: () => {},
+      writeFileSync: (p, data) => { writeCount += 1; assert.equal(p, temp); writeFileSync(p, data); },
+      renameSync: (from, to) => {
+        renameCount += 1;
+        const code = renameErrs.shift();
+        if (code) throw err(code);
+        writeFileSync(to, readFileSync(from, "utf8"));
+      },
+    });
+    assert.equal(writeCount, 1, "temp file is not rewritten while rename retries");
+    assert.equal(renameCount, 3);
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { status: 0 });
+  }
 });

@@ -19,9 +19,10 @@
 // nothing started, so that cut is unambiguously prelaunch.
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { mkdir, readFile, stat, open, writeFile } from "node:fs/promises";
+import { mkdir, open, writeFile } from "node:fs/promises";
 import { constants } from "node:os";
 import { join } from "node:path";
+import { retryWinSharing, type RetryWinSharingOptions } from "../kernel/fsx.ts";
 import { captureStart } from "./proctable.ts";
 import { execTarget, findOnPath } from "./launch.ts";
 import { prepareJob, spawnInJob, type JobPrep } from "./job.ts";
@@ -53,7 +54,20 @@ const WIN_WRAPPER = `import { spawn } from "node:child_process";
 import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const dir = process.argv[2];
-const spec = JSON.parse(readFileSync(join(dir, "${COMMAND_SPEC}"), "utf8"));
+const SHARING = new Set(["EACCES", "EBUSY", "EPERM"]);
+const WAIT = new Int32Array(new SharedArrayBuffer(4));
+function retrySharing(fn, deadline) {
+  for (let attempt = 0; ; attempt++) {
+    try { return fn(); }
+    catch (error) {
+      if (!SHARING.has(error && error.code) || attempt >= 25) throw error;
+      const left = deadline - Date.now();
+      if (left <= 0) throw error;
+      Atomics.wait(WAIT, 0, 0, Math.min(left, Math.min(100, 10 * (attempt + 1))));
+    }
+  }
+}
+const spec = JSON.parse(retrySharing(() => readFileSync(join(dir, "${COMMAND_SPEC}"), "utf8"), Date.now() + 2500));
 try { unlinkSync(join(dir, "${COMMAND_SPEC}")); } catch { /* already gone */ }
 // The status of the attempt is the kernel's 32-bit exit code. Node hands a Windows status back as a number whose bit
 // pattern is that code -- on some paths as a signed int32 (0xC0000005 reads -1073741819) -- and a negative number is not
@@ -61,8 +75,16 @@ try { unlinkSync(join(dir, "${COMMAND_SPEC}")); } catch { /* already gone */ }
 // integer and the OS keeps its low 32 bits, so the same DWORD reaches the caller as this wrapper's own exit status: the
 // record and the observed outcome cannot disagree.
 function dword(code) { return code >>> 0; }
+// Publish the exit record atomically (temp file then rename) with bounded retries on Windows transient sharing errors
+// (antivirus/indexer/concurrent reader). Never fall back to a direct write to "exit" so readers never see partial data.
 function record(status) {
-  try { writeFileSync(join(dir, "exit.tmp"), String(status)); renameSync(join(dir, "exit.tmp"), join(dir, "exit")); } catch { /* never lose the command's own result */ }
+  const deadline = Date.now() + 2500;
+  try {
+    retrySharing(() => writeFileSync(join(dir, "exit.tmp"), String(status)), deadline);
+    retrySharing(() => renameSync(join(dir, "exit.tmp"), join(dir, "exit")), deadline);
+  } catch {
+    try { unlinkSync(join(dir, "exit.tmp")); } catch { /* never lose the command's own result */ }
+  }
 }
 function value(env, name) { const lower = name.toLowerCase(); let found; for (const key of Object.keys(env)) if (key.toLowerCase() === lower) found = env[key]; return found; }
 function put(env, name, val) { const lower = name.toLowerCase(); for (const key of Object.keys(env)) if (key.toLowerCase() === lower) delete env[key]; env[name] = val; }
@@ -203,15 +225,39 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
   } finally { closeSync(fd); }
 }
 
+export interface ReadExitRecordOptions extends RetryWinSharingOptions {
+  /** Test seam: read the exit record text and mtimeMs. */
+  read?: (path: string) => Promise<{ text: string; at: number }>;
+}
+
+async function readExitFile(path: string): Promise<{ text: string; at: number }> {
+  const file = await open(path, "r");
+  try {
+    const [text, info] = await Promise.all([file.readFile("utf8"), file.stat()]);
+    return { text, at: info.mtimeMs };
+  } finally {
+    await file.close();
+  }
+}
+
 /** The status the wrapper recorded, or undefined while there is none (the command runs, or ended without one). The record
  *  is one exit status: on Windows the whole DWORD (a status above 0x7fffffff included), on POSIX 0..255. Anything outside
  *  that is not a status a wrapper wrote -- a negative number a Node version reported, a corrupt or foreign file -- and is
- *  not read as one. */
-export async function readExitRecord(dir: string): Promise<{ status: number; at: number } | undefined> {
+ *  not read as one. On Windows, transient sharing conflicts (`EACCES`, `EBUSY`, `EPERM`) are retried boundedly. */
+export async function readExitRecord(dir: string, options: ReadExitRecordOptions = {}): Promise<{ status: number; at: number } | undefined> {
   const path = join(dir, COMMAND_EXIT);
+  const reader = options.read ?? readExitFile;
   let recorded: string, at: number;
-  try { [recorded, at] = await Promise.all([readFile(path, "utf8"), stat(path).then(s => s.mtimeMs)]); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  try {
+    ({ text: recorded, at } = await retryWinSharing(() => reader(path), {
+      timeoutMs: 2_000,
+      maxAttempts: 20,
+      ...options,
+    }));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
   // A wrapper writes one decimal status (and a newline): anything else in the file -- nothing, a sign, an exponent,
   // text -- is not a status of this attempt.
   const text = recorded.trim();
@@ -231,8 +277,9 @@ export function exitMeaning(status: number): { exitCode: number | null; signal: 
 }
 
 /** The last `bytes` of a file, starting on a UTF-8 character boundary ("" when it is missing). */
-export async function readTail(path: string, bytes = OUTPUT_TAIL_BYTES): Promise<string> {
-  const file = await open(path, "r").catch(error => { if (error.code === "ENOENT") return undefined; throw error; });
+export async function readTail(path: string, bytes = OUTPUT_TAIL_BYTES, options: RetryWinSharingOptions = {}): Promise<string> {
+  const file = await retryWinSharing(() => open(path, "r"), { timeoutMs: 1_000, maxAttempts: 15, ...options })
+    .catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
   if (!file) return "";
   try {
     const { size } = await file.stat(), from = Math.max(0, size - bytes), buffer = Buffer.alloc(size - from);

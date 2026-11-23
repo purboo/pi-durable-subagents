@@ -35,6 +35,7 @@ import { fileURLToPath } from "node:url";
 import { CT, JT, askFields, attentionEntries, isCommandCall, isEntry, type CallResult, type Containment, type Entry, type JournalHandle, type ModelBody, type ProcInfo, type Request, type SendBody, type Spawned, type WithdrawBody } from "../../types.ts";
 import { binDir, callDir, callInbox, callSession, journalPath, outboxRoot } from "../../paths.ts";
 import { readJournalSnapshot, syncDirectory } from "../../kernel/journal.ts";
+import { isWinSharingError } from "../../kernel/fsx.ts";
 import { Outbox } from "../../kernel/mailbox.ts";
 import { contentHash, fileId, forwardRid } from "../../kernel/ids.ts";
 import { execTarget } from "../../platform/launch.ts";
@@ -193,6 +194,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   /** Tests: the pre-intent preparation of a command start (platform/command.ts prepareCommand by default: the Windows
    *  owner's compilation), so its staging lifetime can be exercised where no Windows compiler exists. */
   prepareCommand?: (spec: CommandSpawn) => Promise<CommandPrep | undefined>;
+  /** Tests: exit-record reader for command attempts (platform/command.ts readExitRecord by default). */
+  readExitRecord?: (dir: string) => Promise<{ status: number; at: number } | undefined>;
   /** Observes each slot attempt that admitted nothing: the execution and the providers it found full. */
   attempted?: (exec: string, full: readonly string[]) => void } = {}): Executor {
   const { home, config, orch } = ledgers;
@@ -200,6 +203,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   const piCommand = options.pi ?? "pi";
   // The command start's pre-intent preparation: the Windows owner compilation (cancellable), nothing on POSIX.
   const prepareStart = options.prepareCommand ?? stageCommand;
+  const readCommandExit = options.readExitRecord ?? readExitRecord;
   const active = new Map<string, Active>(), completed = new Map<string, Promise<CallResult>>(), journals = new Map<string, JournalHandle>();
   let queue: Promise<unknown> = Promise.resolve(), closed = false;
   let suspending: Promise<void> | undefined;
@@ -1337,21 +1341,29 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     let watcher: FSWatcher | undefined;
     try { watcher = watch(dir, () => a.wake()); watcher.on("error", () => watcher?.close()); } catch { watcher = undefined; }
     void spawned?.exited.then(() => a.wake());
+    const readExit = async (): Promise<{ status: number; at: number } | undefined> => {
+      try { return await readCommandExit(dir); }
+      catch (error) {
+        if (isWinSharingError(error)) return undefined;
+        throw error;
+      }
+    };
+    const settleExit = async (exit: { status: number; at: number }, known: ProcInfo[], deadline: number | undefined): Promise<CallResult> => {
+      // Processes the command left behind (background ones included) end with it, as a call's processes always do.
+      if (!closed) await endCommand(id, known);
+      // An exit after the deadline (seen late: the orchestrator was down) is a timeout, with the record's data.
+      const late = deadline !== undefined && exit.at > deadline;
+      return await sealCommand(journal, t, id, { status: late ? "timeout" : exit.status === 0 ? "ok" : "failed", ...exitResult(exit.status),
+        ...(late ? { error: `Command timed out after ${t.spec.timeoutMs} ms` } : {}), at: exit.at }, dir);
+    };
     try {
       for (;;) {
         const started = entriesFor(journal, call).findLast(e => e.type === COMMAND_STARTED && e.id === id), known = commandKnown(started);
         // The timeout is wall clock from the start (command-started, else the intent: a crash before the started record),
         // downtime included.
         const deadline = t.spec.timeoutMs !== undefined ? (started ?? intent).ts + t.spec.timeoutMs : undefined;
-        const exit = await readExitRecord(dir);
-        if (exit) {
-          // Processes the command left behind (background ones included) end with it, as a call's processes always do.
-          if (!closed) await endCommand(id, known);
-          // An exit after the deadline (seen late: the orchestrator was down) is a timeout, with the record's data.
-          const late = deadline !== undefined && exit.at > deadline;
-          return await sealCommand(journal, t, id, { status: late ? "timeout" : exit.status === 0 ? "ok" : "failed", ...exitResult(exit.status),
-            ...(late ? { error: `Command timed out after ${t.spec.timeoutMs} ms` } : {}), at: exit.at }, dir);
-        }
+        const exit = await readExit();
+        if (exit) return await settleExit(exit, known, deadline);
         if (closed) throw shutdownError();
         if (a.retired || retiredCall(journal, call)) { await endCommand(id, known); throw shutdownError(); }
         if (hasStopIntent(journal, call)) { await endCommand(id, known); return await sealCommand(journal, t, id, { status: "stopped" }, dir); }
@@ -1365,10 +1377,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         // A failed observation is not a loss: the attempt stays tracked and is watched again (never started over).
         const live = wrapper ? undefined : await commandProcesses(id, known);
         if (!wrapper && live !== undefined && !live.length) {
-          // The wrapper may have written its record just before it ended.
-          const late = await readExitRecord(dir);
+          // The wrapper may have written its record just before it ended (or a Windows scanner may briefly hold it).
+          const late = await readExit();
           if (!late) return "lost";
-          continue;
+          return await settleExit(late, known, deadline);
         }
         const wait = Math.max(1, Math.min(commandTick(), deadline !== undefined ? deadline - Date.now() : Infinity));
         await new Promise<void>(resolve => { const timer = setTimeout(resolve, wait); a.wake = () => { clearTimeout(timer); resolve(); }; });
