@@ -16,7 +16,7 @@ import { openJournal } from "../../../src/kernel/journal.ts";
 import { processAlive } from "../../../src/orchestrator/snapshot.ts";
 import { fenceAgent } from "../../../src/orchestrator/executor/ended.ts";
 import { Containment } from "../../../src/platform/containment.ts";
-import { alive, live, liveTickets, writeTicketSync, type LeaseTicket } from "../../../src/platform/lease.ts";
+import { alive, endLeaseProcesses, live, liveTickets, writeTicketSync, type LeaseTicket } from "../../../src/platform/lease.ts";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
 import {
   attachScannedCommand,
@@ -324,4 +324,36 @@ test("Windows ProcessTable -> Containment -> fenceAgent reuses scanned CommandLi
     { pid: 6412, command: clipWinCommandLine(rawRows[3]!.command!) },
     { pid: 6408, command: "" },
   ]);
+});
+
+test("endLeaseProcesses retries across transient winSnapshotSync failures and uses probePid", async () => {
+  let snaps = 0, killed = false;
+  const killedPids: number[] = [];
+  const probed: number[] = [];
+  const messages: string[] = [];
+  const ticket: LeaseTicket = {
+    seq: 7, resource: "gpu", mode: "exclusive",
+    wrapper: { pid: 100, start: T_LIVE },
+    group: { pid: 5500, start: T_LIVE },
+    command: { pid: 5504, start: T_CHILD },
+    jobDir: "C:\\nonexistent-job-dir-for-snap-retry",
+    argv: ["node"], cwd: "C:\\work", since: 1,
+  };
+  await endLeaseProcesses(ticket, 50, line => messages.push(line), {
+    platform: "win32",
+    snapshotWin: () => {
+      snaps++;
+      if (snaps <= 2) throw new Error("transient WMI timeout");
+      return killed ? new Map() : new Map([
+        [5500, { pid: 5500, ppid: 100, start: T_LIVE, cpuMs: 1 }],
+        [5504, { pid: 5504, ppid: 5500, start: T_CHILD, cpuMs: 1 }],
+      ]);
+    },
+    probePid: pid => { probed.push(pid); return killed ? "dead" : "alive"; },
+    killOwnerWinSync: targets => { killedPids.push(...targets.map(t => t.pid)); killed = true; },
+  });
+  assert.ok(snaps >= 3, `expected snapshot retry after transient errors, got ${snaps}`);
+  assert.ok(probed.includes(5500), "endLeaseProcesses must consult LeaseCheckOptions.probePid");
+  assert.ok(killedPids.includes(5500), "owner was killed even while initial snapshots failed");
+  assert.deepEqual(messages, [], "clean retirement after retry must not warn of survivors");
 });

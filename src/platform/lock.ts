@@ -509,18 +509,18 @@ export class OsLock implements Contract {
         await exited.catch(() => {});
         const code = (error as NodeJS.ErrnoException).code;
         if (code === "ENOENT" || (spawnFailed && candidate.fallbackOnSpawnError)) {
-          if (candidate.command === cachedWinHelper) {
-            cachedWinHelper = undefined;
+          if (candidate.command === cachedWinHelper) cachedWinHelper = undefined;
+          if (candidate.selfHealOnCrash) {
             if (code === "EACCES" || code === "EPERM" || code === "EBUSY") {
               winHelperCooldownUntil = Math.max(winHelperCooldownUntil, Date.now() + WIN_LOCK_HELPER_COOLDOWN_MS);
-            } else if (code !== "ENOENT" && candidate.selfHealOnCrash) {
+            } else if (code !== "ENOENT") {
               await rm(candidate.command, { force: true }).catch(() => {});
               winHelperCooldownUntil = Math.max(winHelperCooldownUntil, Date.now() + WIN_LOCK_HELPER_COOLDOWN_MS);
             }
           }
           continue;
         }
-        if (candidate.selfHealOnCrash && exitCode !== undefined && exitCode !== 0 && exitCode !== 2 && !errorText.startsWith("open: ")) {
+        if (candidate.selfHealOnCrash && !isLockTimeout(error) && typeof exitCode === "number" && exitCode !== 0 && exitCode !== 2 && !errorText.startsWith("open: ")) {
           if (candidate.command === cachedWinHelper) cachedWinHelper = undefined;
           await rm(candidate.command, { force: true }).catch(() => {});
           winHelperCooldownUntil = Math.max(winHelperCooldownUntil, Date.now() + WIN_LOCK_HELPER_COOLDOWN_MS);

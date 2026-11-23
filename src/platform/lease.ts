@@ -49,10 +49,6 @@ export interface LeaseCheckOptions {
 const checkOpts = (options?: LeaseCheckOptions): LeaseCheckOptions | undefined =>
   options && typeof options === "object" ? options : undefined;
 
-function kernelPidAlive(pid: number): boolean {
-  return probeKernelPid(pid) !== "dead";
-}
-
 function resolveProbePid(opts?: LeaseCheckOptions): (pid: number) => KernelPidProbe {
   if (opts?.probePid) return opts.probePid;
   if (opts?.processAlive) return pid => (opts.processAlive!(pid) ? "alive" : "dead");
@@ -242,16 +238,20 @@ export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (l
   const started = Date.now(), until = started + 5000;
   if ((options.platform ?? process.platform) === "win32") {
     const snap = options.snapshotWin ?? winSnapshotSync;
+    const trySnap = (): Map<number, WinProcessRow> | undefined => {
+      try { return snap(0); } catch { return undefined; }
+    };
     if (isWinJobTicket(t)) {
       // Terminating the verified Job Object owner closes the job's sole handle (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),
       // so the kernel ends the command root and every surviving child/grandchild without walking dead parent PIDs.
       const killOwner = options.killOwnerWinSync ?? options.killWinSync ?? (targets => killProcessSync(targets));
-      const pidAlive = options.processAlive ?? kernelPidAlive;
+      const probe = resolveProbePid(options);
       const tag = holdTag(t);
       const proven = new Map<string, WinProcessIdentity>();
-      const addProvenCmd = (cmd: WinProcessIdentity, ...snapshots: ReadonlyArray<ReadonlyMap<number, WinProcessRow>>) => {
+      const addProvenCmd = (cmd: WinProcessIdentity, ...snapshots: ReadonlyArray<ReadonlyMap<number, WinProcessRow> | undefined>) => {
         proven.set(`${cmd.pid}:${cmd.start}`, cmd);
         for (const snapshot of snapshots) {
+          if (!snapshot) continue;
           for (const d of winLiveDescendants([cmd], snapshot.values())) {
             proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
           }
@@ -259,14 +259,14 @@ export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (l
       };
       let checkedOwnerHandle = false;
       for (;;) {
-        const rows = snap(0);
+        const rows = trySnap();
         const groupState = t.jobDir ? readGroupRecordStateSync(t.jobDir) : { state: "absent" as const };
         const groupRec = groupState.state === "ready" ? groupState.record : undefined;
         const began = t.jobDir ? readBeginIdentitySync(t.jobDir) : undefined;
         const recordedOwner = (groupRec?.group && isWinStart(groupRec.group.start) ? groupRec.group : undefined)
           ?? (t.group && isWinStart(t.group.start) ? { pid: t.group.pid, start: t.group.start } : undefined)
           ?? (began && isWinStart(began.start) ? began : undefined);
-        const taggedRow = recordedOwner ? undefined
+        const taggedRow = recordedOwner || !rows ? undefined
           : [...rows.values()].find(r => isWinStart(r.start) && winTag(r.command, "DSA_HOLD") === tag);
         const owner: WinProcessIdentity | undefined = recordedOwner
           ?? (taggedRow ? { pid: taggedRow.pid, start: taggedRow.start } : undefined);
@@ -274,13 +274,13 @@ export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (l
           ?? (t.command && isWinStart(t.command.start) ? { pid: t.command.pid, start: t.command.start } : undefined);
         if (owner) proven.set(`${owner.pid}:${owner.start}`, owner);
         if (cmd) addProvenCmd(cmd, rows);
-        const ownerLiveInRows = Boolean(owner && rows.get(owner.pid) && sameCreation(rows.get(owner.pid)!.start, owner.start));
-        const shouldKillOwner = Boolean(owner && (ownerLiveInRows || (!checkedOwnerHandle && recordedOwner !== undefined && pidAlive(owner.pid))));
-        checkedOwnerHandle = true;
+        const ownerLiveInRows = Boolean(owner && rows && rows.get(owner.pid) && sameCreation(rows.get(owner.pid)!.start, owner.start));
+        const shouldKillOwner = Boolean(owner && (ownerLiveInRows || (recordedOwner !== undefined && (!checkedOwnerHandle || !rows) && probe(owner.pid) !== "dead")));
+        if (rows) checkedOwnerHandle = true;
         if (shouldKillOwner && owner) {
           try { killOwner([owner]); } catch { /* retry until deadline when a verified owner resists termination */ }
         }
-        const checkRows = shouldKillOwner ? snap(0) : rows;
+        const checkRows = shouldKillOwner ? trySnap() : rows;
         let transientGroup = groupState.state === "transient";
         let effectiveCmd = cmd;
         if (!groupRec && t.jobDir && shouldKillOwner) {
@@ -298,11 +298,13 @@ export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (l
           }
         }
         if (effectiveCmd) addProvenCmd(effectiveCmd, checkRows);
-        const remaining = [...proven.values()].filter(p => {
-          const row = checkRows.get(p.pid);
-          return row !== undefined && sameCreation(row.start, p.start);
-        }).length;
-        if (!remaining && !transientGroup) break;
+        const remaining = checkRows
+          ? [...proven.values()].filter(p => {
+            const row = checkRows.get(p.pid);
+            return row !== undefined && sameCreation(row.start, p.start);
+          }).length
+          : Math.max(1, proven.size);
+        if (checkRows && !remaining && !transientGroup) break;
         if (Date.now() >= until) { say(`hold: ${remaining || 1} processes of ${who(t)} survived; releasing`); break; }
         await new Promise(r => setTimeout(r, 25));
       }
@@ -319,29 +321,37 @@ export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (l
     const proven = new Map<string, WinProcessIdentity>([[`${rootIdentity.pid}:${rootIdentity.start}`, rootIdentity]]);
     let checkedRootHandle = false;
     for (;;) {
-      const rows = snap(0);
-      for (const d of winLiveDescendants([...proven.values()], rows.values())) {
-        proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+      const rows = trySnap();
+      if (rows) {
+        for (const d of winLiveDescendants([...proven.values()], rows.values())) {
+          proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+        }
       }
-      const liveTargets = [...proven.values()].filter(p => {
-        const row = rows.get(p.pid);
-        return row !== undefined && sameCreation(row.start, p.start);
-      });
+      const liveTargets = rows
+        ? [...proven.values()].filter(p => {
+          const row = rows.get(p.pid);
+          return row !== undefined && sameCreation(row.start, p.start);
+        })
+        : [rootIdentity];
       if (!checkedRootHandle && !liveTargets.some(p => p.pid === rootIdentity.pid)) {
         liveTargets.unshift(rootIdentity);
       }
-      checkedRootHandle = true;
-      if (!liveTargets.length) break;
+      if (rows) checkedRootHandle = true;
+      if (rows && !liveTargets.length) break;
       try { killWin(liveTargets); } catch { /* retry until deadline when a verified owned process resists termination */ }
-      const after = snap(0);
-      for (const d of winLiveDescendants([...proven.values()], after.values())) {
-        proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+      const after = trySnap();
+      if (after) {
+        for (const d of winLiveDescendants([...proven.values()], after.values())) {
+          proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+        }
       }
-      const remaining = [...proven.values()].filter(p => {
-        const row = after.get(p.pid);
-        return row !== undefined && sameCreation(row.start, p.start);
-      }).length;
-      if (!remaining) break;
+      const remaining = after
+        ? [...proven.values()].filter(p => {
+          const row = after.get(p.pid);
+          return row !== undefined && sameCreation(row.start, p.start);
+        }).length
+        : Math.max(1, proven.size);
+      if (after && !remaining) break;
       if (Date.now() >= until) { say(`hold: ${remaining} processes of ${who(t)} survived; releasing`); break; }
       await new Promise(r => setTimeout(r, 25));
     }

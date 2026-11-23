@@ -78,16 +78,16 @@ export interface ExecTargetOptions {
  *  the node script it runs, so that script runs under this Node instead and argv stays an argv (no shell quoting).
  *  A bare name is looked up on the command's own PATH (`options.env`), not this process's: the command's PATH may have
  *  the shim the caller's has not (a call's prepended `$DSA_HOME/bin`). */
-/** Escape Windows cmd.exe metacharacters on an unquoted argv element (one CreateProcessW will not wrap in quotes). */
-function escapeCmdToken(value: string): string {
-  if (/[\r\n]/.test(value)) throw new Error("Windows .cmd/.bat arguments cannot contain CR or LF");
-  // Empty strings and strings with spaces, tabs or double quotes are wrapped in "..." by CreateProcessW / libuv,
-  // where cmd.exe treats & | < > ( ) ^ literally; adding ^ inside quotes would pass literal carets through.
-  if (value.length === 0 || /[ \t"]/.test(value)) return value;
-  return value.replace(/[&|<>()^]/g, "^$&");
+/** Quote one argument for `cmd.exe /d /s /c ""path" "arg""` (passed with `windowsVerbatimArguments: true`).
+ *  Wrapping every token in double quotes ensures cmd.exe treats spaces and metacharacters (`&`, `|`, `<`, `>`, `(`, `)`,
+ *  `^`) literally both on the outer cmd.exe command line and when a batch shim forwards `%*` to Node. Embedded CR, LF or
+ *  double quotes cannot be safely escaped for cmd.exe batch parsing (CVE-2024-27980 / BatBadBut) and are refused. */
+function quoteCmdBatchArg(value: string): string {
+  if (/[\r\n"]/.test(value)) throw new Error("Windows .cmd/.bat arguments cannot contain CR, LF or double quotes");
+  return `"${value}"`;
 }
 
-export function execTarget(command: string, args: readonly string[], options: ExecTargetOptions = {}): { command: string; args: string[] } {
+export function execTarget(command: string, args: readonly string[], options: ExecTargetOptions = {}): { command: string; args: string[]; verbatim?: true } {
   const platform = options.platform ?? process.platform, env = options.env ?? process.env;
   if (platform !== "win32") return { command, args: [...args] };
   // A bare name is looked up through PATHEXT (`pi` → `pi.cmd`), the way the command's own shell would find it.
@@ -97,10 +97,10 @@ export function execTarget(command: string, args: readonly string[], options: Ex
   if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args] };
   const script = shimScript(resolved);
   if (script) return { command: process.execPath, args: [script, ...args] };
-  // Leading `if 1==1` prevents `cmd.exe /s /c` from stripping the first and last quote when both the .cmd path and
-  // the last argument (or the .cmd path alone with no args) are quoted by CreateProcessW, without `call`'s double-pass
-  // percent/caret expansion.
-  return { command: comspec(env), args: ["/d", "/s", "/c", "if", "1==1", escapeCmdToken(resolved), ...args.map(escapeCmdToken)] };
+  // Outer quotes satisfy `cmd.exe /s /c`, which unconditionally strips the first and last `"` from the command string,
+  // leaving `"path" "arg1" ...` intact for cmd.exe and batch `%*` forwarding. Callers pass `windowsVerbatimArguments: true`.
+  const inner = [quoteCmdBatchArg(resolved), ...args.map(quoteCmdBatchArg)].join(" ");
+  return { command: comspec(env), args: ["/d", "/s", "/c", `"${inner}"`], verbatim: true };
 }
 /** The node script a generated `.cmd`/`.bat` shim runs, when it names one (`%dp0%` is the shim's directory).
  *  Shims that customize NODE_PATH or NODE_OPTIONS (e.g. pnpm global shims) are not unwrapped so their environment
@@ -112,7 +112,7 @@ export function shimScript(file: string): string | undefined {
   const dir = dirname(file);
   for (const match of text.matchAll(/"([^"\r\n]+\.(?:js|mjs|cjs))"|'([^'\r\n]+\.(?:js|mjs|cjs))'/gi)) {
     const raw = match[1] ?? match[2]!;
-    const rel = raw.replace(/^%~?dp0%?[\\/]?/i, "");
+    const rel = raw.replace(/^%~?dp0%?[\\/]*/i, "");
     const resolved = rel !== raw
       ? resolve(dir, process.platform === "win32" ? rel : rel.replace(/\\/g, "/"))
       : normalize(raw.replace(/%~?dp0%?/gi, dir));

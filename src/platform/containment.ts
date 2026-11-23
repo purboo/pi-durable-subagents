@@ -51,6 +51,7 @@ export class Containment implements Contract {
   /** C1, C3: Inject the execution tag and capture the direct child's start token. */
   async spawn(spec: SpawnSpec): Promise<Spawned> {
     const child = spawn(spec.command, spec.args, { cwd: spec.cwd, shell: spec.shell,
+      ...(spec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       env: { ...process.env, ...spec.env, DSA_EXEC: spec.exec }, stdio: "pipe" });
     // Buffer output immediately: Node drains child pipes on exit, even while
     // identity capture is pending and the caller has not received the streams.

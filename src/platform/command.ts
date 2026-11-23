@@ -94,7 +94,7 @@ const env = {};
 for (const key of Object.keys(spec.env)) put(env, key, spec.env[key]);
 put(env, "ComSpec", shell);
 put(env, "PATHEXT", value(spec.env, "PATHEXT") || value(process.env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD");
-const options = { cwd: spec.cwd, env, stdio: ["ignore", "inherit", "inherit"], windowsHide: true };
+const options = { cwd: spec.cwd, env, stdio: ["ignore", "inherit", "inherit"], windowsHide: true, ...(spec.verbatim ? { windowsVerbatimArguments: true } : {}) };
 let child;
 try { child = typeof spec.command === "string" ? spawn(spec.command, { ...options, shell }) : spawn(spec.command[0], spec.command.slice(1), options); }
 catch (error) { const status = error && error.code === "ENOENT" ? 127 : 126; record(status); process.exit(status); }
@@ -161,12 +161,19 @@ export { prepareCancelled } from "./job.ts";
  *  case: one `PATH`, one `ComSpec`, one `PATHEXT`), the command the wrapper runs (an argv whose program is a .cmd/.bat shim
  *  unwrapped to the program it names) and the wrapper's own argv. Shared by the staging and the start, so both describe the
  *  same attempt. */
-function windowsPlan(spec: CommandSpawn): { env: NodeJS.ProcessEnv; command: string | readonly string[]; args: string[] } {
+function windowsPlan(spec: CommandSpawn): { env: NodeJS.ProcessEnv; command: string | readonly string[]; verbatim?: true; args: string[] } {
   const inherited = normalizeEnv(spec.env);
   const env = mergeEnv(inherited, { ComSpec: envValue(inherited, "ComSpec") || comspec(inherited),
     PATHEXT: envValue(inherited, "PATHEXT") || ".COM;.EXE;.BAT;.CMD" });
-  const command = typeof spec.command === "string" ? spec.command : (() => { const target = execTarget(spec.command[0]!, spec.command.slice(1), { env }); return [target.command, ...target.args]; })();
-  return { env, command, args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [winTagArg("DSA_EXEC", spec.exec)] : [])] };
+  let command: string | readonly string[];
+  let verbatim: true | undefined;
+  if (typeof spec.command === "string") command = spec.command;
+  else {
+    const target = execTarget(spec.command[0]!, spec.command.slice(1), { env });
+    command = [target.command, ...target.args];
+    verbatim = target.verbatim;
+  }
+  return { env, command, ...(verbatim ? { verbatim } : {}), args: [join(spec.dir, COMMAND_WRAPPER), spec.dir, ...(spec.exec ? [winTagArg("DSA_EXEC", spec.exec)] : [])] };
 }
 
 /** Stage what a Windows command start needs, before its durable intent: the command spec and the wrapper the child runs,
@@ -178,7 +185,7 @@ export async function prepareCommand(spec: CommandSpawn): Promise<CommandPrep | 
   // A command line can be long and contain anything: pass it through a file, not argv.
   await mkdir(spec.dir, { recursive: true });
   const plan = windowsPlan(spec);
-  await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env }));
+  await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env, ...(plan.verbatim ? { verbatim: true } : {}) }));
   await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
   return prepareJob(spec.dir, { exe: process.execPath, env: helperEnv({ SystemRoot: systemRoot() }), cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
     args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.signal ? { signal: spec.signal } : {}) });
@@ -197,7 +204,7 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
     // them would only risk a spec the owner was not prepared for, so the start reads what it staged.
     const plan = windowsPlan(spec);
     if (!spec.prepared) {
-      await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env }));
+      await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env, ...(plan.verbatim ? { verbatim: true } : {}) }));
       await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
     }
     // An already revoked permission never prepares or starts; the executor's stage checks again immediately before the

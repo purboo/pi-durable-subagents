@@ -39,10 +39,24 @@ export function serviceFiles(home: string, dsa: string, entry: string, platform:
   }
   throw new Error(`Starter service unavailable on ${platform}`);
 }
-/** P1: Invoke the platform service manager, surfacing the exact failed command. */
+/** P1: Invoke the platform service manager, surfacing the exact failed command and execFile metadata. */
 export async function runServiceCommand(command: string, args: string[]): Promise<void> {
   try { await promisify(execFile)(command, args, { timeout: 10_000 }); }
-  catch (error) { throw new Error(`${command} ${args.join(" ")}: ${(error as { stderr?: string }).stderr || String(error)}`); }
+  catch (error) {
+    const e = error as { stderr?: string; code?: string | number; killed?: boolean; signal?: string | null };
+    const wrapped = new Error(`${command} ${args.join(" ")}: ${e.stderr || String(error)}`) as Error & { code?: string | number; killed?: boolean; signal?: string | null };
+    if (e.code !== undefined) wrapped.code = e.code;
+    if (e.killed) wrapped.killed = true;
+    if (e.signal) wrapped.signal = e.signal;
+    throw wrapped;
+  }
+}
+/** Whether a `schtasks /Query` failure reflects an execution/permission error rather than an absent task. */
+function isSchtasksHardError(error: unknown): boolean {
+  const e = error as { code?: unknown; killed?: unknown; signal?: unknown } | null | undefined;
+  if (e?.killed || e?.signal) return true;
+  if (typeof e?.code === "string" && ["ENOENT", "EACCES", "EPERM", "ETIMEDOUT", "EPIPE"].includes(e.code)) return true;
+  return /access is denied|denied|拒绝访问|zugriff verweigert|アクセスが拒否|accès refusé|acceso denegado|timed? ?out/i.test(String(error));
 }
 export type ServiceRunner = (command: string, args: string[]) => Promise<void>;
 /** P1: Activate or deactivate the optional starter; injected runners isolate service tests. */
@@ -73,15 +87,20 @@ export async function manageService(files: ServiceFile[], install: boolean, opti
     } else if (options.dryRun) {
       await run("schtasks", ["/Delete", "/F", "/TN", name]);
     } else {
-      // Locale-independent absence check: /Query exits non-zero when the task does not exist in any Windows UI language.
+      // Locale-independent absence check: /Query exits non-zero when the task does not exist in any Windows UI language,
+      // while spawn/timeout/access-denied failures propagate instead of silently leaving a scheduled task behind.
       let exists = true;
       try { await run("schtasks", ["/Query", "/TN", name]); }
-      catch { exists = false; }
+      catch (queryError) {
+        if (isSchtasksHardError(queryError)) throw queryError;
+        exists = false;
+      }
       if (exists) {
         try { await run("schtasks", ["/Delete", "/F", "/TN", name]); }
         catch (error) {
           let stillExists = false;
-          try { await run("schtasks", ["/Query", "/TN", name]); stillExists = true; } catch { /* gone */ }
+          try { await run("schtasks", ["/Query", "/TN", name]); stillExists = true; }
+          catch (recheckError) { if (isSchtasksHardError(recheckError)) throw error; }
           if (stillExists) throw error;
         }
       }

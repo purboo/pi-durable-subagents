@@ -204,6 +204,20 @@ test('service files and activation use temporary HOME and fake runners on both p
     write() {},
   });
   for (const f of winFiles) await assert.rejects(readFile(f.path), { code: 'ENOENT' });
+  // Uninstall when /Query fails with a hard execution/permission error (timeout/ENOENT/access denied) propagates and keeps files.
+  await manageService(winFiles, true, { platform: 'win32', runner: async () => {}, write() {} });
+  await assert.rejects(manageService(winFiles, false, {
+    platform: 'win32',
+    runner: async () => { throw Object.assign(new Error('schtasks timed out'), { killed: true, code: 'ETIMEDOUT' }); },
+    write() {},
+  }), /timed out/);
+  for (const f of winFiles) assert.equal(await readFile(f.path, 'utf8'), f.content);
+  await assert.rejects(manageService(winFiles, false, {
+    platform: 'win32',
+    runner: async () => { throw new Error('ERROR: Access is denied.'); },
+    write() {},
+  }), /Access is denied/);
+  for (const f of winFiles) assert.equal(await readFile(f.path, 'utf8'), f.content);
 });
 
 test('P1 start publishes nothing and invokes the starter only while work is pending', { timeout: 15000 }, async t => {

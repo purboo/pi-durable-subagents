@@ -607,6 +607,16 @@ test("Windows lock helper resolution: budget reservation, child abort/unref, coo
   );
   assert.equal(fallbackRan, false, "genuine 'open: ' lock-path error must not fall through");
   assert.equal((await stat(validExe)).isFile(), true, "valid cached exe must not be deleted on 'open: ' error");
+
+  // 4. LOCK_TIMEOUT on a healthy cached helper must NOT trigger selfHealOnCrash deletion.
+  const slowHealthyExe = join(dir, "slow-healthy-DsaLock.exe");
+  await writeFile(slowHealthyExe, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+  const timeoutLock = new OsLock(150, [
+    { command: slowHealthyExe, args: [], pathInEnv: true, fallbackOnSpawnError: true, selfHealOnCrash: true },
+    { command: process.execPath, args: ["-e", "process.stdout.write('locked\\n'); process.stdin.resume();"], pathInEnv: true },
+  ]);
+  await assert.rejects(timeoutLock.tryAcquire(join(dir, "timeout.lock")), isLockTimeout);
+  assert.equal((await stat(slowHealthyExe)).isFile(), true, "timed-out healthy cached exe must not be deleted");
 });
 
 test("C3 fence never kills a pid whose start differs from the scanned identity (pid reuse)", { skip: process.platform !== "linux", timeout: 10000 }, async () => {

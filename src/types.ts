@@ -426,6 +426,8 @@ export interface SpawnSpec {
   env: Record<string, string>;
   /** Run `command` through the platform shell (Windows: cmd.exe, with Node's own quoting). */
   shell?: boolean;
+  /** Windows: pass `args` verbatim to CreateProcessW without libuv re-quoting (for pre-quoted `cmd.exe /d /s /c "..."`). */
+  windowsVerbatimArguments?: boolean;
 }
 
 export interface Spawned {

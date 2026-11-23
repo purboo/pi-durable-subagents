@@ -624,10 +624,18 @@ public static class DsaJob
         return Marshal.StringToHGlobalUni(text.ToString());
     }
 
-    /** An argv as a CreateProcess command line, by the quoting rules CommandLineToArgvW (and the C runtime) parse. */
+    /** An argv as a CreateProcess command line, by the quoting rules CommandLineToArgvW (and the C runtime) parse.
+     *  Preserves pre-quoted cmd.exe /d /s /c "..." batch invocations verbatim (matching Node's windowsVerbatimArguments). */
     static string CommandLine(string application, string[] arguments)
     {
         StringBuilder text = new StringBuilder(Quote(application));
+        if (arguments != null && arguments.Length == 4
+            && String.Equals(Path.GetFileName(application), "cmd.exe", StringComparison.OrdinalIgnoreCase)
+            && arguments[0] == "/d" && arguments[1] == "/s" && arguments[2] == "/c"
+            && arguments[3].Length >= 2 && arguments[3][0] == '"' && arguments[3][arguments[3].Length - 1] == '"')
+        {
+            return text.Append(" /d /s /c ").Append(arguments[3]).ToString();
+        }
         if (arguments != null) foreach (string argument in arguments) text.Append(' ').Append(Quote(argument));
         return text.ToString();
     }

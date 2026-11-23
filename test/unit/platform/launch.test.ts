@@ -219,19 +219,25 @@ test("execTarget resolves a bare program on the command's own environment, with 
   const old = process.env.PATH;
   process.env.PATH = second; t.after(() => { if (old === undefined) delete process.env.PATH; else process.env.PATH = old; });
   assert.deepEqual(execTarget("tool", [], { ...windows, env: { Path: first } }), { command: process.execPath, args: [script] }, "not the parent's shim");
-  // A shim that names no node script runs through the command's ComSpec (also when it is spelled COMSPEC), not ours.
+  // A shim that names no node script runs through the command's ComSpec (also when it is spelled COMSPEC), not ours,
+  // with outer-quoted verbatim arguments so cmd.exe /s /c keeps every token quoted (spaces & metacharacters safe).
   assert.deepEqual(execTarget("tool", ["x"], { ...windows, env: { PATH: second, COMSPEC: "D:\\Windows\\system32\\cmd.exe" } }),
-    { command: "D:\\Windows\\system32\\cmd.exe", args: ["/d", "/s", "/c", "if", "1==1", secondShim, "x"] });
-  // Unquoted cmd.exe metacharacters are escaped while spaced args (quoted by CreateProcessW) keep literal characters; CR/LF are refused.
+    { command: "D:\\Windows\\system32\\cmd.exe", args: ["/d", "/s", "/c", `""${secondShim}" "x""`], verbatim: true });
   assert.deepEqual(execTarget("tool", ["a&b|c", "hello & world"], { ...windows, env: { PATH: second, COMSPEC: "D:\\Windows\\system32\\cmd.exe" } }),
-    { command: "D:\\Windows\\system32\\cmd.exe", args: ["/d", "/s", "/c", "if", "1==1", secondShim, "a^&b^|c", "hello & world"] });
-  assert.throws(() => execTarget("tool", ["line1\nline2"], { ...windows, env: { PATH: second } }), /CR or LF/);
+    { command: "D:\\Windows\\system32\\cmd.exe", args: ["/d", "/s", "/c", `""${secondShim}" "a&b|c" "hello & world""`], verbatim: true });
+  // CR, LF and embedded double quotes are refused on the cmd.exe batch fallback (BatBadBut / cmd injection).
+  assert.throws(() => execTarget("tool", ["line1\nline2"], { ...windows, env: { PATH: second } }), /CR, LF or double quotes/);
+  assert.throws(() => execTarget("tool", ['a"b&calc'], { ...windows, env: { PATH: second } }), /CR, LF or double quotes/);
+  // A shim with a double separator after %dp0% (e.g. %dp0%\tool.js) still resolves relative to the shim dir, not root.
+  const dblSepShim = join(first, "dblsep.cmd");
+  await writeFile(dblSepShim, `@echo off\r\n"%dp0%\\tool.js" %*\r\n`);
+  assert.deepEqual(execTarget(dblSepShim, ["ok"], { ...windows }), { command: process.execPath, args: [script, "ok"] });
   // A pnpm-style .cmd shim setting NODE_PATH or NODE_OPTIONS is NOT unwrapped so its env setup runs through cmd.exe.
   const pnpmDir = join(dir, "pnpm bin"); await mkdir(pnpmDir);
   const pnpmShim = join(pnpmDir, "my tool.cmd");
   await writeFile(pnpmShim, `@SETLOCAL\r\n@SET "NODE_PATH=C:\\pnpm\\node_modules"\r\n"${process.execPath}" "${script}" %*\r\n`);
   assert.deepEqual(execTarget(pnpmShim, ["arg with space"], { ...windows, env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" } }),
-    { command: "C:\\Windows\\System32\\cmd.exe", args: ["/d", "/s", "/c", "if", "1==1", pnpmShim, "arg with space"] });
+    { command: "C:\\Windows\\System32\\cmd.exe", args: ["/d", "/s", "/c", `""${pnpmShim}" "arg with space""`], verbatim: true });
   // PATHEXT is the command's too: `.CMD` alone finds no `.bat`; `.BAT` then finds it, on the same PATH.
   assert.deepEqual(execTarget("tool", [], { ...windows, env: { PATH: third, PATHEXT: ".CMD" } }), { command: "tool", args: [] }, "not found: the name stays as it was");
   assert.equal(findOnPath("tool", third, { ...windows, pathext: ".CMD" }), undefined);
