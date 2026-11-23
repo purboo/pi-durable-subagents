@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.1
+
+- **Standalone `pi` binary safety (#11, #7)**: When `pi` runs as a standalone compiled Bun/SEA binary (`process.execPath` points to `pi` rather than `node`), `launchOrchestrator`, `install-service`, Windows shim unwrapping and `npmCommand` now resolve a real Node.js runtime (`DSA_NODE_BIN` -> verified Node `process.execPath` -> `node`/`nodejs` on `PATH`, preferring `.exe`/`.com` on Windows and wrapping `.cmd` shims through `cmd.exe`), refuse any runtime resolving to `pi` while keeping multi-call shims (`mise`/`volta`/`asdf`) working, and add a hard `DSA_ORCHESTRATOR_LAUNCH` self-spawn guard inside the extension so a misconfigured launch exits immediately instead of spawning recursive headless `pi` sessions.
+- **`pi` 1.5.1+ / 1.6.0 cache-warming compatibility**:
+  - Ignore 1-token `CacheWarmer` payloads in exact-fork request capture, exact-child request splicing and `live.json` waiting-state tracking, and stop cache warming inside exact children via `cache_warming_decision`.
+  - Account for standalone `type: "usage"` (`cache_warm`) session entries across session usage folds, live `entry_appended` observation, child usage reporting and execution `evidence()` (deduplicated by entry id and scoped to the call's own execution segment).
+
 ## 1.6.0
 
 - **Native Windows support** (Node.js 22.19+ and 24, no WSL or POSIX tools required; based on #4):
