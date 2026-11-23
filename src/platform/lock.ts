@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { LockHandle, OsLock as Contract } from "../types.ts";
-import { powershellPath } from "./windows.ts";
+import { helperEnv, powershellPath } from "./windows.ts";
 
 const perl = `use Fcntl qw(:flock); $|=1;
 open(my $f, ">>", $ARGV[0]) or do { warn "open: $!"; exit 1; };
@@ -83,7 +83,7 @@ export class OsLock implements Contract {
     }
     for (const candidate of this.candidates ?? defaultHelpers()) {
       const args = candidate.pathInEnv ? [...candidate.args] : [...candidate.args, path];
-      const env = candidate.pathInEnv ? { ...process.env, DSA_LOCK_PATH: path } : process.env;
+      const env = candidate.pathInEnv ? { ...(win ? helperEnv() : process.env), DSA_LOCK_PATH: path } : process.env;
       const child = spawn(candidate.command, args, { stdio: "pipe", env, windowsHide: true });
       let errorText = "";
       child.stderr.on("data", chunk => { errorText = (errorText + chunk).slice(-4096); });

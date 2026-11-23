@@ -230,7 +230,7 @@ test("OS lock releases on holder SIGKILL and exactly one concurrent acquirer suc
   }
 });
 
-test("issue #2: a lock helper that does not answer in time fails with the transient timeout code, after the given limit", { timeout: 15000, skip: process.platform === "win32" ? "the Windows lock helper is this Node and cannot be slowed through PATH" : false }, async () => {
+test("issue #2: a lock helper that does not answer in time fails with the transient timeout code, after the given limit", { timeout: 15000, skip: process.platform === "win32" ? "this fixture delays the POSIX perl helper through PATH" : false }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "dsa-lock-slow-"));
   try {
     // A perl that never answers (a machine going back to sleep): first on PATH.
@@ -252,12 +252,10 @@ test("OS lock releases when the helper dies directly, never steals a live lock, 
   const path = join(dir, "orch $' (1).lock");
   const table = new ProcessTable();
   const lock = new OsLock();
-  let first: Awaited<ReturnType<OsLock["tryAcquire"]>> = null;
+  const first = holder(path);
   let recovered: Awaited<ReturnType<OsLock["tryAcquire"]>> = null;
   try {
-    const before = new Set((await table.list(new Set(), { fresh: true })).filter(p => p.ppid === process.pid).map(p => `${p.pid}:${p.start}`));
-    first = await lock.tryAcquire(path);
-    assert.ok(first);
+    assert.equal(await line(first), "yes");
     assert.equal((await stat(path)).isFile(), true);
     if (process.platform === "win32") {
       await assert.rejects(open(path, "r"), /EBUSY|EPERM|EACCES/);
@@ -267,8 +265,10 @@ test("OS lock releases when the helper dies directly, never steals a live lock, 
     // Past the old 2 s directory stale window, concurrent contenders still get null and never steal the live lock.
     await delay(2200);
     assert.deepEqual(await Promise.all([lock.tryAcquire(path), lock.tryAcquire(path), lock.tryAcquire(path)]), [null, null, null]);
-    const helper = await until(async () => (await table.list(new Set(), { fresh: true }))
-      .find(p => p.ppid === process.pid && !before.has(`${p.pid}:${p.start}`)));
+    // Observe from outside the holder so the snapshot helper itself cannot be selected.
+    const helpers = (await table.list(new Set(), { fresh: true })).filter(p => p.ppid === first.pid);
+    assert.equal(helpers.length, 1);
+    const helper = helpers[0]!;
     process.kill(helper.pid, "SIGKILL");
     await until(async () => {
       const live = await table.list(new Set(), { fresh: true });
@@ -277,15 +277,16 @@ test("OS lock releases when the helper dies directly, never steals a live lock, 
     assert.equal((await stat(path)).isFile(), true);
     recovered = await until(async () => (await lock.tryAcquire(path)) ?? undefined);
     // Releasing the dead first handle is a clean no-op and never disturbs the new holder.
-    await first.release();
-    first = null;
+    const released = new Promise(resolve => first.once("exit", resolve));
+    first.stdin!.end();
+    assert.equal(await released, 0);
     assert.equal(await lock.tryAcquire(path), null);
     await recovered.release();
     recovered = null;
     const handle = await open(path, "r");
     await handle.close();
   } finally {
-    await first?.release().catch(() => {});
+    await cleanup(first);
     await recovered?.release().catch(() => {});
     await rm(dir, { recursive: true, force: true });
   }
