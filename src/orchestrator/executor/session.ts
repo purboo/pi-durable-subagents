@@ -5,10 +5,11 @@ import { ASK_CUT, CT } from "../../types.ts";
 import type { Model } from "../../compat/model.ts";
 
 interface Block { type?: string; text?: string; id?: string; name?: string }
-interface Message { role?: string; content?: string | Block[]; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; details?: Record<string, unknown>; usage?: { input?: number; output?: number; cost?: { total?: number } } }
+export interface RawUsage { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } }
+interface Message { role?: string; content?: string | Block[]; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; details?: Record<string, unknown>; usage?: RawUsage }
 export interface SessionEntry {
   type: string; id?: string; customType?: string; data?: Record<string, unknown>; message?: Message;
-  provider?: string; modelId?: string; details?: Record<string, unknown>;
+  provider?: string; modelId?: string; details?: Record<string, unknown>; kind?: string; usage?: RawUsage; timestamp?: string | number;
 }
 export interface SessionState { entries: SessionEntry[]; corrupt: readonly number[] }
 // A child session is append-only while observed (pi appends whole lines), so a cached state is extended by parsing only
@@ -103,6 +104,9 @@ export function evidence(entries: SessionEntry[], exec: string) {
         if (value.trim()) text = value;
       }
       usage.input += m.usage?.input ?? 0; usage.output += m.usage?.output ?? 0; usage.costUsd += m.usage?.cost?.total ?? 0;
+    } else if (e.type === "usage" && e.usage) {
+      usage.input += (e.usage.input ?? 0) + (e.usage.cacheRead ?? 0) + (e.usage.cacheWrite ?? 0);
+      usage.output += e.usage.output ?? 0; usage.costUsd += e.usage.cost?.total ?? 0;
     }
     // P28: an ask cut off by shutdown or abort while its question waited keeps an unknown outcome, like one with no result.
     if (m?.role === "toolResult" && m.toolCallId && !(asked.has(m.toolCallId) && cutAskResult(m))) tools.delete(m.toolCallId);

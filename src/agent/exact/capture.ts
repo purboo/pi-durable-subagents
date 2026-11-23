@@ -126,3 +126,18 @@ export function exactCaptureEnabled(config: unknown): boolean {
 
 /** The identity of a capture's payload: the sha256 of its serialized bytes. */
 export const payloadHash = (payload: ProviderPayload) => contentHash(payload);
+
+/** Whether a provider payload is pi's 1-token cache-warming refresh (pi 1.5.1+ CacheWarmer).
+ *  CacheWarmer replays the last request with maxTokens: 1 (clamped to 16 on OpenAI Responses); real turns
+ *  use the model's maxTokens (thousands). */
+export function isCacheWarmingPayload(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const p = payload as Record<string, unknown>;
+  if (p.max_tokens === 1 || p.max_completion_tokens === 1 || p.maxTokens === 1) return true;
+  if (p.max_output_tokens === 16 || p.max_output_tokens === 1) return true;
+  const gen = p.generationConfig as Record<string, unknown> | undefined;
+  if (gen && typeof gen === "object" && gen.maxOutputTokens === 1) return true;
+  const inf = p.inferenceConfig as Record<string, unknown> | undefined;
+  if (inf && typeof inf === "object" && inf.maxTokens === 1) return true;
+  return false;
+}

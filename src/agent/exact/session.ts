@@ -11,7 +11,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { dsaHome } from "../../paths.ts";
-import { writeCapture, type Capture, type ProviderPayload } from "./capture.ts";
+import { isCacheWarmingPayload, writeCapture, type Capture, type ProviderPayload } from "./capture.ts";
 import { clone } from "./splice.ts";
 
 /** The home of the dsa state (the captures live under it): $DSA_HOME or the default state root. */
@@ -35,7 +35,9 @@ export async function registerCapture(pi: ExtensionAPI, home: string): Promise<v
   let writing: Promise<void> = Promise.resolve();
   pi.on("before_provider_request", (event, ctx: ExtensionContext) => {
     const payload = event.payload as ProviderPayload | undefined;
-    if (!payload || typeof payload !== "object") return;
+    // pi 1.5.1+ CacheWarmer replays the last request with maxTokens: 1 (16 on OpenAI Responses) through this hook;
+    // never overwrite the real capture with a cache-warming payload or exact children would inherit a 1-token cap.
+    if (!payload || typeof payload !== "object" || isCacheWarmingPayload(payload)) return;
     const sessionId = ctx.sessionManager?.getSessionId?.();
     if (!sessionId) return;
     const model = ctx.model;

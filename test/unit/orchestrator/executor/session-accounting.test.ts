@@ -14,6 +14,17 @@ test("P31 usage excludes context, predecessor generations and foreign segments a
   assert.equal(sessionUsage(entries.slice(0, 3), call).length, 0);
 });
 
+test("P31 standalone usage entries (e.g. cache_warm) count inside own segments and exclude inherited/foreign ones", () => {
+  const call = "W@1/a@2";
+  const segment = (exec: string): SessionEntry => ({ type: "custom", customType: CT.exec, data: { exec } });
+  const warm = (id: string, cost: number): SessionEntry => ({ type: "usage", id, kind: "cache_warm", usage: { input: 10, cacheRead: 1000, output: 1, cost: { total: cost } } });
+  const entries = [warm("inherited", 0.5), segment("W@1/a@1#1.1"), warm("prev", 0.4), segment(`${call}#1.1`), warm("w1", 0.02), segment("W@1/b@1#1.1"), warm("foreign", 0.3), segment(`${call}#1.2`), warm("w2", 0.03)];
+  assert.deepEqual(sessionUsage(entries, call), [
+    { id: "w1", usage: { input: 1010, output: 1, costUsd: 0.02 } },
+    { id: "w2", usage: { input: 1010, output: 1, costUsd: 0.03 } },
+  ]);
+});
+
 test("P4 receipts cover nested messages, native custom messages and control resolutions only", () => {
   assert.equal(receiptId({ type: "message", message: { details: { rid: "message" } } }), "message");
   assert.equal(receiptId({ type: "custom_message", details: { rid: "native" } }), "native");

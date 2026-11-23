@@ -25,6 +25,11 @@ test("UI §3: the child publishes waiting, then the streaming thinking/text, the
     assert.equal(read().text, "Done.");
     handlers.get("message_end")!({ message: { role: "assistant" } }, ctx);
     assert.equal(read().phase, "idle");
+    // A cache-warming refresh fires before_provider_request with max_tokens: 1 (or max_output_tokens: 16) and never
+    // emits message_end, so live.json must stay idle rather than sticking in waiting.
+    handlers.get("before_provider_request")!({ payload: { model: "m", max_tokens: 1 } }, ctx);
+    handlers.get("before_provider_request")!({ payload: { model: "m", max_output_tokens: 16 } }, ctx);
+    assert.equal(read().phase, "idle");
     enabled = false; handlers.get("before_provider_request")!({}, ctx);
     assert.equal(read().phase, "idle", "a child that is no longer current publishes nothing");
   } finally { rmSync(dir, { recursive: true, force: true }); }

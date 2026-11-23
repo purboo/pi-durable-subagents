@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { captureFacts, exactCaptureEnabled, exactPath, pruneCaptures, readCapture, writeCapture, type Capture } from "../../../src/agent/exact/capture.ts";
+import { captureFacts, exactCaptureEnabled, exactPath, isCacheWarmingPayload, pruneCaptures, readCapture, writeCapture, type Capture } from "../../../src/agent/exact/capture.ts";
 import { registerCapture } from "../../../src/agent/exact/session.ts";
 import { ExtensionRunner, createExtensionRuntime } from "@earendil-works/pi-coding-agent";
 import { cacheMarkers, childConversation, clone, payloadTools, splicePayload } from "../../../src/agent/exact/splice.ts";
@@ -113,6 +113,29 @@ test("EX1 a disabled capture writes nothing", async t => {
   assert.equal(hooks.has("before_provider_request"), false, "the capture is off: no request is observed");
 });
 
+test("EX1 cache-warming payloads are detected and never overwrite the parent's capture", async t => {
+  assert.equal(isCacheWarmingPayload({ model: "m", max_tokens: 1 }), true);
+  assert.equal(isCacheWarmingPayload({ model: "m", max_output_tokens: 16 }), true);
+  assert.equal(isCacheWarmingPayload({ model: "m", max_completion_tokens: 1 }), true);
+  assert.equal(isCacheWarmingPayload({ generationConfig: { maxOutputTokens: 1 } }), true);
+  assert.equal(isCacheWarmingPayload({ inferenceConfig: { maxTokens: 1 } }), true);
+  assert.equal(isCacheWarmingPayload({ model: "m", max_tokens: 4096 }), false);
+  assert.equal(isCacheWarmingPayload({ model: "m", max_output_tokens: 4096 }), false);
+  const home = await mkdtemp(join(tmpdir(), "dsa-exact-warm-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const hooks = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+  await registerCapture({ on: (name: string, fn: (event: unknown, ctx: unknown) => unknown) => hooks.set(name, fn) } as never, home);
+  const ctx = { sessionManager: { getSessionId: () => "s1" }, model: { provider: "qa", id: "m", api: "anthropic-messages" }, thinkingLevel: "off" };
+  const real = { model: "m", max_tokens: 4096, messages: [{ role: "user", content: "real" }] };
+  hooks.get("before_provider_request")!({ payload: real }, ctx);
+  for (let i = 0; i < 50 && !(await readCapture(home, "s1")); i++) await new Promise(resolve => setTimeout(resolve, 20));
+  // Idle or streaming cache warming replays with max_tokens: 1 (or max_output_tokens: 16); capture must keep real.
+  hooks.get("before_provider_request")!({ payload: { ...real, max_tokens: 1 } }, ctx);
+  hooks.get("before_provider_request")!({ payload: { model: "m", max_output_tokens: 16, input: [] } }, ctx);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.deepEqual((await readCapture(home, "s1"))?.payload, real);
+});
+
 test("EX4 the splice keeps every parent field and concatenates the conversations (anthropic)", () => {
   const parent = capture().payload;
   const child = { model: "m", max_tokens: 1, system: [{ type: "text", text: "child system" }], stream: true,
@@ -205,6 +228,7 @@ test("EX4 the exact child replaces the request with the parent's fields and the 
   assert.deepEqual((out.messages as unknown[]).length, 2);
   assert.deepEqual(out.system, [{ type: "text", text: "parent system" }]);
   assert.equal(out.max_tokens, 4096);
+  assert.deepEqual(f.hooks.get("cache_warming_decision")!({}, f.ctx), { action: "stop" }, "exact children stop cache warming so parent max_tokens is never spliced onto a warm refresh");
 });
 
 test("EX4 the exact child refuses a request on another model without throwing", async t => {

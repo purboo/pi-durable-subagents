@@ -38,4 +38,10 @@ test("P31, P33, P37: per-call usage excludes inherited context and earlier gener
   assert.equal(g2.tokens, 12); assert.ok(Math.abs(g2.costUsd - 0.12) < 1e-9);
   assert.equal(g1.tokens, 10); assert.ok(Math.abs(g1.costUsd - 0.1) < 1e-9);
   assert.equal(usage(entries as never).tokens, 1022, "without a call identity everything counts (legacy/test use)");
+  // Standalone usage entries (pi 1.5.1+ cache_warm) count toward the owning call's budget and deduplicate by id.
+  const withWarm = [...entries, { id: "cw1", type: "usage", kind: "cache_warm", usage: { input: 2, cacheRead: 100, output: 1, cost: { total: 0.05 } } },
+    { id: "cw1", type: "usage", kind: "cache_warm", usage: { input: 2, cacheRead: 100, output: 1, cost: { total: 0.05 } } }];
+  const g2w = usage(withWarm as never, "w@1/k@2");
+  assert.equal(g2w.tokens, 12 + 103);
+  assert.ok(Math.abs(g2w.costUsd - 0.17) < 1e-9);
 });
