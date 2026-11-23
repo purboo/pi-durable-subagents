@@ -2,7 +2,6 @@ import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { statSync } from "node:fs";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LockHandle, OsLock as Contract } from "../types.ts";
 import { frameworkCompiler } from "./job.ts";
@@ -141,6 +140,8 @@ export interface LockHelper {
   readonly pathInEnv?: boolean;
   /** Fall through to the next candidate on any spawn error (e.g. AppLocker/AV EACCES on a cached compiled helper). */
   readonly fallbackOnSpawnError?: boolean;
+  /** Self-heal a corrupt cached compiled helper when it crashes without an `open: ` lock-path diagnostic. */
+  readonly selfHealOnCrash?: boolean;
 }
 
 function readyExecutable(exe: string): boolean {
@@ -152,19 +153,33 @@ function readyExecutable(exe: string): boolean {
   }
 }
 
-/** Content-addressed user-local cache directories for the compiled Windows lock helper. */
+/** Content-addressed user-private cache directory for the compiled Windows lock helper (`%LOCALAPPDATA%` only; never a
+ *  shared temp directory). Returns empty when `LOCALAPPDATA` is unavailable so callers fall back to PowerShell. */
 export function winLockHelperCacheDirs(env: NodeJS.ProcessEnv = process.env, arch: string = process.arch): string[] {
+  const localAppData = envValue(env, "LOCALAPPDATA");
+  if (!localAppData) return [];
   const hash = createHash("sha256").update(WIN_LOCK_HELPER_SOURCE).update("\0").update(arch).digest("hex").slice(0, 16);
-  const dirs: string[] = [];
-  const add = (base: string | undefined) => {
-    if (!base) return;
-    const candidate = join(base, "pi-durable-subagents", "lock-helper", `v1-${hash}`);
-    if (!dirs.includes(candidate)) dirs.push(candidate);
-  };
-  const effective = helperEnv(env);
-  add(envValue(effective, "LOCALAPPDATA"));
-  add(envValue(effective, "TEMP") || envValue(effective, "TMP") || tmpdir());
-  return dirs;
+  return [join(localAppData, "pi-durable-subagents", "lock-helper", `v1-${hash}`)];
+}
+
+/** Sub-budget reserved for compiling the Windows lock helper so the PowerShell fallback always retains at least ~2/3 of
+ *  the caller's `timeoutMs` budget. */
+export function winLockHelperCompileBudget(budgetMs: number): number {
+  if (!Number.isFinite(budgetMs) || budgetMs <= 0) return 0;
+  return Math.min(5_000, Math.floor(budgetMs / 3));
+}
+
+/** Cooldown before retrying a failed Windows lock helper compile/spawn/crash (permanent disable is only for missing `csc.exe`). */
+export const WIN_LOCK_HELPER_COOLDOWN_MS = 60_000;
+
+function abortError(): NodeJS.ErrnoException {
+  return Object.assign(new Error("lock helper compile aborted"), { code: "ABORT_ERR", name: "AbortError", killed: true });
+}
+
+function isMissingCompilerError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const e = error as { compilerMissing?: boolean; code?: string };
+  return e.compilerMissing === true;
 }
 
 /** Compile and atomically publish `DsaLock.exe` into `cacheDir` (reusing an existing binary immediately). Safe under
@@ -175,6 +190,7 @@ export async function compileWinLockHelper(
   options: {
     compiler?: string;
     timeoutMs?: number;
+    signal?: AbortSignal;
     env?: NodeJS.ProcessEnv;
     arch?: string;
     renameFile?: (from: string, to: string) => Promise<void>;
@@ -184,43 +200,86 @@ export async function compileWinLockHelper(
 ): Promise<string> {
   const exe = join(cacheDir, WIN_LOCK_HELPER_EXE);
   if (readyExecutable(exe)) return exe;
+  if (options.signal?.aborted) throw abortError();
   await mkdir(cacheDir, { recursive: true });
   if (readyExecutable(exe)) return exe;
   const effectiveEnv = options.env ?? helperEnv();
-  const compiler = options.compiler ?? frameworkCompiler(effectiveEnv, options.arch ?? process.arch);
+  let compiler: string;
+  try {
+    compiler = options.compiler ?? frameworkCompiler(effectiveEnv, options.arch ?? process.arch);
+  } catch (error) {
+    throw Object.assign(
+      error instanceof Error ? error : new Error(String(error)),
+      { compilerMissing: true },
+    );
+  }
   const stage = join(cacheDir, `build-${process.pid.toString(36)}-${randomBytes(8).toString("hex")}`);
   const build = "DsaLock.build.exe";
   await mkdir(stage, { recursive: true });
   try {
+    if (options.signal?.aborted) throw abortError();
     await writeFile(join(stage, WIN_LOCK_HELPER_SOURCE_FILE), WIN_LOCK_HELPER_SOURCE, "utf8");
     await new Promise<void>((resolve, reject) => {
-      execFile(
+      if (options.signal?.aborted) { reject(abortError()); return; }
+      let settled = false;
+      const done = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(killTimer);
+        options.signal?.removeEventListener("abort", onAbort);
+        fn();
+      };
+      const child = execFile(
         compiler,
         ["/nologo", "/optimize+", "/codepage:65001", "/target:exe", `/out:${build}`, WIN_LOCK_HELPER_SOURCE_FILE],
         {
           cwd: stage,
-          timeout: options.timeoutMs ?? 30_000,
           windowsHide: true,
           env: effectiveEnv,
           maxBuffer: 1024 * 1024,
           encoding: "utf8",
         },
         (error, stdout, stderr) => {
-          if (!error) { resolve(); return; }
+          if (!error) { done(resolve); return; }
+          const code = (error as NodeJS.ErrnoException).code;
           const detail = String(stderr || stdout || "").trim().replace(/\s+/g, " ").slice(0, 200);
           const wrapped = Object.assign(
             new Error(`lock helper compile failed: ${error.message}${detail ? `: ${detail}` : ""}`),
-            { killed: (error as { killed?: boolean }).killed, code: (error as NodeJS.ErrnoException).code },
+            {
+              killed: (error as { killed?: boolean }).killed,
+              code,
+              compilerMissing: code === "ENOENT" && !stderr && !stdout,
+            },
           );
-          reject(wrapped);
+          done(() => reject(wrapped));
         },
       );
+      const terminateChild = () => {
+        try { child.kill("SIGKILL"); } catch { /* gone */ }
+        child.stdin?.destroy();
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.unref();
+      };
+      const onAbort = () => {
+        terminateChild();
+        done(() => reject(abortError()));
+      };
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      const timeout = options.timeoutMs ?? 30_000;
+      const killTimer = setTimeout(() => {
+        terminateChild();
+        done(() => reject(Object.assign(new Error(`lock helper compile timed out (${timeout} ms)`), { killed: true, code: "ETIMEDOUT" })));
+      }, Math.max(1, timeout));
+      killTimer.unref();
     });
+    if (options.signal?.aborted) throw abortError();
     const built = join(stage, build);
     const renameFile = options.renameFile ?? rename;
     const deadline = Date.now() + (options.publishMs ?? 5_000);
     const retryMs = options.retryMs ?? 50;
     for (;;) {
+      if (options.signal?.aborted) throw abortError();
       if (readyExecutable(exe)) return exe;
       try {
         await renameFile(built, exe);
@@ -232,7 +291,11 @@ export async function compileWinLockHelper(
         if (!["EBUSY", "EPERM", "EACCES", "EAGAIN", "EEXIST"].includes(code) || Date.now() + retryMs >= deadline) {
           throw error;
         }
-        await new Promise(r => setTimeout(r, retryMs));
+        await new Promise<void>(r => {
+          const onAbort = () => { clearTimeout(waitTimer); r(); };
+          const waitTimer = setTimeout(() => { options.signal?.removeEventListener("abort", onAbort); r(); }, retryMs);
+          options.signal?.addEventListener("abort", onAbort, { once: true });
+        });
       }
     }
   } finally {
@@ -241,14 +304,45 @@ export async function compileWinLockHelper(
 }
 
 let cachedWinHelper: string | undefined;
-let winHelperFailed = false;
-let winHelperInFlight: Promise<string | undefined> | undefined;
+let winHelperDisabled = false;
+let winHelperCooldownUntil = 0;
+let winHelperInFlight: {
+  promise: Promise<string | undefined>;
+  controller: AbortController;
+  waiters: number;
+} | undefined;
 
-async function resolveWinLockHelper(timeoutMs: number): Promise<string | undefined> {
+/** Test seam: reset module-level cached Windows lock helper state. */
+export function resetWinLockHelperState(): void {
+  cachedWinHelper = undefined;
+  winHelperDisabled = false;
+  winHelperCooldownUntil = 0;
+  if (winHelperInFlight) {
+    winHelperInFlight.controller.abort();
+    winHelperInFlight = undefined;
+  }
+}
+
+export interface ResolveWinLockHelperOptions {
+  env?: NodeJS.ProcessEnv;
+  arch?: string;
+  compiler?: string;
+  now?: () => number;
+  cooldownMs?: number;
+  compile?: (cacheDir: string, options: { compiler?: string; timeoutMs?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv; arch?: string }) => Promise<string>;
+}
+
+/** Resolve or compile the cached Windows lock helper within the reserved sub-budget so PowerShell fallback keeps the
+ *  majority of `budgetMs`. Transient failures apply a cooldown; only a missing compiler disables permanently. */
+export async function resolveWinLockHelper(budgetMs: number, options: ResolveWinLockHelperOptions = {}): Promise<string | undefined> {
+  const now = options.now ?? Date.now;
+  const cooldownMs = options.cooldownMs ?? WIN_LOCK_HELPER_COOLDOWN_MS;
   if (cachedWinHelper && readyExecutable(cachedWinHelper)) return cachedWinHelper;
   cachedWinHelper = undefined;
-  if (winHelperFailed) return undefined;
-  const dirs = winLockHelperCacheDirs();
+  if (winHelperDisabled) return undefined;
+  if (now() < winHelperCooldownUntil) return undefined;
+  const dirs = winLockHelperCacheDirs(options.env, options.arch);
+  if (!dirs.length) return undefined;
   for (const dir of dirs) {
     const exe = join(dir, WIN_LOCK_HELPER_EXE);
     if (readyExecutable(exe)) {
@@ -256,33 +350,68 @@ async function resolveWinLockHelper(timeoutMs: number): Promise<string | undefin
       return exe;
     }
   }
+  const compileBudget = winLockHelperCompileBudget(budgetMs);
+  if (compileBudget <= 0) return undefined;
   if (!winHelperInFlight) {
-    winHelperInFlight = (async () => {
-      let timedOut = false;
-      for (const dir of dirs) {
-        try {
-          const exe = await compileWinLockHelper(dir, { timeoutMs: Math.max(5_000, timeoutMs) });
-          cachedWinHelper = exe;
-          return exe;
-        } catch (error) {
-          if ((error as { killed?: boolean; code?: string } | undefined)?.killed ||
-              /timed out|ETIMEDOUT/i.test(String((error as Error)?.message ?? error))) {
-            timedOut = true;
+    const controller = new AbortController();
+    const compileFn = options.compile ?? compileWinLockHelper;
+    const entry = {
+      controller,
+      waiters: 0,
+      promise: (async () => {
+        let missingCompiler = false;
+        let aborted = false;
+        for (const dir of dirs) {
+          if (controller.signal.aborted) { aborted = true; break; }
+          try {
+            const exe = await compileFn(dir, {
+              ...(options.compiler !== undefined ? { compiler: options.compiler } : {}),
+              timeoutMs: compileBudget,
+              signal: controller.signal,
+              ...(options.env !== undefined ? { env: options.env } : {}),
+              ...(options.arch !== undefined ? { arch: options.arch } : {}),
+            });
+            cachedWinHelper = exe;
+            return exe;
+          } catch (error) {
+            if (isMissingCompilerError(error)) {
+              missingCompiler = true;
+            } else if (controller.signal.aborted || (error as { name?: string; code?: string } | undefined)?.name === "AbortError" || (error as { code?: string } | undefined)?.code === "ABORT_ERR") {
+              aborted = true;
+            }
           }
         }
-      }
-      if (!timedOut) winHelperFailed = true;
-      return undefined;
-    })().finally(() => { winHelperInFlight = undefined; });
+        if (missingCompiler) {
+          winHelperDisabled = true;
+        } else if (!aborted) {
+          winHelperCooldownUntil = Math.max(winHelperCooldownUntil, now() + cooldownMs);
+        }
+        return undefined;
+      })().finally(() => {
+        if (winHelperInFlight === entry) winHelperInFlight = undefined;
+      }),
+    };
+    winHelperInFlight = entry;
   }
+  const active = winHelperInFlight;
+  active.waiters += 1;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   try {
     return await Promise.race([
-      winHelperInFlight,
-      new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), Math.max(1, timeoutMs)); }),
+      active.promise,
+      new Promise<undefined>(resolve => {
+        timer = setTimeout(() => { timedOut = true; resolve(undefined); }, compileBudget);
+      }),
     ]);
   } finally {
     clearTimeout(timer);
+    active.waiters -= 1;
+    if (timedOut && active.waiters <= 0) {
+      // Kill and unref the timed-out compiler so short-lived CLI processes never hang after falling back to PowerShell.
+      active.controller.abort();
+      winHelperCooldownUntil = Math.max(winHelperCooldownUntil, now() + cooldownMs);
+    }
   }
 }
 
@@ -296,7 +425,7 @@ const defaultHelpers = async (budgetMs: number): Promise<readonly LockHelper[]> 
   if (process.platform === "win32") {
     const exe = await resolveWinLockHelper(budgetMs);
     const ps = powershellHelper();
-    return exe ? [{ command: exe, args: [], pathInEnv: true, fallbackOnSpawnError: true }, ps] : [ps];
+    return exe ? [{ command: exe, args: [], pathInEnv: true, fallbackOnSpawnError: true, selfHealOnCrash: true }, ps] : [ps];
   }
   return [{ command: "perl", args: ["-e", perl] }, { command: "python3", args: ["-c", python] }];
 };
@@ -337,6 +466,7 @@ export class OsLock implements Contract {
       const child = spawn(candidate.command, args, { stdio: "pipe", env, windowsHide: true });
       let errorText = "";
       let spawnFailed = false;
+      let exitCode: number | null | undefined;
       child.stderr.on("data", chunk => { errorText = (errorText + chunk).slice(-4096); });
       child.stdin.on("error", () => {});
       const exited = new Promise<number | null>((resolve, reject) => {
@@ -361,6 +491,7 @@ export class OsLock implements Contract {
             });
           }),
           closed.then(code => {
+            exitCode = code;
             if (code === 2) return false;
             throw new Error(`C4 lock helper exited (${code}): ${errorText}`);
           }),
@@ -380,8 +511,19 @@ export class OsLock implements Contract {
         if (code === "ENOENT" || (spawnFailed && candidate.fallbackOnSpawnError)) {
           if (candidate.command === cachedWinHelper) {
             cachedWinHelper = undefined;
-            if (code === "EACCES" || code === "EPERM") winHelperFailed = true;
+            if (code === "EACCES" || code === "EPERM" || code === "EBUSY") {
+              winHelperCooldownUntil = Math.max(winHelperCooldownUntil, Date.now() + WIN_LOCK_HELPER_COOLDOWN_MS);
+            } else if (code !== "ENOENT" && candidate.selfHealOnCrash) {
+              await rm(candidate.command, { force: true }).catch(() => {});
+              winHelperCooldownUntil = Math.max(winHelperCooldownUntil, Date.now() + WIN_LOCK_HELPER_COOLDOWN_MS);
+            }
           }
+          continue;
+        }
+        if (candidate.selfHealOnCrash && exitCode !== undefined && exitCode !== 0 && exitCode !== 2 && !errorText.startsWith("open: ")) {
+          if (candidate.command === cachedWinHelper) cachedWinHelper = undefined;
+          await rm(candidate.command, { force: true }).catch(() => {});
+          winHelperCooldownUntil = Math.max(winHelperCooldownUntil, Date.now() + WIN_LOCK_HELPER_COOLDOWN_MS);
           continue;
         }
         throw error;

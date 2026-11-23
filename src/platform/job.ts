@@ -1084,9 +1084,18 @@ export function readGroupRecordStateSync(dir: string): SyncGroupState {
   catch { return { state: "absent" }; }
 }
 
-export function readGroupRecordSync(dir: string): GroupRecord | undefined {
-  const s = readGroupRecordStateSync(dir);
-  return s.state === "ready" ? s.record : undefined;
+/** Synchronous group-record reader for recovery/sweep callers (`gateJobProcesses`); retries briefly on Windows
+ *  transient sharing locks (unlike {@link readGroupRecordStateSync}, which stays single-shot non-blocking for leases). */
+export function readGroupRecordSync(dir: string, options: RetryWinSharingOptions & { readFile?: (path: string) => string } = {}): GroupRecord | undefined {
+  const readFn = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+  let text: string;
+  try {
+    text = retryWinSharingSync(() => readFn(join(dir, JOB_GROUP)), { timeoutMs: 250, maxAttempts: 5, ...options });
+  } catch {
+    return undefined;
+  }
+  try { return parseGroupText(text); }
+  catch { return undefined; }
 }
 
 function parseBeginText(text: string): { pid: number; start: string } | undefined {

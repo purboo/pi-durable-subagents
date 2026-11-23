@@ -4,6 +4,7 @@
 import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { retryWinSharing } from "../../../kernel/fsx.ts";
 import { publishFile } from "../../../kernel/mailbox.ts";
 import { callDir } from "../../../paths.ts";
 import { validate } from "../../../agent/child/schema.ts";
@@ -33,13 +34,26 @@ const GATE_STDOUT = "stdout.log";
 /** Windows gate wrapper: runs inside the per-gate Job Object (created suspended and assigned before its first
  *  instruction). Normalizes the case-insensitive Windows environment, executes the gate command through its ComSpec
  *  with stdout inherited and stdin/stderr attached to NUL, and exits with the normalized DWORD status. */
-const GATE_WRAPPER_SOURCE = `import { spawn } from "node:child_process";
+export const GATE_WRAPPER_SOURCE = `import { spawn } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 const dir = process.argv[2];
+const SHARING = new Set(["EACCES", "EBUSY", "EPERM"]);
+const WAIT = new Int32Array(new SharedArrayBuffer(4));
+function retrySharing(fn, deadline) {
+  for (let attempt = 0; ; attempt++) {
+    try { return fn(); }
+    catch (error) {
+      if (!SHARING.has(error && error.code) || attempt >= 25) throw error;
+      const left = deadline - Date.now();
+      if (left <= 0) throw error;
+      Atomics.wait(WAIT, 0, 0, Math.min(left, Math.min(100, 10 * (attempt + 1))));
+    }
+  }
+}
 let spec;
 try {
-  spec = JSON.parse(readFileSync(join(dir, "${GATE_SPEC}"), "utf8"));
+  spec = JSON.parse(retrySharing(() => readFileSync(join(dir, "${GATE_SPEC}"), "utf8"), Date.now() + 2500));
   try { unlinkSync(join(dir, "${GATE_SPEC}")); } catch { /* already gone */ }
 } catch { process.exit(126); }
 function dword(code) { return code >>> 0; }
@@ -66,6 +80,8 @@ export interface GateOptions {
   job?: Pick<JobOptions, "compiler" | "compileMs" | "publish" | "timeoutMs" | "observeMs" | "endMs" | "observe" | "endHelper" | "stdio">;
   onJobOwnerSpawned?: () => void;
   beforeRecordTracked?: () => Promise<void> | void;
+  /** Test seam: read the Windows gate's stdout capture file (`readFile(path, "utf8")` by default). */
+  readStdout?: (path: string) => Promise<string>;
 }
 
 function tracked(journal: JournalHandle, intent: Entry): ProcInfo[] {
@@ -288,8 +304,13 @@ export async function runGate(t: CallTicket, home: string, cwd: string, exec: st
       await scanQueue.catch(() => {});
       retired = await fenceGate(t.journal, intent, containment);
     }
-    if (stdoutReady && retired && !signal.aborted) {
-      finishRead = readFile(stdoutPath, "utf8").then(text => { stdout = text; });
+    if (stdoutReady && retired && !signal.aborted && gate.output === "json") {
+      const readStdout = options.readStdout ?? ((path: string) => readFile(path, "utf8"));
+      finishRead = retryWinSharing(() => readStdout(stdoutPath), {
+        platform: options.platform ?? process.platform,
+        timeoutMs: 2_000,
+        maxAttempts: 20,
+      }).then(text => { stdout = text; });
     }
   } else {
     try {

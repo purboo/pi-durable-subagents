@@ -18,7 +18,7 @@ import {
   JOB_BEGIN, JOB_END, JOB_ERROR, JOB_GROUP, JOB_HOST_EXE, JOB_HOST_EXIT, JOB_HOST_LOG, JOB_HOST_MARKER, JOB_HOST_PREFIX,
   JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, JOB_STOP, JobPrepareCancelled, asciiJson, compileJobHost, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
   jobHostArgv, jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, readBeginIdentity, readGroupEndSync, readGroupRecord,
-  readStartErrorSync, requestJobStop, spawnInJob, startError, type PublishBuild,
+  readGroupRecordStateSync, readGroupRecordSync, readStartErrorSync, requestJobStop, spawnInJob, startError, type PublishBuild,
 } from "../../../src/platform/job.ts";
 import { winProcessRows } from "../../../src/platform/windows.ts";
 
@@ -853,6 +853,43 @@ test("job record readers retry Windows transient sharing conflicts and fail clos
         return "CreateProcess failed (error 2)\n";
       },
     }), "CreateProcess failed (error 2)");
+
+    // readGroupRecordSync retries Windows transient sharing errors (short budget), fails closed on ENOENT/exhaustion,
+    // while readGroupRecordStateSync remains single-shot non-blocking for lease checks.
+    const syncGroupErrs = ["EACCES", "EBUSY", "EPERM"];
+    let syncGroupCalls = 0;
+    assert.deepEqual(readGroupRecordSync(dir, {
+      platform: "win32",
+      baseDelayMs: 1,
+      sleepSync: () => {},
+      readFile: () => {
+        syncGroupCalls += 1;
+        const code = syncGroupErrs.shift();
+        if (code) throw err(code);
+        return JSON.stringify({ pid: 77, start: "639000000000000030", group: { pid: 76, start: "639000000000000025" } });
+      },
+    }), { pid: 77, start: "639000000000000030", group: { pid: 76, start: "639000000000000025" } });
+    assert.equal(syncGroupCalls, 4);
+
+    let syncEnoentCalls = 0;
+    assert.equal(readGroupRecordSync(dir, {
+      platform: "win32",
+      sleepSync: () => { throw new Error("must not sleep on ENOENT"); },
+      readFile: () => { syncEnoentCalls += 1; throw err("ENOENT"); },
+    }), undefined);
+    assert.equal(syncEnoentCalls, 1);
+
+    let syncExhaustCalls = 0;
+    assert.equal(readGroupRecordSync(dir, {
+      platform: "win32",
+      baseDelayMs: 1,
+      sleepSync: () => {},
+      readFile: () => { syncExhaustCalls += 1; throw err("EBUSY"); },
+    }), undefined);
+    assert.equal(syncExhaustCalls, 5, "default short retry budget is 5 attempts");
+
+    // readGroupRecordStateSync stays single-shot non-blocking (returns absent immediately on missing file).
+    assert.deepEqual(readGroupRecordStateSync(dir), { state: "absent" });
   }
 });
 

@@ -196,6 +196,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   prepareCommand?: (spec: CommandSpawn) => Promise<CommandPrep | undefined>;
   /** Tests: exit-record reader for command attempts (platform/command.ts readExitRecord by default). */
   readExitRecord?: (dir: string) => Promise<{ status: number; at: number } | undefined>;
+  /** Tests: platform override for Windows-specific command exit handling (defaults to `IS_WINDOWS ? "win32" : process.platform`). */
+  platform?: NodeJS.Platform;
   /** Observes each slot attempt that admitted nothing: the execution and the providers it found full. */
   attempted?: (exec: string, full: readonly string[]) => void } = {}): Executor {
   const { home, config, orch } = ledgers;
@@ -204,6 +206,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   // The command start's pre-intent preparation: the Windows owner compilation (cancellable), nothing on POSIX.
   const prepareStart = options.prepareCommand ?? stageCommand;
   const readCommandExit = options.readExitRecord ?? readExitRecord;
+  const isWin = (options.platform ?? (IS_WINDOWS ? "win32" : process.platform)) === "win32";
   const active = new Map<string, Active>(), completed = new Map<string, Promise<CallResult>>(), journals = new Map<string, JournalHandle>();
   let queue: Promise<unknown> = Promise.resolve(), closed = false;
   let suspending: Promise<void> | undefined;
@@ -1344,7 +1347,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     const readExit = async (): Promise<{ status: number; at: number } | undefined> => {
       try { return await readCommandExit(dir); }
       catch (error) {
-        if (isWinSharingError(error)) return undefined;
+        if (isWin && isWinSharingError(error)) return undefined;
         throw error;
       }
     };

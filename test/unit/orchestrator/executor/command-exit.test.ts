@@ -37,6 +37,7 @@ async function commandFixture(t: TestContext, options: {
   rerun?: boolean;
   liveByScan?: ProcInfo[][];
   readExitRecord?: (dir: string) => Promise<{ status: number; at: number } | undefined>;
+  platform?: NodeJS.Platform;
 } = {}) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "dsa-cmd-exit-"))), wid = ulid();
   const orch = await openJournal(orchLedger(home)), journal = await openJournal(journalPath(home, wid));
@@ -57,6 +58,7 @@ async function commandFixture(t: TestContext, options: {
       memory: async () => 1e6,
       sweepMs: 10_000,
       ...(options.readExitRecord ? { readExitRecord: options.readExitRecord } : {}),
+      ...(options.platform ? { platform: options.platform } : {}),
     },
   );
   t.after(async () => {
@@ -76,9 +78,10 @@ const dataOf = (result: { data?: unknown }) => result.data as CommandData;
 
 const sharingError = (code: "EACCES" | "EBUSY" | "EPERM") => Object.assign(new Error(`${code}: sharing violation`), { code });
 
-test("command watcher survives transient sharing errors while running and seals the published exit status", { timeout: 10_000 }, async t => {
+test("command watcher survives transient sharing errors while running on Windows and seals the published exit status", { timeout: 10_000 }, async t => {
   let reads = 0;
   const f = await commandFixture(t, {
+    platform: "win32",
     liveByScan: [[{ pid: 1234, ppid: 0, start: "live-1" }], []],
     readExitRecord: async dir => {
       reads += 1;
@@ -108,6 +111,7 @@ test("command watcher recovers a late exit record locked transiently right after
   let calls = 0;
   let fileAttempts = 0;
   const f = await commandFixture(t, {
+    platform: "win32",
     liveByScan: [[]], // process and job already retired on first scan
     readExitRecord: async dir => {
       calls += 1;
@@ -142,9 +146,10 @@ test("command watcher fails closed as unknown when exit evidence is genuinely mi
   assert.equal(dataOf(result).exitCode, null);
 });
 
-test("command watcher fails closed as unknown when sharing conflicts persist past bounded retries after retirement", { timeout: 10_000 }, async t => {
+test("command watcher fails closed as unknown on Windows when sharing conflicts persist past bounded retries after retirement", { timeout: 10_000 }, async t => {
   let reads = 0;
   const f = await commandFixture(t, {
+    platform: "win32",
     liveByScan: [[]],
     readExitRecord: async dir => {
       reads += 1;
@@ -161,6 +166,23 @@ test("command watcher fails closed as unknown when sharing conflicts persist pas
   assert.equal(result.status, "unknown", "never hangs or crashes on persistent sharing conflict");
   assert.equal(result.error, "Command ended without an exit record");
   assert.equal(reads, 2, "checked before and after retirement scan, then failed closed");
+});
+
+test("command watcher propagates POSIX EACCES/EPERM permission errors explicitly instead of silently sealing unknown", { timeout: 10_000 }, async t => {
+  for (const code of ["EACCES", "EPERM"] as const) {
+    let reads = 0;
+    const f = await commandFixture(t, {
+      platform: "linux",
+      liveByScan: [[]],
+      readExitRecord: async () => {
+        reads += 1;
+        throw Object.assign(new Error(`${code}: permission denied`), { code });
+      },
+    });
+    await assert.rejects(f.executor.run(f.ticket), { code });
+    assert.equal(reads, 1, `POSIX ${code} propagated immediately on first read without turning into lost/unknown`);
+    assert.equal(f.journal.entries().find(e => e.type === JT.sealed), undefined, "permission error did not silently seal unknown");
+  }
 });
 
 test("command watcher reads a real published exit record cleanly after retirement", { timeout: 10_000 }, async t => {

@@ -21,7 +21,7 @@ import { openJournal } from "../../../../src/kernel/journal.ts";
 import { Containment } from "../../../../src/platform/containment.ts";
 import { winTag, type WinProcessIdentity, type WinProcessRow } from "../../../../src/platform/windows.ts";
 import createEffects from "../../../../src/orchestrator/executor/effects/index.ts";
-import { gateRetired } from "../../../../src/orchestrator/executor/effects/gate.ts";
+import { GATE_WRAPPER_SOURCE, gateRetired } from "../../../../src/orchestrator/executor/effects/gate.ts";
 import { sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
 import type { CallTicket } from "../../../../src/orchestrator/contract.ts";
 import { JT, type CallResult, type ProcInfo } from "../../../../src/types.ts";
@@ -706,4 +706,51 @@ test("Windows job gate: uncertain owner adoption still tracks, fences, and never
   assert.deepEqual(second, res);
   assert.equal(f.journal.entries().filter(e => e.type === "gate-intent").length, 1);
   if (existsSync(actionLog)) assert.equal((await readFile(actionLog, "utf8")).trim(), "ran");
+});
+
+test("Windows job gate: skips reading unused stdout when output !== 'json', retries transient sharing errors on JSON stdout, and wrapper retries gate.json", { skip: linuxOnly, timeout: 30_000 }, async t => {
+  // Wrapper source retries transient sharing errors (EACCES/EBUSY/EPERM) when reading gate.json.
+  assert.match(GATE_WRAPPER_SOURCE, /SHARING = new Set\(\["EACCES", "EBUSY", "EPERM"\]\)/);
+  assert.match(GATE_WRAPPER_SOURCE, /retrySharing\(\(\) => readFileSync\(join\(dir, "gate\.json"\), "utf8"\)/);
+
+  const f = await setupEnv(t, "WINGATESTDOUT");
+  const { compiler } = await createJobStandIn(f.root);
+  const containment = makeWinContainment();
+
+  // 1. Non-JSON gate must not read stdoutPath at all (even if stdout.log would fail with EBUSY).
+  let nonJsonReads = 0;
+  f.ticket.spec.gate = `"${process.execPath}" -e "process.stdout.write('ignored output')"`;
+  const nonJsonEffects = createEffects(f.ledgers, containment, {
+    platform: "win32",
+    job: { compiler, observe: async () => procRows() },
+    readStdout: async () => {
+      nonJsonReads += 1;
+      throw Object.assign(new Error("EBUSY: should not read stdout for non-json gate"), { code: "EBUSY" });
+    },
+  });
+  const nonJsonRes = await nonJsonEffects.beforeSeal(f.ticket, `${f.ticket.callId}#1.1`, f.result, { signal: new AbortController().signal });
+  assert.equal(nonJsonRes.status, "ok");
+  assert.equal(nonJsonReads, 0, "stdoutPath is skipped when gate.output !== 'json'");
+
+  // 2. JSON gate retries transient Windows sharing errors (EBUSY/EACCES/EPERM) when reading stdoutPath.
+  const fJson = await setupEnv(t, "WINGATEJSON");
+  const errCodes = ["EBUSY", "EACCES", "EPERM"] as const;
+  let jsonReads = 0;
+  fJson.ticket.spec.gate = {
+    command: `"${process.execPath}" -e "process.stdout.write(JSON.stringify({ ok: 42 }))"`,
+    output: "json",
+  };
+  const jsonEffects = createEffects(fJson.ledgers, containment, {
+    platform: "win32",
+    job: { compiler, observe: async () => procRows() },
+    readStdout: async path => {
+      const code = errCodes[jsonReads++];
+      if (code) throw Object.assign(new Error(`${code}: transient AV lock`), { code });
+      return readFile(path, "utf8");
+    },
+  });
+  const jsonRes = await jsonEffects.beforeSeal(fJson.ticket, `${fJson.ticket.callId}#1.1`, fJson.result, { signal: new AbortController().signal });
+  assert.equal(jsonRes.status, "ok");
+  assert.deepEqual(jsonRes.data, { gate: { ok: 42 } });
+  assert.equal(jsonReads, 4, "retried 3 transient sharing errors then read JSON stdout");
 });

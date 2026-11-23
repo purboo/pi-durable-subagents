@@ -12,12 +12,16 @@ import { ProcessTable } from "../../../src/platform/proctable.ts";
 import { Containment } from "../../../src/platform/containment.ts";
 import {
   OsLock,
+  WIN_LOCK_HELPER_COOLDOWN_MS,
   WIN_LOCK_HELPER_EXE,
   WIN_LOCK_HELPER_SOURCE,
   WIN_LOCK_HELPER_SOURCE_FILE,
   compileWinLockHelper,
   isLockTimeout,
+  resetWinLockHelperState,
+  resolveWinLockHelper,
   winLockHelperCacheDirs,
+  winLockHelperCompileBudget,
 } from "../../../src/platform/lock.ts";
 import type { Spawned } from "../../../src/types.ts";
 
@@ -398,10 +402,21 @@ test("Windows compiled lock helper source, cache dirs, atomic publish and reuse 
 
   const dirsA = winLockHelperCacheDirs({ LOCALAPPDATA: "/local", TEMP: "/tmp" }, "x64");
   const dirsB = winLockHelperCacheDirs({ LOCALAPPDATA: "/local", TEMP: "/tmp" }, "ia32");
-  assert.equal(dirsA.length, 2);
+  const dirsNoLocal = winLockHelperCacheDirs({ TEMP: "/tmp", TMP: "/tmp" }, "x64");
+  const dirsCase = winLockHelperCacheDirs({ localappdata: "/local-ci" }, "x64");
+  assert.equal(dirsA.length, 1, "only user-private LOCALAPPDATA cache dir is used (never shared TEMP/TMP)");
   assert.ok(dirsA[0]!.startsWith(join("/local", "pi-durable-subagents", "lock-helper", "v1-")));
-  assert.ok(dirsA[1]!.startsWith(join("/tmp", "pi-durable-subagents", "lock-helper", "v1-")));
   assert.notEqual(dirsA[0], dirsB[0]);
+  assert.deepEqual(dirsNoLocal, [], "missing LOCALAPPDATA skips compiled helper instead of falling back to shared TEMP");
+  assert.equal(dirsCase.length, 1);
+  assert.ok(dirsCase[0]!.startsWith(join("/local-ci", "pi-durable-subagents", "lock-helper", "v1-")));
+
+  // Reserved compile sub-budget always leaves >= ~2/3 of total budget for PowerShell fallback and caps at 5s.
+  assert.equal(winLockHelperCompileBudget(15_000), 5_000);
+  assert.equal(winLockHelperCompileBudget(30_000), 5_000);
+  assert.equal(winLockHelperCompileBudget(9_000), 3_000);
+  assert.equal(winLockHelperCompileBudget(3_000), 1_000);
+  assert.equal(winLockHelperCompileBudget(0), 0);
 
   if (process.platform === "win32") return;
   const dir = await mkdtemp(join(tmpdir(), "dsa-lock-compile-"));
@@ -455,6 +470,143 @@ test("Windows compiled lock helper source, cache dirs, atomic publish and reuse 
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("Windows lock helper resolution: budget reservation, child abort/unref, cooldown vs permanent disable, and corrupt exe self-healing", { timeout: 25000, skip: process.platform === "win32" ? "uses POSIX shell/node helper stubs" : false }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "dsa-lock-resolve-"));
+  t.after(async () => {
+    resetWinLockHelperState();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // 1. Budget reservation + abort/unref: a hung compiler is killed within budget/3 and does NOT keep a short-lived CLI open.
+  const hangPidFile = join(dir, "hang-csc.pid");
+  const hangCompiler = join(dir, "hang-csc.sh");
+  await writeFile(
+    hangCompiler,
+    `#!/bin/sh\nprintf '%s' "$$" > ${JSON.stringify(hangPidFile)}\nexec sleep 30\n`,
+    { mode: 0o755 },
+  );
+  const cliLocal = join(dir, "cli-local");
+  const cliStarted = Date.now();
+  const cliExit = await new Promise<{ code: number | null; out: string }>((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `
+        import { resolveWinLockHelper } from ${JSON.stringify(lockModule)};
+        const started = Date.now();
+        const exe = await resolveWinLockHelper(450, { env: { LOCALAPPDATA: process.argv[1] }, compiler: process.argv[2] });
+        console.log(JSON.stringify({ exe: exe ?? null, ms: Date.now() - started }));
+      `,
+      cliLocal,
+      hangCompiler,
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", chunk => { out += chunk; });
+    child.once("error", reject);
+    child.once("exit", code => resolve({ code, out: out.trim() }));
+  });
+  const cliElapsed = Date.now() - cliStarted;
+  assert.equal(cliExit.code, 0, "short-lived CLI exited cleanly without waiting for the hung compiler");
+  const cliResult = JSON.parse(cliExit.out) as { exe: string | null; ms: number };
+  assert.equal(cliResult.exe, null);
+  assert.ok(cliResult.ms >= 100 && cliResult.ms < 450, `compile sub-budget respected (${cliResult.ms} ms of 450 ms)`);
+  assert.ok(cliElapsed < 5_000, `CLI process was not held open by hung csc.exe (${cliElapsed} ms)`);
+  if (await stat(hangPidFile).then(() => true, () => false)) {
+    const pid = Number((await readFile(hangPidFile, "utf8")).trim());
+    await until(async () => {
+      try { process.kill(pid, 0); return undefined; } catch { return true; }
+    });
+  }
+
+  // 2. Cooldown on transient compile failure (retries after cooldown) vs permanent disable on missing csc.exe.
+  resetWinLockHelperState();
+  let clock = 10_000;
+  let compileCalls = 0;
+  const transientLocal = join(dir, "transient-local");
+  const transientResult1 = await resolveWinLockHelper(15_000, {
+    env: { LOCALAPPDATA: transientLocal },
+    now: () => clock,
+    cooldownMs: WIN_LOCK_HELPER_COOLDOWN_MS,
+    compile: async () => {
+      compileCalls += 1;
+      throw Object.assign(new Error("EACCES: AV scan lock"), { code: "EACCES" });
+    },
+  });
+  assert.equal(transientResult1, undefined);
+  assert.equal(compileCalls, 1);
+
+  // Within cooldown window: skipped without invoking compiler again.
+  clock += WIN_LOCK_HELPER_COOLDOWN_MS - 1;
+  assert.equal(await resolveWinLockHelper(15_000, {
+    env: { LOCALAPPDATA: transientLocal },
+    now: () => clock,
+    cooldownMs: WIN_LOCK_HELPER_COOLDOWN_MS,
+    compile: async () => { compileCalls += 1; return join(transientLocal, WIN_LOCK_HELPER_EXE); },
+  }), undefined);
+  assert.equal(compileCalls, 1, "cooldown suppresses immediate retry");
+
+  // Once cooldown expires: retries and succeeds!
+  clock += 1;
+  const builtExe = join(transientLocal, WIN_LOCK_HELPER_EXE);
+  await mkdir(transientLocal, { recursive: true });
+  await writeFile(builtExe, "MZ-recovered");
+  const recovered = await resolveWinLockHelper(15_000, {
+    env: { LOCALAPPDATA: transientLocal },
+    now: () => clock,
+    cooldownMs: WIN_LOCK_HELPER_COOLDOWN_MS,
+    compile: async () => { compileCalls += 1; return builtExe; },
+  });
+  assert.equal(recovered, builtExe);
+  assert.equal(compileCalls, 2, "retried compilation after cooldown elapsed");
+
+  // Missing compiler (ENOENT) disables permanently even after cooldown elapses.
+  resetWinLockHelperState();
+  let missingClock = 100_000;
+  const missingLocal = join(dir, "missing-local");
+  const missingCompiler = join(dir, "no-such-csc");
+  assert.equal(await resolveWinLockHelper(15_000, {
+    env: { LOCALAPPDATA: missingLocal },
+    compiler: missingCompiler,
+    now: () => missingClock,
+  }), undefined);
+  missingClock += WIN_LOCK_HELPER_COOLDOWN_MS * 10;
+  let invokedAfterDisable = 0;
+  assert.equal(await resolveWinLockHelper(15_000, {
+    env: { LOCALAPPDATA: missingLocal },
+    now: () => missingClock,
+    compile: async () => { invokedAfterDisable += 1; return builtExe; },
+  }), undefined);
+  assert.equal(invokedAfterDisable, 0, "missing compiler permanently disables retries");
+
+  // 3. Corrupt cached exe self-healing: crashing without "open: " deletes the cached exe and falls through to fallback,
+  // while a genuine "open: " lock-path rejection (e.g. directory or access denied) is NOT deleted and throws.
+  resetWinLockHelperState();
+  const corruptExe = join(dir, "corrupt-DsaLock.exe");
+  await writeFile(corruptExe, "#!/bin/sh\necho 'Unhandled Exception: BadImageFormatException' >&2\nexit 139\n", { mode: 0o755 });
+  const healedLock = new OsLock(3000, [
+    { command: corruptExe, args: [], pathInEnv: true, fallbackOnSpawnError: true, selfHealOnCrash: true },
+    { command: process.execPath, args: ["-e", "process.stdout.write('locked\\n'); process.stdin.resume();"], pathInEnv: true },
+  ]);
+  const handle = await healedLock.tryAcquire(join(dir, "healed.lock"));
+  assert.ok(handle, "crashed cached helper self-healed and fell through to fallback");
+  await handle.release();
+  await assert.rejects(stat(corruptExe), { code: "ENOENT" }, "corrupt cached exe was removed best-effort");
+
+  const validExe = join(dir, "valid-DsaLock.exe");
+  await writeFile(validExe, "#!/bin/sh\necho 'open: lock path is a directory' >&2\nexit 1\n", { mode: 0o755 });
+  let fallbackRan = false;
+  const openErrorLock = new OsLock(3000, [
+    { command: validExe, args: [], pathInEnv: true, fallbackOnSpawnError: true, selfHealOnCrash: true },
+    { command: process.execPath, args: ["-e", "process.stdout.write('locked\\n'); process.stdin.resume();"], pathInEnv: true },
+  ]);
+  await assert.rejects(
+    openErrorLock.tryAcquire(join(dir, "dir.lock")).then(h => { fallbackRan = true; return h; }),
+    /C4 lock helper exited \(1\): open: lock path is a directory/,
+  );
+  assert.equal(fallbackRan, false, "genuine 'open: ' lock-path error must not fall through");
+  assert.equal((await stat(validExe)).isFile(), true, "valid cached exe must not be deleted on 'open: ' error");
 });
 
 test("C3 fence never kills a pid whose start differs from the scanned identity (pid reuse)", { skip: process.platform !== "linux", timeout: 10000 }, async () => {
