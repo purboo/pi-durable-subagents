@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.6.0
 
 - **Native Windows support** (Node.js 22.19+ and 24, no WSL or POSIX tools required; based on #4):
   - **Kernel-released OS locks**: Windows file locks hold an exclusive `FileShare.None` file handle via a cached
