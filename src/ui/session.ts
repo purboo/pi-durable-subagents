@@ -1,7 +1,8 @@
 // Read-only session tailing (C5, P21): incomplete trailing records are never displayed.
-import { closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { fileIdentityKey, fstatIdentitySync, statIdentitySync } from "../kernel/fsx.ts";
 import { CT } from "../types.ts";
 import type { Live } from "../agent/child/live.ts";
 
@@ -19,7 +20,7 @@ export class SessionTail {
   get snapshotIdentity(): string | undefined { return this.pending || this.offset !== this.readSize ? undefined : this.readIdentity; }
   read(path: string): readonly SessionEntry[] {
     let stat;
-    try { stat = statSync(path); } catch (error) {
+    try { stat = statIdentitySync(path); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       this.reset(); return [];
     }
@@ -27,15 +28,15 @@ export class SessionTail {
     if (identity !== this.identity || stat.size < this.offset) { this.reset(); this.identity = identity; }
     if (this.failure) throw this.failure;
     if (stat.size === this.offset) {
-      if (!stat.size) this.readIdentity = `${stat.dev}:${stat.ino}:0`;
+      if (!stat.size) this.readIdentity = fileIdentityKey(stat);
       return this.entries;
     }
     const fd = openSync(path, "r");
     try {
-      stat = fstatSync(fd);
+      stat = fstatIdentitySync(fd);
       const openedIdentity = `${path}:${stat.dev}:${stat.ino}`;
       if (openedIdentity !== this.identity || stat.size < this.offset) { this.reset(); this.identity = openedIdentity; }
-      this.readIdentity = `${stat.dev}:${stat.ino}:${stat.size}`;
+      this.readIdentity = fileIdentityKey(stat);
       this.readSize = stat.size;
       const buffer = Buffer.alloc(Math.min(64 * 1024, stat.size - this.offset));
       while (this.offset < stat.size) {

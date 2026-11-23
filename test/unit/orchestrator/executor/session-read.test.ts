@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import type fs from "node:fs";
+import { appendFile, mkdtemp, open, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { replacePath } from "../../../../src/kernel/fsx.ts";
@@ -58,11 +59,44 @@ test("F3 an in-place rewrite that grows the session is detected by its first 4 K
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(file, line(1) + line(2));
   assert.deepEqual((await readSession(file)).map(e => e.id), ["e1", "e2"]);
-  const { ino } = await stat(file);
+  const { ino } = await stat(file, { bigint: true });
   // pi's _rewriteFile: same inode (truncate + write), different and longer content.
   await writeFile(file, line(11) + line(12) + line(13));
-  assert.equal((await stat(file)).ino, ino);
+  assert.equal((await stat(file, { bigint: true })).ino, ino);
   assert.deepEqual(await readSessionState(file), { entries: [line(11), line(12), line(13)].map(l => JSON.parse(l)), corrupt: [] });
   await writeFile(file, line(12) + line(11) + line(13));
   assert.deepEqual((await readSessionState(file)).entries.map(e => e.id), ["e12", "e11", "e13"], "a same-size rewrite is also re-read");
+});
+
+test("F3 equal-size session replacement beyond 4 KiB head is detected under adjacent huge 64-bit file IDs", async t => {
+  const root = await mkdtemp(join(tmpdir(), "dsa-session-huge-")), file = join(root, "session.jsonl"), next = join(root, "next.jsonl");
+  t.after(async () => { t.mock.restoreAll(); await rm(root, { recursive: true, force: true }); });
+  const sharedHead = JSON.stringify({ type: "custom", id: "head", data: { pad: "h".repeat(4500) } }) + "\n";
+  const tail = (id: string) => JSON.stringify({ type: "custom", id }) + "\n";
+  const firstBytes = sharedHead + tail("v1"), secondBytes = sharedHead + tail("v2");
+  assert.equal(Buffer.byteLength(firstBytes), Buffer.byteLength(secondBytes));
+  assert.ok(Buffer.byteLength(sharedHead) > 4096, "first 4 KiB digest is identical");
+
+  await writeFile(file, firstBytes);
+  await writeFile(next, secondBytes);
+  const probe = await open(file, "r");
+  const fhProto = Object.getPrototypeOf(probe);
+  await probe.close();
+  const realFhStat = fhProto.stat;
+  const baseDev = 9007199254740992n, baseIno = 9007199254740992n;
+  const assigned = new Map<string, { dev: bigint; ino: bigint }>();
+  let seq = 0n;
+  t.mock.method(fhProto, "stat", async function (this: { stat: typeof realFhStat }, opts?: fs.StatOptions) {
+    const big = await realFhStat.call(this, { ...opts, bigint: true }) as fs.BigIntStats;
+    const key = `${big.dev}:${big.ino}`;
+    let hit = assigned.get(key);
+    if (!hit) { hit = { dev: baseDev, ino: baseIno + seq++ }; assigned.set(key, hit); }
+    if (opts?.bigint) return Object.assign(big, hit);
+    const plain = await realFhStat.call(this, opts) as fs.Stats;
+    return Object.assign(plain, { dev: Number(hit.dev), ino: Number(hit.ino) });
+  });
+
+  assert.deepEqual((await readSession(file)).map(e => e.id), ["head", "v1"]);
+  await replacePath(next, file);
+  assert.deepEqual((await readSession(file)).map(e => e.id), ["head", "v2"], "adjacent 64-bit file ID invalidates cached session state");
 });

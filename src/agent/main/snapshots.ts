@@ -1,8 +1,9 @@
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { liveCommandCalls } from "../../orchestrator/executor/command.ts";
+import { statIdentitySync, type FileId } from "../../kernel/fsx.ts";
 import { forgetJournalSnapshot, journalAppends, readJournalFold, readJournalSnapshot, readJournalUncached, type JournalFold } from "../../kernel/journal.ts";
 import { journalPath } from "../../paths.ts";
 import { CT, JT, askText, type AttentionItem, type Entry } from "../../types.ts";
@@ -84,37 +85,37 @@ export function workflows(home: string, origin?: string, fresh = false): MainWor
 
 export { openGeneration };
 /** Whether one journal is unfinished, by file identity: a journal that has not changed is not read again. */
-const decided = new Map<string, { ino: number; size: number; unfinished: boolean }>();
-function unfinishedJournal(path: string, known?: { ino: number; size: number; entries: readonly Entry[] }): boolean {
+const decided = new Map<string, { dev: FileId; ino: FileId; size: number; unfinished: boolean }>();
+function unfinishedJournal(path: string, known?: { dev: FileId; ino: FileId; size: number; entries: readonly Entry[] }): boolean {
   let stat;
-  try { stat = statSync(path); }
+  try { stat = statIdentitySync(path); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; decided.delete(path); return true; } // no done yet
   const hit = decided.get(path);
-  if (hit && hit.ino === stat.ino && hit.size === stat.size) return hit.unfinished;
+  if (hit && hit.dev === stat.dev && hit.ino === stat.ino && hit.size === stat.size) return hit.unfinished;
   // Read without keeping the entries in the shared journal cache: a pi process scans every workflow only when no
   // orchestrator runs, and keeping every journal of the machine cost it hundreds of MB.
   const read = known ?? readJournalUncached(path);
   if (!read) { decided.delete(path); return true; }
   const unfinished = !read.entries.some(e => e.type === JT.done) || openGeneration(read.entries);
-  decided.set(path, { ino: read.ino, size: read.size, unfinished });
+  decided.set(path, { dev: read.dev, ino: read.ino, size: read.size, unfinished });
   return unfinished;
 }
 /** R3, F4: Whether a journal has a live command attempt (liveCommandCalls: an intent not withdrawn, of a call neither
  *  sealed nor retired). A hold never stops
  *  one, so an orchestrator must watch and seal it even while its workflow is held. Cached by file identity. */
-const commanded = new Map<string, { ino: number; size: number; running: boolean }>();
-function startedCommand(path: string, known?: { ino: number; size: number; entries: readonly Entry[] }): boolean {
+const commanded = new Map<string, { dev: FileId; ino: FileId; size: number; running: boolean }>();
+function startedCommand(path: string, known?: { dev: FileId; ino: FileId; size: number; entries: readonly Entry[] }): boolean {
   let stat;
-  try { stat = statSync(path); }
+  try { stat = statIdentitySync(path); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; commanded.delete(path); return false; }
-  if (!stat.isFile()) { commanded.delete(path); return false; } // unreadable held work stays held
+  if (!stat.stats.isFile()) { commanded.delete(path); return false; } // unreadable held work stays held
   const hit = commanded.get(path);
-  if (hit && hit.ino === stat.ino && hit.size === stat.size) return hit.running;
+  if (hit && hit.dev === stat.dev && hit.ino === stat.ino && hit.size === stat.size) return hit.running;
   let read = known;
   try { read ??= readJournalUncached(path); } catch { commanded.delete(path); return false; }
   if (!read) { commanded.delete(path); return false; }
   const running = liveCommandCalls(read.entries).length > 0;
-  commanded.set(path, { ino: read.ino, size: read.size, running });
+  commanded.set(path, { dev: read.dev, ino: read.ino, size: read.size, running });
   return running;
 }
 /** P1: Workflow-side pending work shared by every starter: a workflow without JT.done or with an unsealed generation,
@@ -201,7 +202,7 @@ function ask(scan: AskScan, line: string): void {
 }
 function answeredAsks(path: string): Set<string> | undefined {
   let stat;
-  try { stat = statSync(path); }
+  try { stat = statIdentitySync(path); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { asks.delete(path); return undefined; } throw error; }
   const identity = `${stat.dev}:${stat.ino}`;
   let scan = asks.get(path);

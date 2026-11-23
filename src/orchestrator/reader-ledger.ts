@@ -1,4 +1,5 @@
 // Pi-side ledger state: only projections used by readers, never decoded ledger history or run bodies.
+import { fileIdentityKey } from "../kernel/fsx.ts";
 import { forgetJournalSnapshot, readJournalFold, type JournalFold } from "../kernel/journal.ts";
 import { orchLedger, journalPath } from "../paths.ts";
 import { JT, type Entry, type Request, type RunBody } from "../types.ts";
@@ -106,7 +107,7 @@ export function readerLedger(home: string): JournalFold<ReaderLedger> {
     const record = readJournalFold(path, readers.get(path), emptyReaderLedger, applyReaderLedger, { needles });
     if (record) { record.state.state.seen = record.seen; readers.set(path, record); return record; }
     readers.delete(path);
-    return { dev: 0, ino: 0, size: 0, length: 0, seen: 0, state: emptyReaderLedger() };
+    return { dev: "0", ino: "0", size: 0, length: 0, seen: 0, state: emptyReaderLedger() };
   } catch (error) { readers.delete(path); throw error; } // a partial fold is never retried as an accepted prefix
 }
 export interface WakeStatus { to: string; state: 'pending' | 'applied' | 'skipped' | 'rejected'; rev?: number; generation?: number; reason?: string }
@@ -145,4 +146,4 @@ export function awaitingRuns(home: string, wid: string, key: string, revision: n
   }
   return out.length ? out : undefined;
 }
-export const readerLedgerIdentity = (record: Pick<JournalFold<ReaderLedger>, "dev" | "ino" | "size">): string => `${record.dev}:${record.ino}:${record.size}`;
+export const readerLedgerIdentity = (record: Pick<JournalFold<ReaderLedger>, "dev" | "ino" | "size">): string => fileIdentityKey(record);

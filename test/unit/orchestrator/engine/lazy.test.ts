@@ -3,16 +3,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFile, mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import fs, { existsSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { replacePath } from '../../../../src/kernel/fsx.ts';
 import { openJournal, frameLine } from '../../../../src/kernel/journal.ts';
 import { readCache, writeCache } from '../../../../src/kernel/cache.ts';
 import { publishRequest } from '../../../../src/kernel/mailbox.ts';
 import { journalPath, orchInbox, orchLedger } from '../../../../src/paths.ts';
 import { Engine } from '../../../../src/orchestrator/engine.ts';
-import { settledFacts, settledPath } from '../../../../src/orchestrator/settled.ts';
+import { readSettled, settledFacts, settledPath } from '../../../../src/orchestrator/settled.ts';
 import { statusView, workflowSnapshot } from '../../../../src/orchestrator/snapshot.ts';
 import { JT, type Request, type RunBody, type EvalToOrch, type OrchToEval } from '../../../../src/types.ts';
 import type { Ledgers } from '../../../../src/orchestrator/contract.ts';
@@ -243,4 +245,94 @@ test('settledFacts names why a workflow is not settled', async t => {
   assert.equal(typeof settledFacts(w, () => true), 'object');
   await w.journal.append('resumed', { rid: 'again', n: 9 });
   assert.equal(settledFacts(w, () => true), 'running');
+});
+
+test('old numeric settled caches safely miss and rebuild from source journal; adjacent huge 64-bit IDs reject equal-size replacement', async t => {
+  const f = await home(t), a = await f.boot(), w = await f.finished(a);
+  const path = settledPath(f.dir, w.wid), jPath = journalPath(f.dir, w.wid);
+  await f.close();
+
+  const current = readCache(path)! as { journal: Record<string, unknown> };
+  assert.equal(typeof current.journal.ino, 'string');
+  assert.equal(typeof current.journal.dev, 'string');
+
+  // Legacy numeric cache (rounded float64 ino without lossless decimal string IDs) safely misses and rebuilds.
+  writeCache(path, { ...current, journal: { ino: 9007199254740992, size: current.journal.size, count: current.journal.count, tail: current.journal.tail, tailLength: current.journal.tailLength } }, jPath);
+  assert.equal(readSettled(f.dir, w.wid), undefined);
+  const rebuiltBoot = await f.boot(), rebuiltWf = f.wf(rebuiltBoot, w.wid);
+  assert.equal(rebuiltWf.journal.loaded, true, 'missed legacy cache decodes source journal');
+  const recoverEntry = rebuiltBoot.ledgers.orch.entries().findLast(e => e.type === 'fake-recover' && e.wid === w.wid);
+  assert.ok(recoverEntry, 'recovery ran for the workflow');
+  assert.equal(recoverEntry.settled, undefined, 'full recovery runs against source journal');
+  await f.close();
+  const rebuiltCache = readCache(path)! as { journal: Record<string, unknown> };
+  assert.equal(typeof rebuiltCache.journal.ino, 'string');
+  assert.equal(typeof rebuiltCache.journal.dev, 'string');
+  const lazyAgain = await f.boot();
+  assert.equal(f.wf(lazyAgain, w.wid).journal.loaded, false, 'rebuilt cache opens lazily on next boot');
+  await f.close();
+
+  // Adjacent huge 64-bit IDs (9007199254740992n vs 9007199254740993n) on an equal-size journal replacement with identical tail.
+  const realStat = fs.statSync, realFstat = fs.fstatSync;
+  const base = 9007199254740992n;
+  assert.equal(Number(base), Number(base + 1n));
+  const jReal = realStat(jPath, { bigint: true });
+  const ids = new Map<string, bigint>([[`${jReal.dev}:${jReal.ino}`, base]]);
+  let nextOther = 4n;
+  const mapIno = (dev: bigint, ino: bigint) => {
+    const k = `${dev}:${ino}`;
+    let v = ids.get(k);
+    if (v === undefined) { v = base + nextOther++; ids.set(k, v); }
+    return v;
+  };
+  const patch = (big: fs.BigIntStats, wantBig: boolean) => {
+    const dev = base, ino = mapIno(big.dev, big.ino);
+    return Object.assign(big, wantBig ? { dev, ino } : { dev: Number(dev), ino: Number(ino) });
+  };
+  t.mock.method(fs, 'statSync', (p: fs.PathLike, opts?: fs.StatSyncOptions) => {
+    const big = realStat(p, { ...opts, bigint: true } as fs.StatSyncOptions & { bigint: true }) as fs.BigIntStats | undefined;
+    if (!big) return big;
+    if (opts?.bigint) return patch(big, true);
+    const plain = realStat(p, opts) as fs.Stats;
+    return Object.assign(plain, { dev: Number(base), ino: Number(mapIno(big.dev, big.ino)) });
+  });
+  t.mock.method(fs, 'fstatSync', (fd: number, opts?: fs.StatOptions) => {
+    const big = realFstat(fd, { ...opts, bigint: true }) as fs.BigIntStats;
+    if (opts?.bigint) return patch(big, true);
+    const plain = realFstat(fd, opts) as fs.Stats;
+    return Object.assign(plain, { dev: Number(base), ino: Number(mapIno(big.dev, big.ino)) });
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+
+  // Rewrite settled record under huge ID base (9007199254740992n), then replace journal with equal-size file (9007199254740993n).
+  await rm(path, { force: true });
+  const seeded = await f.boot();
+  assert.equal(f.wf(seeded, w.wid).journal.loaded, true);
+  await f.close();
+  const hugeRecord = readCache(path)! as { journal: { dev: string; ino: string } };
+  assert.equal(hugeRecord.journal.ino, base.toString());
+
+  const originalBytes = await readFile(jPath, 'utf8');
+  const lines = originalBytes.trimEnd().split('\n');
+  const firstEntry = JSON.parse(lines[0]!.slice(9)) as Record<string, unknown>;
+  // Replace one character in first entry while preserving exact byte length and identical final line.
+  const firstJson = JSON.stringify({ ...firstEntry, origin: String(firstEntry.origin).replace(/^cli:t/, 'cli:x') });
+  lines[0] = frameLine(firstJson).trimEnd();
+  const replacementBytes = lines.join('\n') + '\n';
+  assert.equal(Buffer.byteLength(replacementBytes), Buffer.byteLength(originalBytes));
+  assert.equal(lines.at(-1), originalBytes.trimEnd().split('\n').at(-1), 'identical last framed line');
+  const tmpReplace = `${jPath}.replace`;
+  await writeFile(tmpReplace, replacementBytes);
+  const replaceReal = realStat(tmpReplace, { bigint: true });
+  ids.set(`${replaceReal.dev}:${replaceReal.ino}`, base + 1n);
+  await replacePath(tmpReplace, jPath);
+
+  const afterReplace = await f.boot();
+  assert.equal(f.wf(afterReplace, w.wid).journal.loaded, true, 'equal-size replacement with adjacent 64-bit ino refuses lazy open');
+  assert.equal(f.wf(afterReplace, w.wid).journal.entries()[0]?.origin, 'cli:xest');
+  await f.close();
+  const rebuiltHuge = readCache(path)! as { journal: { dev: string; ino: string } };
+  assert.equal(rebuiltHuge.journal.ino, (base + 1n).toString());
+  assert.equal(Number(BigInt(hugeRecord.journal.ino)), Number(BigInt(rebuiltHuge.journal.ino)));
 });

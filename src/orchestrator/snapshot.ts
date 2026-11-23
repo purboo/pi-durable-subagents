@@ -1,9 +1,10 @@
 // Read-only status snapshots (P25: `status` is always a fresh snapshot). Pure readers of committed journals:
 // never depend on orchestrator memory, so the UI, the CLI and the main agent see the same durable state.
 import { initiatorSummary, restartLine } from "./restart.ts";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { FANOUT_BODIES } from "../compat/fanout.ts";
+import { fileIdentityKey, isFileId, isFileSize, statIdentitySync, type FileId } from "../kernel/fsx.ts";
 import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends, readJournalRecord, readJournalSnapshot, readJournalUncached, type JournalRecord } from "../kernel/journal.ts";
 import { readCache, writeCache } from "../kernel/cache.ts";
 import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
@@ -596,7 +597,7 @@ function digestVersion(): string {
   }
   return digestCode;
 }
-const digests = new Map<string, { dev: number; ino: number; size: number; digest: WorkflowDigest; checked: number; ledger?: string; appends: number }>();
+const digests = new Map<string, { dev: FileId; ino: FileId; size: number; digest: WorkflowDigest; checked: number; ledger?: string; appends: number }>();
 const FINAL_STATUS = new Set(["done", "failed", "stopped"]);
 /** Post-seal/recovery work that can append without a new request must not enter a polling trust window. */
 export function pendingRecovery(wid: string, entries: readonly Entry[]): boolean {
@@ -643,11 +644,13 @@ function digestOf(wf: WorkflowSnapshot, entries: readonly Entry[], complete: boo
   if (settled) for (const e of entries) if (e.type === "call") tasks[`${e.key}\0${e.gen}`] = String((e.spec as { task?: string } | undefined)?.task ?? "");
   return settled ? { snapshot: wf, settled: { attention: structuredClone(unresolvedAttention(entries)), tasks } } : { snapshot: wf };
 }
-type StoredDigest = { v: string; home: string; dev: number; ino: number; size: number; digest: WorkflowDigest };
-function storedDigest(home: string, wid: string, dev: number, ino: number, size: number): WorkflowDigest | undefined {
+type StoredDigest = { v: string; home: string; dev: FileId; ino: FileId; size: number; digest: WorkflowDigest };
+function storedDigest(home: string, wid: string, dev: FileId, ino: FileId, size: number): WorkflowDigest | undefined {
   const stored = readCache(join(digestDir(home), `${wid}.json`)) as StoredDigest | undefined;
   const d = stored?.digest, wf = d?.snapshot;
-  if (!(digestVersion() && stored?.v === digestVersion() && stored.home === home && stored.dev === dev && stored.ino === ino && stored.size === size &&
+  if (!(digestVersion() && stored?.v === digestVersion() && stored.home === home &&
+    isFileId(stored.dev) && isFileId(stored.ino) && isFileSize(stored.size) &&
+    stored.dev === dev && stored.ino === ino && stored.size === size &&
     d?.settled && Array.isArray(d.settled.attention) && d.settled.tasks && wf?.wid === wid && Array.isArray(wf.calls) &&
     Array.isArray(wf.attention) && wf.counts && FINAL_STATUS.has(wf.status) && !wf.active && !wf.followUps)) return undefined;
   // The reducer always sets pos with Number(e.pos); a missing position is NaN, which JSON represents as null.
@@ -679,8 +682,8 @@ export function workflowDigest(home: string, wid: string, ledger?: string): Work
   const path = pathsOf(home, wid).journal, memo = digests.get(path), now = Date.now();
   if (memo?.digest.settled) releasable.add(path);
   if (ledger !== undefined && memo?.digest.settled && memo.ledger === ledger && memo.appends === journalAppends() && now >= memo.checked && now - memo.checked < SETTLED_RECHECK_MS) return memo.digest;
-  let dev: number | undefined, ino: number | undefined, size: number | undefined;
-  try { ({ dev, ino, size } = statSync(path)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  let dev: FileId | undefined, ino: FileId | undefined, size: number | undefined;
+  try { ({ dev, ino, size } = statIdentitySync(path)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   if (memo && memo.dev === dev && memo.ino === ino && memo.size === size) {
     memo.ledger = ledger; memo.checked = now; memo.appends = journalAppends();
     return memo.digest;
@@ -699,7 +702,7 @@ export function workflowDigest(home: string, wid: string, ledger?: string): Work
 /** Settled journals a status listing checked without keeping their digest: the journal's identity and who owns the
  *  workflow. A listing covers every workflow of the machine (thousands) but shows only a few finished ones; keeping
  *  all their digests in `digests` cost each pi process hundreds of MB from its first `status` or `send`. */
-const settledMarks = new Map<string, { dev: number; ino: number; size: number; origin?: string; session?: string }>();
+const settledMarks = new Map<string, { dev: FileId; ino: FileId; size: number; origin?: string; session?: string }>();
 /** Replace a settled digest that no poller held before (`held`) by its mark: the next reader takes it from disk. */
 function markSettled(path: string): void {
   const memo = digests.get(path);
@@ -717,8 +720,8 @@ function settledFacts(home: string, wid: string): { origin?: string; session?: s
     settledMarks.delete(path);
     return digest.settled ? { origin: digest.snapshot.origin, session: digest.snapshot.session } : undefined;
   }
-  let dev: number, ino: number, size: number;
-  try { ({ dev, ino, size } = statSync(path)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; settledMarks.delete(path); return undefined; }
+  let dev: FileId, ino: FileId, size: number;
+  try { ({ dev, ino, size } = statIdentitySync(path)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; settledMarks.delete(path); return undefined; }
   const mark = settledMarks.get(path);
   if (mark && mark.dev === dev && mark.ino === ino && mark.size === size) return mark;
   const stored = storedDigest(home, wid, dev, ino, size);
@@ -894,12 +897,12 @@ export function heldWorkflows(home: string): { since?: number; held: (wid: strin
  *  (inode, size, ctime and mode: ctime ticks coarsely, so a chmod right after the failure may leave it unchanged) and
  *  the read is retried once that changes. A journal without its first
  *  entry yet is asked again. */
-const firstOrigins = new Map<string, { origin: unknown } | { failed: { ino: number; size: number; ctimeMs: number; mode: number } | undefined }>();
+const firstOrigins = new Map<string, { origin: unknown } | { failed: { dev: FileId; ino: FileId; size: number; ctimeNs: bigint; mode: bigint } | undefined }>();
 function firstOrigin(home: string, wid: string): unknown {
   const path = journalPath(home, wid), known = firstOrigins.get(path);
   if (known && "origin" in known) return known.origin;
-  const identity = () => { try { const st = statSync(path); return { ino: st.ino, size: st.size, ctimeMs: st.ctimeMs, mode: st.mode }; } catch { return undefined; } };
-  const same = (a: ReturnType<typeof identity>, b: ReturnType<typeof identity>) => !!a && !!b && a.ino === b.ino && a.size === b.size && a.ctimeMs === b.ctimeMs && a.mode === b.mode;
+  const identity = () => { try { const st = statIdentitySync(path); return { dev: st.dev, ino: st.ino, size: st.size, ctimeNs: st.stats.ctimeNs, mode: st.stats.mode }; } catch { return undefined; } };
+  const same = (a: ReturnType<typeof identity>, b: ReturnType<typeof identity>) => !!a && !!b && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.ctimeNs === b.ctimeNs && a.mode === b.mode;
   // The identity is taken before the read, and a failure is kept only when the file did not change during the read:
   // a chmod between the failed read and a later sample would otherwise be recorded as the failure's identity.
   const before = identity();
@@ -1029,7 +1032,7 @@ export function allWorkflows(home: string): WorkflowSnapshot[] {
   return snapshotsOf(home, workflowIds(home));
 }
 export function ledgerIdentity(record: JournalRecord | undefined): string {
-  return record ? `${record.dev}:${record.ino}:${record.size}` : "";
+  return record ? fileIdentityKey(record) : "";
 }
 function snapshotWithLedger(home: string, wid: string, ix: ReaderLedger, mark: string): WorkflowSnapshot {
   const pendingRevision = (ix.revisions.get(wid) ?? 0) > (digests.get(pathsOf(home, wid).journal)?.digest.snapshot.rev ?? 0);

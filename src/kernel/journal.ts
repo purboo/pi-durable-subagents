@@ -1,9 +1,9 @@
 import { open, mkdir, type FileHandle } from 'node:fs/promises';
-import { closeSync, constants, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync, readSync } from 'node:fs';
+import { closeSync, constants, fsyncSync, ftruncateSync, openSync, readFileSync, readSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as zlib from 'node:zlib';
 import type { Entry, JournalHandle } from '../types.ts';
-import { writeAt } from './fsx.ts';
+import { fstatIdentitySync, isFileId, isFileSize, statHandleIdentity, writeAt, type FileId } from './fsx.ts';
 
 const TABLE = new Uint32Array(256).map((_, n) => { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
 /** The CRC-32 (IEEE) of `bytes` as an unsigned number: node's native one when it has it (22.2+), else a table. */
@@ -73,7 +73,7 @@ export async function syncDirectory(path: string): Promise<void> {
 // only the bytes appended since the last read; a different inode or a shorter file is read from scratch.
 /** One read of a journal: its entries and the file they were read from. `length` is the committed bytes decoded; it
  *  is less than `size` while a torn or unfinished last line follows them. */
-export type JournalRecord = { dev: number; ino: number; size: number; length: number; entries: readonly Entry[] };
+export type JournalRecord = { dev: FileId; ino: FileId; size: number; length: number; entries: readonly Entry[] };
 const snapshots = new Map<string, JournalRecord>();
 /** A1, C11: Read a committed snapshot without repairing or writing its tail. The result is shared and frozen. */
 export function readJournalSnapshot(path: string): Entry[] {
@@ -94,7 +94,7 @@ export function readJournalRecord(path: string): JournalRecord | undefined {
   try { fd = openSync(path, 'r'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') { snapshots.delete(path); return undefined; } throw error; }
   try {
-    const { dev, ino, size } = fstatSync(fd), cached = snapshots.get(path);
+    const { dev, ino, size } = fstatIdentitySync(fd), cached = snapshots.get(path);
     if (cached && cached.dev === dev && cached.ino === ino && cached.size === size) return cached;
     const from = cached && cached.dev === dev && cached.ino === ino && size > cached.size ? cached.length : 0;
     const bytes = Buffer.alloc(size - from);
@@ -109,20 +109,20 @@ export function readJournalRecord(path: string): JournalRecord | undefined {
 /** A committed snapshot with the file identity it was read at, without keeping it in the shared snapshot cache (a
  *  cached snapshot of the same file is reused): for one-off scans over many journals whose entries are not needed
  *  again. `undefined` when the file does not exist. */
-export function readJournalUncached(path: string): { ino: number; size: number; entries: readonly Entry[] } | undefined {
+export function readJournalUncached(path: string): { dev: FileId; ino: FileId; size: number; entries: readonly Entry[] } | undefined {
   let fd: number;
   try { fd = openSync(path, 'r'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
   try {
-    const { dev, ino, size } = fstatSync(fd), cached = snapshots.get(path);
-    if (cached && cached.dev === dev && cached.ino === ino && cached.size === size) return { ino, size, entries: cached.entries };
+    const { dev, ino, size } = fstatIdentitySync(fd), cached = snapshots.get(path);
+    if (cached && cached.dev === dev && cached.ino === ino && cached.size === size) return { dev, ino, size, entries: cached.entries };
     const bytes = Buffer.alloc(size);
     for (let read = 0; read < bytes.length;) { const n = readSync(fd, bytes, read, bytes.length - read, read); if (!n) break; read += n; }
-    return { ino, size, entries: decode(bytes).entries };
+    return { dev, ino, size, entries: decode(bytes).entries };
   } finally { closeSync(fd); }
 }
 /** A compact reader's position, with no decoded history. `length` stops before an uncommitted tail. */
-export type JournalFold<T> = { dev: number; ino: number; size: number; length: number; seen: number; state: T };
+export type JournalFold<T> = { dev: FileId; ino: FileId; size: number; length: number; seen: number; state: T };
 /** Find candidate byte positions once per chunk, then advance only as JSON lines pass them. Latin-1 preserves
  *  byte offsets for literal multi-needle searches. Pending partial lines are included in the next chunk. */
 function lineCandidates(bytes: Buffer, needles: readonly Buffer[], pattern?: RegExp): (start: number, end: number) => boolean {
@@ -155,7 +155,7 @@ export function readJournalFold<T>(path: string, prior: JournalFold<T> | undefin
   try { fd = openSync(path, 'r'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
   try {
-    const { dev, ino, size } = fstatSync(fd);
+    const { dev, ino, size } = fstatIdentitySync(fd);
     if (prior && prior.dev === dev && prior.ino === ino && prior.size === size) return prior;
     const kept = prior && prior.dev === dev && prior.ino === ino && size >= prior.size;
     const record: JournalFold<T> = kept ? { ...prior, size } : { dev, ino, size, length: 0, seen: 0, state: empty() };
@@ -239,7 +239,7 @@ export async function openFoldedJournal(path: string, apply: (entry: Entry, offs
 }
 /** What a lazy open checks a journal against: its file identity and size, how many entries it has, and its last
  *  framed line (`tail`: its CRC-32, `tailLength`: its bytes with the newline). */
-export interface JournalExpectation { ino: number; size: number; count: number; tail: string; tailLength: number }
+export interface JournalExpectation { dev: FileId; ino: FileId; size: number; count: number; tail: string; tailLength: number }
 /** The expectation a journal handle meets now (its committed bytes, read back from the file), for a later lazy open;
  *  undefined when the file has no complete entry or does not end at the committed length. */
 export function journalExpectation(journal: JournalHandle): JournalExpectation | undefined {
@@ -248,12 +248,12 @@ export function journalExpectation(journal: JournalHandle): JournalExpectation |
   let fd: number;
   try { fd = openSync(journal.path, 'r'); } catch { return undefined; }
   try {
-    const { ino, size } = fstatSync(fd), tail = lastLine(fd, size);
+    const { dev, ino, size } = fstatIdentitySync(fd), tail = lastLine(fd, size);
     if (!tail) return undefined;
     // The last line must be the last committed entry (a torn tail is truncated by every open, never trusted).
     const json = unframeLine(tail.subarray(0, tail.length - 1));
     if (json === undefined || (JSON.parse(json) as Entry).seq !== count) return undefined;
-    return { ino, size, count, tail: crc32(tail), tailLength: tail.length };
+    return { dev, ino, size, count, tail: crc32(tail), tailLength: tail.length };
   } catch { return undefined; } finally { closeSync(fd); }
 }
 /** The last line of the file (with its newline), when the file ends with one. Reads from the end in chunks. */
@@ -276,11 +276,14 @@ function lastLine(fd: number, size: number): Buffer | undefined {
  *  (verifying it as openJournal does) on the first access to its entries or the first append. Undefined when the file
  *  is not what was expected: the caller opens it eagerly. Decoding later finds the same bytes or throws (one writer). */
 export async function openLazyJournal(path: string, expect: JournalExpectation): Promise<JournalHandle | undefined> {
+  if (!expect || !isFileId(expect.dev) || !isFileId(expect.ino) || !isFileSize(expect.size) ||
+      !Number.isSafeInteger(expect.count) || expect.count < 1 || !Number.isSafeInteger(expect.tailLength) ||
+      expect.tailLength < 10 || expect.tailLength > expect.size || typeof expect.tail !== 'string') return undefined;
   let fd: number;
   try { fd = openSync(path, 'r'); } catch { return undefined; }
   try {
-    const { ino, size } = fstatSync(fd);
-    if (ino !== expect.ino || size !== expect.size || expect.count < 1 || expect.tailLength < 10 || expect.tailLength > size) return undefined;
+    const { dev, ino, size } = fstatIdentitySync(fd);
+    if (dev !== expect.dev || ino !== expect.ino || size !== expect.size) return undefined;
     const tail = Buffer.alloc(expect.tailLength);
     for (let read = 0; read < tail.length;) { const n = readSync(fd, tail, read, tail.length - read, size - tail.length + read); if (!n) return undefined; read += n; }
     if (tail[tail.length - 1] !== 10 || tail.indexOf(10) !== tail.length - 1 || crc32(tail) !== expect.tail) return undefined;
@@ -292,20 +295,20 @@ export async function openLazyJournal(path: string, expect: JournalExpectation):
   return openHandle(path, expect);
 }
 /** Decode a journal synchronously as openJournal does (a torn tail is truncated), for a lazy handle's first access. */
-function loadSync(path: string, expect: JournalExpectation): { entries: Entry[]; size: number } {
+function loadSync(path: string, expect: JournalExpectation): { dev: FileId; ino: FileId; entries: Entry[]; size: number } {
   const fd = openSync(path, 'r+');
   try {
-    const { ino, size } = fstatSync(fd);
-    if (ino !== expect.ino || size !== expect.size) throw new Error(`Journal changed while not loaded: ${path} has ${size} bytes, ${expect.size} expected`);
+    const { dev, ino, size } = fstatIdentitySync(fd);
+    if (dev !== expect.dev || ino !== expect.ino || size !== expect.size) throw new Error(`Journal changed while not loaded: ${path} has ${size} bytes, ${expect.size} expected`);
     const bytes = readFileSync(fd), decoded = decode(bytes);
     if (decoded.entries.length !== expect.count) throw new Error(`Journal changed while not loaded: ${path} has ${decoded.entries.length} entries, ${expect.count} expected`);
     if (decoded.length !== bytes.length) { ftruncateSync(fd, decoded.length); fsyncSync(fd); }
-    return { entries: decoded.entries, size: decoded.length };
+    return { dev, ino, entries: decoded.entries, size: decoded.length };
   } finally { closeSync(fd); }
 }
 async function openHandle(path: string, lazy?: JournalExpectation, apply?: (entry: Entry, offset: number) => void): Promise<JournalHandle | undefined> {
-  let entries: Entry[] | undefined, size: number, file: FileHandle | undefined, count = lazy?.count ?? 0;
-  if (lazy) size = lazy.size;
+  let entries: Entry[] | undefined, dev: FileId, ino: FileId, size: number, file: FileHandle | undefined, count = lazy?.count ?? 0;
+  if (lazy) { dev = lazy.dev; ino = lazy.ino; size = lazy.size; }
   else {
   await mkdir(dirname(path), { recursive: true });
   let created = false;
@@ -321,7 +324,9 @@ async function openHandle(path: string, lazy?: JournalExpectation, apply?: (entr
       const decoded = decode(await first.readFile());
       entries = decoded.entries; size = decoded.length; count = entries.length;
     }
-    if (size !== (await first.stat()).size) { await first.truncate(size); await first.sync(); }
+    const stat = await statHandleIdentity(first);
+    dev = stat.dev; ino = stat.ino;
+    if (size !== stat.size) { await first.truncate(size); await first.sync(); }
     if (created) { await first.sync(); await syncDirectory(dirname(path)); }
   } catch (error) { await first.close(); throw error; }
   file = first;
@@ -330,7 +335,7 @@ async function openHandle(path: string, lazy?: JournalExpectation, apply?: (entr
   /** The entries, decoding a lazy handle's file first. */
   const all = (): Entry[] => {
     if (apply) throw new Error('Folded journal does not retain entries');
-    if (!entries) { const loaded = loadSync(path, lazy!); entries = loaded.entries; size = loaded.size; }
+    if (!entries) { const loaded = loadSync(path, lazy!); dev = loaded.dev; ino = loaded.ino; entries = loaded.entries; size = loaded.size; }
     return entries;
   };
   let queue: Promise<unknown> = Promise.resolve(), closed = false, failed: unknown, view: Entry[] | undefined;
@@ -340,7 +345,11 @@ async function openHandle(path: string, lazy?: JournalExpectation, apply?: (entr
   const reopen = async (): Promise<FileHandle> => {
     if (file) return file;
     const f = await open(path, constants.O_RDWR);
-    try { const now = (await f.stat()).size; if (now !== size) throw new Error(`Journal changed while closed: ${path} has ${now} bytes, ${size} committed`); }
+    try {
+      const now = await statHandleIdentity(f);
+      if (now.dev !== dev || now.ino !== ino || now.size !== size)
+        throw new Error(`Journal changed while closed: ${path} has ${now.size} bytes, ${size} committed`);
+    }
     catch (error) { await f.close(); throw error; }
     descriptors++;
     return file = f;

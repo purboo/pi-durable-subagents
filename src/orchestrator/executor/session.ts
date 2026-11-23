@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
+import { statHandleIdentity, type FileId } from "../../kernel/fsx.ts";
 import { ASK_CUT, CT } from "../../types.ts";
 import type { Model } from "../../compat/model.ts";
 
@@ -14,7 +15,7 @@ export interface SessionState { entries: SessionEntry[]; corrupt: readonly numbe
 // the bytes appended since the last read. A different inode, a shorter file or a changed first 4 KiB (pi rewrites a
 // session in place when it migrates or initializes it) is read from scratch.
 const HEAD = 4096;
-const cache = new Map<string, { ino: number; size: number; length: number; lines: number; head: string; headLength: number; state: SessionState }>();
+const cache = new Map<string, { dev: FileId; ino: FileId; size: number; length: number; lines: number; head: string; headLength: number; state: SessionState }>();
 const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const EMPTY: SessionState = { entries: [], corrupt: [] };
 /** C5, E4, F3: Read complete native entries incrementally; an unfinished trailing line is ignored and a malformed
@@ -24,11 +25,11 @@ export async function readSessionState(path: string): Promise<SessionState> {
   const file = await open(path, "r").catch(error => { if (error.code === "ENOENT") return undefined; throw error; });
   if (!file) { cache.delete(path); return EMPTY; }
   try {
-    const { ino, size } = await file.stat();
+    const { dev, ino, size } = await statHandleIdentity(file);
     const head = Buffer.alloc(Math.min(HEAD, size));
     for (let read = 0; read < head.length;) { const { bytesRead } = await file.read(head, read, head.length - read, read); if (!bytesRead) break; read += bytesRead; }
     let cached = cache.get(path);
-    if (cached && (cached.ino !== ino || size < cached.size || digest(head.subarray(0, cached.headLength)) !== cached.head)) cached = undefined;
+    if (cached && (cached.dev !== dev || cached.ino !== ino || size < cached.size || digest(head.subarray(0, cached.headLength)) !== cached.head)) cached = undefined;
     if (cached && cached.size === size) return cached.state;
     const prior = cached, from = prior?.length ?? 0;
     const bytes = Buffer.alloc(size - from);
@@ -43,7 +44,7 @@ export async function readSessionState(path: string): Promise<SessionState> {
     }
     const state = prior && !entries.length && !corrupt.length ? prior.state : {
       entries: prior ? prior.state.entries.concat(entries) : entries, corrupt: prior ? prior.state.corrupt.concat(corrupt) : corrupt };
-    cache.set(path, { ino, size, length: from + offset, lines, head: digest(head), headLength: head.length, state });
+    cache.set(path, { dev, ino, size, length: from + offset, lines, head: digest(head), headLength: head.length, state });
     return state;
   } finally { await file.close(); }
 }

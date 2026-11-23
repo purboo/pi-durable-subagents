@@ -13,7 +13,7 @@ test('older settled records discard fenced process lineage while preserving ever
   const home = await mkdtemp(join(tmpdir(), 'dsa-settled-memory-'));
   const path = journalPath(home, 'w'), journal = await openJournal(path);
   t.after(async () => { await journal.close(); await rm(home, { recursive: true, force: true }); });
-  const record = { v: SETTLED_VERSION, recovery: RECOVERY_VERSION, wid: 'w', journal: { size: 1 },
+  const record = { v: SETTLED_VERSION, recovery: RECOVERY_VERSION, wid: 'w', journal: { dev: '1', ino: '2', size: 1 },
     done: { type: 'workflow-done', status: 'done' }, revision: 1, resumed: [], calls: 2,
     sweep: [{ exec: 'w@1/a@1#1.1', call: 'w@1/a@1', tracked: ['4242 77'] }, { exec: 'w@1/b@1#1.1', call: 'w@1/b@1', tracked: [] }] };
   writeCache(settledPath(home, 'w'), record, path);

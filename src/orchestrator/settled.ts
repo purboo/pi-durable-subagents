@@ -7,6 +7,7 @@
 import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { readCache, writeCache } from "../kernel/cache.ts";
+import { isFileId, isFileSize } from "../kernel/fsx.ts";
 import { journalExpectation, type JournalExpectation } from "../kernel/journal.ts";
 import { cacheDir, journalPath } from "../paths.ts";
 import { JT, isEntry, type Entry, type JournalHandle } from "../types.ts";
@@ -105,7 +106,7 @@ export function settledFacts(wf: Workflow, recovered: (call: string) => boolean)
 export function readSettled(home: string, wid: string): SettledRecord | undefined {
   const record = readCache(settledPath(home, wid)) as SettledRecord | undefined;
   if (!record || record.v !== SETTLED_VERSION || record.recovery !== RECOVERY_VERSION || record.wid !== wid) return undefined;
-  if (!record.journal || typeof record.journal.size !== "number" || !record.done || typeof record.revision !== "number" || !Array.isArray(record.sweep) || !Array.isArray(record.resumed)) return undefined;
+  if (!record.journal || !isFileId(record.journal.dev) || !isFileId(record.journal.ino) || !isFileSize(record.journal.size) || !record.done || typeof record.revision !== "number" || !Array.isArray(record.sweep) || !Array.isArray(record.resumed)) return undefined;
   // Version 2 records held fenced tags with obsolete pid/start lineage. Keep their tags only; no rebuild is needed.
   const tags: string[] = [];
   for (const s of record.sweep as unknown[]) {

@@ -1,8 +1,9 @@
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { UiDeps } from "../agent/main.ts";
+import { fileIdentityKey, isFileIdentityKey, statIdentitySync } from "../kernel/fsx.ts";
 import { crc32, readJournalSnapshot } from "../kernel/journal.ts";
 type Entry = ReturnType<typeof readJournalSnapshot>[number];
 import { readCache, writeCache } from "../kernel/cache.ts";
@@ -64,14 +65,15 @@ function factsVersion(): string {
   return factsCode;
 }
 type StoredFacts = { v: string; callId: string; endedAt: number; session: string; facts: Facts };
-const sessionIdentity = (path: string) => { try { const s = statSync(path); return `${s.dev}:${s.ino}:${s.size}`; } catch { return "none"; } };
+const sessionIdentity = (path: string) => { try { return fileIdentityKey(statIdentitySync(path)); } catch { return "none"; } };
 function factsPath(home: string, wid: string, key: string, gen: number): string { return join(factsDir(home), wid, `${encodeURIComponent(key)}@${gen}.json`); }
 function storedFacts(path: string, callId: string, endedAt: number, session: string): Facts | undefined {
   const v = factsVersion();
   if (!v) return undefined;
   try {
     const stored = readCache(path) as StoredFacts | undefined;
-    return stored?.v === v && stored.callId === callId && stored.endedAt === endedAt && stored.session === session &&
+    const validSession = stored?.session === "none" || isFileIdentityKey(stored?.session);
+    return stored?.v === v && stored.callId === callId && stored.endedAt === endedAt && validSession && stored.session === session &&
       typeof stored.facts?.task === "string" && typeof stored.facts.latest === "string" && Number.isFinite(stored.facts.tools) ? { ...stored.facts, model: stored.facts.model, thinking: stored.facts.thinking, activity: stored.facts.activity, live: undefined } : undefined;
   } catch { return undefined; }
 }
@@ -116,7 +118,7 @@ export class UiData {
   private readConfig(): boolean {
     const path = join(this.home, "config.json");
     let identity = "none";
-    try { const s = statSync(path); identity = `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`; } catch { /* optional */ }
+    try { const s = statIdentitySync(path); identity = `${fileIdentityKey(s)}:${s.stats.mtimeNs}:${s.stats.ctimeNs}`; } catch { /* optional */ }
     if (identity === this.configIdentity) return false;
     this.configIdentity = identity;
     try {

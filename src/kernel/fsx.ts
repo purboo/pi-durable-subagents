@@ -1,10 +1,61 @@
-// Cross-platform filesystem primitives the durable writers share. Windows refuses to replace a file that another
-// handle has open (POSIX allows it), so a replacement retries briefly: readers close their handles, and a live writer
-// closes its own handle around the rename.
-import { renameSync, unlinkSync, writeFileSync } from "node:fs";
+// Cross-platform filesystem primitives the durable writers and derived-cache readers share. Windows refuses to replace
+// a file that another handle has open (POSIX allows it), so a replacement retries briefly: readers close their handles,
+// and a live writer closes its own handle around the rename. File identities (`dev`, `ino`) are read as `bigint`s and
+// kept as canonical lossless decimal strings so 64-bit NTFS/ReFS file IDs above 2^53 never collide under IEEE-754 rounding.
+import fs, { renameSync, unlinkSync, writeFileSync, type BigIntStats } from "node:fs";
 import { rename, unlink, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
+
+/** Canonical unsigned decimal string representation of a 64-bit device or file identifier. */
+export type FileId = string;
+export interface FileIdentity { dev: FileId; ino: FileId; size: number }
+
+const DECIMAL_ID = /^(?:0|[1-9]\d*)$/;
+const MAX_SAFE_SIZE = BigInt(Number.MAX_SAFE_INTEGER);
+
+/** Whether `value` is a canonical unsigned decimal file/device ID string (never a float-rounded JSON number). */
+export function isFileId(value: unknown): value is FileId {
+  return typeof value === "string" && DECIMAL_ID.test(value);
+}
+/** Whether `value` is a non-negative safe integer byte length. */
+export function isFileSize(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function toFileId(value: bigint, name: string): FileId {
+  if (typeof value !== "bigint" || value < 0n) throw new RangeError(`Invalid ${name}: ${String(value)}`);
+  return value.toString();
+}
+/** Convert a `bigint` stat size to a validated non-negative safe integer `number`. */
+export function toFileSize(value: bigint): number {
+  if (typeof value !== "bigint" || value < 0n || value > MAX_SAFE_SIZE) throw new RangeError(`Invalid file size: ${String(value)}`);
+  return Number(value);
+}
+export function fileIdentityOf(stat: Pick<BigIntStats, "dev" | "ino" | "size">): FileIdentity {
+  return { dev: toFileId(stat.dev, "device id"), ino: toFileId(stat.ino, "file id"), size: toFileSize(stat.size) };
+}
+export function fileIdentityKey(id: FileIdentity): string {
+  return `${id.dev}:${id.ino}:${id.size}`;
+}
+export function isFileIdentityKey(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parts = value.split(":");
+  if (parts.length !== 3) return false;
+  const [dev, ino, size] = parts;
+  return isFileId(dev) && isFileId(ino) && isFileId(size) && isFileSize(Number(size));
+}
+export function statIdentitySync(path: string): FileIdentity & { stats: BigIntStats } {
+  const stats = fs.statSync(path, { bigint: true });
+  return { ...fileIdentityOf(stats), stats };
+}
+export function fstatIdentitySync(fd: number): FileIdentity & { stats: BigIntStats } {
+  const stats = fs.fstatSync(fd, { bigint: true });
+  return { ...fileIdentityOf(stats), stats };
+}
+export async function statHandleIdentity(file: FileHandle): Promise<FileIdentity & { stats: BigIntStats }> {
+  const stats = await file.stat({ bigint: true });
+  return { ...fileIdentityOf(stats), stats };
+}
 
 const WIN_SHARING_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 const SYNC_WAIT_BUF = new Int32Array(new SharedArrayBuffer(4));
