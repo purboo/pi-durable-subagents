@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import type { LockHandle, OsLock as Contract } from "../types.ts";
+import { powershellPath } from "./windows.ts";
 
 const perl = `use Fcntl qw(:flock); $|=1;
 open(my $f, ">>", $ARGV[0]) or do { warn "open: $!"; exit 1; };
@@ -14,80 +15,87 @@ except OSError as e:
 print('locked',flush=True)
 while sys.stdin.buffer.read(4096): pass
 `;
-/** Windows has no flock. A helper holds an atomically created lock directory; its owner record and a stale reclaim on
- *  the next attempt cover a holder that was killed without releasing. The holder's stdin gives the same release-on-
- *  parent-death property the Unix helpers get from their pipe. */
-const node = `import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-const path = process.argv[1];
-const token = process.pid + ":" + Math.round(performance.timeOrigin);
-const owner = join(path, "owner.json");
-let held = false;
-function alive(pid) { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } }
-function ownerPid() { try { const info = JSON.parse(readFileSync(owner, "utf8")); return info && typeof info.pid === "number" ? info.pid : 0; } catch { return 0; } }
-function claim() {
-  for (let tries = 0; tries < 20; tries++) {
-    try { mkdirSync(path); writeFileSync(owner, JSON.stringify({ pid: process.pid, token })); return true; }
-    catch (e) {
-      if (e.code !== "EEXIST") throw e;
-      let pid = ownerPid();
-      // The holder may be between mkdir and its owner write. Wait briefly for the owner record instead of reporting
-      // the lock held: a burst of CLI senders would otherwise all miss the same short window.
-      for (let wait = 0; !pid && wait < 40; wait++) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-        pid = ownerPid();
-      }
-      if (pid && alive(pid)) return false;
-      if (!pid) { try { if (Date.now() - statSync(path).mtimeMs < 2000) return false; } catch { /* vanished: retry */ } }
-      // A crashed holder left the directory. Rename it aside first: one contender wins the rename, so two cannot both
-      // remove and create the same lock.
-      const grave = path + ".stale." + process.pid + "." + Math.random().toString(36).slice(2);
-      try { renameSync(path, grave); rmSync(grave, { recursive: true, force: true }); } catch { /* another contender */ }
-    }
-  }
-  return false;
+/** Windows has no flock, Node's fs.open shares files on Win32, and foreign PID checks can race PID reuse or fail to
+ *  prove handle ownership. PowerShell opens the lock file with .NET FileStream and FileShare.None (dwShareMode = 0), so
+ *  the Windows kernel refuses every other open, rename or delete while the handle lives and releases it at once when
+ *  the helper dies (C4). Only Win32 sharing/lock violations (0x80070020 / 0x80070021) exit 2 (held); access denied, an
+ *  existing directory at the lock path or a missing parent directory exits 1 without deleting or renaming anything. */
+const powershell =
+  "$ErrorActionPreference = 'Stop'; " +
+  "$p = $env:DSA_LOCK_PATH; " +
+  "if ([string]::IsNullOrEmpty($p)) { [System.Console]::Error.WriteLine('open: empty lock path'); [System.Environment]::Exit(1) }; " +
+  "try { " +
+  "$fs = [System.IO.FileStream]::new($p, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) " +
+  "} catch { " +
+  "$e = $_.Exception; " +
+  "while ($e -and -not ($e -is [System.IO.IOException]) -and $e.InnerException) { $e = $e.InnerException }; " +
+  "$hr = if ($e) { [int]$e.HResult } else { 0 }; " +
+  "if ($e -is [System.IO.IOException] -and ($hr -eq -2147024864 -or $hr -eq -2147024863)) { [System.Environment]::Exit(2) }; " +
+  "try { " +
+  "if ([System.IO.Directory]::Exists($p)) { [System.Console]::Error.WriteLine(\"open: lock path is a directory: $p\"); [System.Environment]::Exit(1) }; " +
+  "$msg = if ($e) { \"$($e.GetType().Name) (0x$($hr.ToString('x8'))): $($e.Message)\" } else { \"$_\" }; " +
+  "[System.Console]::Error.WriteLine(\"open: $msg\") " +
+  "} catch {}; " +
+  "[System.Environment]::Exit(1) " +
+  "}; " +
+  "try { " +
+  "$out = [System.Console]::OpenStandardOutput(); " +
+  "$out.Write([byte[]](108,111,99,107,101,100,10), 0, 7); " +
+  "$out.Flush(); " +
+  "$in = [System.Console]::OpenStandardInput(); " +
+  "while ($in.ReadByte() -ge 0) {} " +
+  "} catch {}; " +
+  "try { $fs.Close() } catch {}; " +
+  "[System.GC]::KeepAlive($fs); " +
+  "[System.Environment]::Exit(0)";
+
+export interface LockHelper {
+  readonly command: string;
+  readonly args: readonly string[];
+  /** Pass `path` in `DSA_LOCK_PATH` instead of argv (`powershell.exe -Command` parses trailing argv as script text). */
+  readonly pathInEnv?: boolean;
 }
-function release() {
-  if (!held) return;
-  held = false;
-  try { const info = JSON.parse(readFileSync(owner, "utf8")); if (info.token !== token) return; } catch { return; }
-  try { rmSync(path, { recursive: true, force: true }); } catch { /* gone */ }
-}
-if (!claim()) process.exit(2);
-held = true;
-process.on("exit", release);
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) process.on(signal, () => { release(); process.exit(0); });
-process.stdout.write("locked\\n");
-process.stdin.resume();
-process.stdin.on("end", () => { release(); process.exit(0); });
-`;
-const helpers = () => process.platform === "win32"
-  ? [[process.execPath, ["--input-type=module", "-e", node]] as const]
-  : [["perl", ["-e", perl]] as const, ["python3", ["-c", python]] as const];
+
+const defaultHelpers = (): readonly LockHelper[] => process.platform === "win32"
+  ? [{ command: powershellPath(), args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", powershell], pathInEnv: true }]
+  : [{ command: "perl", args: ["-e", perl] }, { command: "python3", args: ["-c", python] }];
 
 /** The error code of a helper that did not answer in time (a slow or suspended machine): transient, not a broken lock. */
 export const LOCK_TIMEOUT = "DSA_LOCK_TIMEOUT";
 export function isLockTimeout(error: unknown): boolean { return (error as { code?: unknown } | undefined)?.code === LOCK_TIMEOUT; }
 
-/** C4: A kernel flock held by a helper whose stdin belongs only to the holder. */
+/** C4: A kernel lock held by a helper whose stdin belongs only to the holder: `flock` through perl or python3 on
+ *  Linux/macOS, a `FileShare.None` `FileStream` handle through Windows PowerShell on Windows. */
 export class OsLock implements Contract {
-  /** `timeoutMs` bounds how long the helper may take to answer (3 s by default; background callers allow more). */
+  /** `timeoutMs` bounds how long the helper may take to answer (3 s on Unix, 15 s on Windows for cold PowerShell
+   *  startup; background callers allow 15 s everywhere). */
   private readonly timeoutMs: number;
-  constructor(timeoutMs = 3000) { this.timeoutMs = timeoutMs; }
+  private readonly candidates?: readonly LockHelper[];
+  constructor(timeoutMs = process.platform === "win32" ? 15_000 : 3000, candidates?: readonly LockHelper[]) {
+    this.timeoutMs = timeoutMs;
+    this.candidates = candidates;
+  }
   /** C4: Attempt non-blocking exclusion; holder death closes the helper's stdin. */
   async tryAcquire(path: string): Promise<LockHandle | null> {
     const win = process.platform === "win32";
-    if (!win && process.platform !== "linux" && process.platform !== "darwin") throw new Error(`C4 capability unavailable: ${process.platform}`);
-    // The helper runs on the orchestrator's own Node on Windows: no perl/python3 is installed by default there.
-    for (const [command, args] of helpers().map(([c, a]) => [c, [...a, path]] as const)) {
-      const child = spawn(command, [...args], { stdio: "pipe", windowsHide: true });
+    if (!this.candidates && !win && process.platform !== "linux" && process.platform !== "darwin") {
+      throw new Error(`C4 capability unavailable: ${process.platform}`);
+    }
+    for (const candidate of this.candidates ?? defaultHelpers()) {
+      const args = candidate.pathInEnv ? [...candidate.args] : [...candidate.args, path];
+      const env = candidate.pathInEnv ? { ...process.env, DSA_LOCK_PATH: path } : process.env;
+      const child = spawn(candidate.command, args, { stdio: "pipe", env, windowsHide: true });
       let errorText = "";
       child.stderr.on("data", chunk => { errorText = (errorText + chunk).slice(-4096); });
       child.stdin.on("error", () => {});
-      const ended = new Promise<number | null>((resolve, reject) => {
+      const exited = new Promise<number | null>((resolve, reject) => {
         child.once("error", reject); child.once("exit", resolve);
       });
-      void ended.catch(() => {});
+      const closed = new Promise<number | null>((resolve, reject) => {
+        child.once("error", reject); child.once("close", resolve);
+      });
+      void exited.catch(() => {});
+      void closed.catch(() => {});
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const acquired = await Promise.race([
@@ -99,7 +107,7 @@ export class OsLock implements Contract {
               else if (output.includes("\n")) reject(new Error("Invalid lock helper response"));
             });
           }),
-          ended.then(code => {
+          closed.then(code => {
             if (code === 2) return false;
             throw new Error(`C4 lock helper exited (${code}): ${errorText}`);
           }),
@@ -110,15 +118,15 @@ export class OsLock implements Contract {
         return { release: () => release ??= (async () => {
           child.stdin.end();
           const kill = setTimeout(() => child.kill("SIGKILL"), 1000);
-          try { await ended; } finally { clearTimeout(kill); }
+          try { await exited; } finally { clearTimeout(kill); }
         })() };
       } catch (error) {
         child.kill("SIGKILL");
-        await ended.catch(() => {});
+        await exited.catch(() => {});
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
       } finally { clearTimeout(timer); }
     }
-    throw new Error(process.platform === "win32" ? "C4 capability unavailable: the lock helper did not start" : "C4 capability unavailable: install perl or python3 for flock");
+    throw new Error(win ? "C4 capability unavailable: PowerShell lock helper was not found" : "C4 capability unavailable: install perl or python3 for flock");
   }
 }

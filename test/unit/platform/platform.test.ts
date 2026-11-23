@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,17 +10,18 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
 import { Containment } from "../../../src/platform/containment.ts";
-import { OsLock } from "../../../src/platform/lock.ts";
+import { OsLock, isLockTimeout } from "../../../src/platform/lock.ts";
 import type { Spawned } from "../../../src/types.ts";
 
+const WAIT_MS = process.platform === "win32" ? 15000 : 4000;
 async function until<T>(fn: () => Promise<T | undefined>): Promise<T> {
-  const end = Date.now() + 4000;
+  const end = Date.now() + WAIT_MS;
   while (Date.now() < end) { const value = await fn(); if (value !== undefined) return value; await delay(20); }
   throw new Error("Timed out waiting for process evidence");
 }
 function line(child: ChildProcess): Promise<string> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("No child response")), 4000);
+    const timer = setTimeout(() => reject(new Error("No child response")), WAIT_MS);
     let text = "";
     child.stdout!.on("data", chunk => { text += chunk; if (text.includes("\n")) { clearTimeout(timer); resolve(text.trim()); } });
     child.once("error", error => { clearTimeout(timer); reject(error); });
@@ -203,7 +204,7 @@ function holder(path: string): ChildProcess {
   `, path], { stdio: "pipe" });
 }
 
-test("OS lock releases on holder SIGKILL and exactly one concurrent acquirer succeeds", { timeout: 15000 }, async () => {
+test("OS lock releases on holder SIGKILL and exactly one concurrent acquirer succeeds", { timeout: process.platform === "win32" ? 45000 : 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "dsa-lock-")); const path = join(dir, "lock");
   const children: ChildProcess[] = []; const lock = new OsLock();
   try {
@@ -244,6 +245,121 @@ test("issue #2: a lock helper that does not answer in time fails with the transi
     assert.equal(out.timeout, true); assert.match(out.message, /^C4 lock helper timeout \(400 ms\)$/);
     assert.ok(out.ms >= 380 && out.ms < 3000, `${out.ms} ms`);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("OS lock releases when the helper dies directly, never steals a live lock, and holds an exclusive file on Windows", { timeout: process.platform === "win32" ? 45000 : 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dsa-lock-file-"));
+  const path = join(dir, "orch $' (1).lock");
+  const table = new ProcessTable();
+  const lock = new OsLock();
+  let first: Awaited<ReturnType<OsLock["tryAcquire"]>> = null;
+  let recovered: Awaited<ReturnType<OsLock["tryAcquire"]>> = null;
+  try {
+    const before = new Set((await table.list(new Set(), { fresh: true })).filter(p => p.ppid === process.pid).map(p => `${p.pid}:${p.start}`));
+    first = await lock.tryAcquire(path);
+    assert.ok(first);
+    assert.equal((await stat(path)).isFile(), true);
+    if (process.platform === "win32") {
+      await assert.rejects(open(path, "r"), /EBUSY|EPERM|EACCES/);
+      await assert.rejects(rename(path, `${path}.moved`), /EBUSY|EPERM|EACCES/);
+      await assert.rejects(unlink(path), /EBUSY|EPERM|EACCES/);
+    }
+    // Past the old 2 s directory stale window, concurrent contenders still get null and never steal the live lock.
+    await delay(2200);
+    assert.deepEqual(await Promise.all([lock.tryAcquire(path), lock.tryAcquire(path), lock.tryAcquire(path)]), [null, null, null]);
+    const helper = await until(async () => (await table.list(new Set(), { fresh: true }))
+      .find(p => p.ppid === process.pid && !before.has(`${p.pid}:${p.start}`)));
+    process.kill(helper.pid, "SIGKILL");
+    await until(async () => {
+      const live = await table.list(new Set(), { fresh: true });
+      return live.some(p => p.pid === helper.pid && p.start === helper.start) ? undefined : true;
+    });
+    assert.equal((await stat(path)).isFile(), true);
+    recovered = await until(async () => (await lock.tryAcquire(path)) ?? undefined);
+    // Releasing the dead first handle is a clean no-op and never disturbs the new holder.
+    await first.release();
+    first = null;
+    assert.equal(await lock.tryAcquire(path), null);
+    await recovered.release();
+    recovered = null;
+    const handle = await open(path, "r");
+    await handle.close();
+  } finally {
+    await first?.release().catch(() => {});
+    await recovered?.release().catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("OS lock classifies access denied and existing directories as errors without deleting unverified paths", { timeout: process.platform === "win32" ? 30000 : 10000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dsa-lock-unverified-"));
+  const lock = new OsLock();
+  const dirLock = join(dir, "orchestrator.lock");
+  const roLock = join(dir, "readonly.lock");
+  try {
+    await mkdir(dirLock);
+    await writeFile(join(dirLock, "owner.json"), JSON.stringify({ pid: 999999, token: "999999:1" }));
+    await writeFile(join(dirLock, "keep.txt"), "unverified");
+    const old = new Date(Date.now() - 600_000);
+    await utimes(dirLock, old, old);
+    await assert.rejects(lock.tryAcquire(dirLock), /C4 lock helper exited \(1\):[\s\S]*open:/i);
+    assert.equal((await stat(dirLock)).isDirectory(), true);
+    assert.equal(await readFile(join(dirLock, "keep.txt"), "utf8"), "unverified");
+    assert.match(await readFile(join(dirLock, "owner.json"), "utf8"), /999999/);
+
+    if (process.platform === "win32" || process.getuid?.() !== 0) {
+      await writeFile(roLock, "");
+      await chmod(roLock, 0o444);
+      try {
+        await assert.rejects(lock.tryAcquire(roLock), /C4 lock helper exited \(1\):[\s\S]*open:/i);
+      } finally {
+        await chmod(roLock, 0o666).catch(() => {});
+      }
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("OS lock helper protocol covers timeout, malformed response, ENOENT fallback and hung release on every platform", { timeout: 25000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dsa-lock-proto-"));
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      new OsLock(300, [{ command: process.execPath, args: ["-e", "setTimeout(()=>{},10000)"] }]).tryAcquire(join(dir, "slow.lock")),
+      error => isLockTimeout(error) && /^C4 lock helper timeout \(300 ms\)$/.test((error as Error).message),
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 250 && elapsed < 10000, `${elapsed} ms`);
+
+    await assert.rejects(
+      new OsLock(3000, [{ command: process.execPath, args: ["-e", "process.stdout.write('bogus\\n')"] }]).tryAcquire(join(dir, "bad.lock")),
+      /Invalid lock helper response/,
+    );
+
+    const missing = join(dir, "no-such-lock-helper");
+    await assert.rejects(new OsLock(3000, [{ command: missing, args: [] }]).tryAcquire(join(dir, "none.lock")), /^Error: C4 capability unavailable:/);
+
+    const envMarker = join(dir, "seen-path.txt");
+    const fallback = new OsLock(3000, [
+      { command: missing, args: [] },
+      {
+        command: process.execPath,
+        args: ["--input-type=module", "-e", `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(envMarker)}, process.env.DSA_LOCK_PATH ?? ""); process.stdout.write("locked\\n"); setInterval(()=>{}, 1000);`],
+        pathInEnv: true,
+      },
+    ]);
+    const target = join(dir, "fallback.lock");
+    const held = await fallback.tryAcquire(target);
+    assert.ok(held);
+    assert.equal(await readFile(envMarker, "utf8"), target);
+    const releaseStarted = Date.now();
+    await held.release();
+    const releaseMs = Date.now() - releaseStarted;
+    assert.ok(releaseMs >= 900 && releaseMs < 10000, `hung helper force-killed on release (${releaseMs} ms)`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("C3 fence never kills a pid whose start differs from the scanned identity (pid reuse)", { skip: process.platform !== "linux", timeout: 10000 }, async () => {
