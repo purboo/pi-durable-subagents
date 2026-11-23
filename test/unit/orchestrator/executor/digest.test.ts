@@ -24,7 +24,7 @@ const askCall = (id: string) => assistant([{ type: 'toolCall', id, name: 'ask' }
 function history(): SessionEntry[] {
   return [
     { type: 'session' }, assistant([{ type: 'text', text: 'inherited' }]),
-    exec(`${call}#1.1`), assistant([{ type: 'text', text: 'a' }]), receipt('r1'), conflict('r2'), receipt('r2'),
+    exec(`${call}#1.1`), assistant([{ type: 'text', text: 'a' }]), { type: 'usage', id: 'cw1', kind: 'cache_warm', usage: { input: 1, cacheRead: 100, output: 1, cost: { total: 0.002 } } }, receipt('r1'), conflict('r2'), receipt('r2'),
     askCall('t1'), question('q1', 1), result('t1', ASK_CUT.shutdown, true),
     exec('W@1/other@1#1.1'), assistant([{ type: 'text', text: 'foreign' }]), question('q9', 1),
     exec(`${call}#1.2`), askCall('t2'), question('q1', 2), answer('r3', 'q1', 2), result('t2'),

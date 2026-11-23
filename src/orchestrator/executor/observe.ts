@@ -12,7 +12,7 @@ import type { CallTicket, OrchestratorConfig } from "../contract.ts";
 import { readSession, type SessionEntry } from "./session.ts";
 import { entriesOf } from "./indexes.ts";
 import { ActiveTime, activeTotal } from "./time.ts";
-import { observation, reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
+import { entryUsage, observation, reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 
 const UPDATE = '{"type":"tool_execution_update",';
 export const sessionChanged = (name: string | Buffer | null) => name === null || String(name) === "session.jsonl" || String(name) === "inbox";
@@ -150,6 +150,10 @@ export async function observeExecution(d: Dependencies) {
       }
       const args = event.args as { path?: unknown } | undefined;
       if (event.type === "tool_execution_start" && (event.toolName === "edit" || event.toolName === "write") && typeof args?.path === "string") await d.wrote?.(args.path);
+      if (event.type === "entry_appended" && event.entry && typeof event.entry === "object") {
+        const u = entryUsage(event.entry as SessionEntry);
+        if (u && (event.entry as SessionEntry).type === "usage") await d.recordUsage([u]);
+      }
       const slim = observation(event);
       if (slim) {
         await serial(() => t.journal.append("observation", { exec, event: slim }));

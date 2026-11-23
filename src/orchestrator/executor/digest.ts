@@ -4,7 +4,7 @@
 // equals what the whole-array function it replaces computes over the same entries (see the tests).
 import { CT, askFields, type StructuredAskFields } from "../../types.ts";
 import { askOf, cutAskResult, receiptId, type SessionEntry } from "./session.ts";
-import { messageUsage, type Usage } from "./usage.ts";
+import { entryUsage, type Usage } from "./usage.ts";
 
 export type Question = StructuredAskFields & { qid: string; rev: number; question: unknown };
 export interface SessionDigest {
@@ -62,7 +62,7 @@ export class SessionFold {
         this.own = typeof e.data?.exec === "string" && e.data.exec.startsWith(`${this.call}#`);
         s.execAt.set(e.data?.exec, i);
       }
-      const u = this.own && e.message && messageUsage(e.message as Record<string, unknown>);
+      const u = this.own && entryUsage(e);
       if (u) s.usage.push(u);
       const rid = receiptId(e);
       if (rid && !s.receipts.has(rid) && !(e.customType === CT.rejected && e.data?.reason === "identity-conflict")) s.receipts.set(rid, e);

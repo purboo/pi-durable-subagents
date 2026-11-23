@@ -31,7 +31,8 @@ export function answers(req: { kind: string; cond?: { qid?: string; rev?: number
   const qid = req.cond?.qid, rev = req.cond?.rev;
   return (req.kind === 'answer' || req.kind === 'continue') && typeof qid === 'string' && typeof rev === 'number' ? { qid, rev } : undefined;
 }
-type SessionLike = { id?: string; type?: string; message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } } } };
+type RawUsageLike = { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } };
+type SessionLike = { id?: string; type?: string; usage?: RawUsageLike; message?: { role?: string; usage?: RawUsageLike } };
 /** P31, P33, P37: Usage of this call only — assistant messages in segments opened by this call's executions,
  *  deduplicated by entry id. Context inherited from an earlier generation or a forked origin is not charged. */
 export function usage(entries: readonly SessionLike[], call?: string): { tokens: number; costUsd: number } {
@@ -40,7 +41,7 @@ export function usage(entries: readonly SessionLike[], call?: string): { tokens:
     if (e.type === 'custom' && (e as { customType?: string }).customType === CT.exec)
       own = call === undefined || String((e as { data?: { exec?: string } }).data?.exec ?? '').startsWith(`${call}#`) || !/#\d+\.\d+$/.test(String((e as { data?: { exec?: string } }).data?.exec ?? ''));
     if (!own) continue;
-    const u = e.type === 'message' && e.message?.role === 'assistant' ? e.message.usage : undefined;
+    const u = e.type === 'message' && e.message?.role === 'assistant' ? e.message.usage : e.type === 'usage' ? e.usage : undefined;
     if (!u || (e.id && seen.has(e.id))) continue;
     if (e.id) seen.add(e.id);
     tokens += u.totalTokens ?? (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);

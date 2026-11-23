@@ -2,23 +2,37 @@
 import { contentHash } from "../../kernel/ids.ts";
 import { budgets } from "../../kernel/guards.ts";
 import { CT, type CallResult, type Entry } from "../../types.ts";
-import type { SessionEntry } from "./session.ts";
+import type { RawUsage, SessionEntry } from "./session.ts";
 export type Usage = NonNullable<CallResult["usage"]>;
+
+function normalizeUsage(raw: RawUsage): Usage {
+  return {
+    input: (raw.input ?? 0) + (raw.cacheRead ?? 0) + (raw.cacheWrite ?? 0),
+    output: raw.output ?? 0,
+    costUsd: raw.cost?.total ?? 0,
+  };
+}
 
 /** P31: Use the provider message identity, or native timestamp/content identity when pi omits an id. */
 export function messageUsage(message: Record<string, unknown>) {
   if (message.role !== "assistant" || !message.usage) return;
-  const raw = message.usage as { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } };
-  return { id: String(message.id ?? message.timestamp ?? contentHash(message)), usage: {
-    input: (raw.input ?? 0) + (raw.cacheRead ?? 0) + (raw.cacheWrite ?? 0), output: raw.output ?? 0, costUsd: raw.cost?.total ?? 0,
-  } };
+  const raw = message.usage as RawUsage;
+  return { id: String(message.id ?? message.timestamp ?? contentHash(message)), usage: normalizeUsage(raw) };
 }
-/** P31: Charge only messages in segments opened by this call, excluding inherited context. */
+/** P31: Extract usage from either an assistant message entry or a standalone pi `usage` entry (e.g. `cache_warm`). */
+export function entryUsage(entry: SessionEntry) {
+  if (entry.message) return messageUsage(entry.message as Record<string, unknown>);
+  if (entry.type === "usage" && entry.usage) {
+    return { id: String(entry.id ?? entry.timestamp ?? contentHash(entry)), usage: normalizeUsage(entry.usage) };
+  }
+  return undefined;
+}
+/** P31: Charge only messages and usage entries in segments opened by this call, excluding inherited context. */
 export function sessionUsage(entries: SessionEntry[], call: string) {
   let own = false;
   return entries.flatMap(e => {
     if (e.type === "custom" && e.customType === CT.exec) own = typeof e.data?.exec === "string" && e.data.exec.startsWith(`${call}#`);
-    const u = own && e.message && messageUsage(e.message as Record<string, unknown>);
+    const u = own && entryUsage(e);
     return u ? [u] : [];
   });
 }

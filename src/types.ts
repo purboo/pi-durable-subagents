@@ -474,4 +474,5 @@ export const ENV = {
   exhaustedPatterns: "DSA_EXHAUSTED_PATTERNS", // JSON provider -> regex strings, snapshotted at execution start (XP1)
   exactCapture: "DSA_EXACT_CAPTURE", // path of the pinned parent capture of an exact child (EX2)
   exactTools: "DSA_EXACT_TOOLS", // JSON array of the tool names an exact child may run (EX3/EX4)
+  orchestratorLaunch: "DSA_ORCHESTRATOR_LAUNCH", // sentinel set by launchOrchestrator so a mislaunched pi refuses to recurse (#11)
 } as const;

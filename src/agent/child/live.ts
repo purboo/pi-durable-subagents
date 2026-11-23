@@ -6,6 +6,7 @@ import { renameSync, writeFileSync } from "node:fs";
 import { replacePathSync } from "../../kernel/fsx.ts";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isCacheWarmingPayload } from "../exact/capture.ts";
 
 /** UI §3: The ephemeral live state of a child's current model response. */
 export interface Live { phase: "waiting" | "streaming" | "idle"; since: number; at: number; thinking?: string; text?: string; tool?: string }
@@ -32,7 +33,12 @@ export function registerLive(pi: ExtensionAPI, enabled: () => boolean): void {
   // A turn is one model call: from its start (or the provider request) until the first streamed token, it is waiting.
   const waiting = (_event: unknown, ctx: ExtensionContext) => { if (state?.phase !== "waiting") since = Date.now(); publish(ctx, { phase: "waiting", since }); };
   pi.on("turn_start", waiting);
-  pi.on("before_provider_request", waiting);
+  // Ignore pi 1.5.1+ CacheWarmer refreshes: they fire before_provider_request without a matching message_end,
+  // which would leave live.json stuck in "waiting" while a tool is running.
+  pi.on("before_provider_request", (event, ctx) => {
+    if (isCacheWarmingPayload((event as { payload?: unknown })?.payload)) return;
+    waiting(event, ctx);
+  });
   pi.on("message_update", (event, ctx) => {
     const m = event.message as { role?: string; content?: { type: string; thinking?: string; text?: string; name?: string }[] };
     if (m.role !== "assistant" || !Array.isArray(m.content)) return;

@@ -14,7 +14,7 @@ import { readFile } from "node:fs/promises";
 import fs from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CT, ENV } from "../../types.ts";
-import type { Capture } from "./capture.ts";
+import { isCacheWarmingPayload, type Capture } from "./capture.ts";
 import { splicePayload } from "./splice.ts";
 
 /** Every refused tool result starts with this text (EX4). */
@@ -86,10 +86,16 @@ export function registerExactChild(pi: ExtensionAPI, exact: ExactChild): void {
     if (!refused) { refused = true; receipt(CT.exactMismatch, { error }); }
     ctx.abort();
   };
+  // pi 1.5.1+ CacheWarmer replays requests with maxTokens: 1 through before_provider_request; splicing the parent's
+  // max_tokens over a warm refresh would turn it into a full-length generation. Stop warming inside exact children
+  // (no-op on older pi versions that never emit this event).
+  (pi.on as (event: string, handler: () => { action: "stop" }) => void)("cache_warming_decision", () => ({ action: "stop" }));
   // EX4: the request the child would send is replaced by the parent's fields and the concatenated conversation.
   pi.on("before_provider_request", async (event, ctx: ExtensionContext) => {
     const payload = event.payload as Record<string, unknown> | undefined;
-    if (!payload || typeof payload !== "object") return;
+    // Defense in depth: even if another extension overrides cache_warming_decision, never splice parent.max_tokens
+    // onto a 1-token cache-warming payload.
+    if (!payload || typeof payload !== "object" || isCacheWarmingPayload(payload)) return;
     const capture = await captureOf();
     if (!capture) return;
     const model = typeof payload.model === "string" ? payload.model : undefined;

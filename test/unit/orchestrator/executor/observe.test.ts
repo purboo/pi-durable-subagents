@@ -105,5 +105,9 @@ test("each scan records only the usage appended since the previous one; a restar
   list = [u("1"), u("2"), u("3")]; // a session read from scratch: a new list
   await delay(100);
   assert.deepEqual(recorded, [["1", "2"], ["3"], ["1", "2", "3"]]);
+  // Live RPC entry_appended for standalone usage entries (cache_warm) records immediately.
+  stdout.write(JSON.stringify({ type: "entry_appended", entry: { type: "usage", id: "cw-live", kind: "cache_warm", usage: { input: 5, cacheRead: 50, output: 1, cost: { total: 0.001 } } } }) + "\n");
+  await delay(80);
+  assert.ok(recorded.some(batch => batch.includes("cw-live")), "cache_warm entry_appended is recorded");
   assert.equal(journal.entries().some(e => e.type === "observation"), false);
 });
