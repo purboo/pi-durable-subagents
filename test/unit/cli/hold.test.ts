@@ -151,8 +151,8 @@ test('hold: a killed wrapper keeps the lease until its command ends; leftovers e
 
 test('hold: when the wrapper is killed and the command has ended, its leftovers keep the lease until a waiter ends them', { skip: unixOnly }, async t => {
   const home = await root(t), file = join(home, 'log'), pidFile = join(home, 'bg.pid');
-  const a = run(home, ['machine', '--', 'sh', '-c', `sleep 30 & echo $! > ${pidFile}; echo "a start" >> ${file}; sleep 0.5`]);
-  const ticket = await until(() => { const x = granted(home, 'machine', a.child.pid!); return x?.command && existsSync(pidFile) ? x : undefined; });
+  const a = run(home, ['machine', '--', 'sh', '-c', `sleep 30 & echo $! > ${pidFile}.tmp && mv ${pidFile}.tmp ${pidFile}; echo "a start" >> ${file}; sleep 0.5`]);
+  const ticket = await until(() => { const x = granted(home, 'machine', a.child.pid!); return x?.command && existsSync(pidFile) && Number(readFileSync(pidFile, 'utf8').trim()) > 0 ? x : undefined; });
   a.child.kill('SIGKILL'); await a.exit;
   process.kill(ticket.command!.pid, 'SIGKILL');
   const leftover = Number(readFileSync(pidFile, 'utf8'));

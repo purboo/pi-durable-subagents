@@ -33,16 +33,28 @@ function run(t: test.TestContext, home: string, args: string[], env: NodeJS.Proc
   });
   return { child, exit, stderr: () => stderr };
 }
-function cleanupPid(t: test.TestContext, file: string) {
-  t.after(() => { if (existsSync(file)) { try { process.kill(Number(readFileSync(file, 'utf8')), 'SIGKILL'); } catch { /* gone */ } } });
+function readPid(file: string): number | undefined {
+  if (!existsSync(file)) return undefined;
+  const n = Number(readFileSync(file, 'utf8').trim());
+  return Number.isInteger(n) && n > 0 ? n : undefined;
 }
-const pid = (file: string) => Number(readFileSync(file, 'utf8'));
+function cleanupPid(t: test.TestContext, file: string) {
+  t.after(() => {
+    const p = readPid(file);
+    if (p) { try { process.kill(p, 'SIGKILL'); } catch { /* gone */ } }
+  });
+}
+const pid = (file: string) => {
+  const p = readPid(file);
+  assert.ok(p, `expected positive pid in ${file}`);
+  return p;
+};
 const running = (p: number) => lease.alive({ pid: p });
 const current = (home: string, p: number) => lease.readTickets(home, 'tag-machine').find(t => t.wrapper.pid === p);
 
 // The escaped shell waits until the test releases the command, so its new session and environment are observable.
 const escaped = (home: string, ignoreTerm = false) => ['sh', '-c',
-  `setsid sh -c '${ignoreTerm ? 'trap "" TERM; ' : ''}echo $$ > ${join(home, 'escaped.pid')}; ${ignoreTerm ? 'while :; do sleep 1; done' : 'exec sleep 60'}' & while [ ! -f ${join(home, 'go')} ] && [ -d ${home} ]; do sleep 0.02; done`];
+  `setsid sh -c '${ignoreTerm ? 'trap "" TERM; ' : ''}echo $$ > ${join(home, 'escaped.pid.tmp')} && mv ${join(home, 'escaped.pid.tmp')} ${join(home, 'escaped.pid')}; ${ignoreTerm ? 'while :; do sleep 1; done' : 'exec sleep 60'}' & while [ ! -f ${join(home, 'go')} ] && [ -d ${home} ]; do sleep 0.02; done`];
 
 const assertEnded = (home: string) => ['sh', '-c', `p=$(cat ${join(home, 'escaped.pid')}); if [ -r /proc/$p/stat ]; then state=$(awk '{print $3}' /proc/$p/stat); [ "$state" = Z ] || [ "$state" = X ] || exit 99; fi; echo next > ${join(home, 'next')}`];
 
@@ -58,7 +70,7 @@ test('tag: held command receives exact resource:seq and preserves DSA_EXEC / DSA
 test('tag: setsid descendant ends before a waiting holder starts after command exit', linux, async t => {
   const home = await root(t), file = join(home, 'escaped.pid'); cleanupPid(t, file);
   const a = run(t, home, ['machine', '--', ...escaped(home)]);
-  const saved = await until(() => { const t = current(home, a.child.pid!); return t?.command && existsSync(file) ? t : undefined; });
+  const saved = await until(() => { const t = current(home, a.child.pid!); return t?.command && readPid(file) ? t : undefined; });
   const escapedPid = pid(file), stat = readFileSync(`/proc/${escapedPid}/stat`, 'utf8').split(') ')[1]!.split(' ');
   assert.equal(Number(stat[3]), escapedPid, 'descendant has its own session');
   assert.notEqual(escapedPid, saved.command!.pid);
@@ -74,7 +86,7 @@ test('tag: setsid descendant ends before a waiting holder starts after command e
 test('tag: orphan reclamation retains ticket after wrapper, leader and original group are gone', linux, async t => {
   const home = await root(t), file = join(home, 'escaped.pid'); cleanupPid(t, file);
   const a = run(t, home, ['machine', '--', ...escaped(home)]);
-  const saved = await until(() => { const t = current(home, a.child.pid!); return t?.command && existsSync(file) ? t : undefined; });
+  const saved = await until(() => { const t = current(home, a.child.pid!); return t?.command && readPid(file) ? t : undefined; });
   const escapedPid = pid(file);
   a.child.kill('SIGKILL'); await a.exit;
   process.kill(-saved.command!.pid, 'SIGKILL');
@@ -93,7 +105,7 @@ test('yield: exclusive waiter receives lease only after TERM-resistant escaped d
   const home = await root(t), file = join(home, 'escaped.pid'), output: string[] = []; cleanupPid(t, file);
   const a = hold(parseHold(['tag-machine', '--shared', '--yield', '--', ...escaped(home, true)]),
     { env: { ...process.env, DSA_HOME: home }, pollMs: 30, graceMs: 100, stderr: line => output.push(line) });
-  await until(() => existsSync(file) && lease.readTickets(home, 'tag-machine').some(t => t.command));
+  await until(() => Boolean(readPid(file)) && lease.readTickets(home, 'tag-machine').some(t => t.command));
   const escapedPid = pid(file), began = Date.now();
   const b = run(t, home, ['machine', '--', ...assertEnded(home)]);
   assert.equal(await a, 75); assert.equal(await b.exit, 0);
@@ -106,7 +118,7 @@ test('yield: exclusive waiter receives lease only after TERM-resistant escaped d
 test('tag: forwarded signal followed by exit cleans escaped descendants before release', linux, async t => {
   const home = await root(t), file = join(home, 'escaped.pid'); cleanupPid(t, file);
   const a = run(t, home, ['machine', '--', ...escaped(home)]);
-  await until(() => existsSync(file) && current(home, a.child.pid!)?.command);
+  await until(() => Boolean(readPid(file)) && Boolean(current(home, a.child.pid!)?.command));
   a.child.kill('SIGTERM'); assert.equal(await a.exit, 143);
   assert.equal(running(pid(file)), false); assert.deepEqual(lease.readTickets(home, 'tag-machine'), []);
 });

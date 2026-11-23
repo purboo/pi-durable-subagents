@@ -30,7 +30,7 @@ const run = (testArgs) => new Promise(resolve => {
     if (tree) spawnSync(tree.command, tree.args, { stdio: "ignore" });
     else try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
   }, runMs);
-  child.on("close", code => { clearTimeout(deadline); resolve({ code: timedOut ? 1 : code ?? 1, output }); });
+  child.on("close", (code, signal) => { clearTimeout(deadline); resolve({ code: timedOut ? 1 : code ?? 1, signal, output }); });
 });
 const first = await run(args);
 writeFileSync(log, first.output);
@@ -39,7 +39,7 @@ if (first.code === 0) process.exit(0);
 // Failing files: "test at <file>:<line>" (spec reporter) or a TAP "location: '<file>:<line>:<col>'", whatever separator
 // the platform prints (see lib/ci-log.mjs; this repository names test files *.test.{ts,mts,cts,js,mjs,cjs}).
 const relative = failingTestFiles(first.output, process.cwd());
-if (!relative.length) { console.log("::error::test run failed without an identifiable failing file"); process.exit(first.code); }
+if (!relative.length) { console.log(`::error::test run failed without an identifiable failing file (code=${first.code}, signal=${first.signal ?? "none"})`); process.exit(first.code); }
 
 const flags = args.filter(a => a.startsWith("--"));
 console.log(`\n=== rerunning ${relative.length} failing file(s) once: ${relative.join(", ")} ===\n`);
