@@ -11,7 +11,7 @@ export function toolPath(cwd: string, input: string): string {
   let path = input.replace(UNICODE_SPACES, " ");
   if (path.startsWith("@")) path = path.slice(1);
   if (path === "~") path = homedir();
-  else if (path.startsWith("~/")) path = join(homedir(), path.slice(2));
+  else if (path.startsWith("~/") || path.startsWith("~\\")) path = join(homedir(), path.slice(2));
   else if (/^file:\/\//.test(path)) path = fileURLToPath(path);
   return resolve(cwd, path);
 }

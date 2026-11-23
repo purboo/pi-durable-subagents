@@ -22,11 +22,20 @@ export function serviceFiles(home: string, dsa: string, entry: string, platform:
   }
   if (platform === "darwin") return [{ path: join(home, "Library/LaunchAgents", `${name}.plist`), content: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${name}</string>\n<key>ProgramArguments</key><array>${[node, entry, "start"].map(s => `<string>${xml(s)}</string>`).join("")}</array>\n<key>EnvironmentVariables</key><dict><key>DSA_HOME</key><string>${xml(dsa)}</string>${pi ? `<key>DSA_PI_BIN</key><string>${xml(pi)}</string>` : ""}</dict>\n<key>RunAtLoad</key><true/>\n<!-- Keep the detached orchestrator alive after the starter exits. -->\n<key>AbandonProcessGroup</key><true/>\n<key>StartInterval</key><integer>30</integer>\n</dict></plist>\n` }];
   if (platform === "win32") {
-    // Task Scheduler runs a hidden cmd.exe wrapper every minute; it starts at the next minute after logon and survives
-    // the starter exiting (the orchestrator is a detached process). Batch escaping: `%` is doubled and `"` becomes "".
+    // Task Scheduler launches wscript.exe (GUI subsystem) on start.vbs every minute, which runs start.cmd with
+    // SW_HIDE (window style 0) so interactive Windows desktops never flash a console window. The orchestrator itself
+    // runs detached and survives the starter exiting.
+    const dir = join(home, ".pi", "durable-subagents-service");
+    const cmdPath = join(dir, "start.cmd");
+    const vbsPath = join(dir, "start.vbs");
     const bat = (s: string) => s.replace(/%/g, "%%").replace(/"/g, '""');
-    return [{ path: join(home, ".pi", "durable-subagents-service", "start.cmd"), content:
-      `@echo off\r\nsetlocal\r\nset "DSA_HOME=${bat(dsa)}"\r\n${pi ? `set "DSA_PI_BIN=${bat(pi)}"\r\n` : ""}"${bat(node)}" "${bat(entry)}" start\r\n` }];
+    const vbs = (s: string) => s.replace(/"/g, '""');
+    return [
+      { path: cmdPath, content:
+        `@echo off\r\nsetlocal\r\nset "DSA_HOME=${bat(dsa)}"\r\n${pi ? `set "DSA_PI_BIN=${bat(pi)}"\r\n` : ""}"${bat(node)}" "${bat(entry)}" start\r\n` },
+      { path: vbsPath, content:
+        `CreateObject("WScript.Shell").Run "cmd.exe /d /s /c if 1==1 """ & "${vbs(cmdPath)}" & """", 0, False\r\n` },
+    ];
   }
   throw new Error(`Starter service unavailable on ${platform}`);
 }
@@ -54,11 +63,29 @@ export async function manageService(files: ServiceFile[], install: boolean, opti
     const domain = `gui/${options.uid ?? process.getuid?.() ?? 0}`;
     await run("launchctl", install ? ["bootstrap", domain, files[0]!.path] : ["bootout", `${domain}/${name}`], install ? /already (bootstrapped|loaded)|service already exists/i : /not loaded|could not find service|no such process/i);
   } else if (platform === "win32") {
-    const command = `${process.env.ComSpec ?? "cmd.exe"} /d /s /c "${files[0]!.path}"`;
+    const launcher = files.find(f => f.path.endsWith(".vbs"))?.path ?? files[0]!.path;
+    const command = launcher.endsWith(".vbs")
+      ? `wscript.exe //B //NoLogo "${launcher}"`
+      : `${process.env.ComSpec ?? "cmd.exe"} /d /s /c if 1==1 "${launcher}"`;
     if (install) {
       await run("schtasks", ["/Create", "/F", "/SC", "MINUTE", "/MO", "1", "/TN", name, "/TR", command]);
       await run("schtasks", ["/Run", "/TN", name], /already running/i);
-    } else await run("schtasks", ["/Delete", "/F", "/TN", name], /cannot find|not found|does not exist/i);
+    } else if (options.dryRun) {
+      await run("schtasks", ["/Delete", "/F", "/TN", name]);
+    } else {
+      // Locale-independent absence check: /Query exits non-zero when the task does not exist in any Windows UI language.
+      let exists = true;
+      try { await run("schtasks", ["/Query", "/TN", name]); }
+      catch { exists = false; }
+      if (exists) {
+        try { await run("schtasks", ["/Delete", "/F", "/TN", name]); }
+        catch (error) {
+          let stillExists = false;
+          try { await run("schtasks", ["/Query", "/TN", name]); stillExists = true; } catch { /* gone */ }
+          if (stillExists) throw error;
+        }
+      }
+    }
   } else throw new Error(`Starter service unavailable on ${platform}`);
   if (!install && !options.dryRun) await uninstallService(files);
   if (!install && platform === "linux") await run("systemctl", ["--user", "daemon-reload"]);

@@ -11,11 +11,11 @@ test('service dry-run renders both platforms without filesystem or runner effect
   t.after(() => rm(home, { recursive: true, force: true }));
   let calls = 0;
   const runner = async () => { calls++; };
-  for (const platform of ['linux', 'darwin']) for (const install of [true, false]) {
+  for (const platform of ['linux', 'darwin', 'win32']) for (const install of [true, false]) {
     const files = serviceFiles(home, join(home, 'state'), '/cli.ts', platform), output: string[] = [];
     await manageService(files, install, { platform, uid: 123, dryRun: true, runner, write: line => output.push(line) });
     for (const file of files) assert.ok(output.includes(`${file.path}\n${file.content}`));
-    assert.ok(output.some(line => line.startsWith(platform === 'linux' ? 'systemctl --user ' : 'launchctl ')));
+    assert.ok(output.some(line => line.startsWith(platform === 'linux' ? 'systemctl --user ' : platform === 'darwin' ? 'launchctl ' : 'schtasks ')));
     assert.deepEqual(await readdir(home), []);
   }
   for (const command of ['install-service', 'uninstall-service']) {

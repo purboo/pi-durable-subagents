@@ -221,7 +221,17 @@ test("execTarget resolves a bare program on the command's own environment, with 
   assert.deepEqual(execTarget("tool", [], { ...windows, env: { Path: first } }), { command: process.execPath, args: [script] }, "not the parent's shim");
   // A shim that names no node script runs through the command's ComSpec (also when it is spelled COMSPEC), not ours.
   assert.deepEqual(execTarget("tool", ["x"], { ...windows, env: { PATH: second, COMSPEC: "D:\\Windows\\system32\\cmd.exe" } }),
-    { command: "D:\\Windows\\system32\\cmd.exe", args: ["/d", "/s", "/c", secondShim, "x"] });
+    { command: "D:\\Windows\\system32\\cmd.exe", args: ["/d", "/s", "/c", "if", "1==1", secondShim, "x"] });
+  // Unquoted cmd.exe metacharacters are escaped while spaced args (quoted by CreateProcessW) keep literal characters; CR/LF are refused.
+  assert.deepEqual(execTarget("tool", ["a&b|c", "hello & world"], { ...windows, env: { PATH: second, COMSPEC: "D:\\Windows\\system32\\cmd.exe" } }),
+    { command: "D:\\Windows\\system32\\cmd.exe", args: ["/d", "/s", "/c", "if", "1==1", secondShim, "a^&b^|c", "hello & world"] });
+  assert.throws(() => execTarget("tool", ["line1\nline2"], { ...windows, env: { PATH: second } }), /CR or LF/);
+  // A pnpm-style .cmd shim setting NODE_PATH or NODE_OPTIONS is NOT unwrapped so its env setup runs through cmd.exe.
+  const pnpmDir = join(dir, "pnpm bin"); await mkdir(pnpmDir);
+  const pnpmShim = join(pnpmDir, "my tool.cmd");
+  await writeFile(pnpmShim, `@SETLOCAL\r\n@SET "NODE_PATH=C:\\pnpm\\node_modules"\r\n"${process.execPath}" "${script}" %*\r\n`);
+  assert.deepEqual(execTarget(pnpmShim, ["arg with space"], { ...windows, env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" } }),
+    { command: "C:\\Windows\\System32\\cmd.exe", args: ["/d", "/s", "/c", "if", "1==1", pnpmShim, "arg with space"] });
   // PATHEXT is the command's too: `.CMD` alone finds no `.bat`; `.BAT` then finds it, on the same PATH.
   assert.deepEqual(execTarget("tool", [], { ...windows, env: { PATH: third, PATHEXT: ".CMD" } }), { command: "tool", args: [] }, "not found: the name stays as it was");
   assert.equal(findOnPath("tool", third, { ...windows, pathext: ".CMD" }), undefined);

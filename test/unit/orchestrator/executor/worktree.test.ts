@@ -33,9 +33,17 @@ test("toolPath resolves as pi's edit/write tools do", { skip: process.platform =
   assert.equal(toolPath("/w", "@/x/b.txt"), "/x/b.txt");
   assert.equal(toolPath("/w", "@rel.txt"), "/w/rel.txt");
   assert.equal(toolPath("/w", "~/b.txt"), join(homedir(), "b.txt"));
+  assert.equal(toolPath("/w", "~\\b.txt"), join(homedir(), "b.txt"));
   assert.equal(toolPath("/w", "~"), homedir());
   assert.equal(toolPath("/w", pathToFileURL("/x/c d.txt").href), "/x/c d.txt");
   assert.equal(toolPath("/w", "a\u00A0b.txt"), "/w/a b.txt");
+});
+
+test("toolPath expands ~ and ~\\ prefixes across platforms", () => {
+  const base = homedir();
+  assert.equal(toolPath(base, "~"), base);
+  assert.equal(toolPath(base, "~/sub.txt"), join(base, "sub.txt"));
+  assert.equal(toolPath(base, "~\\sub.txt"), join(base, "sub.txt"));
 });
 
 test("worktree roots follow a repository created inside another after a lookup", async t => {

@@ -240,7 +240,8 @@ test('withdraw, findCall, send replay paths and scoped resume stay O(1) across 5
   const elapsedMs = performance.now() - started;
 
   assert.equal(unrelatedReads, 0, 'no unrelated workflow journal was read across 5,000 workflows');
-  assert.ok(elapsedMs < 2000, `expected O(1) operations over 5,000 workflows to stay fast, took ${elapsedMs.toFixed(1)}ms`);
+  // 25 durable submits perform real journal fsyncs (~2-3 s under parallel Windows CI load), whereas O(N=5000) scans take tens of seconds.
+  assert.ok(elapsedMs < 10_000, `expected O(1) operations over 5,000 workflows to stay fast, took ${elapsedMs.toFixed(1)}ms`);
 
   // Verify semantic outcomes of every operation above.
   assert.equal(forwards.filter(f => f.kind === 'withdraw').length, 20, '10 matching withdraws * 2 distinct (wf, key) targets');

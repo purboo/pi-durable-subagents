@@ -154,6 +154,56 @@ test('service files and activation use temporary HOME and fake runners on both p
   const quoted = serviceFiles(home, '/state/$x%q', '/cli/$x%q', 'linux')[0]!.content;
   assert.match(quoted, /DSA_HOME=\/state\/\$x%%q/);
   assert.match(quoted, /\/cli\/\$\$x%%q/);
+
+  // Windows hidden launcher (start.vbs via wscript.exe) and locale-independent uninstall via schtasks /Query.
+  const winHome = join(home, 'win home');
+  const winFiles = serviceFiles(winHome, join(winHome, 'dsa state'), 'C:\\cli dir\\cli.js', 'win32', 'C:\\Program Files\\nodejs\\node.exe', 'C:\\bin\\pi.cmd');
+  assert.equal(winFiles.length, 2);
+  assert.match(winFiles[0]!.path, /start\.cmd$/);
+  assert.match(winFiles[1]!.path, /start\.vbs$/);
+  assert.match(winFiles[1]!.content, /WScript\.Shell.*0, False/);
+  const winCmds: string[][] = [];
+  await manageService(winFiles, true, { platform: 'win32', runner: async (cmd, args) => { winCmds.push([cmd, ...args]); }, write() {} });
+  assert.equal(winCmds[0]![0], 'schtasks');
+  assert.ok(winCmds[0]!.includes('/Create'));
+  assert.match(winCmds[0]!.at(-1)!, /^wscript\.exe \/\/B \/\/NoLogo ".*start\.vbs"$/);
+  for (const f of winFiles) assert.equal(await readFile(f.path, 'utf8'), f.content);
+  // Uninstall when /Query fails with non-English locale text succeeds without calling /Delete and removes both files.
+  const absentCmds: string[][] = [];
+  await manageService(winFiles, false, {
+    platform: 'win32',
+    runner: async (cmd, args) => {
+      absentCmds.push([cmd, ...args]);
+      if (args.includes('/Query')) throw new Error('错误: 系统找不到指定的文件。');
+    },
+    write() {},
+  });
+  assert.deepEqual(absentCmds, [['schtasks', '/Query', '/TN', 'pi-durable-subagents']]);
+  for (const f of winFiles) await assert.rejects(readFile(f.path), { code: 'ENOENT' });
+  // Uninstall when /Query succeeds and /Delete fails while /Query still succeeds rethrows the real error.
+  await manageService(winFiles, true, { platform: 'win32', runner: async () => {}, write() {} });
+  await assert.rejects(manageService(winFiles, false, {
+    platform: 'win32',
+    runner: async (_cmd, args) => {
+      if (args.includes('/Delete')) throw new Error('拒绝访问。');
+    },
+    write() {},
+  }), /拒绝访问/);
+  // Uninstall when /Delete fails due to a race (second /Query fails with non-English text) succeeds cleanly.
+  let queries = 0;
+  await manageService(winFiles, false, {
+    platform: 'win32',
+    runner: async (_cmd, args) => {
+      if (args.includes('/Query')) {
+        queries++;
+        if (queries >= 2) throw new Error('Fehler: Das System kann die angegebene Datei nicht finden.');
+        return;
+      }
+      if (args.includes('/Delete')) throw new Error('Fehler: Das System kann die angegebene Datei nicht finden.');
+    },
+    write() {},
+  });
+  for (const f of winFiles) await assert.rejects(readFile(f.path), { code: 'ENOENT' });
 });
 
 test('P1 start publishes nothing and invokes the starter only while work is pending', { timeout: 15000 }, async t => {

@@ -243,11 +243,19 @@ test("Windows command wrapper: cmd strings, argv programs, missing programs and 
   const root = dirOf(); t.after(() => rm(root, { recursive: true, force: true }));
   const shim = join(root, "shim.cmd");
   writeFileSync(shim, `@echo off\r\n"${process.execPath}" -e "console.log('shim', process.argv[1])" %*\r\n`);
+  // Spaced path + spaced arg + cmd metacharacter + pnpm-style NODE_PATH preservation through cmd.exe.
+  const spacedDir = join(root, "Program Tools");
+  mkdirSync(spacedDir, { recursive: true });
+  const spacedScript = join(spacedDir, "print-env.mjs");
+  writeFileSync(spacedScript, "console.log(JSON.stringify({ args: process.argv.slice(2), nodePath: process.env.NODE_PATH }));\n");
+  const pnpmShim = join(spacedDir, "pnpm tool.cmd");
+  writeFileSync(pnpmShim, `@echo off\r\nsetlocal\r\nset "NODE_PATH=C:\\custom\\pnpm_modules"\r\n"${process.execPath}" "${spacedScript}" %*\r\n`);
   const cases: [string | string[], number, RegExp][] = [
     ["echo hello", 0, /^hello\r?\n$/],
     [[process.execPath, "-e", "process.exit(4)"], 4, /^$/],
     [["no-such-program-xyz"], 127, /^$/],
     [[shim, "arg with space"], 0, /^shim arg with space\r?\n$/],
+    [[pnpmShim, "arg with space", "a&b"], 0, /^\{"args":\["arg with space","a&b"\],"nodePath":"C:\\\\custom\\\\pnpm_modules"\}\r?\n$/],
   ];
   for (const [i, [command, status, output]] of cases.entries()) {
     const dir = join(root, `c${i}`);

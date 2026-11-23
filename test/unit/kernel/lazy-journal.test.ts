@@ -179,12 +179,13 @@ test("real equal-size replacement and adjacent huge 64-bit file IDs invalidate l
   const foldA = readJournalFold(path, undefined, () => [] as string[], (s, e) => s.push(String(e.tag ?? e.same)))!;
   assert.deepEqual(foldA.state, ["alpha", "tail"]);
   const hugeLazy = (await openLazyJournal(path, hugeExpect))!;
+  // Close the open writer handle before replacing the file on Windows (NTFS refuses rename over an open handle).
+  await hugeHandle.close();
 
   await replacePath(next, path);
   assert.equal(await openLazyJournal(path, hugeExpect), undefined, "adjacent 64-bit ino invalidates lazy open");
   assert.throws(() => hugeLazy.entries(), /Journal changed while not loaded/);
   await hugeLazy.close();
-  await hugeHandle.close();
 
   const recB = readJournalRecord(path)!;
   assert.equal(recB.ino, highInoB.toString());

@@ -9,7 +9,7 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
 import { userInfo } from "node:os";
-import { delimiter, dirname, extname, isAbsolute, join, win32 } from "node:path";
+import { delimiter, dirname, extname, isAbsolute, join, normalize, resolve, win32 } from "node:path";
 import { comspec, envValue, IS_WINDOWS, winTagArg } from "./windows.ts";
 
 const WINDOWS_EXECUTABLE = new Set([".exe", ".com", ".cmd", ".bat"]);
@@ -78,6 +78,15 @@ export interface ExecTargetOptions {
  *  the node script it runs, so that script runs under this Node instead and argv stays an argv (no shell quoting).
  *  A bare name is looked up on the command's own PATH (`options.env`), not this process's: the command's PATH may have
  *  the shim the caller's has not (a call's prepended `$DSA_HOME/bin`). */
+/** Escape Windows cmd.exe metacharacters on an unquoted argv element (one CreateProcessW will not wrap in quotes). */
+function escapeCmdToken(value: string): string {
+  if (/[\r\n]/.test(value)) throw new Error("Windows .cmd/.bat arguments cannot contain CR or LF");
+  // Empty strings and strings with spaces, tabs or double quotes are wrapped in "..." by CreateProcessW / libuv,
+  // where cmd.exe treats & | < > ( ) ^ literally; adding ^ inside quotes would pass literal carets through.
+  if (value.length === 0 || /[ \t"]/.test(value)) return value;
+  return value.replace(/[&|<>()^]/g, "^$&");
+}
+
 export function execTarget(command: string, args: readonly string[], options: ExecTargetOptions = {}): { command: string; args: string[] } {
   const platform = options.platform ?? process.platform, env = options.env ?? process.env;
   if (platform !== "win32") return { command, args: [...args] };
@@ -88,15 +97,25 @@ export function execTarget(command: string, args: readonly string[], options: Ex
   if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args] };
   const script = shimScript(resolved);
   if (script) return { command: process.execPath, args: [script, ...args] };
-  return { command: comspec(env), args: ["/d", "/s", "/c", resolved, ...args] };
+  // Leading `if 1==1` prevents `cmd.exe /s /c` from stripping the first and last quote when both the .cmd path and
+  // the last argument (or the .cmd path alone with no args) are quoted by CreateProcessW, without `call`'s double-pass
+  // percent/caret expansion.
+  return { command: comspec(env), args: ["/d", "/s", "/c", "if", "1==1", escapeCmdToken(resolved), ...args.map(escapeCmdToken)] };
 }
-/** The node script a generated `.cmd`/`.bat` shim runs, when it names one (`%dp0%` is the shim's directory). */
+/** The node script a generated `.cmd`/`.bat` shim runs, when it names one (`%dp0%` is the shim's directory).
+ *  Shims that customize NODE_PATH or NODE_OPTIONS (e.g. pnpm global shims) are not unwrapped so their environment
+ *  setup runs through cmd.exe instead of being silently dropped. */
 export function shimScript(file: string): string | undefined {
   let text: string;
   try { text = readFileSync(file, "utf8"); } catch { return undefined; }
+  if (/^\s*@?\s*set\s+"?NODE_(?:PATH|OPTIONS)=/im.test(text)) return undefined;
   const dir = dirname(file);
   for (const match of text.matchAll(/"([^"\r\n]+\.(?:js|mjs|cjs))"|'([^'\r\n]+\.(?:js|mjs|cjs))'/gi)) {
-    const raw = match[1] ?? match[2]!, resolved = raw.replace(/%~?dp0%?/gi, dir);
+    const raw = match[1] ?? match[2]!;
+    const rel = raw.replace(/^%~?dp0%?[\\/]?/i, "");
+    const resolved = rel !== raw
+      ? resolve(dir, process.platform === "win32" ? rel : rel.replace(/\\/g, "/"))
+      : normalize(raw.replace(/%~?dp0%?/gi, dir));
     if (isAbsolute(resolved) && existsSync(resolved)) return resolved;
   }
   return undefined;
