@@ -446,17 +446,20 @@ export class Engine {
     await this.deliverWakes();
     this.consumed = { length: this.intakeSeen, pending: this.lifecycle().open.size > 0 };
   }
-  private findCall(to: string, bareWid = false): { wf: Workflow; entry: Entry } | undefined {
-    for (const wf of this.store.workflows.values()) {
-      // Every address of a call starts with its wid: another workflow's journal need not be decoded.
-      if (wf.journal.loaded === false && !String(to).startsWith(wf.wid)) continue;
-      const calls = revisionEntries(wf).filter(e => e.type === 'call' || e.type === 'generation');
-      // For sends, a bare wid addresses its call when the workflow has exactly one key (stop <wid> means the workflow).
-      const keys = new Set(calls.map(e => String(e.key)));
-      const named = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}` || (bareWid && to === wf.wid && keys.size === 1));
-      const entry = named && calls.findLast(e => e.key === named.key);
-      if (entry) return { wf, entry };
-    }
+  /** Every valid call address starts with `<wid>` (`<wid>`, `<wid>/<key>`, or `<wid>@<rev>/<key>@<gen>`). */
+  private workflowOf(to: unknown): Workflow | undefined {
+    const wid = typeof to === 'string' ? to.split(/[@/]/)[0] : '';
+    return wid ? this.store.workflows.get(wid) : undefined;
+  }
+  private findCall(to: unknown, bareWid = false): { wf: Workflow; entry: Entry } | undefined {
+    const wf = this.workflowOf(to);
+    if (!wf || (!bareWid && to === wf.wid)) return undefined;
+    const calls = revisionEntries(wf).filter(e => e.type === 'call' || e.type === 'generation');
+    // For sends, a bare wid addresses its call when the workflow has exactly one key (stop <wid> means the workflow).
+    const keys = new Set(calls.map(e => String(e.key)));
+    const named = calls.findLast(e => to === `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` || to === `${wf.wid}/${e.key}` || (bareWid && to === wf.wid && keys.size === 1));
+    const entry = named && calls.findLast(e => e.key === named.key);
+    return entry ? { wf, entry } : undefined;
   }
   /** P25: Explain an unknown send target with the addresses that would work. */
   private unknownCall(to: unknown): string {
@@ -470,14 +473,16 @@ export class Engine {
     const rids = (req.body as { rids: string[] }).rids;
     this.lifecycle();
     const sent = [...new Set(rids)].flatMap(rid => this.sends.get(rid) ?? []).sort((a, b) => a.at - b.at).map(item => item.request);
-    for (const wf of this.store.workflows.values()) {
-      const visited = new Set<string>();
-      for (const target of sent) {
-        const found = this.findCall((target.body as SendBody).to, true);
-        if (!found || found.wf !== wf || visited.has(found.entry.key as string)) continue;
-        visited.add(found.entry.key as string);
-        await this.executor.forward(req, this.context(wf, found.entry));
-      }
+    const visited = new Map<Workflow, Set<string>>();
+    for (const target of sent) {
+      const found = this.findCall((target.body as SendBody | null | undefined)?.to, true);
+      if (!found) continue;
+      let keys = visited.get(found.wf);
+      if (!keys) { keys = new Set(); visited.set(found.wf, keys); }
+      const key = found.entry.key as string;
+      if (keys.has(key)) continue;
+      keys.add(key);
+      await this.executor.forward(req, this.context(found.wf, found.entry));
     }
   }
   private async decide(req: Request): Promise<Decision> {
@@ -525,23 +530,20 @@ export class Engine {
       await this.revise(await this.store.revisionIntent(req as Request<ReviseBody>, wf));
       if (!this.states.has(wf.wid) && !this.terminal(wf)) await this.startWorkflow(wf);
     } else if (req.kind === 'send') {
-      // A generation that took this request is in the workflow it addresses (see findCall).
-      const to = String((req.body as SendBody)?.to ?? '');
-      const existing = [...this.store.workflows.values()].filter(wf => wf.journal.loaded !== false || to.startsWith(wf.wid)).flatMap(wf => wf.journal.entries().filter(e => e.type === 'generation' && generationRids(e).includes(req.rid)).map(entry => ({ wf, entry })))[0];
-      if (existing) { this.dispatchGeneration(existing.wf, existing.entry); return { action: 'apply' }; }
+      // A generation, model-choice or live forward that took this request is in the workflow it addresses (see findCall).
+      const addressed = this.workflowOf((req.body as SendBody | null | undefined)?.to);
+      const existing = addressed?.journal.entries().find(e => e.type === 'generation' && generationRids(e).includes(req.rid));
+      if (existing) { this.dispatchGeneration(addressed!, existing); return { action: 'apply' }; }
       // A sealed choice was committed before its reply. Replay it even if another request has since opened a generation.
-      const chosen = [...this.store.workflows.values()].filter(wf => wf.journal.loaded !== false || to.startsWith(wf.wid))
-        .flatMap(wf => revisionEntries(wf).filter(e => e.type === 'model-choice' && e.rid === req.rid))[0];
+      const chosen = addressed && revisionEntries(addressed).find(e => e.type === 'model-choice' && e.rid === req.rid);
       if (chosen) { await this.note(req.rid, String(chosen.model), 'next-generation'); return { action: 'apply' }; }
-      if ((req.body as SendBody)?.kind === 'model') {
+      if (addressed && (req.body as SendBody)?.kind === 'model') {
         // A live forward may have committed just before a crash, then been refused or superseded before replay.
         // Keep its original outcome; never turn it into a fresh sealed choice or send it to a newer generation.
-        for (const wf of this.store.workflows.values()) {
-          if (wf.journal.loaded === false && !to.startsWith(wf.wid)) continue;
-          const log = revisionEntries(wf), prior = log.find(e => e.type === 'forward' && e.rid === req.rid && (e.envelope as { kind?: string } | undefined)?.kind === 'model');
-          if (!prior) continue;
-          const entry = log.find(e => (e.type === 'call' || e.type === 'generation') && `${wf.wid}@${wf.revision}/${e.key}@${e.gen}` === prior.dest);
-          if (entry && !log.some(e => (e.type === JT.sealed || e.type === 'retired') && e.call === prior.dest)) return this.executor.forward(req, this.context(wf, entry));
+        const log = revisionEntries(addressed), prior = log.find(e => e.type === 'forward' && e.rid === req.rid && (e.envelope as { kind?: string } | undefined)?.kind === 'model');
+        if (prior) {
+          const entry = log.find(e => (e.type === 'call' || e.type === 'generation') && `${addressed.wid}@${addressed.revision}/${e.key}@${e.gen}` === prior.dest);
+          if (entry && !log.some(e => (e.type === JT.sealed || e.type === 'retired') && e.call === prior.dest)) return this.executor.forward(req, this.context(addressed, entry));
           return { action: 'apply' };
         }
       }
@@ -612,11 +614,11 @@ export class Engine {
       if (wid && !this.store.workflows.has(wid)) return { action: 'reject', reason: 'unknown-workflow' };
       // A resume releases held work in its scope (one workflow, one session's, or all) and continues parked workflows;
       // running ones need nothing and final ones are final.
-      const inScope = (wf: Workflow) => wid ? wf.wid === wid : origin ? wf.origin === origin : true;
+      const scope = wid ? [this.store.workflows.get(wid)!] : [...this.store.workflows.values()].filter(wf => origin ? wf.origin === origin : true);
       const took = (wf: Workflow) => lazy(wf) ? wf.settled.resumed.includes(req.rid) : wf.journal.entries().some(e => e.type === 'resumed' && e.rid === req.rid);
       const replayed = this.ledgers.orch.entries().some(e => e.type === 'undrain' && e.rid === req.rid);
       // Held follow-ups of a finished workflow are released too; they run again through dispatchGeneration below.
-      const holding = [...this.store.workflows.values()].filter(wf => inScope(wf) && this.held(wf.wid) && (!this.terminal(wf) || this.openFollowUps(wf)));
+      const holding = scope.filter(wf => this.held(wf.wid) && (!this.terminal(wf) || this.openFollowUps(wf)));
       const releasing = replayed || holding.length > 0;
       const final = (wf: Workflow) => { const done = this.terminal(wf); return done && done.status !== 'parked' ? String(done.status) : undefined; };
       const parked = (wf: Workflow) => this.terminal(wf)?.status === 'parked';
@@ -624,19 +626,19 @@ export class Engine {
         const target = wid ? this.store.workflows.get(wid)! : undefined;
         if (target && final(target) && !took(target)) return { action: 'reject', reason: `terminal:${final(target)} — start a new run` };
         if (target && !parked(target) && !took(target)) return { action: 'reject', reason: 'not-parked: already running' };
-        if (!target && ![...this.store.workflows.values()].some(wf => inScope(wf) && (parked(wf) || took(wf)))) return { action: 'reject', reason: 'nothing-to-resume' };
+        if (!target && !scope.some(wf => parked(wf) || took(wf))) return { action: 'reject', reason: 'nothing-to-resume' };
       }
       // A1: the pinned files of a finished workflow this resume starts are verified first (a start no longer hashes
       // them): a changed file refuses the resume before anything is recorded.
-      for (const wf of this.store.workflows.values()) {
+      for (const wf of scope) {
         const done = this.terminal(wf);
-        if (!inScope(wf) || !(done?.status === 'parked' || (releasing && !done))) continue;
+        if (!(done?.status === 'parked' || (releasing && !done))) continue;
         try { await this.store.ready(wf); } catch (error) { return { action: 'reject', reason: `pin-failed: ${String(error)}` }; }
       }
       if (releasing && !replayed) await this.ledgers.orch.append('undrain', { rid: req.rid, ...(wid ? { wid } : origin ? { origin } : {}) });
-      for (const wf of this.store.workflows.values()) {
-        const done = this.terminal(wf), released = releasing && inScope(wf) && !done && (replayed || holding.includes(wf));
-        if (!released && !(inScope(wf) && done?.status === 'parked')) continue;
+      for (const wf of scope) {
+        const done = this.terminal(wf), released = releasing && !done && (replayed || holding.includes(wf));
+        if (!released && done?.status !== 'parked') continue;
         if (!took(wf)) {
           const n = (!released ? this.states.get(wf.wid)?.ev : undefined) ?? Math.max(0, ...wf.journal.entries().filter(e => e.type === 'ev').map(e => Number(e.n))) + 1;
           await wf.journal.append('resumed', { rid: req.rid, n });
@@ -650,7 +652,7 @@ export class Engine {
         if (!this.states.has(wf.wid)) await this.startWorkflow(wf);
       }
       // A settled workflow not decoded has no generation to run (each ended, its finished attention recorded).
-      for (const wf of this.store.workflows.values()) if (!lazy(wf)) for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
+      for (const wf of scope) if (!lazy(wf)) for (const entry of revisionEntries(wf).filter(e => e.type === 'generation')) this.dispatchGeneration(wf, entry);
     } else if (req.kind === 'drain') {
       const { fence, origin, wid } = (req.body as DrainBody) ?? {}, scoped = Boolean(origin || wid);
       // Recorded in one step of the executor's serial queue (F2): a command call's intent is either before the drain
