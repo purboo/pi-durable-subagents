@@ -39,74 +39,78 @@ test('status and tail follow real engine journals with fake executor', { timeout
   await mkdir(join(home, 'agent/agents'), { recursive: true });
   await writeFile(join(home, 'agent/agents/test.md'), '---\nname: test\ndescription: test\n---\nTest');
   const ledgers = { home, orch, config: {} }, engine = new Engine(ledgers, fakeExecutor(ledgers), { discovery: { home, agentDir: join(home, 'agent'), globalNpmRoot: null } });
-  t.after(async () => { await engine.close(); await orch.close(); });
-  await engine.recover();
-  await publishRequest(orchInbox(home), { rid: 'run', from: 'test', to: 'orch', sseq: 1, kind: 'run', body: { cwd: home, source: "return await runs.run('a',{agent:'test',task:'hello'});" } });
-  await engine.intake();
-  const wid = String(orch.entries().find(e => e.type === JT.created)!.wid);
-  const output: string[] = [], controller = new AbortController();
-  const follow = tail(home, wid, text => output.push(text), controller.signal, 10);
-  try { await until(() => output.some(s => s.includes(': done'))); } finally { controller.abort(); await follow; }
-  assert.match(output.join('\n'), /a@1 ok/);
-  let json = '';
-  assert.equal(await main(['status', wid, '--json'], { env: { DSA_HOME: home }, write: s => { json = s; } }), 0);
-  assert.equal(JSON.parse(json).status, 'done');
-  assert.equal(JSON.parse(json).calls[0].result.ok, true);
-  await assert.rejects(main(['status', 'missing'], { env: { DSA_HOME: home } }), /Unknown workflow/);
-  // T10: the list view is the compact projection; events are a timeline without observation noise.
-  const out: string[] = [], env = { DSA_HOME: home }, write = (s: string) => { out.push(s); };
-  // The finished notice is appended just after the workflow's done record; wait for it rather than race it.
-  await until(() => readJournalSnapshot(journalPath(home, wid)).some(e => e.type === JT.attention));
-  assert.equal(await main(['status'], { env, write }), 0);
-  assert.match(out.join('\n'), new RegExp(`^${wid}@1: done · 1/1 done\n  a@1 ok "hello"\n  finished: ".* done: 1 ok"$`));
-  out.length = 0; assert.equal(await main(['status', '--json'], { env, write }), 0);
-  const view = JSON.parse(out[0]!);
-  assert.deepEqual(view.workflows[0].calls, [{ key: 'a', gen: 1, callId: `${wid}@1/a@1`, phase: 'sealed', status: 'ok', ok: true, lastLine: 'hello' }]);
-  assert.ok(!('entries' in view.workflows[0]) && !('result' in view.workflows[0].calls[0]));
-  out.length = 0; assert.equal(await main(['events', wid, '--json'], { env, write }), 0);
-  const events = out.map(line => JSON.parse(line));
-  assert.deepEqual(events.map(e => e.event), ['created', 'script-start', 'call', 'sealed', 'done', 'attention']);
-  assert.deepEqual([events[3].call, events[3].status, events[4].status], [`${wid}@1/a@1`, 'ok', 'done']);
-  out.length = 0; assert.equal(await main(['events', wid], { env, write }), 0);
-  assert.match(out[2]!, new RegExp(`^\\S+Z #\\d+ call\\s+key=a gen=1 agent=test$`));
-  await assert.rejects(main(['events', 'missing'], { env, write }), /Unknown workflow/);
+  try {
+    await engine.recover();
+    await publishRequest(orchInbox(home), { rid: 'run', from: 'test', to: 'orch', sseq: 1, kind: 'run', body: { cwd: home, source: "return await runs.run('a',{agent:'test',task:'hello'});" } });
+    await engine.intake();
+    const wid = String(orch.entries().find(e => e.type === JT.created)!.wid);
+    const output: string[] = [], controller = new AbortController();
+    const follow = tail(home, wid, text => output.push(text), controller.signal, 10);
+    try { await until(() => output.some(s => s.includes(': done'))); } finally { controller.abort(); await follow; }
+    assert.match(output.join('\n'), /a@1 ok/);
+    let json = '';
+    assert.equal(await main(['status', wid, '--json'], { env: { DSA_HOME: home }, write: s => { json = s; } }), 0);
+    assert.equal(JSON.parse(json).status, 'done');
+    assert.equal(JSON.parse(json).calls[0].result.ok, true);
+    await assert.rejects(main(['status', 'missing'], { env: { DSA_HOME: home } }), /Unknown workflow/);
+    // T10: the list view is the compact projection; events are a timeline without observation noise.
+    const out: string[] = [], env = { DSA_HOME: home }, write = (s: string) => { out.push(s); };
+    // The finished notice is appended just after the workflow's done record; wait for it rather than race it.
+    await until(() => readJournalSnapshot(journalPath(home, wid)).some(e => e.type === JT.attention));
+    assert.equal(await main(['status'], { env, write }), 0);
+    assert.match(out.join('\n'), new RegExp(`^${wid}@1: done · 1/1 done\n  a@1 ok "hello"\n  finished: ".* done: 1 ok"$`));
+    out.length = 0; assert.equal(await main(['status', '--json'], { env, write }), 0);
+    const view = JSON.parse(out[0]!);
+    assert.deepEqual(view.workflows[0].calls, [{ key: 'a', gen: 1, callId: `${wid}@1/a@1`, phase: 'sealed', status: 'ok', ok: true, lastLine: 'hello' }]);
+    assert.ok(!('entries' in view.workflows[0]) && !('result' in view.workflows[0].calls[0]));
+    out.length = 0; assert.equal(await main(['events', wid, '--json'], { env, write }), 0);
+    const events = out.map(line => JSON.parse(line));
+    assert.deepEqual(events.map(e => e.event), ['created', 'script-start', 'call', 'sealed', 'done', 'attention']);
+    assert.deepEqual([events[3].call, events[3].status, events[4].status], [`${wid}@1/a@1`, 'ok', 'done']);
+    out.length = 0; assert.equal(await main(['events', wid], { env, write }), 0);
+    assert.match(out[2]!, new RegExp(`^\\S+Z #\\d+ call\\s+key=a gen=1 agent=test$`));
+    await assert.rejects(main(['events', 'missing'], { env, write }), /Unknown workflow/);
+  } finally { await engine.close(); await orch.close(); }
 });
 
 test('CLI outbox recovers pending, retires receipts and serializes concurrent senders', { timeout: 15000 }, async t => {
   const home = await root(t), held = await new OsLock().tryAcquire(orchLock(home)); assert.ok(held);
-  t.after(() => held.release());
-  const first = (await submit(home, 'drain'))[0]!;
-  await unlink(join(orchInbox(home), `${fileId(first.rid)}.json`));
-  const results = await Promise.all([submit(home, 'stop', 'w@1/a@1'), submit(home, 'resume', 'w')]);
-  let inbox = await scanInbox(orchInbox(home));
-  assert.equal(inbox.length, 3);
-  assert.deepEqual(inbox.map(r => r.sseq).sort(), [1, 2, 3]);
-  assert.match(first.from, /^cli:.+@.+$/);
-  assert.deepEqual(results[0]![0]!.body, { target: 'w@1/a@1' });
-  assert.deepEqual(results[1]![0]!.body, { wid: 'w' });
-  const ledger = await openJournal(orchLedger(home));
-  await ledger.append('applied', { rid: first.rid }); await ledger.close();
-  await unlink(join(orchInbox(home), `${fileId(first.rid)}.json`));
-  await submit(home, 'resume');
-  inbox = await scanInbox(orchInbox(home));
-  assert.ok(!inbox.some(r => r.rid === first.rid));
-  assert.equal(Math.max(...inbox.map(r => r.sseq)), 4);
-  assert.ok(readJournalSnapshot(join(home, 'outbox', `${fileId(first.from)}.jsonl`)).some(e => e.type === 'resolved' && e.rid === first.rid));
+  try {
+    const first = (await submit(home, 'drain'))[0]!;
+    await unlink(join(orchInbox(home), `${fileId(first.rid)}.json`));
+    const results = await Promise.all([submit(home, 'stop', 'w@1/a@1'), submit(home, 'resume', 'w')]);
+    let inbox = await scanInbox(orchInbox(home));
+    assert.equal(inbox.length, 3);
+    assert.deepEqual(inbox.map(r => r.sseq).sort(), [1, 2, 3]);
+    assert.match(first.from, /^cli:.+@.+$/);
+    assert.deepEqual(results[0]![0]!.body, { target: 'w@1/a@1' });
+    assert.deepEqual(results[1]![0]!.body, { wid: 'w' });
+    const ledger = await openJournal(orchLedger(home));
+    await ledger.append('applied', { rid: first.rid }); await ledger.close();
+    await unlink(join(orchInbox(home), `${fileId(first.rid)}.json`));
+    await submit(home, 'resume');
+    inbox = await scanInbox(orchInbox(home));
+    assert.ok(!inbox.some(r => r.rid === first.rid));
+    assert.equal(Math.max(...inbox.map(r => r.sseq)), 4);
+    assert.ok(readJournalSnapshot(join(home, 'outbox', `${fileId(first.from)}.jsonl`)).some(e => e.type === 'resolved' && e.rid === first.rid));
+  } finally { await held.release(); }
 });
 
 test('stop-all sends one drain with fence without altering journals', async t => {
-  const home = await root(t), held = await new OsLock().tryAcquire(orchLock(home)); assert.ok(held); t.after(() => held.release());
-  for (const [wid, status] of [['running', ''], ['parked', 'parked'], ['done', 'done']]) {
-    const journal = await openJournal(join(home, 'w', wid!, 'journal.jsonl'));
-    await journal.append('wf-created', { revision: 1 }); if (status) await journal.append(JT.done, { status }); await journal.close();
-  }
-  const before = await readFile(join(home, 'w/running/journal.jsonl'));
-  const sent = await submit(home, 'stop-all');
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0]!.kind, 'drain');
-  assert.deepEqual(sent[0]!.body, { fence: true });
-  assert.deepEqual(await scanInbox(orchInbox(home)), sent);
-  assert.deepEqual(await readFile(join(home, 'w/running/journal.jsonl')), before);
+  const home = await root(t), held = await new OsLock().tryAcquire(orchLock(home)); assert.ok(held);
+  try {
+    for (const [wid, status] of [['running', ''], ['parked', 'parked'], ['done', 'done']]) {
+      const journal = await openJournal(join(home, 'w', wid!, 'journal.jsonl'));
+      await journal.append('wf-created', { revision: 1 }); if (status) await journal.append(JT.done, { status }); await journal.close();
+    }
+    const before = await readFile(join(home, 'w/running/journal.jsonl'));
+    const sent = await submit(home, 'stop-all');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]!.kind, 'drain');
+    assert.deepEqual(sent[0]!.body, { fence: true });
+    assert.deepEqual(await scanInbox(orchInbox(home)), sent);
+    assert.deepEqual(await readFile(join(home, 'w/running/journal.jsonl')), before);
+  } finally { await held.release(); }
 });
 
 test('starter runs injected detached entry only when orchestrator lock is free', { timeout: 10000 }, async t => {

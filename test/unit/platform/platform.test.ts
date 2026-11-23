@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,7 +10,15 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { ProcessTable } from "../../../src/platform/proctable.ts";
 import { Containment } from "../../../src/platform/containment.ts";
-import { OsLock, isLockTimeout } from "../../../src/platform/lock.ts";
+import {
+  OsLock,
+  WIN_LOCK_HELPER_EXE,
+  WIN_LOCK_HELPER_SOURCE,
+  WIN_LOCK_HELPER_SOURCE_FILE,
+  compileWinLockHelper,
+  isLockTimeout,
+  winLockHelperCacheDirs,
+} from "../../../src/platform/lock.ts";
 import type { Spawned } from "../../../src/types.ts";
 
 const WAIT_MS = process.platform === "win32" ? 15000 : 4000;
@@ -358,6 +366,92 @@ test("OS lock helper protocol covers timeout, malformed response, ENOENT fallbac
     await held.release();
     const releaseMs = Date.now() - releaseStarted;
     assert.ok(releaseMs >= 900 && releaseMs < 10000, `hung helper force-killed on release (${releaseMs} ms)`);
+
+    // A candidate marked fallbackOnSpawnError (used for the compiled Windows lock helper) falls back on EACCES too.
+    if (process.platform !== "win32" && process.getuid?.() !== 0) {
+      const blocked = join(dir, "blocked-helper");
+      await writeFile(blocked, "#!/bin/sh\necho locked\n", { mode: 0o644 });
+      const eaccesFallback = new OsLock(3000, [
+        { command: blocked, args: [], fallbackOnSpawnError: true },
+        { command: process.execPath, args: ["-e", "process.stdout.write('locked\\n'); process.stdin.resume();"] },
+      ]);
+      const h = await eaccesFallback.tryAcquire(join(dir, "eacces.lock"));
+      assert.ok(h);
+      await h.release();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Windows compiled lock helper source, cache dirs, atomic publish and reuse preserve C4 invariants", { timeout: 15000 }, async () => {
+  // Pure ASCII C# source holding FileShare.None (never FileShare.Delete) and never deleting/moving unverified paths.
+  assert.match(WIN_LOCK_HELPER_SOURCE, /^[\t\n\r\x20-\x7e]*$/);
+  assert.match(WIN_LOCK_HELPER_SOURCE, /FileMode\.OpenOrCreate,\s*FileAccess\.ReadWrite,\s*FileShare\.None/);
+  assert.doesNotMatch(WIN_LOCK_HELPER_SOURCE, /FileShare\.(Delete|Read|Write)/);
+  assert.doesNotMatch(WIN_LOCK_HELPER_SOURCE, /(File|Directory)\.(Delete|Move)/);
+  assert.match(WIN_LOCK_HELPER_SOURCE, /-2147024864/);
+  assert.match(WIN_LOCK_HELPER_SOURCE, /-2147024863/);
+  assert.match(WIN_LOCK_HELPER_SOURCE, /Directory\.Exists/);
+  assert.match(WIN_LOCK_HELPER_SOURCE, /DSA_LOCK_PATH/);
+  assert.match(WIN_LOCK_HELPER_SOURCE, /108,\s*111,\s*99,\s*107,\s*101,\s*100,\s*10/);
+
+  const dirsA = winLockHelperCacheDirs({ LOCALAPPDATA: "/local", TEMP: "/tmp" }, "x64");
+  const dirsB = winLockHelperCacheDirs({ LOCALAPPDATA: "/local", TEMP: "/tmp" }, "ia32");
+  assert.equal(dirsA.length, 2);
+  assert.ok(dirsA[0]!.startsWith(join("/local", "pi-durable-subagents", "lock-helper", "v1-")));
+  assert.ok(dirsA[1]!.startsWith(join("/tmp", "pi-durable-subagents", "lock-helper", "v1-")));
+  assert.notEqual(dirsA[0], dirsB[0]);
+
+  if (process.platform === "win32") return;
+  const dir = await mkdtemp(join(tmpdir(), "dsa-lock-compile-"));
+  const cacheDir = join(dir, "cache");
+  const countFile = join(dir, "compile-count");
+  const stub = join(dir, "fake-csc.sh");
+  try {
+    await writeFile(
+      stub,
+      [
+        "#!/bin/sh",
+        `printf '1\\n' >> ${JSON.stringify(countFile)}`,
+        `[ -f ${JSON.stringify(WIN_LOCK_HELPER_SOURCE_FILE)} ] || exit 11`,
+        `printf 'MZ-stub' > DsaLock.build.exe`,
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+
+    // 1. First compile publishes atomically and cleans up its staging dir; retries transient EBUSY.
+    let busyOnce = true;
+    const first = await compileWinLockHelper(cacheDir, {
+      compiler: stub,
+      retryMs: 5,
+      renameFile: async (from, to) => {
+        if (busyOnce) { busyOnce = false; throw Object.assign(new Error("EBUSY"), { code: "EBUSY" }); }
+        await rename(from, to);
+      },
+    });
+    assert.equal(first, join(cacheDir, WIN_LOCK_HELPER_EXE));
+    assert.equal(await readFile(first, "utf8"), "MZ-stub");
+    assert.deepEqual(await readdir(cacheDir), [WIN_LOCK_HELPER_EXE]);
+    assert.equal((await readFile(countFile, "utf8")).trim().split("\n").length, 1);
+
+    // 2. Second call reuses the cached executable without invoking the compiler.
+    const second = await compileWinLockHelper(cacheDir, { compiler: stub });
+    assert.equal(second, first);
+    assert.equal((await readFile(countFile, "utf8")).trim().split("\n").length, 1);
+
+    // 3. Concurrent publish race: another process publishes DsaLock.exe while our rename gets EPERM.
+    const raceCache = join(dir, "race-cache");
+    const raced = await compileWinLockHelper(raceCache, {
+      compiler: stub,
+      retryMs: 5,
+      renameFile: async (_from, to) => {
+        await writeFile(to, "MZ-winner");
+        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      },
+    });
+    assert.equal(await readFile(raced, "utf8"), "MZ-winner");
+    assert.deepEqual(await readdir(raceCache), [WIN_LOCK_HELPER_EXE]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

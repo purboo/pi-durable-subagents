@@ -141,30 +141,43 @@ test('a pi-process run and send tool call add no outbox snapshot or unrelated de
   const { home, dir, foreign } = await fixture(t);
   const keys = ['HOME', 'DSA_HOME', 'DSA_SESSION', 'DSA_ORCHESTRATOR_ENTRY', 'PI_CODING_AGENT_DIR', 'PI_OFFLINE'] as const;
   const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
-  Object.assign(process.env, { HOME: home, DSA_HOME: home, PI_CODING_AGENT_DIR: join(home, 'agent'), PI_OFFLINE: '1' });
-  const orch = await openJournal(orchLedger(home)), ledgers = { home, orch, config: {} };
-  const lock = await new OsLock().tryAcquire(orchLock(home)); assert.ok(lock);
-  const engine = new Engine(ledgers, fakeExecutor(ledgers), { evaluator: { async start() {}, send() {}, async close() {} }, discovery: { home, agentDir: join(home, 'agent'), globalNpmRoot: null } });
+  const parse = JSON.parse;
+  let orch: Awaited<ReturnType<typeof openJournal>> | undefined;
+  let lock: Awaited<ReturnType<OsLock['tryAcquire']>> = null;
+  let engine: Engine | undefined;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let started = false;
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
-  let tool: { execute: (...args: unknown[]) => Promise<{ details: unknown }> } | undefined;
   const context = { cwd: home, hasUI: false, isIdle: () => false, ui: { notify() {} },
     sessionManager: { getSessionId: () => 'filter-session', getSessionFile: () => undefined, getLeafId: () => undefined } };
-  const { registerMain } = await import('../../../src/agent/main.ts');
-  registerMain({ on(name: string, fn: never) { handlers.set(name, fn); }, registerTool(value: never) { tool = value; }, sendMessage() {} } as never);
-  await handlers.get('session_start')!({}, context);
-  const timer = setInterval(() => void engine.intake(), 20);
-  const parse = JSON.parse; let unrelated = 0;
-  t.after(async () => {
-    JSON.parse = parse; clearInterval(timer);
-    await handlers.get('session_shutdown')!({ reason: 'reload' }, context);
-    await engine.close(); await orch.close(); await lock.release();
+  try {
+    Object.assign(process.env, { HOME: home, DSA_HOME: home, PI_CODING_AGENT_DIR: join(home, 'agent'), PI_OFFLINE: '1' });
+    orch = await openJournal(orchLedger(home));
+    const ledgers = { home, orch, config: {} };
+    lock = await new OsLock().tryAcquire(orchLock(home)); assert.ok(lock);
+    engine = new Engine(ledgers, fakeExecutor(ledgers), { evaluator: { async start() {}, send() {}, async close() {} }, discovery: { home, agentDir: join(home, 'agent'), globalNpmRoot: null } });
+    let tool: { execute: (...args: unknown[]) => Promise<{ details: unknown }> } | undefined;
+    const { registerMain } = await import('../../../src/agent/main.ts');
+    registerMain({ on(name: string, fn: never) { handlers.set(name, fn); }, registerTool(value: never) { tool = value; }, sendMessage() {} } as never);
+    await handlers.get('session_start')!({}, context);
+    started = true;
+    timer = setInterval(() => void engine!.intake(), 20);
+    let unrelated = 0;
+    JSON.parse = function (...args: Parameters<typeof JSON.parse>) { if (args[0].includes('"probeUnrelated":true')) unrelated++; return parse(...args); };
+    const run = (await tool!.execute('run', { action: 'run', request: 'filtered-run', source: 'export default async () => 1' }, undefined, undefined, context)).details as { wid?: string };
+    assert.ok(run.wid);
+    const sent = (await tool!.execute('send', { action: 'send', request: 'filtered-send', to: 'absent/key', kind: 'steer', message: 'hello' }, undefined, undefined, context)).details as { applied: boolean };
+    assert.equal(sent.applied, false);
+    assert.equal(unrelated, 0);
+    for (const path of [foreign, join(dir, 'main:filter-session.jsonl')]) assert.equal(hasJournalSnapshot(path), false, path);
+  } finally {
+    // Release handles and stop timers before fixture(t)'s t.after removes home (t.after hooks run FIFO, not LIFO).
+    JSON.parse = parse;
+    if (timer) clearInterval(timer);
+    if (started) await handlers.get('session_shutdown')?.({ reason: 'reload' }, context);
+    await engine?.close();
+    await orch?.close();
+    await lock?.release();
     for (const key of keys) if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
-  });
-  JSON.parse = function (...args: Parameters<typeof JSON.parse>) { if (args[0].includes('"probeUnrelated":true')) unrelated++; return parse(...args); };
-  const run = (await tool!.execute('run', { action: 'run', request: 'filtered-run', source: 'export default async () => 1' }, undefined, undefined, context)).details as { wid?: string };
-  assert.ok(run.wid);
-  const sent = (await tool!.execute('send', { action: 'send', request: 'filtered-send', to: 'absent/key', kind: 'steer', message: 'hello' }, undefined, undefined, context)).details as { applied: boolean };
-  assert.equal(sent.applied, false);
-  assert.equal(unrelated, 0);
-  for (const path of [foreign, join(dir, 'main:filter-session.jsonl')]) assert.equal(hasJournalSnapshot(path), false, path);
+  }
 });
