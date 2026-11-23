@@ -95,9 +95,16 @@ test("tracked identity is fenced after exec clears its tag", { timeout: 10000, s
 test("scan discovers untagged descendants and ignores mismatched start tokens", { timeout: 10000, skip: process.platform === "win32" ? "needs /bin/sh and DSA_EXEC environment discovery" : false }, async () => {
   const tag = randomUUID(); const c = new Containment();
   try {
-    const parent = await c.spawn(spec(tag, "/bin/sh", ["-c", "env -u DSA_EXEC sleep 60 & wait"]));
-    // The forked shell still carries the tag until it execs `env -u DSA_EXEC`: wait for the untagged sleep itself.
-    const child = await until(async () => (await c.scan(new Map())).get(tag)?.find(p => p.pid !== parent.pid && p.tag === undefined));
+    const parent = await c.spawn(spec(tag, "/bin/sh", ["-c", "env -u DSA_EXEC /bin/sh -c 'echo $$; exec sleep 60' & wait"]));
+    // Linux caches the first observed execution tag for a (pid, start) identity across exec.
+    // Start scanning only after the child itself confirms that it has entered the untagged environment.
+    let ready = "";
+    for await (const chunk of parent.stdout) {
+      ready += chunk.toString();
+      if (ready.includes("\n")) break;
+    }
+    assert.match(ready.trim(), /^\d+$/);
+    const child = await until(async () => (await c.scan(new Map())).get(tag)?.find(p => p.pid === Number(ready)));
     assert.equal(child.tag, undefined);
     const fresh = new Containment();
     await fresh.fence("nonexistent", [{ ...child, start: "wrong" }]);
