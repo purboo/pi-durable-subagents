@@ -2,6 +2,8 @@
 // A missing tier-0 surface disables Durable Subagents with one exact message; a missing UI surface disables only
 // the UI. Never a silent failure, never a crash of pi.
 
+import { isNodeProcess, resolveNode, resolvePi } from "../platform/launch.ts";
+
 /** Tier 0 = execution (tool, boundaries, receipts); tier 2 = native watch UI. */
 export interface Surface { tier: 0 | 2; where: string; name: string }
 export const SURFACES: readonly Surface[] = [
@@ -22,19 +24,32 @@ export interface CapabilityReport { version?: string; missing: Surface[]; execut
 export const SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = ["linux", "darwin", "win32"];
 /** AC5, P21, issue #1: Check the platform and the surfaces present in pi's modules and extension API; produce exact
  *  degradation messages. */
-export function checkCapabilities(modules: Record<string, Record<string, unknown> | undefined>, api: object, version?: string, platform: NodeJS.Platform = process.platform): CapabilityReport {
+export interface RuntimeProbe {
+  env?: NodeJS.ProcessEnv;
+  isNode?: boolean;
+  hasThreadCpuUsage?: boolean;
+  piPath?: string;
+}
+export function checkCapabilities(modules: Record<string, Record<string, unknown> | undefined>, api: object, version?: string, platform: NodeJS.Platform = process.platform, runtime: RuntimeProbe = {}): CapabilityReport {
   const has = (s: Surface) => s.where === "ExtensionAPI" ? typeof (api as Record<string, unknown>)[s.name] === "function" : modules[s.where]?.[s.name] !== undefined;
   const missing = SURFACES.filter(s => !has(s));
   const name = (list: Surface[]) => list.map(s => `${s.where}.${s.name}`).join(", ");
   const pi = version ? `pi ${version}` : "this pi version";
+  const os = SUPPORTED_PLATFORMS.includes(platform);
   // The evaluator's CPU limit needs worker.cpuUsage and process.threadCpuUsage (Node 22.19); without them a runaway
   // script would never be stopped, so an older Node disables execution rather than run unguarded.
-  const node = typeof (process as { threadCpuUsage?: unknown }).threadCpuUsage === "function";
-  const os = SUPPORTED_PLATFORMS.includes(platform);
-  const execution = os && node && !missing.some(s => s.tier === 0), ui = execution && !missing.some(s => s.tier === 2);
+  // When pi itself is a standalone compiled binary (e.g. Bun via mise, #11), process.execPath is pi rather than node:
+  // check that a real Node.js executable can be resolved via DSA_NODE_BIN or PATH so the orchestrator can start.
+  const hostIsNode = runtime.isNode ?? isNodeProcess();
+  const node = hostIsNode ? (runtime.hasThreadCpuUsage ?? typeof (process as { threadCpuUsage?: unknown }).threadCpuUsage === "function") : true;
+  const probeEnv = runtime.env ?? process.env;
+  const externalNode = os && !hostIsNode ? resolveNode(probeEnv, { platform, versions: { bun: "standalone" }, piPath: runtime.piPath ?? resolvePi(probeEnv).path }) : undefined;
+  const hasNode = hostIsNode ? node : Boolean(externalNode?.path);
+  const execution = os && hasNode && !missing.some(s => s.tier === 0), ui = execution && !missing.some(s => s.tier === 2);
   const messages: string[] = [];
   if (!os) messages.push(`Durable Subagents disabled: it runs only on Linux, macOS and Windows (this is ${platform}); its process layer (process tracking, file locks, command calls) has no ${platform} implementation.`);
-  else if (!node) messages.push(`Durable Subagents disabled: it needs Node.js 22.19 or later (this is ${process.version}).`);
+  else if (hostIsNode && !node) messages.push(`Durable Subagents disabled: it needs Node.js 22.19 or later (this is ${process.version}).`);
+  else if (!hostIsNode && !externalNode?.path) messages.push(`Durable Subagents disabled: pi is running as a standalone binary, so it needs Node.js 22.19 or later on PATH (or DSA_NODE_BIN) to run the orchestrator (${externalNode?.problem}).`);
   else if (!execution) messages.push(`Durable Subagents disabled: ${pi} no longer provides ${name(missing.filter(s => s.tier === 0))}. Running workflows are untouched; run \`pi-durable-subagents smoke\` for details.`);
   else if (!ui) messages.push(`Durable Subagents: native watch view disabled (${pi} no longer exports ${name(missing.filter(s => s.tier === 2))}); use \`pi-durable-subagents tail\`.`);
   return { ...(version ? { version } : {}), missing, execution, ui, messages };

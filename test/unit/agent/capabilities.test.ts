@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { SURFACES, checkCapabilities } from "../../../src/agent/capabilities.ts";
-import { childRefusal } from "../../../src/agent/extension.ts";
+import { childRefusal, orchestratorLaunchRefusal } from "../../../src/agent/extension.ts";
 
 const fn = () => {};
 const api = { on: fn, registerTool: fn, appendEntry: fn, sendMessage: fn, setModel: fn, setThinkingLevel: fn, registerMessageRenderer: fn };
@@ -60,4 +60,26 @@ await load({ on: f, appendEntry: f, sendMessage: f, setModel: f, setThinkingLeve
   assert.equal(child.status, 3);
   assert.equal(child.stdout, "");
   assert.match(child.stderr, /^Durable Subagents disabled: .* no longer provides ExtensionAPI\.registerTool\. Running workflows are untouched/);
+});
+
+test("issue #11: standalone binary checks for external node and DSA_ORCHESTRATOR_LAUNCH aborts extension load with exit 4", { timeout: 30000 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-standalone-")); t.after(() => rm(home, { recursive: true, force: true }));
+  // Standalone host with no node on PATH disables execution with a clear message.
+  const missing = checkCapabilities(real(), api, "1.6.0", process.platform, { isNode: false, env: { PATH: home } });
+  assert.equal(missing.execution, false); assert.equal(missing.ui, false);
+  assert.match(missing.messages[0]!, /standalone binary.*Node\.js 22\.19.*DSA_NODE_BIN/);
+  // Standalone host with a valid DSA_NODE_BIN passes.
+  const ok = checkCapabilities(real(), api, "1.6.0", process.platform, { isNode: false, env: { DSA_NODE_BIN: process.execPath }, piPath: join(home, "pi") });
+  assert.equal(ok.execution, true); assert.equal(ok.ui, true); assert.deepEqual(ok.messages, []);
+  // Recursion guard helper and real extension load.
+  assert.equal(orchestratorLaunchRefusal({}), undefined);
+  assert.match(orchestratorLaunchRefusal({ DSA_ORCHESTRATOR_LAUNCH: "1" })!, /refusing to run inside a pi process spawned as the orchestrator/);
+  const extension = fileURLToPath(new URL("../../../src/agent/extension.ts", import.meta.url));
+  const source = `const { default: load } = await import(${JSON.stringify(pathToFileURL(extension).href)}); const f = () => {};
+await load({ on: f, registerTool: f, appendEntry: f, sendMessage: f, setModel: f, setThinkingLevel: f }); console.log("continued");`;
+  const env = { PATH: process.env.PATH, HOME: home, DSA_HOME: join(home, "dsa"), DSA_ORCHESTRATOR_LAUNCH: "1" };
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", source], { env, encoding: "utf8", timeout: 20000 });
+  assert.equal(child.status, 4);
+  assert.equal(child.stdout, "");
+  assert.match(child.stderr, /refusing to run inside a pi process spawned as the orchestrator/);
 });

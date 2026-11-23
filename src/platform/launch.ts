@@ -7,9 +7,10 @@
 //   end it. Without lingering the user manager stops its scopes at logout, while a plain detached process survives it
 //   (KillUserProcesses=no, the usual default): it starts as a plain detached process then.
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { userInfo } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, normalize, resolve, win32 } from "node:path";
+import { ENV } from "../types.ts";
 import { comspec, envValue, IS_WINDOWS, winTagArg } from "./windows.ts";
 
 const WINDOWS_EXECUTABLE = new Set([".exe", ".com", ".cmd", ".bat"]);
@@ -96,7 +97,10 @@ export function execTarget(command: string, args: readonly string[], options: Ex
     : command;
   if (!/\.(cmd|bat)$/i.test(resolved)) return { command: resolved, args: [...args] };
   const script = shimScript(resolved);
-  if (script) return { command: process.execPath, args: [script, ...args] };
+  if (script) {
+    const node = resolveNode(env, { platform }).path;
+    if (node) return { command: node, args: [script, ...args] };
+  }
   // Outer quotes satisfy `cmd.exe /s /c`, which unconditionally strips the first and last `"` from the command string,
   // leaving `"path" "arg1" ...` intact for cmd.exe and batch `%*` forwarding. Callers pass `windowsVerbatimArguments: true`.
   const inner = [quoteCmdBatchArg(resolved), ...args.map(quoteCmdBatchArg)].join(" ");
@@ -132,6 +136,81 @@ export function shellTarget(command: string, exec?: string, platform: NodeJS.Pla
 /** The PATH (and PATHEXT) of an environment under this platform's naming rules: a Windows environment spells it `Path`
  *  as often as `PATH`, and both are the one variable. POSIX reads `PATH` exactly. */
 const envPath = (env: NodeJS.ProcessEnv) => IS_WINDOWS ? envValue(env, "PATH") : env.PATH;
+
+const NODE_BASENAME = /^node(?:js)?(?:[-._]?v?\d[\d._-]*)?(?:\.exe)?$/i;
+const basenameOf = (filePath: string) => filePath.replace(/^.*[\\/]/, "");
+const realPathOf = (filePath: string) => { try { return realpathSync(filePath); } catch { return filePath; } };
+const normFile = (filePath: string, platform: NodeJS.Platform) => platform === "win32" ? filePath.toLowerCase() : filePath;
+
+/** Whether this process itself is a standalone Node.js runtime (not a compiled Bun or SEA pi binary where
+ *  process.execPath points to pi and running `execPath main.js` would open a recursive pi session, #11). */
+export function isNodeProcess(options: { execPath?: string; versions?: Record<string, string | undefined>; releaseName?: string } = {}): boolean {
+  const versions = options.versions ?? (process.versions as Record<string, string | undefined>);
+  if (versions.bun) return false;
+  const releaseName = options.releaseName ?? process.release?.name;
+  if (releaseName !== "node") return false;
+  const execPath = options.execPath ?? process.execPath;
+  return NODE_BASENAME.test(basenameOf(execPath));
+}
+
+/** Whether `nodePath` and `piPath` invoke the same program. Multi-call version-manager shims (mise, volta, asdf)
+ *  share one realpath binary (e.g. `mise`) across `shims/node` and `shims/pi` and dispatch on argv[0], so two
+ *  distinct paths whose shared target is neither `pi` nor `node` remain distinct programs. */
+export function isSameProgram(nodePath: string, piPath: string | undefined, platform: NodeJS.Platform = process.platform): boolean {
+  if (!piPath) return false;
+  if (normFile(nodePath, platform) === normFile(piPath, platform)) return true;
+  const realNode = realPathOf(nodePath), realPi = realPathOf(piPath);
+  if (normFile(realNode, platform) !== normFile(realPi, platform)) return false;
+  const nodeName = basenameOf(nodePath), piName = basenameOf(piPath), targetName = basenameOf(realNode);
+  if (NODE_BASENAME.test(nodeName) && !NODE_BASENAME.test(piName) && normFile(targetName, platform) !== normFile(piName, platform)) return false;
+  return true;
+}
+
+export interface NodeResolution { path?: string; source?: "DSA_NODE_BIN" | "execPath" | "PATH"; problem?: string }
+export interface NodeResolveOptions {
+  platform?: NodeJS.Platform;
+  execPath?: string;
+  versions?: Record<string, string | undefined>;
+  releaseName?: string;
+  piPath?: string;
+}
+/** Resolve a Node.js executable for launching the orchestrator and JS helpers (#11):
+ *  1. DSA_NODE_BIN when set (must be an absolute path to an executable file, and not pi itself);
+ *  2. process.execPath when this process is a real Node.js runtime (not a compiled Bun/standalone pi binary);
+ *  3. `node` (or `nodejs` on POSIX) on PATH. */
+export function resolveNode(env: NodeJS.ProcessEnv, options: NodeResolveOptions = {}): NodeResolution {
+  const platform = options.platform ?? process.platform;
+  const given = env.DSA_NODE_BIN;
+  if (given) {
+    if (!absolute(given, platform) || !executableFile(given, platform))
+      return { problem: `DSA_NODE_BIN=${given} is not an absolute path to an executable file` };
+    if (isSameProgram(given, options.piPath, platform))
+      return { problem: `DSA_NODE_BIN=${given} resolves to the pi executable (${options.piPath})` };
+    return { path: given, source: "DSA_NODE_BIN" };
+  }
+  const execPath = options.execPath ?? process.execPath;
+  if (isNodeProcess({ execPath, versions: options.versions, releaseName: options.releaseName }) && !isSameProgram(execPath, options.piPath, platform)) {
+    return { path: execPath, source: "execPath" };
+  }
+  const PATH = platform === "win32" ? envValue(env, "PATH") : env.PATH;
+  const pathext = platform === "win32" ? envValue(env, "PATHEXT") : undefined;
+  const found = findOnPath("node", PATH, { platform, pathext })
+    ?? (platform !== "win32" ? findOnPath("nodejs", PATH, { platform }) : undefined);
+  if (found) {
+    if (isSameProgram(found, options.piPath, platform))
+      return { problem: `node on PATH (${found}) resolves to the pi executable (${options.piPath})` };
+    return { path: found, source: "PATH" };
+  }
+  return { problem: `node was not found on PATH (${PATH || "unset"}) and DSA_NODE_BIN is not set` };
+}
+
+/** The starter cannot start an orchestrator without a Node.js runtime (#11). */
+export class NodeNotFound extends Error {
+  constructor(problem: string) {
+    super(`cannot start the orchestrator: ${problem}. Set DSA_NODE_BIN to the absolute path of Node.js 22.19+, or put node on PATH`);
+    this.name = "NodeNotFound";
+  }
+}
 
 export interface PiResolution { path?: string; source?: "DSA_PI_BIN" | "PATH"; problem?: string }
 /** The `pi` the orchestrator launches subagents with: DSA_PI_BIN when set (it must be an executable file), else the
@@ -228,7 +307,7 @@ function orchestratorStdio(env: NodeJS.ProcessEnv): { stdio: SpawnOptions["stdio
 /** The variables the executor sets for one call's processes (a subagent, a command call, a gate). An orchestrator
  *  started from inside a call (its CLI, a command that runs `start`) never carries them: with the call's DSA_EXEC it
  *  would be one of that call's processes, and the call's fence (its end, a stop) would kill it. */
-export const PER_CALL_ENV = ["DSA_SESSION", "DSA_EXEC", "DSA_CALL", "DSA_INBOX", "DSA_JOURNAL", "DSA_SCHEMA", "DSA_BUDGET", "DSA_MODEL", "DSA_RESULT", "DSA_OUTPUT", "DSA_PROBE"] as const;
+export const PER_CALL_ENV = ["DSA_SESSION", "DSA_EXEC", "DSA_CALL", "DSA_INBOX", "DSA_JOURNAL", "DSA_SCHEMA", "DSA_BUDGET", "DSA_MODEL", "DSA_RESULT", "DSA_OUTPUT", "DSA_PROBE", ENV.orchestratorLaunch] as const;
 /** `env` without PER_CALL_ENV. */
 export function orchestratorEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const rest = { ...env };
@@ -240,10 +319,21 @@ export function orchestratorEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  *  session) and every other per-call variable (PER_CALL_ENV) plus DSA_HOME and the resolved DSA_PI_BIN. In its own systemd scope when one is available (the scope execs
  *  the command: same environment, and the pid is the orchestrator's), else a plain detached process. */
 export async function launchOrchestrator(entry: string, env: NodeJS.ProcessEnv, options: LaunchOptions): Promise<Launched> {
+  const platform = options.platform ?? process.platform;
   const pi = resolvePi(env);
   if (!pi.path && options.requirePi) throw new PiNotFound(pi.problem!);
-  const childEnv: NodeJS.ProcessEnv = { ...orchestratorEnv(env), DSA_HOME: options.home, ...(pi.path ? { DSA_PI_BIN: pi.path } : {}) };
-  const node = options.node ?? process.execPath, run = options.spawn ?? spawn;
+  let node: string;
+  const piPath = pi.path ?? (isNodeProcess() ? undefined : process.execPath);
+  if (options.node !== undefined) {
+    if (isSameProgram(options.node, piPath, platform)) throw new NodeNotFound(`orchestrator runtime ${options.node} resolves to the pi executable (${piPath})`);
+    node = options.node;
+  } else {
+    const resolved = resolveNode(env, { platform, piPath });
+    if (!resolved.path) throw new NodeNotFound(resolved.problem!);
+    node = resolved.path;
+  }
+  const childEnv: NodeJS.ProcessEnv = { ...orchestratorEnv(env), DSA_HOME: options.home, [ENV.orchestratorLaunch]: "1", ...(pi.path ? { DSA_PI_BIN: pi.path } : {}) };
+  const run = options.spawn ?? spawn;
   const runner = await scopeRunner(env, options);
   const diagnostic = orchestratorStdio(childEnv);
   // The child holds its own copies of the descriptors; ours are closed once it has started (a failed start closes them).

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
-import { shimScript } from "../platform/launch.ts";
+import { resolveNode, shimScript } from "../platform/launch.ts";
 import { comspec } from "../platform/windows.ts";
 import { cacheDir, dsaHome } from "../paths.ts";
 
@@ -67,7 +67,8 @@ function npmLayout(npm: string, platform: NodeJS.Platform): NpmLayout {
 function npmCommand(npm: string, node: string | null, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): { command: string; args: string[]; verbatim?: boolean } {
   if (platform !== "win32") return { command: "npm", args: ["root", "-g"] };
   const { cli } = npmLayout(npm, platform);
-  if (cli) return { command: node ?? process.execPath, args: [cli, "root", "-g"] };
+  const runtime = node ?? resolveNode(env, { platform }).path;
+  if (cli && runtime) return { command: runtime, args: [cli, "root", "-g"] };
   if (!/\.(?:cmd|bat)$/i.test(npm)) return { command: npm, args: ["root", "-g"] };
   return { command: comspec(env), args: ["/d", "/s", "/c", `""${npm}" root -g"`], verbatim: true };
 }

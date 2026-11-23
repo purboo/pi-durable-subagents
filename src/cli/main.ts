@@ -14,7 +14,7 @@ import { doctor, renderDoctor, size } from "./doctor.ts";
 import { smoke } from "./smoke.ts";
 import { serviceFiles, manageService, type ServiceRunner } from "./service.ts";
 import { leaseLines, leaseState } from "../platform/lease.ts";
-import { resolvePi, type PiResolution } from "../platform/launch.ts";
+import { resolveNode, resolvePi, type PiResolution } from "../platform/launch.ts";
 import { currentOrchestrator, decidedBy, legacyRestart, cliInitiator, waitExit, waitSuccessor } from "./restart.ts";
 import { restartInputError } from "../orchestrator/restart.ts";
 import { packageVersion } from "../version.ts";
@@ -230,7 +230,8 @@ export async function main(args = process.argv.slice(2), options: { env?: NodeJS
     if (refused) { (options.write ?? (line => console.error(line)))(refused); return 1; }
     const pi: PiResolution = command === "install-service" ? resolvePi(env) : {};
     if (command === "install-service" && !pi.path) write(`note: ${pi.problem}; the service can start an orchestrator only once DSA_PI_BIN is set in it`);
-    const files = serviceFiles(env.HOME ?? homedir(), home, entry, process.platform, process.execPath, pi.path);
+    const node = resolveNode(env, { piPath: pi.path }).path ?? process.execPath;
+    const files = serviceFiles(env.HOME ?? homedir(), home, entry, process.platform, node, pi.path);
     await manageService(files, command === "install-service", { dryRun, runner: options.serviceRunner, write });
     files.forEach(f => write(`${command}: ${f.path}`));
     return 0;

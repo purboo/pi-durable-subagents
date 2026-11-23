@@ -18,12 +18,22 @@ const LOADED = Symbol.for("pi-durable-subagents.loaded");
 /** P21: A child (DSA_EXEC set) without its execution surfaces cannot do its call; it reports the exact message on
  *  stderr and exits 3, so the executor records the message per call and counts a loss (failed after K2) instead of
  *  waiting on a child that will never act. Returns the stderr text, or undefined when the child may proceed. */
+/** Issue #11: Defense in depth against a standalone compiled pi binary ever spawning itself as the orchestrator.
+ *  launchOrchestrator sets DSA_ORCHESTRATOR_LAUNCH=1; a real Node.js orchestrator deletes it at startup, so seeing
+ *  it inside the pi extension means pi itself was launched in place of node. */
+export function orchestratorLaunchRefusal(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!env[ENV.orchestratorLaunch]) return undefined;
+  return "Durable Subagents: refusing to run inside a pi process spawned as the orchestrator (set DSA_NODE_BIN to a Node.js 22.19+ executable or put node on PATH).";
+}
+
 export function childRefusal(report: CapabilityReport, env: NodeJS.ProcessEnv): string | undefined {
   if (!env[ENV.exec] || report.execution) return undefined;
   return report.messages.join("\n");
 }
 
 export default async function (pi: ExtensionAPI) {
+  const loopRefusal = orchestratorLaunchRefusal(process.env);
+  if (loopRefusal !== undefined) { writeSync(2, `${loopRefusal}\n`); process.exit(4); }
   const modules = { "@earendil-works/pi-coding-agent": coding, "@earendil-works/pi-tui": tui, "@earendil-works/pi-ai": ai } as unknown as Record<string, Record<string, unknown>>;
   const report = checkCapabilities(modules, pi, typeof (coding as Record<string, unknown>).VERSION === "string" ? String((coding as Record<string, unknown>).VERSION) : undefined);
   if (process.env.DSA_PROBE) { writeFileSync(process.env.DSA_PROBE, JSON.stringify(report)); return; }

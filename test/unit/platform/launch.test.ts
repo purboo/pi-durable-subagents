@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ChildProcess } from "node:child_process";
-import { execTarget, executableFile, findOnPath, launchOrchestrator, PiNotFound, resolvePi, scopeRunner, SCOPE_ARGS, type Spawner } from "../../../src/platform/launch.ts";
+import { execTarget, executableFile, findOnPath, isNodeProcess, isSameProgram, launchOrchestrator, NodeNotFound, PiNotFound, resolveNode, resolvePi, scopeRunner, SCOPE_ARGS, type Spawner } from "../../../src/platform/launch.ts";
 import { startOrchestrator } from "../../../src/cli/control.ts";
 import { orchLedger } from "../../../src/paths.ts";
 import { serviceFiles } from "../../../src/cli/service.ts";
@@ -71,7 +71,7 @@ test("the starter passes the resolved pi as DSA_PI_BIN and never the starting se
   const launched = await launchOrchestrator("/entry.js", { PATH: bin, DSA_SESSION: "s1", OTHER: "x" }, { home: "/h", spawn, platform: "darwin", requirePi: true, node: "/node" });
   assert.deepEqual(launched, { pid: 4243, scope: false, pi });
   assert.deepEqual(calls.map(c => [c.command, c.args]), [["/node", ["/entry.js"]]]);
-  assert.deepEqual(calls[0]!.env, { PATH: bin, OTHER: "x", DSA_HOME: "/h", DSA_PI_BIN: pi });
+  assert.deepEqual(calls[0]!.env, { PATH: bin, OTHER: "x", DSA_HOME: "/h", DSA_ORCHESTRATOR_LAUNCH: "1", DSA_PI_BIN: pi });
 });
 
 test("an orchestrator started from inside a call never carries the call's identity (DSA_EXEC, DSA_CALL, ...)", { skip: process.platform === "win32" ? "POSIX fixture paths; see the Windows test" : false }, async t => {
@@ -138,7 +138,8 @@ test("on this host: the orchestrator runs in its own scope, outside the starter'
   await writeFile(entry, `import { readFileSync, renameSync, writeFileSync } from "node:fs";\n` +
     `writeFileSync(${JSON.stringify(out + ".tmp")}, process.pid + "\\n" + readFileSync("/proc/self/cgroup", "utf8"));\n` +
     `renameSync(${JSON.stringify(out + ".tmp")}, ${JSON.stringify(out)});\nsetInterval(() => {}, 1000);\nprocess.on("SIGTERM", () => process.exit(0));\n`);
-  const env: NodeJS.ProcessEnv = { ...process.env, DSA_PI_BIN: process.execPath };
+  const piBin = await executable(dir, "pi");
+  const env: NodeJS.ProcessEnv = { ...process.env, DSA_PI_BIN: piBin };
   delete env.DSA_SCOPE;
   const launched = await launchOrchestrator(entry, env, { home: dir, linger: () => true });
   t.after(() => { try { process.kill(launched.pid, "SIGKILL"); } catch { /* exited */ } });
@@ -175,7 +176,7 @@ test("Windows: pi resolves through PATHEXT (.cmd), DSA_PI_BIN is passed, and the
   const launched = await launchOrchestrator("C:\\entry.js", { PATH: bin, DSA_SESSION: "s1", OTHER: "x" }, { home: "C:\\h", spawn, platform: "win32", requirePi: true, node: "C:\\node.exe" });
   assert.deepEqual(launched, { pid: 4243, scope: false, pi });
   assert.deepEqual(calls.map(c => [c.command, c.args]), [["C:\\node.exe", ["C:\\entry.js"]]]);
-  assert.deepEqual(calls[0]!.env, { PATH: bin, OTHER: "x", DSA_HOME: "C:\\h", DSA_PI_BIN: pi });
+  assert.deepEqual(calls[0]!.env, { PATH: bin, OTHER: "x", DSA_HOME: "C:\\h", DSA_ORCHESTRATOR_LAUNCH: "1", DSA_PI_BIN: pi });
   const [file] = serviceFiles("C:\\Users\\u", "C:\\state", "C:\\cli.js", "win32", "C:\\node.exe", pi);
   assert.match(file!.path, /start\.cmd$/);
   assert.match(file!.content, /set "DSA_HOME=C:\\state"/);
@@ -255,4 +256,47 @@ test("execTarget resolves a bare program on the command's own environment, with 
     const piShim = join(first, "pi.cmd"); await writeFile(piShim, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
     assert.deepEqual(resolvePi({ Path: first, PATHEXT: ".CMD" }), { path: piShim, source: "PATH" });
   }
+});
+
+test("issue #11: resolveNode skips standalone Bun/pi execPath, resolves node from PATH or DSA_NODE_BIN, allows multi-call shims, and refuses pi", {
+  skip: process.platform === "win32" ? "POSIX symlink and executable-bit fixture" : false,
+}, async t => {
+  const dir = await root(t);
+  const nodeBin = await executable(join(dir, "bin"), "node");
+  const piBin = await executable(join(dir, "pi-dist"), "pi");
+  // Real Node.js process detection.
+  assert.equal(isNodeProcess({ execPath: "/usr/bin/node", versions: { node: "24.0.0" }, releaseName: "node" }), true);
+  assert.equal(isNodeProcess({ execPath: "/usr/bin/nodejs", versions: { node: "24.0.0" }, releaseName: "node" }), true);
+  assert.equal(isNodeProcess({ execPath: "C:\\Program Files\\nodejs\\node.exe", versions: { node: "24.0.0" }, releaseName: "node" }), true);
+  assert.equal(isNodeProcess({ execPath: piBin, versions: { node: "24.0.0", bun: "1.2.0" }, releaseName: "node" }), false, "compiled Bun binary is never Node");
+  assert.equal(isNodeProcess({ execPath: piBin, versions: { node: "24.0.0" }, releaseName: "node" }), false, "non-node binary name is rejected even without versions.bun");
+  // Standalone pi binary falls back to node on PATH instead of process.execPath.
+  assert.deepEqual(resolveNode({ PATH: join(dir, "bin") }, { execPath: piBin, versions: { node: "24.0.0", bun: "1.2.0" }, piPath: piBin }),
+    { path: nodeBin, source: "PATH" });
+  // DSA_NODE_BIN takes precedence when valid and distinct from pi.
+  const customNode = await executable(join(dir, "custom"), "node24");
+  assert.deepEqual(resolveNode({ PATH: join(dir, "empty"), DSA_NODE_BIN: customNode }, { execPath: piBin, versions: { bun: "1.2.0" }, piPath: piBin }),
+    { path: customNode, source: "DSA_NODE_BIN" });
+  // Missing node on PATH with standalone binary fails clearly instead of returning pi.
+  assert.match(String(resolveNode({ PATH: join(dir, "empty") }, { execPath: piBin, versions: { bun: "1.2.0" }, piPath: piBin }).problem), /node was not found on PATH/);
+  // Direct symlink to pi is refused.
+  const fakeNode = join(dir, "fake-node"); await symlink(piBin, fakeNode);
+  assert.equal(isSameProgram(fakeNode, piBin), true);
+  assert.match(String(resolveNode({ DSA_NODE_BIN: fakeNode }, { piPath: piBin }).problem), /resolves to the pi executable/);
+  // Multi-call version-manager shims (mise/volta/asdf): both shims symlink to the same dispatcher binary.
+  const mise = await executable(join(dir, "mise-bin"), "mise");
+  const shims = join(dir, "shims"); await mkdir(shims);
+  const miseNode = join(shims, "node"), misePi = join(shims, "pi");
+  await symlink(mise, miseNode); await symlink(mise, misePi);
+  assert.equal(isSameProgram(miseNode, misePi), false, "multi-call shims for node and pi are distinct programs");
+  assert.deepEqual(resolveNode({ PATH: shims }, { execPath: piBin, versions: { bun: "1.2.0" }, piPath: misePi }),
+    { path: miseNode, source: "PATH" });
+  // launchOrchestrator refuses when node resolves to pi.
+  const { spawn } = recorder();
+  await assert.rejects(launchOrchestrator("/entry.js", { DSA_PI_BIN: piBin }, { home: dir, node: piBin, spawn, platform: "darwin" }),
+    (e: unknown) => e instanceof NodeNotFound && /resolves to the pi executable/.test(e.message));
+  // launchOrchestrator tags child env with DSA_ORCHESTRATOR_LAUNCH=1 and strips it when inherited from caller.
+  const r = recorder();
+  await launchOrchestrator("/entry.js", { PATH: join(dir, "bin"), DSA_PI_BIN: piBin, DSA_ORCHESTRATOR_LAUNCH: "1" }, { home: dir, node: nodeBin, spawn: r.spawn, platform: "darwin" });
+  assert.equal(r.calls[0]!.env.DSA_ORCHESTRATOR_LAUNCH, "1");
 });
