@@ -911,7 +911,7 @@ header comment.
 - **Outputs (P19).** For `spec.output`:
   - **Relative path:** publish the output text immutably as
     `artifactsDir/<key>@<gen>/<n>-<basename>` with `publishFile`, and
-    atomically point `latest` at it (symlink tmp + rename + dir fsync).
+    atomically publish `latest` with the same bytes (a regular copy on Windows and a relative symlink on POSIX), then sync the directory.
   - **Absolute path:** write it best effort: tmp, fsync, rename, dir fsync.
     If the existing file's hash differs from the last hash we wrote, skip it
     and add a `JT.attention{kind:"unknown"}` naming the conflict.

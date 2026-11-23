@@ -1,8 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile, writeFile, readlink, readdir, unlink } from "node:fs/promises";
+import { lstat, readFile, writeFile, readlink, readdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fixture, crash } from "./helpers.ts";
+
+async function checkLatest(path: string, output: string) {
+  const latest = join(dirname(path), "latest");
+  assert.equal(await readFile(latest, "utf8"), output);
+  if (process.platform === "win32") assert.ok((await lstat(latest)).isFile());
+  else assert.equal(await readlink(latest), "1-out.txt");
+}
 
 for (const absolute of [false, true]) for (const window of ["normal", "intent", "effect", "record"]) test(`${absolute ? "absolute" : "relative"} output reconciles ${window}`, async ctx => {
   const f = await fixture(ctx); f.t.spec.output = absolute ? join(f.root, "out.txt") : "nested/out.txt";
@@ -17,7 +24,7 @@ for (const absolute of [false, true]) for (const window of ["normal", "intent", 
   assert.equal(f.journal.entries().filter(e => e.type === "output").length, 1);
   if (!absolute) {
     assert.equal(path, join(f.home, "w", f.t.wid, "artifacts", "task@1", "1-out.txt"));
-    assert.equal(await readlink(join(dirname(path), "latest")), "1-out.txt");
+    await checkLatest(path, f.result.output);
     assert.deepEqual((await readdir(dirname(path))).sort(), ["1-out.txt", "latest"]);
   }
 });
@@ -51,10 +58,10 @@ test("artifact recovery repairs a missing latest link after immutable publicatio
   await assert.rejects(f.before({ ...f.t, journal: crash(f.journal, "output") }), /crash:/);
   const path = String(f.journal.entries().find(e => e.type === "output-intent")!.path);
   await unlink(join(dirname(path), "latest"));
-  await f.before(); assert.equal(await readlink(join(dirname(path), "latest")), "1-out.txt");
+  await f.before(); await checkLatest(path, f.result.output);
 });
 test("concurrent identical repeats publish once", async ctx => {
-  const f = await fixture(ctx); f.t.spec.output = "out.txt"; f.t.spec.gate = "true";
+  const f = await fixture(ctx); f.t.spec.output = "out.txt"; f.t.spec.gate = 'exit 0';
   const effects = f.effects(), ctl = { signal: new AbortController().signal };
   const [a, b] = await Promise.all([effects.beforeSeal(f.t, "exec", f.result, ctl), effects.beforeSeal(f.t, "exec", f.result, ctl)]);
   assert.deepEqual(a, b);

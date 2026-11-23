@@ -23,7 +23,9 @@ async function replace(path: string, bytes: string) {
     await replacePath(join(dir, temp), path); await syncDirectory(dir);
   } finally { await unlink(join(dir, temp)).catch(() => {}); }
 }
-async function latest(path: string) {
+async function latest(path: string, bytes: string) {
+  // Publishing a regular copy on Windows also works for accounts without symlink privileges.
+  if (process.platform === "win32") return replace(join(dirname(path), "latest"), bytes);
   const dir = dirname(path), temp = join(dir, `.${randomUUID()}.link`);
   try {
     await symlink(basename(path), temp); await replacePath(temp, join(dir, "latest")); await syncDirectory(dir);
@@ -53,7 +55,7 @@ export async function publishOutput(t: CallTicket, home: string, result: CallRes
       } else { if (current !== digest) await replace(path, result.output); else await syncDirectory(dirname(path)); }
     } else {
       if (await publishFile(dirname(path), basename(path), result.output) === "conflict") throw new Error(`Artifact conflict: ${path}`);
-      await latest(path);
+      await latest(path, result.output);
     }
     done ??= await t.journal.append("output", { call: t.callId, path, hash: digest });
   }
