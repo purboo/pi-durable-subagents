@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openJournal } from "../../../../src/kernel/journal.ts";
 import { Containment } from "../../../../src/platform/containment.ts";
-import { indexSweep, seededSweep, sweepSeed, recordFenceFailure, recordOnce, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
+import { JOB_BEGIN, JOB_GROUP } from "../../../../src/platform/job.ts";
+import { gateJobTracked, indexSweep, seededSweep, sweepSeed, recordFenceFailure, recordOnce, resolveFenceAttention, serialContainment, skipLostCandidate, sweepExecutions } from "../../../../src/orchestrator/executor/sweep.ts";
 import { gateRetired } from "../../../../src/orchestrator/executor/effects/gate.ts";
 import { JT, type Entry, type ProcInfo } from "../../../../src/types.ts";
 import { setTimeout as delay } from "node:timers/promises";
@@ -166,6 +167,54 @@ test("F1 a gate without an outcome whose fence failed is retried with its tracke
   await sweepExecutions([journal], containment, { fenced: async (_j, exec, call, was) => { fenced.push(`${exec}:${call}:${was}`); } });
   assert.deepEqual(fences, [["gate:w@1/k@1#1", 1]]);
   assert.deepEqual(fenced, ["gate:w@1/k@1#1:w@1/k@1:false"]);
+});
+
+test("F1 sweepExecutions recovers Windows gate owner and wrapper identities from durable jobDir even without gate-tracked", async t => {
+  const root = await mkdtemp(join(tmpdir(), "dsa-sweep-wingate-"));
+  const journal = await openJournal(join(root, "workflow"));
+  const jobDir1 = join(root, "gate-1", "job"), jobDir2 = join(root, "gate-2", "job");
+  await mkdir(jobDir1, { recursive: true });
+  await mkdir(jobDir2, { recursive: true });
+  t.after(async () => { await journal.close(); await rm(root, { recursive: true, force: true }); });
+
+  const ownerStart = "639000000500000010", ownerJitter = "639000000500000017", wrapperStart = "639000000500000050";
+  // Gate 1: full group record + jittered gate-tracked duplicate + extra descendant.
+  await writeFile(join(jobDir1, JOB_BEGIN), JSON.stringify({ pid: 4100, start: ownerStart }));
+  await writeFile(join(jobDir1, JOB_GROUP), JSON.stringify({ pid: 4200, start: wrapperStart, group: { pid: 4100, start: ownerStart } }));
+  // Gate 2: pre-group crash with only helper-begin, zero gate-tracked entries.
+  await writeFile(join(jobDir2, JOB_BEGIN), JSON.stringify({ pid: 5100, start: ownerStart }));
+
+  await journal.append("gate-intent", { call: "w@1/a@1", id: "gate:w@1/a@1#1", exec: "w@1/a@1#1.1", jobDir: jobDir1 });
+  await journal.append("gate-tracked", { id: "gate:w@1/a@1#1", process: { pid: 4100, ppid: 1, start: ownerJitter, tag: "gate:w@1/a@1#1" } });
+  await journal.append("gate-tracked", { id: "gate:w@1/a@1#1", process: { pid: 4300, ppid: 4200, start: "639000000500000090", tag: "gate:w@1/a@1#1" } });
+  await journal.append("fence-failed", { exec: "gate:w@1/a@1#1", error: "Fence timeout" });
+
+  await journal.append("gate-intent", { call: "w@1/b@1", id: "gate:w@1/b@1#1", exec: "w@1/b@1#1.1", jobDir: jobDir2 });
+  await journal.append("fence-failed", { exec: "gate:w@1/b@1#1", error: "Fence timeout" });
+
+  const scanned = new Map<string, readonly ProcInfo[]>(), fenced = new Map<string, readonly ProcInfo[]>();
+  const containment = {
+    async scan(known: ReadonlyMap<string, readonly ProcInfo[]>) { for (const [k, v] of known) scanned.set(k, v); return new Map(); },
+    async fence(exec: string, tracked: readonly ProcInfo[]) { fenced.set(exec, tracked); },
+  };
+  await sweepExecutions([journal], containment);
+
+  assert.deepEqual(
+    fenced.get("gate:w@1/a@1#1")?.map(p => ({ pid: p.pid, start: p.start })),
+    [
+      { pid: 4100, start: ownerStart },
+      { pid: 4200, start: wrapperStart },
+      { pid: 4300, start: "639000000500000090" },
+    ],
+    "merges jobDir owner+wrapper with gate-tracked and deduplicates WMI 10-tick jitter",
+  );
+  assert.deepEqual(
+    fenced.get("gate:w@1/b@1#1")?.map(p => ({ pid: p.pid, start: p.start })),
+    [{ pid: 5100, start: ownerStart }],
+    "recovers pre-group helper-begin owner identity with zero gate-tracked entries",
+  );
+  assert.deepEqual(scanned.get("gate:w@1/b@1#1"), fenced.get("gate:w@1/b@1#1"));
+  assert.deepEqual(gateJobTracked(join(root, "nonexistent"), "gate:missing", []), []);
 });
 
 test("F4 a serial containment never overlaps process-table snapshots", async () => {

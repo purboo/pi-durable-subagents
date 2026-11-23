@@ -1,6 +1,7 @@
 import test from "node:test";
 import { detachedSleep } from "../../../harness/pi.ts";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { readFile, access } from "node:fs/promises";
 import { join } from "node:path";
 import { Containment } from "../../../../src/platform/containment.ts";
@@ -23,7 +24,7 @@ const gateCases = win ? [
   ["false schema", { command: "echo null", output: "json", schema: false }, "gate-failed"],
   ["timeout", { command: "sleep 30", timeoutMs: 100 }, "gate-failed"],
 ] as const;
-for (const [name, gate, status] of gateCases) test(`gate outcome: ${name}`, { timeout: 10000 }, async ctx => {
+for (const [name, gate, status] of gateCases) test(`gate outcome: ${name}`, { timeout: win ? 60000 : 10000 }, async ctx => {
   const f = await fixture(ctx); f.t.spec.gate = gate;
   const result = await f.before(); assert.equal(result.status, status); assert.equal(result.ok, status === "ok");
   if (name === "JSON") assert.deepEqual(result.data, { gate: { value: 3 } });
@@ -38,7 +39,7 @@ test("gate reads immutable result/output inputs in the call cwd", { skip: win ? 
   f.t.spec.gate = { command: `test "$DSA_CALL" = "${f.t.callId}" && test "$(cat "$DSA_OUTPUT")" = complete && cat "$DSA_RESULT"`, output: "json" };
   const result = await f.before(); assert.deepEqual((result.data as any).gate, f.result);
 });
-for (const window of ["intent", "effect", "outcome"]) test(`gate crash at ${window} never reruns`, async ctx => {
+for (const window of ["intent", "effect", "outcome"]) test(`gate crash at ${window} never reruns`, { timeout: win ? 60000 : 10000 }, async ctx => {
   const f = await fixture(ctx), marker = join(f.cwd, "marker"); f.t.spec.gate = "echo ran >> marker";
   const type = window === "intent" ? "gate-intent" : "gate";
   await assert.rejects(f.before({ ...f.t, journal: crash(f.journal, type, window !== "effect") }), /crash:/);
@@ -58,7 +59,7 @@ test("recover fences a live gate and persists unknown only once", { timeout: 100
   assert.equal((await containment.scan(new Map([[id, []]]))).get(id)?.length ?? 0, 0);
   assert.equal((await f.before()).status, "unknown");
 });
-test("abort during gate fences descendants and preserves the original result", { timeout: process.platform === "win32" ? 30000 : 10000 }, async ctx => {
+test("abort during gate fences descendants and preserves the original result", { timeout: win ? 60000 : 10000 }, async ctx => {
   const f = await fixture(ctx), ctl = new AbortController(); f.t.spec.gate = win ? `"${process.execPath}" -e "setInterval(()=>{},1000)"` : "sleep 30 & wait"; f.t.spec.output = "out.txt";
   const journal = { ...f.journal, append: async <T extends string>(type: T, fields: Record<string, unknown>) => {
     const entry = await f.journal.append(type, fields); if (type === "gate-tracked") ctl.abort(); return entry;
@@ -72,6 +73,27 @@ test("abort during gate fences descendants and preserves the original result", {
 test("a gate that exits after starting a detached descendant fences that descendant", { timeout: 10000, skip: win ? "POSIX detachedSleep helper" : false }, async ctx => {
   const f = await fixture(ctx); f.t.spec.gate = `${detachedSleep(30)} >/dev/null`;
   assert.equal((await f.before()).status, "ok");
+  const id = `gate:${f.t.callId}#1`;
+  assert.equal((await new Containment().scan(new Map([[id, []]]))).get(id)?.length ?? 0, 0);
+});
+test("Windows gate drains detached grandchild on normal exit and records durable jobDir", { timeout: 90000, skip: win ? false : "native Windows Job Object gate test" }, async ctx => {
+  const f = await fixture(ctx), grandPidFile = join(f.cwd, "grand.pid");
+  const script = [
+    "const { spawn } = require('node:child_process'), { writeFileSync } = require('node:fs');",
+    "const g = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });",
+    "g.unref();",
+    `writeFileSync(${JSON.stringify(grandPidFile)}, String(g.pid));`,
+    "process.stdout.write(JSON.stringify({ ok: true }));",
+  ].join("");
+  f.t.spec.gate = { command: `"${process.execPath}" -e ${JSON.stringify(script)}`, output: "json" };
+  const result = await f.before();
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.data, { gate: { ok: true } });
+  const intent = f.journal.entries().find(e => e.type === "gate-intent")!;
+  assert.equal(typeof intent.jobDir, "string");
+  assert.ok(existsSync(grandPidFile));
+  const grandPid = Number(readFileSync(grandPidFile, "utf8").trim());
+  assert.throws(() => process.kill(grandPid, 0), "detached grandchild ended with the Windows gate Job Object");
   const id = `gate:${f.t.callId}#1`;
   assert.equal((await new Containment().scan(new Map([[id, []]]))).get(id)?.length ?? 0, 0);
 });

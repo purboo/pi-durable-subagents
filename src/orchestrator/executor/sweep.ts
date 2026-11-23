@@ -3,9 +3,39 @@
 import type { Containment, Entry, JournalHandle, ProcInfo } from "../../types.ts";
 import { JT, attentionEntries, isEntry } from "../../types.ts";
 import { Containment as PlatformContainment } from "../../platform/containment.ts";
+import { readBeginIdentitySync, readGroupRecordSync } from "../../platform/job.ts";
 import { ProcessTable } from "../../platform/proctable.ts";
+import { isWinStart, sameCreation } from "../../platform/windows.ts";
 import type { Model } from "../../compat/model.ts";
 import { fenceAgent } from "./ended.ts";
+
+/** Read verified Windows Job Object owner and wrapper identities from a gate's durable `jobDir`. */
+export function gateJobProcesses(jobDir: unknown, tag?: string): ProcInfo[] {
+  if (typeof jobDir !== "string" || !jobDir) return [];
+  const out: ProcInfo[] = [];
+  const add = (pid: number | undefined, start: string | undefined, ppid = 0) => {
+    if (!pid || !Number.isInteger(pid) || pid <= 0 || !isWinStart(start)) return;
+    if (out.some(k => k.pid === pid && (k.start === start || sameCreation(k.start, start)))) return;
+    out.push({ pid, ppid, start, ...(tag ? { tag } : {}) });
+  };
+  const group = readGroupRecordSync(jobDir), began = readBeginIdentitySync(jobDir);
+  add(group?.group?.pid, group?.group?.start);
+  add(began?.pid, began?.start);
+  add(group?.pid, group?.start, group?.group?.pid ?? began?.pid ?? 0);
+  return out;
+}
+
+/** Merge durable Windows gate job identities with journaled `gate-tracked` entries, deduplicated by `(pid, start)`. */
+export function gateJobTracked(jobDir: unknown, id: string, recorded: readonly ProcInfo[]): ProcInfo[] {
+  const fromJob = gateJobProcesses(jobDir, id);
+  if (!fromJob.length) return [...recorded];
+  const out: ProcInfo[] = [...fromJob];
+  for (const p of recorded) {
+    if (out.some(k => k.pid === p.pid && (k.start === p.start || sameCreation(k.start, p.start)))) continue;
+    out.push(p);
+  }
+  return out;
+}
 
 /** C2, F4: Real observers share snapshots; injected tables retain serialized access. */
 export function serialContainment(table?: Pick<ProcessTable, "list">): PlatformContainment {
@@ -126,7 +156,7 @@ export async function sweepExecutions(journals: Iterable<JournalHandle>, contain
     for (const e of gates) {
       const id = String(e.id);
       if (e.type === "gate-intent" && !gated.has(id) && (failed.has(id) || hooks.failing?.(id)))
-        targets.push({ journal, exec: id, call: String(e.call), fenced: false, failed: true, tracked: tracked.get(id) ?? [] });
+        targets.push({ journal, exec: id, call: String(e.call), fenced: false, failed: true, tracked: gateJobTracked(e.jobDir, id, tracked.get(id) ?? []) });
     }
     const ordered = [
       ...execs.map(e => ({ exec: String(e.exec), call: String(e.call), order: e.seq, fenced: false })),
