@@ -101,7 +101,8 @@ public static class DsaJob
     const uint OPEN_EXISTING = 3;
     const uint OPEN_ALWAYS = 4;
     const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
-    const uint INFINITE = 0xFFFFFFFF;
+    const uint WAIT_OBJECT_0 = 0x00000000;
+    const uint WAIT_TIMEOUT = 0x00000102;
     static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -434,12 +435,23 @@ public static class DsaJob
                 TerminateProcess(child.hProcess, 1);
                 return Fail(dir, "ResumeThread", Marshal.GetLastWin32Error());
             }
-            if (WaitForSingleObject(child.hProcess, INFINITE) != 0) return Fail(dir, "WaitForSingleObject", Marshal.GetLastWin32Error());
-            uint code;
-            if (!GetExitCodeProcess(child.hProcess, out code)) return Fail(dir, "GetExitCodeProcess", Marshal.GetLastWin32Error());
+            string stopPath = Path.Combine(dir, "stop");
+            bool stopped = false;
+            for (;;)
+            {
+                uint waited = WaitForSingleObject(child.hProcess, 50);
+                if (waited == WAIT_OBJECT_0) break;
+                if (waited != WAIT_TIMEOUT) return Fail(dir, "WaitForSingleObject", Marshal.GetLastWin32Error());
+                if (File.Exists(stopPath)) { stopped = true; break; }
+            }
+            uint code = 1;
+            if (!stopped && !GetExitCodeProcess(child.hProcess, out code)) return Fail(dir, "GetExitCodeProcess", Marshal.GetLastWin32Error());
             DrainJob(job);
-            // The record and the returned status carry the whole DWORD, above 0x7fffffff included: it is the wrapper's.
-            WriteAtomic(Path.Combine(dir, "group-end"), @"{""status"":" + code.ToString(CultureInfo.InvariantCulture) + "}");
+            if (!stopped)
+            {
+                // The record and the returned status carry the whole DWORD, above 0x7fffffff included: it is the wrapper's.
+                WriteAtomic(Path.Combine(dir, "group-end"), @"{""status"":" + code.ToString(CultureInfo.InvariantCulture) + "}");
+            }
             status = code;
             return true;
         }
@@ -661,6 +673,8 @@ export const JOB_GROUP = "group";
 export const JOB_END = "group-end";
 /** Written (atomically) when the owner could not start the wrapper: a short reason for the failed attempt. */
 export const JOB_ERROR = "start-error";
+/** Written (atomically) by a caller requesting a controlled stop so the owner calls DrainJob and exits without `group-end`. */
+export const JOB_STOP = "stop";
 /** Written by the owner's first statement: its absence proves the program never ran (a launcher problem, not a failure
  *  of this attempt), which is what a bare "the owner ended" otherwise hides. */
 export const JOB_BEGIN = "helper-begin";
@@ -806,7 +820,7 @@ export interface JobPrep {
 export async function prepareJob(dir: string, launch: JobLaunch,
   options: { compiler?: string; compileMs?: number; signal?: AbortSignal; publish?: PublishBuild } = {}): Promise<JobPrep> {
   // Evidence of an earlier attempt in the same directory must never be read as this attempt's.
-  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
+  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_STOP, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
   const host = await compileJobHost(dir, { ...(options.compiler ? { compiler: options.compiler } : {}),
     ...(options.compileMs ? { timeoutMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}),
     ...(options.publish ? { publish: options.publish } : {}) });
@@ -979,6 +993,8 @@ export interface JobSpawned {
   uncertain?: string;
   /** Terminate the live owner through this process's direct ChildProcess handle (closing the Job Object). */
   killOwner?: () => boolean;
+  /** Request a controlled stop (`stop` sentinel file) so `DsaJob.exe` drains the Job Object before exiting. */
+  requestStop?: () => Promise<void>;
   /** Resolves when the owner ends (a wake-up only: the exit record is the outcome). */
   exited: Promise<void>;
 }
@@ -1113,6 +1129,15 @@ export function readStartErrorSync(dir: string, options: RetryWinSharingOptions 
     return text || undefined;
   } catch { return undefined; }
 }
+
+/** Ask a live job owner (`DsaJob.exe`) to drain its Job Object (`DrainJob`) and exit without writing `group-end`. */
+export async function requestJobStop(dir: string): Promise<void> {
+  await writeFileAtomic(join(dir, JOB_STOP), "stop", {
+    encoding: "utf8",
+    timeoutMs: 2_500,
+    maxAttempts: 25,
+  }).catch(() => {});
+}
 /** One process-table observation, retried for a while: a PowerShell/CIM read fails transiently on a loaded machine, and
  *  a failed observation must never be read as "no process" (that would let a second attempt start). */
 async function observeWithin(observe: () => Promise<WinProcessRow[]>, budgetMs: number): Promise<WinProcessRow[]> {
@@ -1148,6 +1173,10 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   } finally { if (errors !== undefined) closeSync(errors); }
   let ended = false;
   const killOwner = (): boolean => !ended && helper.exitCode === null && helper.signalCode === null && helper.kill("SIGKILL");
+  const requestStop = async (): Promise<void> => {
+    if (ended) return;
+    await requestJobStop(dir);
+  };
   options.onOwnerSpawned?.(killOwner);
   let recordedExit: Promise<void> | undefined;
   // The owner's end is durably written to JOB_HOST_EXIT before `exited` resolves, and every path that formats a
@@ -1214,7 +1243,7 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
     }
     // The owner outlives this process by design (the command must): its end is a wake-up, never a held event loop.
     if (options.unref !== false) helper.unref();
-    return { pid: helperPid ?? 0, start, uncertain: `${reason}${await startError(dir)}${failure}`, killOwner, exited };
+    return { pid: helperPid ?? 0, start, uncertain: `${reason}${await startError(dir)}${failure}`, killOwner, requestStop, exited };
   };
   try {
     await new Promise<void>((resolve, reject) => { helper.once("spawn", resolve); helper.once("error", reject); });
@@ -1249,7 +1278,7 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
   catch (error) { return refuse(`the command job group could not be observed (${String((error as Error)?.message ?? error)})`, recorded); }
   if (ended) {
     if (options.unref !== false) helper.unref();
-    return { pid, start: "", killOwner, exited };
+    return { pid, start: "", killOwner, requestStop, exited };
   }
   const began = recorded.group ?? await readBeginIdentity(dir);
   const expectedOwnerStart = helperPid !== undefined && began?.pid === helperPid ? began.start : undefined;
@@ -1284,7 +1313,7 @@ export async function spawnInJob(dir: string, launch: JobLaunch, options: JobOpt
     start = recorded.start;
   }
   if (options.unref !== false) helper.unref(); // the owner outlives this process by design: its end is a wake-up, never a held event loop
-  return { pid, start, ...(helperPid !== undefined && helperStart ? { group: { pid: helperPid, start: helperStart } } : {}), killOwner, exited };
+  return { pid, start, ...(helperPid !== undefined && helperStart ? { group: { pid: helperPid, start: helperStart } } : {}), killOwner, requestStop, exited };
 }
 
 /** The reason an owner left, when it left one, appended to the failure a call reports: whether it ever ran, why its

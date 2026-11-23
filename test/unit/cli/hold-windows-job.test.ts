@@ -5,13 +5,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, readdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { hold, parseHold } from "../../../src/cli/hold.ts";
-import { leaseDir, live, liveTickets, orphaned, readTickets, type EndLeaseOptions } from "../../../src/platform/lease.ts";
+import { hold, parseHold, resolveWinHoldTarget } from "../../../src/cli/hold.ts";
+import { endLeaseProcesses, enqueue, leaseDir, leaseJobDir, live, liveTickets, orphaned, readTickets, type EndLeaseOptions, type LeaseTicket } from "../../../src/platform/lease.ts";
 import type { WinProcessIdentity, WinProcessRow } from "../../../src/platform/windows.ts";
 
 const posixOnly = process.platform === "linux" ? false : "the stand-in uses Linux /proc to track detached descendants";
@@ -115,16 +115,20 @@ async function createJobStandIn(root: string): Promise<{ compiler: string; owner
     `const child = spawn(process.execPath, wrappedArgs, { cwd, env, detached: true, stdio: logPath ? "ignore" : "inherit" });`,
     `const childPgid = child.pid;`,
     `const holdMarker = env.DSA_HOLD ? \`DSA_HOLD=\${env.DSA_HOLD}\` : "";`,
+    `const homeMarker = env.DSA_HOME ? \`DSA_HOME=\${env.DSA_HOME}\` : "";`,
     `const drainScript = [`,
     `  "const { existsSync, readdirSync, readFileSync } = require('node:fs');",`,
-    `  "const pgid = Number(process.argv[1]), ownerPid = Number(process.argv[2]), marker = process.argv[3];",`,
+    `  "const pgid = Number(process.argv[1]), ownerPid = Number(process.argv[2]), marker = process.argv[3], homeMarker = process.argv[4];",`,
     `  "const sweep = () => {",`,
     `  "  if (pgid) { try { process.kill(-pgid, 'SIGKILL'); } catch {} }",`,
     `  "  if (marker && existsSync('/proc')) {",`,
     `  "    for (const n of readdirSync('/proc')) {",`,
     `  "      const p = Number(n);",`,
     `  "      if (!p || p === process.pid || p === ownerPid) continue;",`,
-    `  "      try { if (readFileSync('/proc/' + p + '/environ', 'utf8').split('\\\\0').includes(marker)) process.kill(p, 'SIGKILL'); } catch {}",`,
+    `  "      try {",`,
+    `  "        const entries = readFileSync('/proc/' + p + '/environ', 'utf8').split('\\\\0');",`,
+    `  "        if (entries.includes(marker) && (!homeMarker || entries.includes(homeMarker))) process.kill(p, 'SIGKILL');",`,
+    `  "      } catch {}",`,
     `  "    }",`,
     `  "  }",`,
     `  "};",`,
@@ -132,7 +136,7 @@ async function createJobStandIn(root: string): Promise<{ compiler: string; owner
     `  "process.stdin.once('end', () => { sweep(); setTimeout(() => { sweep(); process.exit(0); }, 15); });",`,
     `].join("");`,
     // Kernel pipe-EOF watchdog: models Win32 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE even when this owner receives SIGKILL.
-    `const reaper = spawn(process.execPath, ["-e", drainScript, String(childPgid), String(process.pid), holdMarker], { detached: true, stdio: ["pipe", "ignore", "ignore"] });`,
+    `const reaper = spawn(process.execPath, ["-e", drainScript, String(childPgid), String(process.pid), holdMarker, homeMarker], { detached: true, stdio: ["pipe", "ignore", "ignore"] });`,
     `reaper.stdin.on("error", () => {});`,
     `reaper.unref();`,
     `const drainJob = () => {`,
@@ -140,7 +144,10 @@ async function createJobStandIn(root: string): Promise<{ compiler: string; owner
     `  if (holdMarker && existsSync("/proc")) {`,
     `    for (const n of readdirSync("/proc")) {`,
     `      if (!/^\\d+$/.test(n) || Number(n) === process.pid || Number(n) === reaper.pid) continue;`,
-    `      try { if (readFileSync(\`/proc/\${n}/environ\`, "utf8").split("\\0").includes(holdMarker)) process.kill(Number(n), "SIGKILL"); } catch {}`,
+    `      try {`,
+    `        const entries = readFileSync(\`/proc/\${n}/environ\`, "utf8").split("\\0");`,
+    `        if (entries.includes(holdMarker) && (!homeMarker || entries.includes(homeMarker))) process.kill(Number(n), "SIGKILL");`,
+    `      } catch {}`,
     `    }`,
     `  }`,
     `};`,
@@ -160,14 +167,23 @@ async function createJobStandIn(root: string): Promise<{ compiler: string; owner
     `await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });`,
     `writeAtomic(join(dir, "group"), JSON.stringify({ pid: child.pid, start: ticks(child.pid), group: ownerIdentity }));`,
     `writeFileSync(gateFile, "go");`,
-    `const code = await new Promise(resolve => child.once("exit", (c) => resolve(c ?? 1)));`,
+    `const stopPath = join(dir, "stop");`,
+    `const outcome = await new Promise(resolve => {`,
+    `  let settled = false;`,
+    `  const finish = result => { if (settled) return; settled = true; clearInterval(iv); resolve(result); };`,
+    `  child.once("exit", c => finish({ stopped: false, code: c ?? 1 }));`,
+    `  const iv = setInterval(() => {`,
+    `    if (env.HOLD_TEST_IGNORE_STOP !== "1" && existsSync(stopPath)) finish({ stopped: true, code: 1 });`,
+    `  }, 15);`,
+    `});`,
+    `if (outcome.stopped && env.HOLD_TEST_STOP_OBSERVED) writeFileSync(env.HOLD_TEST_STOP_OBSERVED, "1");`,
     `drainJob();`,
     `for (let i = 0; i < 100; i++) {`,
     `  if (!nonZombieGroupAlive(childPgid)) break;`,
     `  await new Promise(r => setTimeout(r, 10));`,
     `}`,
-    `writeAtomic(join(dir, "group-end"), JSON.stringify({ status: code >>> 0 }));`,
-    `process.exit(code >>> 0);`,
+    `if (!outcome.stopped) writeAtomic(join(dir, "group-end"), JSON.stringify({ status: outcome.code >>> 0 }));`,
+    `process.exit(outcome.code >>> 0);`,
   ].join("\n"));
   chmodSync(ownerScript, 0o755);
 
@@ -531,6 +547,7 @@ test("Windows job hold: normal exit drains surviving grandchildren without dead-
   assert.deepEqual(await Promise.all([yielding, waiter]), [75, 0]);
   assert.match(yieldStderr.join("\n"), /^hold: yielded machine to .+ \(exit 75\)$/m);
   assert.equal(await readFile(afterYieldCheck, "utf8"), "dead", "yielded job's grandchild is dead before waiter runs");
+  assert.equal(killedTargets.length, 0, "controlled stop drained the job without pre-killing or falling back to killOwner");
 
   // 3. Signal forwarded to wrapper terminates the job (including detached grandchild), releases ticket, and returns 143.
   const runner = await writeHolderRunner(home, compiler);
@@ -569,4 +586,267 @@ test("Windows job hold: normal exit drains surviving grandchildren without dead-
   assert.match(missingErr[0] ?? "", /^hold: cannot run .*nonexistent-win-cmd\.exe:/);
   assert.deepEqual(readTickets(home, "machine"), []);
   assert.deepEqual(await readdir(leaseDir(home, "machine")).then(n => n.filter(x => x.endsWith(".json") || x === ".jobs")), []);
+});
+
+test("resolveWinHoldTarget completes PATHEXT on extensionless absolute and relative Windows paths", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "dsa-win-target-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dottedDir = join(dir, "nodejs.v22");
+  mkdirSync(dottedDir);
+  const toolExe = join(dir, "tool.exe");
+  const nodeExe = join(dottedDir, "node.exe");
+  const shimScript = join(dir, "cli.mjs");
+  const shimCmd = join(dir, "mycli.cmd");
+  writeFileSync(toolExe, "MZ");
+  writeFileSync(nodeExe, "MZ");
+  writeFileSync(shimScript, "console.log('ok');\n");
+  writeFileSync(shimCmd, `@echo off\r\n"%dp0%/cli.mjs" %*\r\n`);
+
+  const env: NodeJS.ProcessEnv = { PATHEXT: ".COM;.EXE;.BAT;.CMD", ComSpec: "C:\\Windows\\System32\\cmd.exe" };
+  // Extensionless absolute path resolves to .exe.
+  assert.deepEqual(resolveWinHoldTarget(join(dir, "tool"), ["--version"], dir, env), { command: toolExe, args: ["--version"] });
+  // Extensionless absolute path under a parent directory containing a dot still detects no extension and resolves to .exe.
+  assert.deepEqual(resolveWinHoldTarget(join(dottedDir, "node"), ["-v"], dir, env), { command: nodeExe, args: ["-v"] });
+  // Extensionless absolute path resolving to a .cmd shim unwraps its node script cleanly.
+  assert.deepEqual(resolveWinHoldTarget(join(dir, "mycli"), ["arg1"], dir, env), { command: process.execPath, args: [shimScript, "arg1"] });
+  // Already-extensioned absolute path stays unchanged.
+  assert.deepEqual(resolveWinHoldTarget(toolExe, ["x"], dir, env), { command: toolExe, args: ["x"] });
+  // Relative path with separator still resolves against cwd + PATHEXT.
+  assert.deepEqual(resolveWinHoldTarget("./tool", ["y"], dir, env), { command: toolExe, args: ["y"] });
+  // Nonexistent Windows drive path falls back to execTarget without throwing.
+  assert.deepEqual(resolveWinHoldTarget("C:\\Program Files\\nodejs\\missing-node", ["-v"], dir, env), {
+    command: "C:\\Program Files\\nodejs\\missing-node",
+    args: ["-v"],
+  });
+});
+
+test("Windows job hold: --yield with already-settled fast command returns command exit code (not 75)", { skip: posixOnly, timeout: 30_000 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-win-job-fast-yield-"));
+  t.after(() => { cleanupHomeProcesses(home); return rm(home, { recursive: true, force: true }); });
+  const { compiler } = await createJobStandIn(home);
+  const seam = makeWinLeaseSeam();
+  const stderrLines: string[] = [];
+
+  const code = await hold(parseHold(["machine", "--yield", "--", process.execPath, "-e", "process.exit(17)"]), {
+    env: { ...process.env, DSA_HOME: home },
+    platform: "win32",
+    pollMs: 25,
+    graceMs: 100,
+    captureWrapperStart: async pid => ticksForPid(pid),
+    lease: seam,
+    job: { compiler, observe: async () => [...procSnapshot().values()] },
+    stderr: l => stderrLines.push(l),
+    beforeRecordCommand: async () => {
+      // Hold right before ticket.command is written until the fast command AND its DsaJob owner have both exited
+      // (so `spawned.exited` is already settled), and enqueue a live waiter before hold enters its yield loop.
+      const jobDir = leaseJobDir(home, "machine", 1);
+      await until(() => existsSync(join(jobDir, "group-end")) && existsSync(join(jobDir, "host-exit")), "fast command and job host settled");
+      const group = JSON.parse(readFileSync(join(jobDir, "group"), "utf8")) as { group: { pid: number } };
+      await until(() => !pidAlive(group.group.pid), "job owner exited");
+      await enqueue(home, {
+        resource: "machine",
+        mode: "exclusive",
+        wrapper: { pid: process.pid, start: ticksForPid(process.pid) },
+        argv: ["waiter"],
+        cwd: home,
+        since: Date.now(),
+      }, undefined, seam);
+    },
+  });
+
+  assert.equal(code, 17, "already-settled command must return its real exit code instead of falsely yielding with 75");
+  assert.doesNotMatch(stderrLines.join("\n"), /yielded/, "must not claim the completed command was yielded");
+});
+
+test("Windows job hold: --yield and signal use controlled stop (DrainJob) and never pre-kill owner before endLeaseProcesses snapshot", { skip: posixOnly, timeout: 30_000 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-win-job-ctrl-stop-"));
+  t.after(() => { cleanupHomeProcesses(home); return rm(home, { recursive: true, force: true }); });
+  const { compiler } = await createJobStandIn(home);
+
+  // 1. Responsive owner on --yield: controlled stop triggers DrainJob without writing group-end or invoking killOwner.
+  {
+    const stopObserved = join(home, "yield-stop-observed");
+    const grandPidFile = join(home, "ctrl-yield-grand.pid");
+    const killedTargets: WinProcessIdentity[][] = [];
+    const seam = makeWinLeaseSeam(() => [], killedTargets);
+    const yielding = hold(parseHold(["machine", "--yield", "--", process.execPath, "-e", [
+      "const { spawn } = require('node:child_process'), { writeFileSync } = require('node:fs');",
+      "const g = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });",
+      "g.unref(); writeFileSync(process.argv[1], String(g.pid));",
+      "setInterval(() => {}, 1000);",
+    ].join(""), grandPidFile]), {
+      env: { ...process.env, DSA_HOME: home, HOLD_TEST_STOP_OBSERVED: stopObserved },
+      platform: "win32",
+      pollMs: 25,
+      graceMs: 200,
+      captureWrapperStart: async pid => ticksForPid(pid),
+      lease: seam,
+      job: { compiler, observe: async () => [...procSnapshot().values()] },
+    });
+    await until(() => existsSync(grandPidFile) && readTickets(home, "machine").some(x => x.command !== undefined), "yielding job running");
+    const grandPid = Number(readFileSync(grandPidFile, "utf8").trim());
+    t.after(() => { try { process.kill(grandPid, "SIGKILL"); } catch {} });
+    const waiter = hold(parseHold(["machine", "--", process.execPath, "-e", "process.exit(0)"]), {
+      env: { ...process.env, DSA_HOME: home },
+      platform: "win32",
+      pollMs: 25,
+      graceMs: 100,
+      captureWrapperStart: async pid => ticksForPid(pid),
+      lease: seam,
+      job: { compiler, observe: async () => [...procSnapshot().values()] },
+    });
+    assert.deepEqual(await Promise.all([yielding, waiter]), [75, 0]);
+    assert.equal(existsSync(stopObserved), true, "DsaJob observed the controlled stop sentinel and ran DrainJob");
+    assert.equal(pidAlive(grandPid), false, "detached grandchild was drained before waiter ran");
+    assert.equal(killedTargets.length, 0, "controlled stop avoided force-killing the owner");
+  }
+
+  // 2. Responsive owner on SIGTERM: controlled stop triggers DrainJob and returns 143.
+  {
+    const stopObserved = join(home, "sig-stop-observed");
+    const grandPidFile = join(home, "ctrl-sig-grand.pid");
+    const runner = await writeHolderRunner(home, compiler);
+    const sigHolder = spawn(process.execPath, [runner, "machine", "--", process.execPath, "-e", [
+      "const { spawn } = require('node:child_process'), { writeFileSync } = require('node:fs');",
+      "const g = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });",
+      "g.unref(); writeFileSync(process.argv[1], String(g.pid));",
+      "setInterval(() => {}, 1000);",
+    ].join(""), grandPidFile], {
+      env: { ...process.env, DSA_HOME: home, DSA_CALL: undefined, DSA_EXEC: undefined, HOLD_TEST_STOP_OBSERVED: stopObserved },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const sigExit = new Promise<number | null>(resolve => sigHolder.once("exit", code => resolve(code)));
+    await until(() => existsSync(grandPidFile) && readTickets(home, "machine").some(x => x.command !== undefined), "signal job running");
+    const grandPid = Number(readFileSync(grandPidFile, "utf8").trim());
+    t.after(() => { try { process.kill(grandPid, "SIGKILL"); } catch {} });
+    sigHolder.kill("SIGTERM");
+    assert.equal(await sigExit, 143);
+    assert.equal(existsSync(stopObserved), true, "SIGTERM triggered controlled stop instead of pre-killing the owner");
+    assert.equal(pidAlive(grandPid), false, "detached grandchild ended cleanly");
+  }
+
+  // 3. Unresponsive owner (ignores stop file): hold does NOT pre-kill owner before endLeaseProcesses;
+  // endLeaseProcesses captures the live owner + command in its first snap(0) BEFORE calling killOwnerWinSync.
+  {
+    const grandPidFile = join(home, "unresp-grand.pid");
+    const events: string[] = [];
+    let ownerPid = 0, cmdPid = 0;
+    const seam: EndLeaseOptions = {
+      platform: "win32",
+      snapshotWin: () => {
+        const rows = procSnapshot();
+        if (ownerPid && cmdPid && rows.has(ownerPid) && rows.has(cmdPid)) {
+          events.push("snap-saw-owner-and-cmd");
+        }
+        return rows;
+      },
+      startWinSync: pid => procSnapshot().get(pid)?.start ?? "",
+      processAlive: pid => pidAlive(pid),
+      killOwnerWinSync: targets => {
+        events.push(`kill-owner:${targets.map(x => x.pid).join(",")}`);
+        for (const target of targets) {
+          try { process.kill(target.pid, "SIGTERM"); } catch { /* gone */ }
+        }
+      },
+    };
+    const yielding = hold(parseHold(["gpu", "--yield", "--", process.execPath, "-e", [
+      "const { spawn } = require('node:child_process'), { writeFileSync } = require('node:fs');",
+      "const g = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });",
+      "g.unref(); writeFileSync(process.argv[1], String(g.pid));",
+      "setInterval(() => {}, 1000);",
+    ].join(""), grandPidFile]), {
+      env: { ...process.env, DSA_HOME: home, HOLD_TEST_IGNORE_STOP: "1" },
+      platform: "win32",
+      pollMs: 25,
+      graceMs: 100,
+      captureWrapperStart: async pid => ticksForPid(pid),
+      lease: seam,
+      job: { compiler, observe: async () => [...procSnapshot().values()] },
+    });
+    const activeTicket = await until(() => {
+      if (!existsSync(grandPidFile)) return false;
+      return readTickets(home, "gpu").find(x => x.command !== undefined && x.group !== undefined);
+    }, "unresponsive yielding job running");
+    ownerPid = activeTicket.group!.pid;
+    cmdPid = activeTicket.command!.pid;
+    const grandPid = Number(readFileSync(grandPidFile, "utf8").trim());
+    t.after(() => { try { process.kill(grandPid, "SIGKILL"); } catch {} });
+
+    const waiter = hold(parseHold(["gpu", "--", process.execPath, "-e", "process.exit(0)"]), {
+      env: { ...process.env, DSA_HOME: home },
+      platform: "win32",
+      pollMs: 25,
+      graceMs: 100,
+      captureWrapperStart: async pid => ticksForPid(pid),
+      lease: seam,
+      job: { compiler, observe: async () => [...procSnapshot().values()] },
+    });
+    assert.deepEqual(await Promise.all([yielding, waiter]), [75, 0]);
+    const firstSnap = events.indexOf("snap-saw-owner-and-cmd");
+    const firstKill = events.indexOf(`kill-owner:${ownerPid}`);
+    assert.ok(firstSnap >= 0, `expected endLeaseProcesses snapshot to see live owner and command, got ${JSON.stringify(events)}`);
+    assert.ok(firstKill > firstSnap, `owner must not be killed before first endLeaseProcesses snapshot, got ${JSON.stringify(events)}`);
+    assert.equal(pidAlive(grandPid), false, "detached grandchild ended before waiter ran");
+  }
+});
+
+test("endLeaseProcesses re-reads late-written group record on checkRows before releasing", async t => {
+  const home = await mkdtemp(join(tmpdir(), "dsa-win-job-late-group-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const jobDir = join(home, "job-1");
+  mkdirSync(jobDir, { recursive: true });
+
+  const owner: WinProcessIdentity = { pid: 9100, start: "639000000500001000" };
+  const cmd: WinProcessIdentity = { pid: 9200, start: "639000000500002000" };
+  const grand: WinProcessIdentity = { pid: 9300, start: "639000000500003000" };
+  // Before killOwner, only helper-begin exists; `group` has not been published yet.
+  writeFileSync(join(jobDir, "helper-begin"), JSON.stringify(owner));
+
+  const ticket: LeaseTicket = {
+    seq: 1,
+    resource: "machine",
+    mode: "exclusive",
+    wrapper: { pid: 9000, start: "639000000500000500" },
+    jobDir,
+    argv: ["cmd"],
+    cwd: home,
+    since: Date.now(),
+    grantedAt: Date.now(),
+  };
+
+  let snapCall = 0;
+  const killed: WinProcessIdentity[][] = [];
+  const logs: string[] = [];
+  await endLeaseProcesses(ticket, 100, l => logs.push(l), {
+    platform: "win32",
+    processAlive: pid => snapCall < 2 && pid === owner.pid,
+    snapshotWin: () => {
+      snapCall += 1;
+      if (snapCall === 1) {
+        // Initial snap(0) BEFORE killOwner: owner, cmd, and grandchild are all live, while `group` is still absent.
+        return new Map<number, WinProcessRow>([
+          [owner.pid, { pid: owner.pid, ppid: 9000, start: owner.start }],
+          [cmd.pid, { pid: cmd.pid, ppid: owner.pid, start: cmd.start }],
+          [grand.pid, { pid: grand.pid, ppid: cmd.pid, start: grand.start }],
+        ]);
+      }
+      if (snapCall === 2) {
+        // checkRows AFTER killOwner: owner and cmd have exited, while grandchild is STILL draining!
+        return new Map<number, WinProcessRow>([
+          [grand.pid, { pid: grand.pid, ppid: cmd.pid, start: grand.start }],
+        ]);
+      }
+      // Next scan: grandchild has finished exiting.
+      return new Map<number, WinProcessRow>();
+    },
+    killOwnerWinSync: targets => {
+      killed.push(targets.map(x => ({ ...x })));
+      // Simulate DsaJob publishing `group` right before dying from the kill.
+      writeFileSync(join(jobDir, "group"), JSON.stringify({ pid: cmd.pid, start: cmd.start, group: owner }));
+    },
+  });
+
+  assert.deepEqual(killed, [[owner]], "targeted only the verified owner");
+  assert.ok(snapCall >= 3, `must re-read late group on checkRows and wait for grandchild to exit (saw ${snapCall} snapshots)`);
+  assert.deepEqual(logs, [], "clean exit after grandchild drained without timing out");
 });

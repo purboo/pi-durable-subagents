@@ -16,9 +16,9 @@ import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   JOB_BEGIN, JOB_END, JOB_ERROR, JOB_GROUP, JOB_HOST_EXE, JOB_HOST_EXIT, JOB_HOST_LOG, JOB_HOST_MARKER, JOB_HOST_PREFIX,
-  JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, JobPrepareCancelled, asciiJson, compileJobHost, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
+  JOB_HOST_SOURCE, JOB_SPEC, JOB_SPEC_HEADER, JOB_STOP, JobPrepareCancelled, asciiJson, compileJobHost, frameworkCompiler, frameworkCompilerCandidates, jobEnv,
   jobHostArgv, jobHostPaths, jobSpecText, prepareCancelled, prepareJob, publishBuild, readBeginIdentity, readGroupEndSync, readGroupRecord,
-  readStartErrorSync, spawnInJob, startError, type PublishBuild,
+  readStartErrorSync, requestJobStop, spawnInJob, startError, type PublishBuild,
 } from "../../../src/platform/job.ts";
 import { winProcessRows } from "../../../src/platform/windows.ts";
 
@@ -93,7 +93,7 @@ test("the owner source is self-contained, ASCII, and carries the Win32 group con
   assert.ok(!JOB_HOST_SOURCE.includes("@@DIR@@"));
   assert.match(JOB_HOST_SOURCE, /^[\t\n\r\x20-\x7e]*$/, "the owner source is ASCII only");
   // Every evidence file the orchestrator reads is named by the owner itself (a rename here would break recovery).
-  for (const name of [JOB_SPEC, JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR]) assert.ok(JOB_HOST_SOURCE.includes(`"${name}"`), name);
+  for (const name of [JOB_SPEC, JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_STOP]) assert.ok(JOB_HOST_SOURCE.includes(`"${name}"`), name);
   // stdin is empty; two independent append-only handles mean one stream cannot overwrite the other.
   assert.match(JOB_HOST_SOURCE, /CreateFileW\("NUL"/);
   assert.match(JOB_HOST_SOURCE, /FILE_APPEND_DATA/);
@@ -147,6 +147,15 @@ test("the owner source is self-contained, ASCII, and carries the Win32 group con
   assert.match(JOB_HOST_SOURCE, /if \(String\.IsNullOrEmpty\(logPath\)\)/);
   assert.match(JOB_HOST_SOURCE, /DuplicateHandle\(current, raw, current, out handle, 0, true, DUPLICATE_SAME_ACCESS\)/);
   assert.match(JOB_HOST_SOURCE, /if \(String\.IsNullOrEmpty\(logPath\)\) ReleaseOwnStdHandles\(\);/);
+  // Controlled stop polling: polls WaitForSingleObject(child.hProcess, 50) for `stop` on WAIT_TIMEOUT (258),
+  // calls DrainJob(job), and skips writing `group-end` when stopped while preserving normal WAIT_OBJECT_0 exit.
+  assert.match(JOB_HOST_SOURCE, /WAIT_OBJECT_0 = 0x00000000/);
+  assert.match(JOB_HOST_SOURCE, /WAIT_TIMEOUT = 0x00000102/);
+  assert.match(JOB_HOST_SOURCE, /WaitForSingleObject\(child\.hProcess, 50\)/);
+  assert.ok(!/WaitForSingleObject\(child\.hProcess, INFINITE\)/.test(JOB_HOST_SOURCE), "wait loop polls for stop instead of blocking INFINITE");
+  assert.match(JOB_HOST_SOURCE, /string stopPath = Path\.Combine\(dir, "stop"\);/);
+  assert.match(JOB_HOST_SOURCE, /if \(File\.Exists\(stopPath\)\) \{ stopped = true; break; \}/);
+  assert.match(JOB_HOST_SOURCE, /if \(!stopped\)\s*\{\s*(?:\/\/[^\n]*\n\s*)*WriteAtomic\(Path\.Combine\(dir, "group-end"\)/);
   // Surviving grandchildren are terminated and drained to ActiveProcesses == 0 before group-end is recorded.
   const drainAt = JOB_HOST_SOURCE.indexOf("DrainJob(job);");
   assert.ok(drainAt > JOB_HOST_SOURCE.indexOf("GetExitCodeProcess(child.hProcess, out code)"));
@@ -602,7 +611,7 @@ test("the owner is staged before any start: compiled, spec written, nothing star
   assert.ok(existsSync(staging.host.source));
   assert.match(readFileSync(join(dir, JOB_SPEC), "utf8"), new RegExp(`^${JOB_SPEC_HEADER}\n`));
   // And nothing that could act: no group, no owner process, no command output, no reason (nothing failed).
-  for (const name of [JOB_GROUP, JOB_END, JOB_BEGIN, JOB_HOST_EXIT, JOB_ERROR, "output.log"]) assert.ok(!existsSync(join(dir, name)), `no ${name}`);
+  for (const name of [JOB_GROUP, JOB_END, JOB_BEGIN, JOB_STOP, JOB_HOST_EXIT, JOB_ERROR, "output.log"]) assert.ok(!existsSync(join(dir, name)), `no ${name}`);
   assert.deepEqual(readdirSync(dir).filter(name => name.startsWith(JOB_HOST_PREFIX)), [staging.host.dir.slice(dir.length + 1)]);
   await staging.release();
   assert.ok(!existsSync(staging.host.dir), "release removes the compiled owner");
@@ -845,4 +854,35 @@ test("job record readers retry Windows transient sharing conflicts and fail clos
       },
     }), "CreateProcess failed (error 2)");
   }
+});
+
+test("requestJobStop writes the stop sentinel atomically and prepareJob clears stale stop files", async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  await requestJobStop(dir);
+  assert.equal(readFileSync(join(dir, JOB_STOP), "utf8"), "stop");
+  assert.ok(!existsSync(join(dir, `${JOB_STOP}.tmp`)), "atomic write leaves no temporary file behind");
+  if (process.platform !== "win32") {
+    const compiler = await stubCompiler(dir, 'import { writeFileSync } from "node:fs"; writeFileSync("DsaJob.build.exe", "MZ");');
+    const staging = await prepareJob(dir, launchFor(dir), { compiler });
+    assert.ok(!existsSync(join(dir, JOB_STOP)), "prepareJob clears a stale stop sentinel before spawning a fresh attempt");
+    await staging.release();
+  }
+});
+
+test("requestStop drains a running job (including detached grandchildren) without writing group-end", { skip: windowsOnly, timeout: 180_000 }, async t => {
+  const dir = dirOf(); t.after(() => rm(dir, { recursive: true, force: true }));
+  const { program, beatScript, beat, pidFile } = treeProgram(dir);
+  const launched = await spawnInJob(dir, { exe: process.execPath, args: [program, beat, pidFile, beatScript, "keep"], cwd: dir,
+    log: join(dir, "output.log"), env: { ...process.env } });
+  assert.ok(launched);
+  const grandchild = Number(await until(() => existsSync(pidFile) ? readFileSync(pidFile, "utf8") : undefined, "the grandchild pid"));
+  await until(() => existsSync(beat) && readFileSync(beat, "utf8").length > 0, "the grandchild to beat");
+  await launched.requestStop?.();
+  await untilEnded(launched);
+  await gone(grandchild);
+  await gone(launched.pid);
+  assert.ok(!existsSync(join(dir, JOB_END)), "controlled stop must not write a fake normal group-end exit status");
+  const size = readFileSync(beat, "utf8").length;
+  await delay(400);
+  assert.equal(readFileSync(beat, "utf8").length, size, "the grandchild stops acting after controlled DrainJob");
 });

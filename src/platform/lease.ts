@@ -9,7 +9,7 @@ import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, rmdirSync, sta
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { replacePath, replacePathSync } from "../kernel/fsx.ts";
-import { readBeginIdentitySync, readGroupEndSync, readGroupRecordStateSync, readGroupRecordSync } from "./job.ts";
+import { readBeginIdentitySync, readGroupEndSync, readGroupRecordStateSync } from "./job.ts";
 import { OsLock } from "./lock.ts";
 import { ProcessTable } from "./proctable.ts";
 import { IS_WINDOWS, isWinStart, killProcessSync, killTreeSync, sameCreation, winLiveDescendants, winSnapshotSync, winStartSync, winTag, type WinProcessIdentity, type WinProcessRow } from "./windows.ts";
@@ -222,12 +222,22 @@ export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (l
       // Terminating the verified Job Object owner closes the job's sole handle (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),
       // so the kernel ends the command root and every surviving child/grandchild without walking dead parent PIDs.
       const killOwner = options.killOwnerWinSync ?? options.killWinSync ?? (targets => killProcessSync(targets));
+      const pidAlive = options.processAlive ?? kernelPidAlive;
       const tag = holdTag(t);
       const proven = new Map<string, WinProcessIdentity>();
+      const addProvenCmd = (cmd: WinProcessIdentity, ...snapshots: ReadonlyArray<ReadonlyMap<number, WinProcessRow>>) => {
+        proven.set(`${cmd.pid}:${cmd.start}`, cmd);
+        for (const snapshot of snapshots) {
+          for (const d of winLiveDescendants([cmd], snapshot.values())) {
+            proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+          }
+        }
+      };
       let checkedOwnerHandle = false;
       for (;;) {
         const rows = snap(0);
-        const groupRec = t.jobDir ? readGroupRecordSync(t.jobDir) : undefined;
+        const groupState = t.jobDir ? readGroupRecordStateSync(t.jobDir) : { state: "absent" as const };
+        const groupRec = groupState.state === "ready" ? groupState.record : undefined;
         const began = t.jobDir ? readBeginIdentitySync(t.jobDir) : undefined;
         const recordedOwner = (groupRec?.group && isWinStart(groupRec.group.start) ? groupRec.group : undefined)
           ?? (t.group && isWinStart(t.group.start) ? { pid: t.group.pid, start: t.group.start } : undefined)
@@ -239,30 +249,37 @@ export async function endLeaseProcesses(t: LeaseTicket, graceMs: number, say: (l
         const cmd: WinProcessIdentity | undefined = (groupRec && isWinStart(groupRec.start) ? { pid: groupRec.pid, start: groupRec.start } : undefined)
           ?? (t.command && isWinStart(t.command.start) ? { pid: t.command.pid, start: t.command.start } : undefined);
         if (owner) proven.set(`${owner.pid}:${owner.start}`, owner);
-        if (cmd) {
-          proven.set(`${cmd.pid}:${cmd.start}`, cmd);
-          for (const d of winLiveDescendants([cmd], rows.values())) {
-            proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
-          }
-        }
+        if (cmd) addProvenCmd(cmd, rows);
         const ownerLiveInRows = Boolean(owner && rows.get(owner.pid) && sameCreation(rows.get(owner.pid)!.start, owner.start));
-        const shouldKillOwner = Boolean(owner && (ownerLiveInRows || (!checkedOwnerHandle && recordedOwner !== undefined)));
+        const shouldKillOwner = Boolean(owner && (ownerLiveInRows || (!checkedOwnerHandle && recordedOwner !== undefined && pidAlive(owner.pid))));
         checkedOwnerHandle = true;
         if (shouldKillOwner && owner) {
           try { killOwner([owner]); } catch { /* retry until deadline when a verified owner resists termination */ }
         }
         const checkRows = shouldKillOwner ? snap(0) : rows;
-        if (cmd) {
-          for (const d of winLiveDescendants([cmd], checkRows.values())) {
-            proven.set(`${d.pid}:${d.start}`, { pid: d.pid, start: d.start });
+        let transientGroup = groupState.state === "transient";
+        let effectiveCmd = cmd;
+        if (!groupRec && t.jobDir && shouldKillOwner) {
+          const lateGroupState = readGroupRecordStateSync(t.jobDir);
+          transientGroup = lateGroupState.state === "transient";
+          if (lateGroupState.state === "ready") {
+            const late = lateGroupState.record;
+            if (late.group && isWinStart(late.group.start)) {
+              proven.set(`${late.group.pid}:${late.group.start}`, late.group);
+            }
+            if (isWinStart(late.start)) {
+              effectiveCmd = { pid: late.pid, start: late.start };
+              addProvenCmd(effectiveCmd, rows, checkRows);
+            }
           }
         }
+        if (effectiveCmd) addProvenCmd(effectiveCmd, checkRows);
         const remaining = [...proven.values()].filter(p => {
           const row = checkRows.get(p.pid);
           return row !== undefined && sameCreation(row.start, p.start);
         }).length;
-        if (!remaining) break;
-        if (Date.now() >= until) { say(`hold: ${remaining} processes of ${who(t)} survived; releasing`); break; }
+        if (!remaining && !transientGroup) break;
+        if (Date.now() >= until) { say(`hold: ${remaining || 1} processes of ${who(t)} survived; releasing`); break; }
         await new Promise(r => setTimeout(r, 25));
       }
       return;

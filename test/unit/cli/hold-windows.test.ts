@@ -20,9 +20,9 @@ async function root(t: test.TestContext) {
   t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {}));
   return home;
 }
-async function until<T>(fn: () => T | undefined | false, ms = 30_000): Promise<T> {
+async function until<T>(fn: () => T | undefined | false | Promise<T | undefined | false>, ms = 30_000): Promise<T> {
   const end = performance.now() + ms;
-  for (;;) { const value = fn(); if (value) return value; if (performance.now() > end) throw new Error("Timed out"); await delay(25); }
+  for (;;) { const value = await fn(); if (value) return value; if (performance.now() > end) throw new Error("Timed out"); await delay(25); }
 }
 interface Run { child: ChildProcess; exit: Promise<number | null>; stdout: () => string; stderr: () => string }
 function run(home: string, args: string[], input?: string): Run {

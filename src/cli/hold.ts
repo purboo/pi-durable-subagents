@@ -5,7 +5,7 @@ import { watch, type FSWatcher } from "node:fs";
 import { constants } from "node:os";
 import path from "node:path";
 import { dsaHome } from "../paths.ts";
-import { prepareCancelled, prepareJob, readGroupEndSync, readGroupRecord, readStartErrorSync, spawnInJob, startError, type JobLaunch, type JobOptions } from "../platform/job.ts";
+import { prepareCancelled, prepareJob, readGroupEndSync, readGroupRecord, readStartErrorSync, requestJobStop, spawnInJob, startError, type JobLaunch, type JobOptions } from "../platform/job.ts";
 import { captureStart } from "../platform/proctable.ts";
 import { executableFile, execTarget } from "../platform/launch.ts";
 import { comspec, envValue, IS_WINDOWS, isWinStart, mergeEnv, normalizeEnv } from "../platform/windows.ts";
@@ -64,14 +64,19 @@ export function parseHold(args: string[]): HoldArgs {
 const age = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`;
 const SIGNALS = (IS_WINDOWS ? ["SIGINT", "SIGTERM", "SIGBREAK"] : ["SIGINT", "SIGTERM", "SIGHUP"]) as readonly NodeJS.Signals[];
 
-function resolveWinHoldTarget(command: string, args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): { command: string; args: string[] } {
-  if (!path.isAbsolute(command) && !path.win32.isAbsolute(command) && /[\\/]/.test(command)) {
-    const candidate = path.resolve(cwd, command);
+export function resolveWinHoldTarget(command: string, args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): { command: string; args: string[] } {
+  const isAbs = path.isAbsolute(command) || path.win32.isAbsolute(command);
+  if (isAbs || /[\\/]/.test(command)) {
+    const candidate = isAbs ? command : path.resolve(cwd, command);
     if (executableFile(candidate, "win32")) return execTarget(candidate, args, { env, platform: "win32" });
-    if (!path.extname(candidate)) {
+    if (!path.win32.extname(candidate)) {
       const exts = (envValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";");
-      for (const ext of exts) {
-        if (ext && executableFile(candidate + ext, "win32")) return execTarget(candidate + ext, args, { env, platform: "win32" });
+      for (const rawExt of exts) {
+        const ext = rawExt.trim();
+        if (!ext) continue;
+        const lower = ext.toLowerCase();
+        if (executableFile(candidate + lower, "win32")) return execTarget(candidate + lower, args, { env, platform: "win32" });
+        if (lower !== ext && executableFile(candidate + ext, "win32")) return execTarget(candidate + ext, args, { env, platform: "win32" });
       }
     }
   }
@@ -120,13 +125,31 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
   }
   const ticket: LeaseTicket = granted ?? await enqueue(home, request, undefined, leaseOpts);
   let child: ReturnType<typeof spawn> | undefined, interrupted: NodeJS.Signals | undefined, wake = () => {}, cleaned = false;
-  let winJobActive = false, killActiveOwner: (() => boolean) | undefined;
+  let winJobActive = false, activeJobDir: string | undefined;
+  let activeJob: { requestStop?: () => Promise<void>; exited: Promise<void> } | undefined;
   const prepAbort = new AbortController();
+  const stopWinJob = async () => {
+    const stopBudgetMs = Math.min(Math.max(graceMs, 250), 2000);
+    if (activeJob) {
+      await activeJob.requestStop?.();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          activeJob.exited,
+          new Promise<void>(resolve => { timer = setTimeout(resolve, stopBudgetMs); }),
+        ]);
+      } finally { clearTimeout(timer); }
+    } else if (activeJobDir) {
+      await requestJobStop(activeJobDir);
+    }
+    await endLeaseProcesses(ticket, graceMs, say, leaseOpts);
+  };
   const onSignal = (signal: NodeJS.Signals) => {
     if (winHold) {
       interrupted = signal;
       prepAbort.abort();
-      try { killActiveOwner?.(); } catch { /* gone */ }
+      if (activeJob?.requestStop) void activeJob.requestStop();
+      else if (activeJobDir) void requestJobStop(activeJobDir);
       wake();
     } else if (child?.pid) {
       try { process.kill(-child.pid, signal); } catch { /* gone */ }
@@ -220,6 +243,7 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
       // hard-killed at any instant during or after launch, readers recover the job owner and command from `jobDir`.
       ticket.jobDir = jobDir;
       writeTicketSync(home, ticket);
+      activeJobDir = jobDir;
       winJobActive = true;
       let spawned;
       try {
@@ -228,7 +252,10 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
           proceed: () => !interrupted,
           stdio: options.job?.stdio ?? [process.stdin.isTTY ? "ignore" : "inherit", "inherit", "inherit"],
           unref: false,
-          onOwnerSpawned: killOwner => { killActiveOwner = killOwner; options.onJobOwnerSpawned?.(); },
+          onOwnerSpawned: () => {
+            if (interrupted) void requestJobStop(jobDir);
+            options.onJobOwnerSpawned?.();
+          },
           ...(options.job?.timeoutMs !== undefined ? { timeoutMs: options.job.timeoutMs } : {}),
           ...(options.job?.observeMs !== undefined ? { observeMs: options.job.observeMs } : {}),
           ...(options.job?.endMs !== undefined ? { endMs: options.job.endMs } : {}),
@@ -237,7 +264,7 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
         });
       } catch (error) {
         if (interrupted) {
-          await endLeaseProcesses(ticket, graceMs, say, leaseOpts);
+          await stopWinJob();
           cleaned = true;
           return 128 + (constants.signals[interrupted] ?? 1);
         }
@@ -255,7 +282,10 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
         cleaned = true;
         return 128 + (constants.signals[interrupted ?? "SIGINT"] ?? 1);
       }
-      killActiveOwner = spawned.killOwner;
+      activeJob = spawned;
+      let jobEnded = false;
+      void spawned.exited.then(() => { jobEnded = true; wake(); });
+      if (interrupted) void spawned.requestStop?.();
       if (spawned.uncertain) {
         if (isWinStart(spawned.start)) {
           ticket.group = { pid: spawned.pid, start: spawned.start };
@@ -265,9 +295,7 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
       }
       const groupRec = await readGroupRecord(jobDir);
       if (!groupRec || !isWinStart(groupRec.start) || !groupRec.group || !isWinStart(groupRec.group.start)) {
-        spawned.killOwner?.();
-        await Promise.race([spawned.exited, new Promise<void>(r => setTimeout(r, 5000))]);
-        await endLeaseProcesses(ticket, graceMs, say, leaseOpts);
+        await stopWinJob();
         cleaned = true;
         throw new Error(`hold: cannot verify command start identity for pid ${spawned.pid}`);
       }
@@ -275,16 +303,14 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
       ticket.command = { pid: groupRec.pid, start: groupRec.start };
       ticket.group = { pid: groupRec.group.pid, start: groupRec.group.start };
       await writeTicket(home, ticket).catch(() => {});
-      let jobEnded = false;
-      void spawned.exited.then(() => { jobEnded = true; wake(); });
+      if (!jobEnded && readGroupEndSync(jobDir)) jobEnded = true;
       while (!jobEnded) {
         if (interrupted) break;
         if (args.yield) {
           const all = liveTickets(home, args.resource, leaseOpts);
           const waiter = all.filter(t => t.grantedAt === undefined && blockers(t, all).some(b => b.seq === ticket.seq)).sort(rank)[0];
           if (waiter) {
-            spawned.killOwner?.();
-            await endLeaseProcesses(ticket, graceMs, say, leaseOpts);
+            await stopWinJob();
             cleaned = true;
             say(`hold: yielded ${args.resource} to ${who(waiter)} after ${age(Date.now() - ticket.grantedAt!)}; the command was stopped (exit ${WAIT_EXPIRED})`);
             return WAIT_EXPIRED;
@@ -293,8 +319,7 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
         await pause();
       }
       if (interrupted) {
-        spawned.killOwner?.();
-        await endLeaseProcesses(ticket, graceMs, say, leaseOpts);
+        await stopWinJob();
         cleaned = true;
         return 128 + (constants.signals[interrupted] ?? 1);
       }
@@ -340,10 +365,8 @@ export async function hold(args: HoldArgs, options: HoldOptions = {}): Promise<n
     watcher?.close();
     // Also covers errors during launch/capture/write and forwarded signals followed by command exit.
     try {
-      if ((child || winJobActive) && !cleaned) {
-        if (winHold) killActiveOwner?.();
-        await endLeaseProcesses(ticket, graceMs, say, leaseOpts);
-      }
+      if (winJobActive && !cleaned) await stopWinJob();
+      else if (child && !cleaned) await endLeaseProcesses(ticket, graceMs, say, leaseOpts);
     }
     finally {
       removeTicket(home, ticket);
