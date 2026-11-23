@@ -153,13 +153,20 @@ function readyExecutable(exe: string): boolean {
   }
 }
 
-/** Content-addressed user-private cache directory for the compiled Windows lock helper (`%LOCALAPPDATA%` only; never a
- *  shared temp directory). Returns empty when `LOCALAPPDATA` is unavailable so callers fall back to PowerShell. */
+/** Content-addressed user-private cache directories for the compiled Windows lock helper (`%LOCALAPPDATA%` first, then
+ *  `DSA_HOME` when `LOCALAPPDATA` is absent in a stripped environment; never a shared temp directory). Returns empty when
+ *  neither is set so callers fall back to PowerShell. */
 export function winLockHelperCacheDirs(env: NodeJS.ProcessEnv = process.env, arch: string = process.arch): string[] {
-  const localAppData = envValue(env, "LOCALAPPDATA");
-  if (!localAppData) return [];
   const hash = createHash("sha256").update(WIN_LOCK_HELPER_SOURCE).update("\0").update(arch).digest("hex").slice(0, 16);
-  return [join(localAppData, "pi-durable-subagents", "lock-helper", `v1-${hash}`)];
+  const dirs: string[] = [];
+  const localAppData = envValue(env, "LOCALAPPDATA");
+  if (localAppData) dirs.push(join(localAppData, "pi-durable-subagents", "lock-helper", `v1-${hash}`));
+  const dsaHome = envValue(env, "DSA_HOME");
+  if (dsaHome) {
+    const candidate = join(dsaHome, "cache", "lock-helper", `v1-${hash}`);
+    if (!dirs.includes(candidate)) dirs.push(candidate);
+  }
+  return dirs;
 }
 
 /** Sub-budget reserved for compiling the Windows lock helper so the PowerShell fallback always retains at least ~2/3 of

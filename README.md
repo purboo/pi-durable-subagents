@@ -40,16 +40,16 @@ covers Linux, macOS and Windows.
 
 Windows uses native facilities, no WSL and no POSIX tools: the process table
 comes from PowerShell/CIM (`Win32_Process`, identity is pid plus creation
-time), process trees end through handle-verified Win32 `TerminateProcess`
-(`GetProcessTimes` checked on the open handle, live creation-ordered
-descendants only), file locks are a small Node
-helper holding an atomically created lock directory, command calls run through
-`cmd.exe` inside a Windows Job Object per attempt (a kernel-owned group: the
-wrapper is assigned before it runs, the group's only handle is held by a small
-.NET Framework executable compiled per launch from source carried in the
-package with the framework's own `csc.exe`, and the group's last handle dying
-kills whatever the command left behind), and `install-service` uses Task
-Scheduler.
+time, fail-closed on protected-PID reuse), process trees end through
+handle-verified Win32 `TerminateProcess` (`GetProcessTimes` checked on the open
+handle, live creation-ordered descendants only), file locks hold a
+kernel-released exclusive `FileShare.None` file handle (via a cached .NET
+Framework helper compiled under `%LOCALAPPDATA%` with PowerShell fallback),
+command calls, `hold` leases and gates run inside Windows Job Objects
+(`KILL_ON_JOB_CLOSE` kernel-owned groups whose sole handle is held by a small
+.NET Framework executable compiled per launch with `csc.exe`, so the group's
+last handle closing terminates every surviving descendant), and
+`install-service` uses a hidden `wscript.exe` launcher in Task Scheduler.
 Two Windows differences: another process's environment is unreadable, so
 execution identity is the live creation-ordered process tree (a grandchild
 whose parent exited before a scan is not found by the `DSA_EXEC` tag the way

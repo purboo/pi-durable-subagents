@@ -1208,7 +1208,7 @@ test("C1 forwarded steer then withdraw is consumed with child receipts", { timeo
 });
 
 test("P7 a live steer is recorded delivered exactly once on its child receipt; a restart never duplicates it", { timeout: 30000 }, async t => {
-  const f = await setup(t, { k: { trackerMs: 25 } }), ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 2" } }, { text: "done" }]));
+  const f = await setup(t, { k: { trackerMs: 25 } }), ticket = f.ticket("a", script([{ tool: "bash", args: { command: "sleep 2" } }, { delayMs: 500, text: "done" }]));
   const pending = f.executor.run(ticket);
   await until(() => f.journal.entries().some(e => e.type === "observation" && (e.event as { type: string }).type === "tool_execution_start"));
   const req: Request = { rid: "seen-steer", from: "main:test", to: "orch", sseq: 1, kind: "send", body: { to: ticket.callId, kind: "steer", message: "also check the docs" } };

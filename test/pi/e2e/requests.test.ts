@@ -21,7 +21,10 @@ async function stack(t: TestContext) {
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: [FAUX], defaultProvider: "probe", defaultModel: "scripted" }));
   await writeFile(join(cwd, ".pi/agents/echo.md"), "---\nname: echo\ndescription: echo\n---\nYou echo.\n");
   const noop = join(root, "noop.mjs"); await writeFile(noop, "");
-  const base: NodeJS.ProcessEnv = { PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`, HOME: root, DSA_HOME: home,
+  const winKeep = process.platform === "win32"
+    ? Object.fromEntries(["SystemRoot", "ComSpec", "PATHEXT", "LOCALAPPDATA", "TEMP", "TMP"].flatMap(k => process.env[k] ? [[k, process.env[k]]] : []))
+    : {};
+  const base: NodeJS.ProcessEnv = { ...winKeep, PATH: `${join(REPO, "node_modules/.bin")}${delimiter}${process.env.PATH}`, HOME: root, DSA_HOME: home,
     PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PROBE_DIR: root };
   const cli = (args: string[], extra: NodeJS.ProcessEnv = {}) => new Promise<Result>((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], { cwd, env: { ...base, ...extra }, stdio: ["ignore", "pipe", "pipe"] });

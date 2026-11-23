@@ -403,11 +403,14 @@ test("Windows compiled lock helper source, cache dirs, atomic publish and reuse 
   const dirsA = winLockHelperCacheDirs({ LOCALAPPDATA: "/local", TEMP: "/tmp" }, "x64");
   const dirsB = winLockHelperCacheDirs({ LOCALAPPDATA: "/local", TEMP: "/tmp" }, "ia32");
   const dirsNoLocal = winLockHelperCacheDirs({ TEMP: "/tmp", TMP: "/tmp" }, "x64");
+  const dirsDsaHome = winLockHelperCacheDirs({ DSA_HOME: "/user/dsa", TEMP: "/tmp" }, "x64");
   const dirsCase = winLockHelperCacheDirs({ localappdata: "/local-ci" }, "x64");
   assert.equal(dirsA.length, 1, "only user-private LOCALAPPDATA cache dir is used (never shared TEMP/TMP)");
   assert.ok(dirsA[0]!.startsWith(join("/local", "pi-durable-subagents", "lock-helper", "v1-")));
   assert.notEqual(dirsA[0], dirsB[0]);
-  assert.deepEqual(dirsNoLocal, [], "missing LOCALAPPDATA skips compiled helper instead of falling back to shared TEMP");
+  assert.deepEqual(dirsNoLocal, [], "missing LOCALAPPDATA/DSA_HOME skips compiled helper instead of falling back to shared TEMP");
+  assert.equal(dirsDsaHome.length, 1, "stripped env with DSA_HOME falls back to user-private DSA_HOME cache dir");
+  assert.ok(dirsDsaHome[0]!.startsWith(join("/user/dsa", "cache", "lock-helper", "v1-")));
   assert.equal(dirsCase.length, 1);
   assert.ok(dirsCase[0]!.startsWith(join("/local-ci", "pi-durable-subagents", "lock-helper", "v1-")));
 

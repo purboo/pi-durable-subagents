@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Native Windows support (Node.js 22.19+ and 24, no WSL or POSIX tools):
+  - **Kernel-released OS locks**: Windows file locks now hold an exclusive `FileShare.None` file handle via a cached
+    `.NET Framework` helper compiled into a user-private directory (`%LOCALAPPDATA%` or `DSA_HOME`, with bounded
+    compile budget, self-healing and PowerShell fallback) so a killed holder releases its lock immediately in the kernel.
+  - **Windows Job Objects for commands, `hold` leases and gates**: `hold` leases and gates now run inside
+    `KILL_ON_JOB_CLOSE` Job Objects alongside command attempts, with controlled `stop`/`DrainJob` teardown on `--yield`
+    and signals, snapshot-before-kill reclamation, and atomic `MoveFileExW` exit/gate record publication with bounded
+    Windows sharing-violation retries.
+  - **64-bit lossless file identities & atomic `latest`**: Journal, cache, reader-ledger and UI readers now preserve
+    full 64-bit NTFS `FileId` values as decimal strings (never truncating at `Number.MAX_SAFE_INTEGER`), and Windows
+    `latest` pointers publish atomically without requiring symlink privileges.
+  - **Process liveness, `.cmd` shims and Task Scheduler service**: Protected-PID `EPERM` checks fail closed when a
+    verified creation timestamp is missing from the snapshot, `ended` diagnostics reuse already-scanned `CommandLine`
+    rows, non-unwrapped `.cmd`/`.bat` shims (including pnpm shims setting `NODE_PATH`/`NODE_OPTIONS`) execute with
+    verbatim `cmd.exe /d /s /c` quoting while refusing CR/LF/quote injection, and `install-service`/`uninstall-service`
+    use a hidden `wscript.exe` launcher with locale-independent `schtasks` checks.
+  - **Engine lookup performance**: `Engine.findCall`, `withdraw` and single-target routing use O(1) indexed lookups
+    instead of scanning all workflows on every request.
 - A fence that runs out of its budget now says where the budget went, in the timeout it throws: how many scans
   completed and how slow the slowest was, how many processes the last scan still listed, how many kills were issued and
   how many targets were skipped because their identity was never confirmed. The same text reaches the console line, the

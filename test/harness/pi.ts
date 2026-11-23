@@ -56,7 +56,7 @@ export function startPi(opts: { root: string; name: string; extensions?: string[
   const modelArgs = opts.model === false ? [] : ["--provider", "probe", "--model", "scripted"];
   const args = ["--mode", "rpc", ...extArgs, ...modelArgs, "--session-dir", path.join(dir, "sessions"), ...(opts.args ?? [])];
   const target = execTarget(PI_BIN, args, { env: env as NodeJS.ProcessEnv });
-  const child = spawn(target.command, target.args, { cwd: path.join(dir, "work"), env: env as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true });
+  const child = spawn(target.command, target.args, { cwd: path.join(dir, "work"), env: env as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"], detached: true, windowsHide: true, ...(target.verbatim ? { windowsVerbatimArguments: true } : {}) });
   const events: PiEvent[] = [];
   const waiters: { pred: (e: PiEvent) => boolean; resolve: (e: PiEvent) => void }[] = [];
   let buf = "";
