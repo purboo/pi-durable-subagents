@@ -8,7 +8,7 @@ import { fileIdentityKey, isFileId, isFileSize, statIdentitySync, type FileId } 
 import { crc32, forgetJournalSnapshot, forgetJournalSnapshotsIf, journalAppends, readJournalRecord, readJournalSnapshot, readJournalUncached, type JournalRecord } from "../kernel/journal.ts";
 import { readCache, writeCache } from "../kernel/cache.ts";
 import { digestDir, journalPath, pinnedDir, workflowDir } from "../paths.ts";
-import { JT, askText, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf } from "../types.ts";
+import { JT, askText, attentionEntries, isEntry, type AttentionItem, type CallResult, type Entry, type EntryOf, type ResourceStats } from "../types.ts";
 import { parseModel, resolveModel, type Model } from "../compat/model.ts";
 import { heldOn, isModelPool, modelLimit, modelPool, slotsFull } from "./slots.ts";
 import type { OrchestratorConfig } from "./contract.ts";
@@ -154,6 +154,8 @@ export interface CallSnapshot extends ModelStatus {
   lastActivity?: number; startedAt?: number; endedAt?: number;
   /** P31: the sealed result's usage, else the committed usage entries so far. */
   usage?: Usage;
+  /** Latest checkpointed process-tree resource usage (memory, processes, CPU). */
+  resources?: ResourceStats;
   /** EX6: the exactness of the call and the usage of its provider requests. */
   exact?: ExactReport;
   /** Tool executions observed across the call's executions. */
@@ -426,6 +428,9 @@ function snapshotReducer(wid: string, entries: readonly Entry[]) {
           call.model = m.provider ? `${m.provider}/${m.id}` : m.id; call.usedModel = call.model;
           if (sends.get(call.callId)?.some(s => s.kind === "model" && !s.reason && s.model?.toLowerCase() === call.model?.toLowerCase())) call.selectedModel = call.model;
         }
+      } else if (e.type === "time" && e.resources && typeof e.resources === "object") {
+        const call = byExec.get(String(e.exec));
+        if (call) call.resources = e.resources as ResourceStats;
       } else if (e.type === "observation") {
         // Only what the agent did counts as activity; tracker scans and time checkpoints are bookkeeping.
         const call = byExec.get(String(e.exec)); if (call) call.lastActivity = e.ts;
@@ -1155,7 +1160,7 @@ export function commandFacts(c: CommandStatus): string {
 export interface StatusCall extends ModelStatus, CommandStatus {
   key: string; gen: number; callId: string; phase: CallPhase;
   sharedWorktree?: string[];
-  status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage;
+  status?: CallResult["status"]; ok?: boolean; model?: string; tools?: number; usage?: Usage; resources?: ResourceStats;
   /** EX6: the exactness of the call and the usage of its provider requests. */
   exact?: ExactReport;
   /** Messages forwarded to the call whose child receipt has not been observed yet (P7). */
@@ -1233,7 +1238,7 @@ export function compactWorkflow(wf: WorkflowSnapshot, leases?: Map<string, strin
       const r = c.result, last = r?.output?.split("\n").map(l => l.trim()).filter(Boolean).at(-1);
       return { key: c.key, gen: c.gen, callId: c.callId, phase: c.phase, ...modelStatus(c), ...commandStatus(c), ...(r ? { status: r.status, ok: r.ok } : {}),
         ...(c.sharedWorktree ? { sharedWorktree: c.sharedWorktree } : {}),
-        ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}),
+        ...(c.model ? { model: c.model } : {}), ...(c.tools ? { tools: c.tools } : {}), ...(c.pending ? { pending: c.pending } : {}), ...(c.switching ? { switching: c.switching } : {}), ...(c.switchFailed ? { switchFailed: c.switchFailed } : {}), ...(nonzero(c.usage) ? { usage: c.usage } : {}), ...(c.resources ? { resources: c.resources } : {}),
         ...(last ? { lastLine: clip(last, 200) } : {}), ...(r?.error ? { error: clip(r.error, 300) } : {}), ...(c.hibernated ? { hibernated: true as const } : {}),
         ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(c.writerWait && !r ? { writerWait: c.writerWait } : {}), ...(!r && leases?.get(c.callId) ? { lease: leases.get(c.callId) } : {}),
         ...(c.notesPending ? { notesPending: c.notesPending } : {}), ...(c.queuedFor && !r && !wf.paused ? { queued: queuedText(c.queuedFor) } : {}), ...(c.exact ? { exact: c.exact } : {}) };
@@ -1311,7 +1316,7 @@ export interface BriefCall extends ModelStatus, CommandStatus {
   /** Since the call started, and since its last activity (shown when quiet for a minute or more). */
   for?: string; quiet?: string;
   /** Input + output tokens so far: a running call at 0 has done nothing yet. */
-  tokens?: string; status?: CallResult["status"]; error?: string;
+  tokens?: string; memory?: string; status?: CallResult["status"]; error?: string;
   /** Hibernated: it holds no provider slot while it waits (P28). */
   hibernated?: true;
   /** Bound question id, until the next execution starts running. */
@@ -1517,6 +1522,7 @@ export function statusBrief(home: string, options: { origin?: string; keep?: num
         ...(live && c.startedAt !== undefined ? { for: age(now - c.startedAt) } : {}),
         ...(agent && live && c.phase !== "asking" && quiet !== undefined && quiet >= 60_000 ? { quiet: age(quiet) } : {}),
         ...(agent && live && c.startedAt !== undefined ? { tokens: tokens(c.usage) } : {}),
+        ...(live && c.resources && c.resources.peakMemoryMb > 0 ? { memory: `${Math.round(c.resources.memoryMb)} MiB (peak ${Math.round(c.resources.peakMemoryMb)} MiB, ${c.resources.processes} proc${c.resources.processes === 1 ? "" : "s"})` } : {}),
         ...(c.result ? { status: c.result.status, ...(c.result.error ? { error: clip(c.result.error, 200) } : {}) } : {}),
         ...(c.hibernated ? { hibernated: true as const } : {}), ...(c.answered ? { answered: c.answered } : {}), ...(c.answerForwarded ? { answerForwarded: c.answerForwarded } : {}), ...(live && c.writerWait ? { writerWait: c.writerWait } : {}),
         ...(live && byCall.get(c.callId) ? { lease: byCall.get(c.callId) } : {}),

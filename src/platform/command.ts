@@ -25,7 +25,9 @@ import { join } from "node:path";
 import { retryWinSharing, type RetryWinSharingOptions } from "../kernel/fsx.ts";
 import { captureStart } from "./proctable.ts";
 import { execTarget, findOnPath } from "./launch.ts";
+import type { ResourceLimits } from "../types.ts";
 import { prepareJob, spawnInJob, type JobPrep } from "./job.ts";
+import { probeKernelLimits, wrapLinuxScope } from "./limits.ts";
 import { DWORD_MAX, comspec, envValue, helperEnv, IS_WINDOWS, mergeEnv, normalizeEnv, systemRoot, winTagArg } from "./windows.ts";
 
 export const COMMAND_LOG = "output.log";
@@ -132,6 +134,8 @@ export interface CommandSpawn {
    *  intent, so the check that a stop arrived while the owner compiled is the executor's second one: it calls this after
    *  the staging, immediately before the spawn. */
   proceed?: () => boolean;
+  /** Optional per-call process-tree resource limits (passed to Windows Job Object or Linux cgroup v2 scope). */
+  limits?: ResourceLimits;
 }
 export interface SpawnedCommand {
   /** The wrapper process (the session leader); `start` is its start token ("" when it ended before it was captured). */
@@ -139,6 +143,8 @@ export interface SpawnedCommand {
   /** Windows: the job host (compiled owner) that holds the attempt's kernel group. Its identity is tracked with the
    *  wrapper's, so a scan finds the whole group and its absence proves the group is closed (see platform/job.ts). */
   group?: { pid: number; start: string };
+  /** Linux: transient systemd scope unit name when launched with cgroup v2 kernel hard limits. */
+  scopeUnit?: string;
   /** Windows: the attempt was started but its owner could not be confirmed retired (platform/job.ts). `pid`/`start` are
    *  then the owner's identity; the attempt must be watched until a scan confirms it retired, never started again. */
   uncertain?: string;
@@ -180,6 +186,21 @@ function windowsPlan(spec: CommandSpawn): { env: NodeJS.ProcessEnv; command: str
  *  then the group owner compiled (bounded and cancellable: `signal` ends the compiler, removes what it wrote and rejects
  *  with a cancelled preparation). Nothing is started, so a crash here leaves no intent and no process: the attempt is
  *  unambiguously prelaunch. POSIX prepares nothing (the wrapper is /bin/sh). */
+/** Commit headroom reserved for Windows wrapper.mjs (Node.js) inside the Job Object so a tight memoryMb limit never
+ *  OOM-kills the wrapper before it can run the user command or write its exit record; Layer 1 enforces exact memoryMb. */
+const WIN_WRAPPER_MEMORY_OVERHEAD_MB = 64;
+function winJobLimits(limits: ResourceLimits | undefined): { memoryMb?: number; maxProcesses?: number; cpuPercent?: number } | undefined {
+  if (!limits) return undefined;
+  const { memoryMb, maxProcesses, cpuPercent } = limits;
+  if (memoryMb === undefined && maxProcesses === undefined && cpuPercent === undefined) return undefined;
+  return {
+    ...(memoryMb !== undefined ? { memoryMb: memoryMb + WIN_WRAPPER_MEMORY_OVERHEAD_MB } : {}),
+    // Account for wrapper.mjs (1 Node process) running inside the Job Object alongside the user command.
+    ...(maxProcesses !== undefined ? { maxProcesses: maxProcesses + 1 } : {}),
+    ...(cpuPercent !== undefined ? { cpuPercent } : {}),
+  };
+}
+
 export async function prepareCommand(spec: CommandSpawn): Promise<CommandPrep | undefined> {
   if (!IS_WINDOWS) return undefined;
   // A command line can be long and contain anything: pass it through a file, not argv.
@@ -187,8 +208,9 @@ export async function prepareCommand(spec: CommandSpawn): Promise<CommandPrep | 
   const plan = windowsPlan(spec);
   await writeFile(join(spec.dir, COMMAND_SPEC), JSON.stringify({ command: plan.command, cwd: spec.cwd, env: plan.env, ...(plan.verbatim ? { verbatim: true } : {}) }));
   await writeFile(join(spec.dir, COMMAND_WRAPPER), COMMAND_WRAPPER_SOURCE);
+  const limits = winJobLimits(spec.limits);
   return prepareJob(spec.dir, { exe: process.execPath, env: helperEnv({ SystemRoot: systemRoot() }), cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
-    args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.signal ? { signal: spec.signal } : {}) });
+    args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}), ...(limits ? { limits } : {}) }, { ...(spec.signal ? { signal: spec.signal } : {}) });
 }
 
 /** Start a command (see the module comment). Rejects when it cannot start (a missing cwd, no /bin/sh); undefined when
@@ -211,8 +233,9 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
     // spawn (spawnInJob), so a stop or retirement that arrived while the owner compiled still starts nothing.
     if (spec.proceed && !spec.proceed()) return undefined;
     // Start the internal Node wrapper with OS defaults. It reads the command's environment from command.json.
+    const limits = winJobLimits(spec.limits);
     return await spawnInJob(spec.dir, { exe: process.execPath, env: helperEnv({ SystemRoot: systemRoot() }), cwd: spec.cwd, log: join(spec.dir, COMMAND_LOG),
-      args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}) }, { ...(spec.proceed ? { proceed: spec.proceed } : {}),
+      args: plan.args, ...(spec.exec ? { exec: spec.exec } : {}), ...(limits ? { limits } : {}) }, { ...(spec.proceed ? { proceed: spec.proceed } : {}),
       ...(spec.prepared ? { prepared: spec.prepared } : {}), ...(spec.signal ? { signal: spec.signal } : {}) });
   }
   // POSIX: the wrapper's stdout and stderr are this descriptor, which it inherits and this process closes after the
@@ -221,14 +244,18 @@ export async function spawnCommand(spec: CommandSpawn): Promise<SpawnedCommand |
   try {
     const mv = resolveMv(), argv = commandArgv(spec.command);
     if (spec.proceed && !spec.proceed()) return undefined;
-    const child = spawn("/bin/sh", ["-c", WRAPPER, "dsa-command", spec.dir, mv, ...argv],
+    const baseArgs = ["-c", WRAPPER, "dsa-command", spec.dir, mv, ...argv];
+    const wrapped = spec.limits && process.platform === "linux"
+      ? wrapLinuxScope(spec.exec ?? `cmd-${Date.now()}`, "/bin/sh", baseArgs, spec.limits, probeKernelLimits({ platform: "linux", env: spec.env, kind: "command" }))
+      : { command: "/bin/sh", args: baseArgs };
+    const child = spawn(wrapped.command, wrapped.args,
       { cwd: spec.cwd, env: spec.env, detached: true, stdio: ["ignore", fd, fd] });
     const exited = new Promise<void>(resolve => { child.once("exit", () => resolve()); child.once("error", () => resolve()); });
     await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
     child.unref();
     const pid = child.pid!;
     const start = child.exitCode !== null || child.signalCode !== null ? "" : await captureStart(pid).catch(() => "");
-    return { pid, start, exited };
+    return { pid, start, ...(wrapped.unit ? { scopeUnit: wrapped.unit } : {}), exited };
   } finally { closeSync(fd); }
 }
 

@@ -12,7 +12,7 @@ import type { JournalHandle } from "../types.ts";
 import type { OrchestratorConfig } from "./contract.ts";
 
 /** The keys the orchestrator reads; config.json also holds pi-side settings (ui, onQuit) that it ignores. */
-const KEYS = ["defaultModel", "pools", "providers", "memory", "writerLock", "askRequireDecision", "exactCapture", "k"] as const;
+const KEYS = ["defaultModel", "pools", "providers", "memory", "limits", "writerLock", "askRequireDecision", "exactCapture", "k"] as const;
 const K = ["lossBound", "checkpointMs", "stallMs", "progressMs", "switchTimeoutMs", "idleExitMs", "trackerMs", "hibernateMs", "spawnBudget", "probeMs", "eventRetentionMs", "waitCheckMs", "resumeSpillMs"];
 
 export const configPath = (home: string) => join(home, "config.json");
@@ -29,7 +29,7 @@ const count = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >
 /** What is wrong with a parsed config.json for the orchestrator, or undefined. Unknown keys are allowed. */
 export function configProblem(raw: unknown): string | undefined {
   if (!record(raw)) return "config.json must be a JSON object";
-  const { defaultModel, pools, providers, memory, writerLock, askRequireDecision, exactCapture, k } = raw;
+  const { defaultModel, pools, providers, memory, limits, writerLock, askRequireDecision, exactCapture, k } = raw;
   if (askRequireDecision !== undefined && typeof askRequireDecision !== "boolean") return 'askRequireDecision must be a boolean';
   if (exactCapture !== undefined && typeof exactCapture !== "boolean") return "exactCapture must be a boolean";
   if (writerLock !== undefined && writerLock !== "queue" && writerLock !== "off") return 'writerLock must be "queue" or "off"';
@@ -75,6 +75,23 @@ export function configProblem(raw: unknown): string | undefined {
   if (memory !== undefined) {
     if (!record(memory)) return "memory must be { reserveMb?, perChildMb? }";
     for (const key of ["reserveMb", "perChildMb"]) if (memory[key] !== undefined && !count(memory[key])) return `memory.${key} must be a nonnegative number`;
+  }
+  if (limits !== undefined) {
+    if (!record(limits)) return "limits must be { memoryMb?, maxProcesses?, cpuPercent?, graceMs?, strict? }";
+    for (const key of Object.keys(limits)) {
+      if (!["memoryMb", "maxProcesses", "cpuPercent", "graceMs", "strict"].includes(key))
+        return `limits.${key} is not a limits key (memoryMb, maxProcesses, cpuPercent, graceMs, strict)`;
+    }
+    for (const key of ["memoryMb", "cpuPercent"]) {
+      if (limits[key] !== undefined && !(count(limits[key]) && Number(limits[key]) > 0))
+        return `limits.${key} must be a positive number`;
+    }
+    if (limits.maxProcesses !== undefined && (!Number.isSafeInteger(limits.maxProcesses) || Number(limits.maxProcesses) < 1))
+      return "limits.maxProcesses must be a positive integer";
+    if (limits.graceMs !== undefined && !count(limits.graceMs))
+      return "limits.graceMs must be a nonnegative number";
+    if (limits.strict !== undefined && typeof limits.strict !== "boolean")
+      return "limits.strict must be a boolean";
   }
   if (k !== undefined) {
     if (!record(k)) return "k must map K-parameters to numbers";

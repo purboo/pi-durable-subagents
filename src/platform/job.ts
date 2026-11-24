@@ -58,6 +58,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { retryWinSharing, retryWinSharingSync, writeFileAtomic, type RetryWinSharingOptions } from "../kernel/fsx.ts";
 import { dword, helperEnv, isWinStart, killProcess, sameCreation, systemRoot, winProcessRows, winTag, winTagArg, type WinProcessRow } from "./windows.ts";
+import { clampMemoryBytes, winCpuRate } from "./limits.ts";
 export { sameCreation };
 
 /** The owner type: exported for the packaging check (the compiled name carries it; nothing separate is shipped). */
@@ -81,8 +82,15 @@ public static class DsaJob
     const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
     const int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
     const int JobObjectBasicAccountingInformation = 1;
+    const int JobObjectAssociateCompletionPortInformation = 7;
     const int JobObjectExtendedLimitInformation = 9;
+    const int JobObjectCpuRateControlInformation = 15;
+    const uint JOB_OBJECT_MSG_JOB_MEMORY_LIMIT = 10;
+    const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008;
+    const uint JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200;
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    const uint JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001;
+    const uint JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004;
     const int STD_INPUT_HANDLE = -10;
     const int STD_OUTPUT_HANDLE = -11;
     const int STD_ERROR_HANDLE = -12;
@@ -189,6 +197,20 @@ public static class DsaJob
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+    {
+        public uint ControlFlags;
+        public uint CpuRate;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_ASSOCIATE_COMPLETION_PORT
+    {
+        public IntPtr CompletionKey;
+        public IntPtr CompletionPort;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
     {
         public long TotalUserTime;
@@ -206,7 +228,17 @@ public static class DsaJob
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint length);
     [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_CPU_RATE_CONTROL_INFORMATION info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_ASSOCIATE_COMPLETION_PORT info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr CreateIoCompletionPort(IntPtr fileHandle, IntPtr existingPort, UIntPtr completionKey, uint concurrentThreads);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetQueuedCompletionStatus(IntPtr port, out uint bytesTransferred, out UIntPtr completionKey, out IntPtr overlapped, uint timeoutMs);
+    [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info, uint length, IntPtr returnLength);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint length, IntPtr returnLength);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool TerminateJobObject(IntPtr job, uint exitCode);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -263,7 +295,9 @@ public static class DsaJob
         try { WriteAtomic(Path.Combine(dir, "helper-begin"), ProcessIdentity(unchecked((int)GetCurrentProcessId()), GetCurrentProcess())); } catch (Exception) { }
         string application, workingDirectory, logPath;
         string[] arguments, environment;
-        try { ReadSpec(dir, out application, out workingDirectory, out logPath, out arguments, out environment); }
+        ulong memoryBytes;
+        uint maxProcesses, cpuRate;
+        try { ReadSpec(dir, out application, out workingDirectory, out logPath, out arguments, out environment, out memoryBytes, out maxProcesses, out cpuRate); }
         catch (Exception failure)
         {
             Fail(dir, "job spec", 0, failure.GetType().Name + ": " + failure.Message);
@@ -273,23 +307,39 @@ public static class DsaJob
         // instead of turning into this host's own failure code. 125/126 are only ever written by a host that recorded
         // why it did not get to run (or did not get) the wrapper, so a caller can tell the two apart.
         uint status;
-        return Run(dir, application, arguments, workingDirectory, logPath, environment, out status) ? unchecked((int)status) : 125;
+        return Run(dir, application, arguments, workingDirectory, logPath, environment, memoryBytes, maxProcesses, cpuRate, out status) ? unchecked((int)status) : 125;
     }
 
     /** The attempt's spec: ASCII lines, one base64-encoded UTF-16LE field each, so no code page, quoting rule or
-     *  surrogate can change it (Field decodes each one to its exact code units). DSAJOB1, exe, cwd, log, argument count,
-     *  arguments, environment count, NAME=value entries. */
-    static void ReadSpec(string dir, out string application, out string workingDirectory, out string logPath, out string[] arguments, out string[] environment)
+     *  surrogate can change it (Field decodes each one to its exact code units). DSAJOB1/DSAJOB2, exe, cwd, log,
+     *  argument count, arguments, environment count, NAME=value entries, plus optional DSAJOB2 limit lines
+     *  (memoryBytes, maxProcesses, cpuRate). */
+    static void ReadSpec(string dir, out string application, out string workingDirectory, out string logPath, out string[] arguments, out string[] environment, out ulong memoryBytes, out uint maxProcesses, out uint cpuRate)
     {
         string path = Path.Combine(dir, "job.json");
         string[] lines = File.ReadAllLines(path, Encoding.ASCII);
         int at = 0;
-        if (lines.Length < 5 || lines[at++] != "DSAJOB1") throw new FormatException("unknown job spec header");
+        if (lines.Length < 5) throw new FormatException("unknown job spec header");
+        string header = lines[at++];
+        if (header != "DSAJOB1" && header != "DSAJOB2") throw new FormatException("unknown job spec header");
         application = Field(lines[at++]);
         workingDirectory = Field(lines[at++]);
         logPath = Field(lines[at++]);
         arguments = Fields(lines, ref at);
         environment = Fields(lines, ref at);
+        memoryBytes = 0;
+        maxProcesses = 0;
+        cpuRate = 0;
+        if (header == "DSAJOB2")
+        {
+            if (lines.Length - at < 3) throw new FormatException("truncated job spec limits");
+            if (!UInt64.TryParse(lines[at++], NumberStyles.Integer, CultureInfo.InvariantCulture, out memoryBytes))
+                throw new FormatException("bad job memory limit");
+            if (!UInt32.TryParse(lines[at++], NumberStyles.Integer, CultureInfo.InvariantCulture, out maxProcesses))
+                throw new FormatException("bad job process limit");
+            if (!UInt32.TryParse(lines[at++], NumberStyles.Integer, CultureInfo.InvariantCulture, out cpuRate))
+                throw new FormatException("bad job cpu rate limit");
+        }
         if (at != lines.Length) throw new FormatException("trailing job spec fields");
         try { File.Delete(path); } catch (Exception) { }
     }
@@ -326,10 +376,10 @@ public static class DsaJob
 
     /** Run the wrapper inside a new group. True means the wrapper ran and the returned status is the full exit code the
      *  kernel gave it; false means this host failed, wrote start-error and started nothing (or killed what it started). */
-    static bool Run(string dir, string application, string[] arguments, string workingDirectory, string logPath, string[] environment, out uint status)
+    static bool Run(string dir, string application, string[] arguments, string workingDirectory, string logPath, string[] environment, ulong memoryBytes, uint maxProcesses, uint cpuRate, out uint status)
     {
         status = 0;
-        IntPtr job = IntPtr.Zero, output = IntPtr.Zero, errorHandle = IntPtr.Zero, input = IntPtr.Zero, block = IntPtr.Zero;
+        IntPtr job = IntPtr.Zero, iocp = IntPtr.Zero, output = IntPtr.Zero, errorHandle = IntPtr.Zero, input = IntPtr.Zero, block = IntPtr.Zero;
         IntPtr list = IntPtr.Zero, inheritable = IntPtr.Zero;
         // DeleteProcThreadAttributeList takes only a list InitializeProcThreadAttributeList produced.
         bool listReady = false;
@@ -340,9 +390,44 @@ public static class DsaJob
             job = CreateJobObjectW(IntPtr.Zero, null);
             if (job == IntPtr.Zero) return Fail(dir, "CreateJobObject", Marshal.GetLastWin32Error());
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            uint limitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (memoryBytes > 0)
+            {
+                limitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+                ulong capped = IntPtr.Size == 4 && memoryBytes > UInt32.MaxValue ? (ulong)UInt32.MaxValue : memoryBytes;
+                limits.JobMemoryLimit = new UIntPtr(capped);
+            }
+            if (maxProcesses > 0)
+            {
+                limitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                limits.BasicLimitInformation.ActiveProcessLimit = maxProcesses;
+            }
+            limits.BasicLimitInformation.LimitFlags = limitFlags;
             if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref limits, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
                 return Fail(dir, "SetInformationJobObject", Marshal.GetLastWin32Error());
+            if (memoryBytes > 0)
+            {
+                iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, IntPtr.Zero, UIntPtr.Zero, 1);
+                if (iocp != IntPtr.Zero)
+                {
+                    JOBOBJECT_ASSOCIATE_COMPLETION_PORT assoc = new JOBOBJECT_ASSOCIATE_COMPLETION_PORT();
+                    assoc.CompletionKey = job;
+                    assoc.CompletionPort = iocp;
+                    if (!SetInformationJobObject(job, JobObjectAssociateCompletionPortInformation, ref assoc, (uint)Marshal.SizeOf(typeof(JOBOBJECT_ASSOCIATE_COMPLETION_PORT))))
+                    {
+                        CloseHandle(iocp);
+                        iocp = IntPtr.Zero;
+                    }
+                }
+            }
+            if (cpuRate > 0)
+            {
+                JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuLimits = new JOBOBJECT_CPU_RATE_CONTROL_INFORMATION();
+                cpuLimits.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+                cpuLimits.CpuRate = cpuRate > 10000u ? 10000u : cpuRate;
+                if (!SetInformationJobObject(job, JobObjectCpuRateControlInformation, ref cpuLimits, (uint)Marshal.SizeOf(typeof(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION))))
+                    return Fail(dir, "SetInformationJobObject(CpuRate)", Marshal.GetLastWin32Error());
+            }
 
             SECURITY_ATTRIBUTES inherit = new SECURITY_ATTRIBUTES();
             inherit.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
@@ -437,15 +522,46 @@ public static class DsaJob
             }
             string stopPath = Path.Combine(dir, "stop");
             bool stopped = false;
+            bool memoryLimitNotified = false;
             for (;;)
             {
+                if (iocp != IntPtr.Zero)
+                {
+                    uint msg; UIntPtr key; IntPtr ov;
+                    while (GetQueuedCompletionStatus(iocp, out msg, out key, out ov, 0))
+                    {
+                        if (msg == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT) memoryLimitNotified = true;
+                    }
+                }
                 uint waited = WaitForSingleObject(child.hProcess, 50);
                 if (waited == WAIT_OBJECT_0) break;
                 if (waited != WAIT_TIMEOUT) return Fail(dir, "WaitForSingleObject", Marshal.GetLastWin32Error());
                 if (File.Exists(stopPath)) { stopped = true; break; }
             }
+            if (iocp != IntPtr.Zero)
+            {
+                uint msg; UIntPtr key; IntPtr ov;
+                while (GetQueuedCompletionStatus(iocp, out msg, out key, out ov, 0))
+                {
+                    if (msg == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT) memoryLimitNotified = true;
+                }
+            }
             uint code = 1;
             if (!stopped && !GetExitCodeProcess(child.hProcess, out code)) return Fail(dir, "GetExitCodeProcess", Marshal.GetLastWin32Error());
+            if (!stopped && memoryBytes > 0 && code != 0)
+            {
+                // Require an actual kernel memory-limit notification or OOM NTSTATUS so unrelated non-zero exits
+                // are never misclassified as OOM merely because peak memory touched the ceiling earlier.
+                bool hit = memoryLimitNotified || code == 0xC000012Du || code == 0xC0000017u;
+                if (hit)
+                {
+                    ulong peak = 0;
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+                    if (QueryInformationJobObject(job, JobObjectExtendedLimitInformation, out info, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)), IntPtr.Zero))
+                        peak = info.PeakJobMemoryUsed.ToUInt64();
+                    try { WriteAtomic(Path.Combine(dir, "limit-exceeded"), @"{""kind"":""memory"",""peakBytes"":" + peak.ToString(CultureInfo.InvariantCulture) + "}"); } catch (Exception) { }
+                }
+            }
             DrainJob(job);
             if (!stopped)
             {
@@ -473,6 +589,7 @@ public static class DsaJob
             if (block != IntPtr.Zero) Marshal.FreeHGlobal(block);
             // The group's only handle (non-inherited): closing it kills every process the command left behind.
             if (job != IntPtr.Zero) CloseHandle(job);
+            if (iocp != IntPtr.Zero) CloseHandle(iocp);
         }
     }
 
@@ -675,6 +792,8 @@ export const JOB_HOST_EXIT = "host-exit";
 export const JOB_SPEC = "job.json";
 /** The spec's first line: the owner refuses a file it does not recognize. */
 export const JOB_SPEC_HEADER = "DSAJOB1";
+/** Spec header when OS kernel Job Object resource limits are attached. */
+export const JOB_SPEC_HEADER_V2 = "DSAJOB2";
 /** Written (atomically) after the wrapper is in the group and before it may run: `{"pid":<wrapper pid>}`. */
 export const JOB_GROUP = "group";
 /** Written when the owner saw the wrapper end: `{"status":<wrapper exit status>}`. */
@@ -683,6 +802,8 @@ export const JOB_END = "group-end";
 export const JOB_ERROR = "start-error";
 /** Written (atomically) by a caller requesting a controlled stop so the owner calls DrainJob and exits without `group-end`. */
 export const JOB_STOP = "stop";
+/** Written (atomically) when the Windows Job Object kernel memory hard cap was hit before the wrapper exited. */
+export const JOB_LIMIT_EXCEEDED = "limit-exceeded";
 /** Written by the owner's first statement: its absence proves the program never ran (a launcher problem, not a failure
  *  of this attempt), which is what a bare "the owner ended" otherwise hides. */
 export const JOB_BEGIN = "helper-begin";
@@ -729,10 +850,16 @@ export function jobEnv(env: NodeJS.ProcessEnv): string[] {
  *  identically under any code page, and UTF-16LE carries every JS string -- a curly quote, an emoji, even an unpaired
  *  surrogate -- unchanged: the owner turns every line back with Convert.FromBase64String and takes each byte pair as one
  *  code unit, and refuses a field that is not a whole number of them. */
-export function jobSpecText(launch: Pick<JobLaunch, "exe" | "args" | "cwd" | "log" | "env">): string {
+export function jobSpecText(launch: Pick<JobLaunch, "exe" | "args" | "cwd" | "log" | "env" | "limits">): string {
   const env = jobEnv(launch.env);
-  const lines = [JOB_SPEC_HEADER, field(launch.exe), field(launch.cwd), field(launch.log), String(launch.args.length),
-    ...launch.args.map(field), String(env.length), ...env.map(field)];
+  const lim = launch.limits;
+  const memBytes = lim?.memoryMb !== undefined ? clampMemoryBytes(lim.memoryMb) : 0;
+  const maxProcs = lim?.maxProcesses !== undefined && lim.maxProcesses >= 1 ? Math.floor(lim.maxProcesses) : 0;
+  const cpuRate = lim?.cpuPercent !== undefined && lim.cpuPercent > 0 ? winCpuRate(lim.cpuPercent) : 0;
+  const hasLimits = memBytes > 0 || maxProcs > 0 || cpuRate > 0;
+  const lines = [hasLimits ? JOB_SPEC_HEADER_V2 : JOB_SPEC_HEADER, field(launch.exe), field(launch.cwd), field(launch.log), String(launch.args.length),
+    ...launch.args.map(field), String(env.length), ...env.map(field),
+    ...(hasLimits ? [String(memBytes), String(maxProcs), String(cpuRate)] : [])];
   return `${lines.join("\n")}\n`;
 }
 const field = (text: string): string => Buffer.from(text, "utf16le").toString("base64");
@@ -828,7 +955,7 @@ export interface JobPrep {
 export async function prepareJob(dir: string, launch: JobLaunch,
   options: { compiler?: string; compileMs?: number; signal?: AbortSignal; publish?: PublishBuild } = {}): Promise<JobPrep> {
   // Evidence of an earlier attempt in the same directory must never be read as this attempt's.
-  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_STOP, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
+  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_STOP, JOB_LIMIT_EXCEEDED, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
   const host = await compileJobHost(dir, { ...(options.compiler ? { compiler: options.compiler } : {}),
     ...(options.compileMs ? { timeoutMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}),
     ...(options.publish ? { publish: options.publish } : {}) });
@@ -987,6 +1114,8 @@ export interface JobLaunch {
   /** Resource lease tag (`DSA_HOLD=<resource:seq>`): spelled in the owner's own argv so a killed hold wrapper's job
    *  is discoverable before the group record exists. */
   hold?: string;
+  /** Optional OS kernel Job Object resource caps (applied via JobMemoryLimit, ActiveProcessLimit, CpuRateControl). */
+  limits?: { memoryMb?: number; maxProcesses?: number; cpuPercent?: number };
 }
 export interface JobSpawned {
   /** The program's pid (from the group record, not from this process's child). */
@@ -1069,6 +1198,16 @@ function parseGroupText(text: string): GroupRecord {
 }
 
 /** The group record written before ResumeThread (with legacy `{"pid":<n>}` compatibility); undefined while not ready. */
+/** Read a Windows Job Object `limit-exceeded` marker written by DsaJob.exe, if present. Never throws. */
+export async function readJobLimitExceeded(dir: string, options: RetryWinSharingOptions = {}): Promise<{ kind: string; peakBytes: number } | undefined> {
+  try {
+    const text = await retryWinSharing(() => readFile(join(dir, JOB_LIMIT_EXCEEDED), "utf8"), { timeoutMs: 250, maxAttempts: 6, ...options });
+    const raw = JSON.parse(text) as { kind?: unknown; peakBytes?: unknown };
+    if (typeof raw.kind === "string") return { kind: raw.kind, peakBytes: Number(raw.peakBytes) || 0 };
+  } catch { /* absent or unreadable */ }
+  return undefined;
+}
+
 export async function readGroupRecord(dir: string, options: RetryWinSharingOptions & { readFile?: (path: string) => Promise<string> } = {}): Promise<GroupRecord | undefined> {
   const readFn = options.readFile ?? ((path: string) => readFile(path, "utf8"));
   let text: string;

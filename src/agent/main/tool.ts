@@ -10,9 +10,9 @@ import { compileFanout } from "../../compat/fanout.ts";
 import { checkLabels } from "../../events/labels.ts";
 
 /** Call fields a tasks/chain run applies to every step that does not set its own. */
-export const stepDefaults = ["agent", "model", "timeoutMs", "budget", "isolation", "context", "tools", "skills", "once", "writer", "env", "rerun"];
+export const stepDefaults = ["agent", "model", "timeoutMs", "budget", "limits", "isolation", "context", "tools", "skills", "once", "writer", "env", "rerun"];
 /** The run-level defaults a command step takes; agent steps take the others (env and rerun belong to command calls). */
-const commandDefaults = new Set(["timeoutMs", "writer", "env", "rerun"]), agentOnly = new Set(["env", "rerun"]);
+const commandDefaults = new Set(["timeoutMs", "limits", "writer", "env", "rerun"]), agentOnly = new Set(["env", "rerun"]);
 /** The run-level defaults that apply to one step: a command step skips agent-only fields, an agent step skips env/rerun. */
 function defaultsFor(step: Args, defaults: Args): Args {
   const command = step.command !== undefined;

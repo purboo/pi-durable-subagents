@@ -27,6 +27,14 @@ test("configProblem accepts pi-side keys and names the first invalid orchestrato
   assert.equal(configProblem({ k: { trackerMs: 0 } }), "k.trackerMs must be a positive number");
   assert.match(String(configProblem({ k: { tracker: 1 } })), /^k\.tracker is not a K-parameter/);
   assert.equal(configProblem({ defaultModel: 1 }), "defaultModel must be a string");
+  assert.equal(configProblem({ limits: { memoryMb: 2048, maxProcesses: 32, cpuPercent: 200, graceMs: 0, strict: false } }), undefined);
+  assert.equal(configProblem({ limits: [] }), "limits must be { memoryMb?, maxProcesses?, cpuPercent?, graceMs?, strict? }");
+  assert.equal(configProblem({ limits: { memoryMb: 0 } }), "limits.memoryMb must be a positive number");
+  assert.equal(configProblem({ limits: { cpuPercent: -5 } }), "limits.cpuPercent must be a positive number");
+  assert.equal(configProblem({ limits: { maxProcesses: 1.5 } }), "limits.maxProcesses must be a positive integer");
+  assert.equal(configProblem({ limits: { graceMs: -1 } }), "limits.graceMs must be a nonnegative number");
+  assert.equal(configProblem({ limits: { strict: "yes" } }), "limits.strict must be a boolean");
+  assert.match(String(configProblem({ limits: { ramMb: 100 } })), /^limits\.ramMb is not a limits key/);
   // Only the orchestrator's keys identify its settings: a ui change is not a new config.
   assert.equal(configHash({ providers: { a: { slots: 1 } } }), configHash({ providers: { a: { slots: 1 } }, ui: { dock: "off" } } as OrchestratorConfig));
 });

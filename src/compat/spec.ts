@@ -1,8 +1,8 @@
 import { schemaProblems } from "../agent/child/schema.ts";
 
-const fields = new Set(["agent", "task", "model", "cwd", "timeoutMs", "output", "schema", "gate", "isolation", "context", "budget", "once", "tools", "skills", "key", "writer", "command", "env", "rerun"]);
+const fields = new Set(["agent", "task", "model", "cwd", "timeoutMs", "output", "schema", "gate", "isolation", "context", "budget", "once", "tools", "skills", "key", "writer", "command", "env", "rerun", "limits"]);
 /** Fields a command call takes; every other known field belongs to agent calls. */
-export const COMMAND_FIELDS = ["command", "cwd", "timeoutMs", "env", "rerun", "writer", "key"] as const;
+export const COMMAND_FIELDS = ["command", "cwd", "timeoutMs", "env", "rerun", "writer", "key", "limits"] as const;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 type Spec = Record<string, unknown>;
 const isObject = (v: unknown): v is Spec => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -30,6 +30,15 @@ function budget(value: unknown): string[] {
   for (const k of ["tokens", "costUsd"]) if (value[k] !== undefined && !positive(value[k])) errors.push(`budget.${k} must be a positive number${got(value[k])}`);
   return errors;
 }
+function limits(value: unknown): string[] {
+  if (!isObject(value)) return ["limits must be an object {memoryMb?, maxProcesses?, cpuPercent?, graceMs?, strict?}"];
+  const errors = unknown(value, ["memoryMb", "maxProcesses", "cpuPercent", "graceMs", "strict"], "limits.");
+  for (const k of ["memoryMb", "cpuPercent"]) if (value[k] !== undefined && !positive(value[k])) errors.push(`limits.${k} must be a positive number${got(value[k])}`);
+  if (value.maxProcesses !== undefined && (!Number.isSafeInteger(value.maxProcesses) || Number(value.maxProcesses) < 1)) errors.push(`limits.maxProcesses must be a positive integer${got(value.maxProcesses)}`);
+  if (value.graceMs !== undefined && !(typeof value.graceMs === "number" && Number.isFinite(value.graceMs) && value.graceMs >= 0)) errors.push(`limits.graceMs must be a nonnegative number${got(value.graceMs)}`);
+  if (value.strict !== undefined && typeof value.strict !== "boolean") errors.push(`limits.strict must be a boolean${got(value.strict)}`);
+  return errors;
+}
 
 /** P34, P24, T2/T3/T4: Validate a call spec at submission; `key` is accepted only for tasks/chain steps. Empty = valid. */
 export function validateCallSpec(spec: unknown, options: { fanout?: boolean } = {}): string[] {
@@ -51,6 +60,7 @@ export function validateCallSpec(spec: unknown, options: { fanout?: boolean } = 
   if (has("isolation") && s.isolation !== "none" && s.isolation !== "worktree") errors.push(`isolation must be "none" or "worktree"${got(s.isolation)}`);
   if (has("context") && s.context !== "fresh" && s.context !== "fork" && s.context !== "exact") errors.push(`context must be "fresh", "fork" or "exact"${got(s.context)}`);
   if (has("budget")) errors.push(...budget(s.budget));
+  if (has("limits")) errors.push(...limits(s.limits));
   if (has("once") && typeof s.once !== "boolean") errors.push(`once must be a boolean${got(s.once)}`);
   if (has("writer") && typeof s.writer !== "boolean") errors.push(`writer must be a boolean${got(s.writer)}`);
   for (const k of ["tools", "skills"]) if (has(k) && (!Array.isArray(s[k]) || !(s[k] as unknown[]).every(v => typeof v === "string"))) errors.push(`${k} must be an array of strings${got(s[k])}`);
@@ -77,6 +87,7 @@ function commandProblems(s: Spec, options: { fanout?: boolean }): string[] {
     }
   }
   for (const k of ["rerun", "writer"]) if (has(k) && typeof s[k] !== "boolean") errors.push(`${k} must be a boolean${got(s[k])}`);
+  if (has("limits")) errors.push(...limits(s.limits));
   if (options.fanout && has("key") && !text(s.key)) errors.push("key must be a non-empty string");
   return errors;
 }

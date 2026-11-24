@@ -7,7 +7,7 @@ const check = (extra: Record<string, unknown>, fanout = false) => validateCallSp
 
 test("T2: a complete valid spec has no errors; undefined fields count as absent", () => {
   const full = { model: "p/m:high", cwd: "sub", timeoutMs: 1000, output: "out.md", schema: { type: "object" }, isolation: "worktree", context: "fork",
-    budget: { tokens: 10 }, once: true, writer: false, tools: ["read"], skills: [], gate: { command: "true", output: "json", schema: true, timeoutMs: 5 } };
+    budget: { tokens: 10 }, limits: { memoryMb: 1024, maxProcesses: 16, cpuPercent: 200, graceMs: 3000, strict: false }, once: true, writer: false, tools: ["read"], skills: [], gate: { command: "true", output: "json", schema: true, timeoutMs: 5 } };
   assert.deepEqual(check(full), []);
   assert.deepEqual(check({ isolation: "none", context: "fresh", gate: "npm test", budget: { costUsd: 0.5 }, model: undefined }), []);
   assert.deepEqual(check({ key: "a" }, true), []);
@@ -30,6 +30,8 @@ test("T2: every rule reports its exact message", () => {
     [{ ...base, budget: 5 }, ["budget must be an object {tokens?, costUsd?}"]],
     [{ ...base, budget: {} }, ["budget needs tokens or costUsd"]],
     [{ ...base, budget: { tokens: 0, costUsd: -1, usd: 1 } }, ['unknown field "budget.usd"', "budget.tokens must be a positive number (got 0)", "budget.costUsd must be a positive number (got -1)"]],
+    [{ ...base, limits: 5 }, ["limits must be an object {memoryMb?, maxProcesses?, cpuPercent?, graceMs?, strict?}"]],
+    [{ ...base, limits: { memoryMb: 0, maxProcesses: 0, cpuPercent: -1, graceMs: -2, strict: "no", foo: 1 } }, ['unknown field "limits.foo"', "limits.memoryMb must be a positive number (got 0)", "limits.cpuPercent must be a positive number (got -1)", "limits.maxProcesses must be a positive integer (got 0)", "limits.graceMs must be a nonnegative number (got -2)", 'limits.strict must be a boolean (got "no")']],
     [{ ...base, gate: "" }, ["gate must be a non-empty command"]],
     [{ ...base, gate: 1 }, ["gate must be a string or {command, output?, schema?, timeoutMs?}"]],
     [{ ...base, gate: { output: "text", timeoutMs: 0, cmd: "x" } }, ['unknown field "gate.cmd"', "gate.command must be a non-empty string", 'gate.output must be "json"', "gate.timeoutMs must be a positive number (got 0)"]],
@@ -45,7 +47,7 @@ test("T2: every rule reports its exact message", () => {
 
 test("command call: argv or sh string with cwd, timeoutMs, env, rerun, writer and key only", () => {
   assert.deepEqual(validateCallSpec({ command: ["sleep", "1"] }), []);
-  assert.deepEqual(validateCallSpec({ command: "sleep 1; exit 3", cwd: "/tmp", timeoutMs: 5, env: { A_B: "x" }, rerun: true, writer: false }), []);
+  assert.deepEqual(validateCallSpec({ command: "sleep 1; exit 3", cwd: "/tmp", timeoutMs: 5, limits: { memoryMb: 512, maxProcesses: 4 }, env: { A_B: "x" }, rerun: true, writer: false }), []);
   assert.deepEqual(validateCallSpec({ command: "true", key: "w" }, { fanout: true }), []);
   assert.deepEqual(validateCallSpec({ command: "true", agent: "a", task: "t", model: "m", once: true }), [
     "agent is not allowed in a command call", "task is not allowed in a command call", "model is not allowed in a command call", "once is not allowed in a command call"]);

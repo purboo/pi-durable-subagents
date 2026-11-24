@@ -125,6 +125,8 @@ export interface WinProcessRow {
   /** Creation time in .NET ticks (a stable identity token, never reused with the same pid). */
   start: string;
   cpuMs?: number;
+  /** Resident WorkingSetSize in bytes, if reported by Win32_Process. */
+  rssBytes?: number;
   command?: string;
 }
 
@@ -196,19 +198,26 @@ function processQuery(fields: string, body: string, pid?: number): string {
   const where = pid === undefined ? "" : ` WHERE ProcessId=${pid}`;
   return `$s = [wmisearcher]'SELECT ${fields} FROM Win32_Process${where}'; foreach ($p in $s.Get()) { ${body} }`;
 }
-export const PROCESS_ROWS_SCRIPT = processQuery("ProcessId,ParentProcessId,CreationDate,UserModeTime,KernelModeTime,CommandLine",
+export const PROCESS_ROWS_SCRIPT = processQuery("ProcessId,ParentProcessId,CreationDate,UserModeTime,KernelModeTime,WorkingSetSize,CommandLine",
   `if (!$p.CreationDate) { continue }; $t = ${creationTicks}; ` +
   '$c = ([string]$p.CommandLine) -replace "[`t`r`n]", " "; ' +
-  '"{0}`t{1}`t{2}`t{3}`t{4}" -f $p.ProcessId, $p.ParentProcessId, $t, ([uint64]$p.UserModeTime + [uint64]$p.KernelModeTime), $c');
+  '"{0}`t{1}`t{2}`t{3}`t{4}`t{5}" -f $p.ProcessId, $p.ParentProcessId, $t, ([uint64]$p.UserModeTime + [uint64]$p.KernelModeTime), ([uint64]$p.WorkingSetSize), $c');
 
 export function parseProcessRows(stdout: string): WinProcessRow[] {
   const rows: WinProcessRow[] = [];
   for (const line of stdout.split(/\r?\n/)) {
     if (!line) continue;
-    const [pid, ppid, start, cpu, ...rest] = line.split("\t");
+    const parts = line.split("\t");
+    // 6+ columns (current PROCESS_ROWS_SCRIPT): pid, ppid, start, cpu, rssBytes, command...
+    // 5 columns (legacy fixtures): pid, ppid, start, cpu, command
+    const hasRss = parts.length >= 6 && /^\d+$/.test(parts[4]!);
+    const [pid, ppid, start, cpu] = parts;
+    const rss = hasRss ? Number(parts[4]) : undefined;
+    const rest = hasRss ? parts.slice(5) : parts.slice(4);
     const id = Number(pid), parent = Number(ppid), ticks = Number(cpu);
     if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(parent) || parent < 0 || !isWinStart(start)) continue;
     rows.push({ pid: id, ppid: parent, start, ...(Number.isFinite(ticks) ? { cpuMs: ticks / 10_000 } : {}),
+      ...(rss !== undefined && Number.isFinite(rss) ? { rssBytes: rss } : {}),
       ...(rest.length ? { command: rest.join(" ") } : {}) });
   }
   return rows;

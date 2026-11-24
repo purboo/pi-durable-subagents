@@ -60,5 +60,5 @@ test("tool schema documents the command call fields", () => {
   for (const name of ["command", "env", "rerun"]) assert.ok(props[name], `parameter ${name}`);
   assert.match(props.command!.description!, /exitCode, signal, durationMs/);
   assert.match(props.command!.description!, /16 KiB/);
-  assert.match(JSON.stringify(props.tasks), /command specs \{command, cwd\?, timeoutMs\?, env\?, rerun\?, writer\?, key\?\}/);
+  assert.match(JSON.stringify(props.tasks), /command specs \{command, cwd\?, timeoutMs\?, limits\?, env\?, rerun\?, writer\?, key\?\}/);
 });

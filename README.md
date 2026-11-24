@@ -1283,12 +1283,31 @@ State lives in `~/.pi/durable-subagents`; set `DSA_HOME` to move it.
     }
   },
   "memory": { "reserveMb": 2048, "perChildMb": 300 },
+  "limits": { "memoryMb": 4096, "maxProcesses": 64, "cpuPercent": 400, "graceMs": 5000, "strict": false },
   "writerLock": "queue",
   "askRequireDecision": false,
   "exactCapture": true
 }
 ```
 
+- **Per-subagent resource limits (`limits`):** caps each call's entire process
+  tree (the subagent plus every tool/build/test child it spawns). Set global
+  defaults in `config.json` (`limits`, live-reloaded) and override any field
+  per call via `limits: { memoryMb?, maxProcesses?, cpuPercent?, graceMs?, strict? }`
+  on agent calls, command calls, or `tasks`/`chain` defaults:
+  - `memoryMb`: max total resident memory (RSS / WorkingSet) in MiB.
+  - `maxProcesses`: max concurrent processes in the call's tree.
+  - `cpuPercent`: max CPU usage across the tree (% of one core; e.g. `200` = 2 cores).
+  - `graceMs`: consecutive ms a limit may stay exceeded before fencing (default `5000`).
+  - `strict`: when `true`, refuse to start unless OS kernel hard limits cover the requested caps.
+  - **Two-layer enforcement:** Layer 1 monitors the process tree on Linux, macOS
+    and Windows, fences the whole tree on a sustained breach, and seals the call
+    `failed` with the peak usage and top processes (never retried as a loss).
+    Layer 2 automatically adds OS kernel hard limits where available — Linux
+    transient user scopes via `systemd-run --user --scope` under delegated
+    unified cgroup v2 (`MemoryMax` + `CPUQuota`), and Windows Job Object limits
+    (`JobMemoryLimit`, `ActiveProcessLimit`, `CpuRateControl`) for command calls.
+    Run `pi-durable-subagents doctor` to see which backend is active on your host.
 - **Pools:** a model can name a pool (the `model` of a call, a `run --spec`
   file or a model send). The first candidate with a free slot is
   used, and a candidate that keeps failing is skipped for 10 minutes. The

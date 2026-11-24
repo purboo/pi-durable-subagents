@@ -4,7 +4,7 @@
 import type { AgentDefinition } from "../compat/agents.ts";
 import type { PoolEntry } from "../compat/model.ts";
 import type { ExactReason } from "./exact.ts";
-import type { CallId, CallResult, CallSpec, JournalHandle, Request, Wid, WidRev } from "../types.ts";
+import type { CallId, CallResult, CallSpec, JournalHandle, Request, ResourceLimits, Wid, WidRev } from "../types.ts";
 import type { SweepSeed } from "./executor/sweep.ts";
 
 /** User configuration: $DSA_HOME/config.json (all optional). */
@@ -23,6 +23,8 @@ export interface OrchestratorConfig {
    *  `models`: per-model slot limits inside the provider (orchestrator/slots.ts); `slots` may be omitted only with it. */
   providers?: Record<string, { slots?: number; models?: Record<string, { slots: number }>; exhaustedPatterns?: string[] }>;
   memory?: { reserveMb?: number; perChildMb?: number };
+  /** Default per-subagent process-tree resource limits (overridden field-by-field by CallSpec.limits). */
+  limits?: ResourceLimits;
   /** K-parameters overrides (ms / counts). waitCheckMs: period of the waiting/moving check (events/waiting.ts, default 5000; read at orchestrator start). */
   /** Writer lock: "queue" (default) runs one writer call per git worktree at a time; "off" only reminds of observed
    *  shared writes. */
