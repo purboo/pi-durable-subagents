@@ -58,7 +58,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { retryWinSharing, retryWinSharingSync, writeFileAtomic, type RetryWinSharingOptions } from "../kernel/fsx.ts";
 import { dword, helperEnv, isWinStart, killProcess, sameCreation, systemRoot, winProcessRows, winTag, winTagArg, type WinProcessRow } from "./windows.ts";
-import { winCpuRate } from "./limits.ts";
+import { clampMemoryBytes, winCpuRate } from "./limits.ts";
 export { sameCreation };
 
 /** The owner type: exported for the packaging check (the compiled name carries it; nothing separate is shipped). */
@@ -82,8 +82,10 @@ public static class DsaJob
     const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
     const int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
     const int JobObjectBasicAccountingInformation = 1;
+    const int JobObjectAssociateCompletionPortInformation = 7;
     const int JobObjectExtendedLimitInformation = 9;
     const int JobObjectCpuRateControlInformation = 15;
+    const uint JOB_OBJECT_MSG_JOB_MEMORY_LIMIT = 10;
     const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008;
     const uint JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200;
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
@@ -202,6 +204,13 @@ public static class DsaJob
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_ASSOCIATE_COMPLETION_PORT
+    {
+        public IntPtr CompletionKey;
+        public IntPtr CompletionPort;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
     {
         public long TotalUserTime;
@@ -220,6 +229,12 @@ public static class DsaJob
     static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint length);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_CPU_RATE_CONTROL_INFORMATION info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_ASSOCIATE_COMPLETION_PORT info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr CreateIoCompletionPort(IntPtr fileHandle, IntPtr existingPort, UIntPtr completionKey, uint concurrentThreads);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetQueuedCompletionStatus(IntPtr port, out uint bytesTransferred, out UIntPtr completionKey, out IntPtr overlapped, uint timeoutMs);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info, uint length, IntPtr returnLength);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -364,7 +379,7 @@ public static class DsaJob
     static bool Run(string dir, string application, string[] arguments, string workingDirectory, string logPath, string[] environment, ulong memoryBytes, uint maxProcesses, uint cpuRate, out uint status)
     {
         status = 0;
-        IntPtr job = IntPtr.Zero, output = IntPtr.Zero, errorHandle = IntPtr.Zero, input = IntPtr.Zero, block = IntPtr.Zero;
+        IntPtr job = IntPtr.Zero, iocp = IntPtr.Zero, output = IntPtr.Zero, errorHandle = IntPtr.Zero, input = IntPtr.Zero, block = IntPtr.Zero;
         IntPtr list = IntPtr.Zero, inheritable = IntPtr.Zero;
         // DeleteProcThreadAttributeList takes only a list InitializeProcThreadAttributeList produced.
         bool listReady = false;
@@ -390,6 +405,21 @@ public static class DsaJob
             limits.BasicLimitInformation.LimitFlags = limitFlags;
             if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref limits, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
                 return Fail(dir, "SetInformationJobObject", Marshal.GetLastWin32Error());
+            if (memoryBytes > 0)
+            {
+                iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, IntPtr.Zero, UIntPtr.Zero, 1);
+                if (iocp != IntPtr.Zero)
+                {
+                    JOBOBJECT_ASSOCIATE_COMPLETION_PORT assoc = new JOBOBJECT_ASSOCIATE_COMPLETION_PORT();
+                    assoc.CompletionKey = job;
+                    assoc.CompletionPort = iocp;
+                    if (!SetInformationJobObject(job, JobObjectAssociateCompletionPortInformation, ref assoc, (uint)Marshal.SizeOf(typeof(JOBOBJECT_ASSOCIATE_COMPLETION_PORT))))
+                    {
+                        CloseHandle(iocp);
+                        iocp = IntPtr.Zero;
+                    }
+                }
+            }
             if (cpuRate > 0)
             {
                 JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuLimits = new JOBOBJECT_CPU_RATE_CONTROL_INFORMATION();
@@ -492,27 +522,43 @@ public static class DsaJob
             }
             string stopPath = Path.Combine(dir, "stop");
             bool stopped = false;
+            bool memoryLimitNotified = false;
             for (;;)
             {
+                if (iocp != IntPtr.Zero)
+                {
+                    uint msg; UIntPtr key; IntPtr ov;
+                    while (GetQueuedCompletionStatus(iocp, out msg, out key, out ov, 0))
+                    {
+                        if (msg == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT) memoryLimitNotified = true;
+                    }
+                }
                 uint waited = WaitForSingleObject(child.hProcess, 50);
                 if (waited == WAIT_OBJECT_0) break;
                 if (waited != WAIT_TIMEOUT) return Fail(dir, "WaitForSingleObject", Marshal.GetLastWin32Error());
                 if (File.Exists(stopPath)) { stopped = true; break; }
             }
+            if (iocp != IntPtr.Zero)
+            {
+                uint msg; UIntPtr key; IntPtr ov;
+                while (GetQueuedCompletionStatus(iocp, out msg, out key, out ov, 0))
+                {
+                    if (msg == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT) memoryLimitNotified = true;
+                }
+            }
             uint code = 1;
             if (!stopped && !GetExitCodeProcess(child.hProcess, out code)) return Fail(dir, "GetExitCodeProcess", Marshal.GetLastWin32Error());
             if (!stopped && memoryBytes > 0 && code != 0)
             {
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
-                bool hit = code == 0xC000012Du || code == 0xC0000017u;
-                ulong peak = 0;
-                if (QueryInformationJobObject(job, JobObjectExtendedLimitInformation, out info, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)), IntPtr.Zero))
-                {
-                    peak = info.PeakJobMemoryUsed.ToUInt64();
-                    if (peak >= memoryBytes) hit = true;
-                }
+                // Require an actual kernel memory-limit notification or OOM NTSTATUS so unrelated non-zero exits
+                // are never misclassified as OOM merely because peak memory touched the ceiling earlier.
+                bool hit = memoryLimitNotified || code == 0xC000012Du || code == 0xC0000017u;
                 if (hit)
                 {
+                    ulong peak = 0;
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+                    if (QueryInformationJobObject(job, JobObjectExtendedLimitInformation, out info, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)), IntPtr.Zero))
+                        peak = info.PeakJobMemoryUsed.ToUInt64();
                     try { WriteAtomic(Path.Combine(dir, "limit-exceeded"), @"{""kind"":""memory"",""peakBytes"":" + peak.ToString(CultureInfo.InvariantCulture) + "}"); } catch (Exception) { }
                 }
             }
@@ -543,6 +589,7 @@ public static class DsaJob
             if (block != IntPtr.Zero) Marshal.FreeHGlobal(block);
             // The group's only handle (non-inherited): closing it kills every process the command left behind.
             if (job != IntPtr.Zero) CloseHandle(job);
+            if (iocp != IntPtr.Zero) CloseHandle(iocp);
         }
     }
 
@@ -806,7 +853,7 @@ export function jobEnv(env: NodeJS.ProcessEnv): string[] {
 export function jobSpecText(launch: Pick<JobLaunch, "exe" | "args" | "cwd" | "log" | "env" | "limits">): string {
   const env = jobEnv(launch.env);
   const lim = launch.limits;
-  const memBytes = lim?.memoryMb !== undefined && lim.memoryMb > 0 ? Math.max(1024 * 1024, Math.round(lim.memoryMb * 1024 * 1024)) : 0;
+  const memBytes = lim?.memoryMb !== undefined ? clampMemoryBytes(lim.memoryMb) : 0;
   const maxProcs = lim?.maxProcesses !== undefined && lim.maxProcesses >= 1 ? Math.floor(lim.maxProcesses) : 0;
   const cpuRate = lim?.cpuPercent !== undefined && lim.cpuPercent > 0 ? winCpuRate(lim.cpuPercent) : 0;
   const hasLimits = memBytes > 0 || maxProcs > 0 || cpuRate > 0;
@@ -908,7 +955,7 @@ export interface JobPrep {
 export async function prepareJob(dir: string, launch: JobLaunch,
   options: { compiler?: string; compileMs?: number; signal?: AbortSignal; publish?: PublishBuild } = {}): Promise<JobPrep> {
   // Evidence of an earlier attempt in the same directory must never be read as this attempt's.
-  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_STOP, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
+  for (const name of [JOB_BEGIN, JOB_GROUP, JOB_END, JOB_ERROR, JOB_STOP, JOB_LIMIT_EXCEEDED, JOB_HOST_EXIT, JOB_HOST_LOG]) await rm(join(dir, name), { force: true });
   const host = await compileJobHost(dir, { ...(options.compiler ? { compiler: options.compiler } : {}),
     ...(options.compileMs ? { timeoutMs: options.compileMs } : {}), ...(options.signal ? { signal: options.signal } : {}),
     ...(options.publish ? { publish: options.publish } : {}) });
@@ -1152,9 +1199,10 @@ function parseGroupText(text: string): GroupRecord {
 
 /** The group record written before ResumeThread (with legacy `{"pid":<n>}` compatibility); undefined while not ready. */
 /** Read a Windows Job Object `limit-exceeded` marker written by DsaJob.exe, if present. Never throws. */
-export async function readJobLimitExceeded(dir: string): Promise<{ kind: string; peakBytes: number } | undefined> {
+export async function readJobLimitExceeded(dir: string, options: RetryWinSharingOptions = {}): Promise<{ kind: string; peakBytes: number } | undefined> {
   try {
-    const raw = JSON.parse(await readFile(join(dir, JOB_LIMIT_EXCEEDED), "utf8")) as { kind?: unknown; peakBytes?: unknown };
+    const text = await retryWinSharing(() => readFile(join(dir, JOB_LIMIT_EXCEEDED), "utf8"), { timeoutMs: 250, maxAttempts: 6, ...options });
+    const raw = JSON.parse(text) as { kind?: unknown; peakBytes?: unknown };
     if (typeof raw.kind === "string") return { kind: raw.kind, peakBytes: Number(raw.peakBytes) || 0 };
   } catch { /* absent or unreadable */ }
   return undefined;

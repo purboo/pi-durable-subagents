@@ -16,6 +16,16 @@ const exec = promisify(execFile);
 const vanished = (error: unknown) => ["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "");
 
 type Snapshot = ProcInfo[] | string;
+const CAPTURED_AT = Symbol("dsa.capturedAt");
+/** Monotonic capture timestamp (performance.now) of a ProcessTable snapshot, if attached. */
+export function snapshotCapturedAt(procs: readonly ProcInfo[]): number | undefined {
+  return (procs as unknown as { [CAPTURED_AT]?: number })[CAPTURED_AT];
+}
+/** Attach a non-enumerable snapshot capture timestamp so downstream consumers can deduplicate cached scans. */
+export function attachCapturedAt<T extends ProcInfo[]>(procs: T, at: number): T {
+  Object.defineProperty(procs, CAPTURED_AT, { value: at, enumerable: false, configurable: true });
+  return procs;
+}
 // /proc/<pid>/stat is one short line: one open/read/close into a reused buffer, not readFileSync's fstat, sized read
 // and EOF read (a scan reads it for every process of the machine every second).
 const statBuffer = Buffer.alloc(4096);
@@ -58,7 +68,7 @@ export async function captureStart(pid: number): Promise<string> {
 
 /** C2: Observe live process identities, inherited tags and cumulative CPU time. */
 export class ProcessTable implements Table {
-  private pending?: Promise<Snapshot>;
+  private pending?: Promise<{ started: number; value: Snapshot }>;
   private snapshot?: { started: number; value: Snapshot };
   scans = 0;
   private tags = new Map<string, string | undefined>();
@@ -114,20 +124,20 @@ export class ProcessTable implements Table {
 
   /** C2, F1: Concurrent observations share a scan; fences wait out all pre-request work. */
   async list(knownExecs: ReadonlySet<string> = new Set(), options: { maxAgeMs?: number; fresh?: boolean } = {}): Promise<Observation[]> {
-    const value = await this.listRaw(options);
-    if (typeof value === "string") return this.mac(value, knownExecs);
+    const { started, value } = await this.listRaw(options);
+    if (typeof value === "string") return attachCapturedAt(this.mac(value, knownExecs), started);
     // A Windows tag comes from a command line, so a known-id filter keeps unrelated text from becoming an execution.
-    if (this.platform === "win32") return value.map(p => p.tag !== undefined && !knownExecs.has(p.tag)
-      ? attachScannedCommand({ ...p, tag: undefined }, scannedCommand(p)) : p);
-    return value;
+    if (this.platform === "win32") return attachCapturedAt(value.map(p => p.tag !== undefined && !knownExecs.has(p.tag)
+      ? attachScannedCommand({ ...p, tag: undefined }, scannedCommand(p)) : p), started);
+    return attachCapturedAt(value, started);
   }
-  private async listRaw(options: { maxAgeMs?: number; fresh?: boolean }): Promise<Snapshot> {
+  private async listRaw(options: { maxAgeMs?: number; fresh?: boolean }): Promise<{ started: number; value: Snapshot }> {
     if (options.fresh && this.pending) await this.pending.catch(() => {});
     if (this.pending) return this.pending;
-    if (!options.fresh && this.snapshot && performance.now() - this.snapshot.started < (options.maxAgeMs ?? 0)) return this.snapshot.value;
+    if (!options.fresh && this.snapshot && performance.now() - this.snapshot.started < (options.maxAgeMs ?? 0)) return this.snapshot;
     const started = performance.now();
     this.scans++;
-    const promise = this.read().then(value => { this.snapshot = { started, value }; return value; });
+    const promise = this.read().then(value => { const snap = { started, value }; this.snapshot = snap; return snap; });
     this.pending = promise;
     try { return await promise; } finally { if (this.pending === promise) this.pending = undefined; }
   }

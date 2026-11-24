@@ -1,6 +1,7 @@
 // Layer 1 (all platforms): process-tree resource accounting and sustained-violation detection.
 // Pure and deterministic: consumes ProcInfo[] snapshots from Containment.scan / ProcessTable and timestamps.
 import type { ProcInfo, ResourceLimits, ResourceStats } from "../../types.ts";
+import { snapshotCapturedAt } from "../../platform/proctable.ts";
 
 /** Default consecutive ms a resource limit must be exceeded before fencing (avoids killing brief compilation spikes). */
 export const DEFAULT_RESOURCE_GRACE_MS = 5_000;
@@ -52,6 +53,7 @@ export class ResourceMonitor {
   private peakProcesses = 0;
   private peakCpuPercent?: number;
   private lastStats?: ResourceStats;
+  private lastSampleAt?: number;
   private prevAt?: number;
   private prevCpu = new Map<string, number>();
   private exceededSince: { memory?: number; processes?: number; cpu?: number } = {};
@@ -77,6 +79,13 @@ export class ResourceMonitor {
    *  `overheadPids` (command wrapper / Windows job host) are excluded from `processes` and `rssBytes` so
    *  `maxProcesses: 1` allows a single user command without counting internal harness processes. */
   sample(procs: readonly ProcInfo[], nowMs: number, overheadPids?: ReadonlySet<number>): ResourceSample {
+    // Deduplicate cached ProcessTable snapshots so repeated reads of the same scan never reset CPU % to 0,
+    // inflate the next real scan's CPU delta, or advance grace timers on stale spikes.
+    const sampleAt = snapshotCapturedAt(procs) ?? nowMs;
+    if (this.lastSampleAt !== undefined && sampleAt <= this.lastSampleAt && this.lastStats) {
+      return { stats: { ...this.lastStats } };
+    }
+    this.lastSampleAt = sampleAt;
     const counted = overheadPids?.size ? procs.filter(p => !overheadPids.has(p.pid)) : procs;
     let totalRssBytes = 0;
     for (const p of counted) {
@@ -97,7 +106,7 @@ export class ResourceMonitor {
       }
     }
     if (this.prevAt !== undefined) {
-      const dt = nowMs - this.prevAt;
+      const dt = sampleAt - this.prevAt;
       if (dt >= MIN_CPU_DELTA_MS) {
         let deltaCpuMs = 0;
         for (const [id, cpu] of nextCpu) {
@@ -109,13 +118,13 @@ export class ResourceMonitor {
         if (this.peakCpuPercent === undefined || cpuPercent > this.peakCpuPercent) {
           this.peakCpuPercent = cpuPercent;
         }
-        this.prevAt = nowMs;
+        this.prevAt = sampleAt;
         this.prevCpu = nextCpu;
       } else {
         cpuPercent = this.lastStats?.cpuPercent;
       }
     } else {
-      this.prevAt = nowMs;
+      this.prevAt = sampleAt;
       this.prevCpu = nextCpu;
     }
 
@@ -150,8 +159,8 @@ export class ResourceMonitor {
         return undefined;
       }
       if (observed > limit) {
-        this.exceededSince[kind] ??= nowMs;
-        if (nowMs - this.exceededSince[kind]! >= graceMs) {
+        this.exceededSince[kind] ??= sampleAt;
+        if (sampleAt - this.exceededSince[kind]! >= graceMs) {
           return { kind, limit, observed, peak, graceMs, processes, top: top() };
         }
       } else {

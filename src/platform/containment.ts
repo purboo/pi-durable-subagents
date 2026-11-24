@@ -3,7 +3,7 @@ import { PassThrough } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { performance } from "node:perf_hooks";
 import type { Containment as Contract, ExecId, ProcInfo, ProcessTable as Table, Spawned, SpawnSpec } from "../types.ts";
-import { captureStart, ProcessTable } from "./proctable.ts";
+import { attachCapturedAt, captureStart, ProcessTable, snapshotCapturedAt } from "./proctable.ts";
 import { DWORD_MAX, isOwnedWinChild, isWinKillTimeout, isWinStart, KILL_BATCH_SIZE, killTree, normalizeWinTargets, sameCreation, type WinProcessIdentity } from "./windows.ts";
 
 // One table per orchestrator process, including evaluator and gate observers.
@@ -97,6 +97,7 @@ export class Containment implements Contract {
     const windows = this.platform === "win32";
     const execs = new Set([...known.keys(), ...this.launched.keys()]);
     const all = await this.table.list(execs, options);
+    const capturedAt = snapshotCapturedAt(all);
     for (const p of all) if (p.tag !== undefined) execs.add(p.tag);
     const result = new Map<ExecId, ProcInfo[]>(), liveStarts = new Map(all.map(p => [p.pid, p.start]));
     // One index of the table per scan: tagged processes and children by parent, so each execution costs its own tree.
@@ -137,7 +138,8 @@ export class Containment implements Contract {
           if (!selected.has(c.pid) && validChild(parent, c)) { selected.set(c.pid, c); queue.push(c.pid); }
         }
       }
-      result.set(exec, [...selected.values()]);
+      const list = [...selected.values()];
+      result.set(exec, capturedAt !== undefined ? attachCapturedAt(list, capturedAt) : list);
     }
     return result;
   }

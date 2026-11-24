@@ -184,40 +184,43 @@ export async function observeExecution(d: Dependencies) {
       // 2 s deadline right after the orchestrator was stopped or the machine slept (seen on CI as a spurious loss and
       // a rerun). Only a scan that keeps failing for a minute ends the observation.
       // Measured in elapsed time: the scan period is fixed at start while k.trackerMs can be reloaded.
+      let procs: ProcInfo[] | undefined;
       try {
         if (processes) {
-          const procs = await d.track();
+          procs = await d.track();
           clock.scan(procs);
           failingSince = undefined;
-          monitor.setLimits(d.limits?.());
-          const { violation } = monitor.sample(procs, performance.now());
-          if (violation && !ending && !has("resource-limit")) {
-            const byPid = new Map(procs.map(p => [p.pid, p]));
-            const readCmd = d.readCommand ?? commandLine;
-            const ctl = new AbortController();
-            const timer = setTimeout(() => ctl.abort(), 500);
-            let top: TopProcess[] = violation.top;
-            try {
-              top = await Promise.all(violation.top.map(async item => {
-                const p = byPid.get(item.pid);
-                const scanned = p ? scannedCommand(p) : undefined;
-                const cmd = scanned !== undefined ? scanned : await readCmd(item.pid, ctl.signal).catch(() => "");
-                return cmd ? { ...item, command: cmd } : item;
-              }));
-            } finally { clearTimeout(timer); }
-            const message = formatResourceViolation({ ...violation, top });
-            await serial(async () => {
-              if (!has("resource-limit")) {
-                await t.journal.append("resource-limit", { exec, call: t.callId, kind: violation.kind, limit: violation.limit,
-                  observed: violation.observed, peak: violation.peak, processes: violation.processes, top, message });
-              }
-            });
-            signal();
-            return;
-          }
         }
       }
       catch (error) { failingSince ??= performance.now(); if (performance.now() - failingSince >= 60_000) throw error; }
+      if (procs) {
+        monitor.setLimits(d.limits?.());
+        const { violation } = monitor.sample(procs, performance.now());
+        if (violation && !ending && !has("resource-limit")) {
+          const byPid = new Map(procs.map(p => [p.pid, p]));
+          const readCmd = d.readCommand ?? commandLine;
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 500);
+          let top: TopProcess[] = violation.top;
+          try {
+            top = await Promise.all(violation.top.map(async item => {
+              const p = byPid.get(item.pid);
+              const scanned = p ? scannedCommand(p) : undefined;
+              const cmd = scanned !== undefined ? scanned : await readCmd(item.pid, ctl.signal).catch(() => "");
+              return cmd ? { ...item, command: cmd } : item;
+            }));
+          } finally { clearTimeout(timer); }
+          const message = formatResourceViolation({ ...violation, top });
+          await serial(async () => {
+            if (!has("resource-limit")) {
+              await t.journal.append("resource-limit", { exec, call: t.callId, kind: violation.kind, limit: violation.limit,
+                observed: violation.observed, peak: violation.peak, processes: violation.processes, top, message });
+            }
+          });
+          signal();
+          return;
+        }
+      }
       const nextSize = (await fileStat(session).catch(() => ({ size: 0 }))).size;
       if (nextSize > size) { clock.evidence(); size = nextSize; }
       const entries = await (d.read ? d.read() : readSession(session));

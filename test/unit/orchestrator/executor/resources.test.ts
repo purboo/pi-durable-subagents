@@ -12,7 +12,7 @@ import { observeExecution } from "../../../../src/orchestrator/executor/observe.
 import { compactWorkflow, snapshotFromEntries, statusBrief } from "../../../../src/orchestrator/snapshot.ts";
 import createExecutor from "../../../../src/orchestrator/executor/index.ts";
 import { Containment } from "../../../../src/platform/containment.ts";
-import { ProcessTable } from "../../../../src/platform/proctable.ts";
+import { attachCapturedAt, ProcessTable } from "../../../../src/platform/proctable.ts";
 import { probeKernelLimits } from "../../../../src/platform/limits.ts";
 import { request } from "../../../../src/agent/main/tool.ts";
 import { doctor, renderDoctor } from "../../../../src/cli/doctor.ts";
@@ -84,6 +84,32 @@ test("ResourceMonitor enforces maxProcesses, cpuPercent, overheadPids exclusion 
   assert.ok(r.violation);
   assert.equal(r.violation.kind, "processes");
   assert.equal(r.violation.observed, 3);
+});
+
+test("ResourceMonitor deduplicates cached ProcessTable snapshots via capturedAt", () => {
+  const mon = new ResourceMonitor({ cpuPercent: 150, memoryMb: 500, graceMs: 1000 });
+  const snap = (cpuMs: number, mb: number, capturedAt: number) =>
+    attachCapturedAt([{ pid: 10, ppid: 1, start: "s10", rssBytes: mb * MB, cpuMs }], capturedAt);
+
+  // First real scan at t=1000
+  let r = mon.sample(snap(0, 100, 1000), 1000);
+  assert.equal(r.violation, undefined);
+
+  // Second real scan at t=2000: 2000ms CPU in 1000ms wall -> 200% (> 150%), starts grace timer at t=2000
+  const s2 = snap(2000, 100, 2000);
+  r = mon.sample(s2, 2000);
+  assert.equal(r.stats.cpuPercent, 200);
+  assert.equal(r.violation, undefined);
+
+  // Repeated reads of cached snapshot s2 at t=2400 and t=2800 must NOT reset cpuPercent to 0% or break next delta
+  assert.equal(mon.sample(s2, 2400).violation, undefined);
+  assert.equal(mon.sample(s2, 2800).violation, undefined);
+
+  // Third real scan at t=3000: 2000ms CPU in 1000ms wall -> exact 200% (NOT 5x inflated!), crosses 1000ms grace
+  r = mon.sample(snap(4000, 100, 3000), 3000);
+  assert.equal(r.stats.cpuPercent, 200);
+  assert.ok(r.violation);
+  assert.equal(r.violation.kind, "cpu");
 });
 
 test("observeExecution records resource-limit, fences, and surfaces resources in snapshot/statusBrief", { timeout: 10_000 }, async t => {

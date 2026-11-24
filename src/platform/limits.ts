@@ -9,7 +9,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { cpus } from "node:os";
-import { join } from "node:path";
+import { posix } from "node:path";
 import { promisify } from "node:util";
 import { contentHash } from "../kernel/ids.ts";
 import type { ResourceLimits } from "../types.ts";
@@ -59,6 +59,14 @@ export function linuxScopeUnit(exec: string): string {
   return `dsa-exec-${contentHash([exec]).slice(0, 16)}.scope`;
 }
 
+/** Convert MiB to a clamped positive safe integer byte count (avoids scientific notation or Infinity). */
+export function clampMemoryBytes(memoryMb: number): number {
+  if (!Number.isFinite(memoryMb) || memoryMb <= 0) return 0;
+  const raw = memoryMb * 1024 * 1024;
+  if (!Number.isFinite(raw) || raw >= Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+  return Math.max(1024 * 1024, Math.round(raw));
+}
+
 /** Convert cpuPercent (% of one CPU core, e.g. 200 = 2 cores) to Windows Job Object CpuRate (1..10000 = 0.01%..100% of machine). */
 export function winCpuRate(cpuPercent: number, coreCount = Math.max(1, cpus().length)): number {
   const cores = Math.max(1, coreCount);
@@ -100,7 +108,7 @@ export function probeKernelLimits(options: KernelProbeOptions = {}): KernelLimit
     return { backend: "none", memory: false, cpu: false, processes: false, reason: "systemd-run not found on PATH" };
   }
   const runtimeDir = env.XDG_RUNTIME_DIR;
-  const hasBus = Boolean(env.DBUS_SESSION_BUS_ADDRESS) || Boolean(runtimeDir && exists(join(runtimeDir, "bus")));
+  const hasBus = Boolean(env.DBUS_SESSION_BUS_ADDRESS) || Boolean(runtimeDir && exists(posix.join(runtimeDir, "bus")));
   if (!hasBus) {
     return { backend: "none", memory: false, cpu: false, processes: false, reason: "no user systemd D-Bus session (XDG_RUNTIME_DIR/bus unavailable)" };
   }
@@ -111,23 +119,27 @@ export function probeKernelLimits(options: KernelProbeOptions = {}): KernelLimit
     };
   }
   const controllers = new Set<string>();
-  const candidateFiles: string[] = [];
+  let readAuthoritative = false;
   if (uid !== undefined) {
-    candidateFiles.push(`/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/cgroup.controllers`);
-  }
-  try {
-    const selfCg = readText("/proc/self/cgroup");
-    const v2 = selfCg.split("\n").find(l => l.startsWith("0::"));
-    if (v2) {
-      const rel = v2.slice(3).trim();
-      if (rel) candidateFiles.push(`/sys/fs/cgroup${rel}/cgroup.controllers`);
-    }
-  } catch { /* ignore */ }
-  for (const file of candidateFiles) {
+    // user@<uid>.service/cgroup.controllers is authoritative for systemd --user scopes:
+    // if it is readable and empty, controllers are NOT delegated (do not fall through to /proc/self/cgroup).
     try {
-      for (const c of readText(file).trim().split(/\s+/).filter(Boolean)) controllers.add(c);
-      if (controllers.size) break;
-    } catch { /* try next */ }
+      const raw = readText(`/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/cgroup.controllers`);
+      readAuthoritative = true;
+      for (const c of raw.trim().split(/\s+/).filter(Boolean)) controllers.add(c);
+    } catch { /* not readable; fall back to /proc/self/cgroup below */ }
+  }
+  if (!readAuthoritative) {
+    try {
+      const selfCg = readText("/proc/self/cgroup");
+      const v2 = selfCg.split("\n").find(l => l.startsWith("0::"));
+      const rel = v2?.slice(3).trim();
+      // Never accept the root cgroup ("/") as proof of unprivileged user delegation.
+      if (rel && rel !== "/") {
+        const raw = readText(`/sys/fs/cgroup${rel}/cgroup.controllers`);
+        for (const c of raw.trim().split(/\s+/).filter(Boolean)) controllers.add(c);
+      }
+    } catch { /* ignore */ }
   }
   const memory = controllers.has("memory");
   const cpu = controllers.has("cpu");
@@ -179,18 +191,20 @@ export function wrapLinuxScope(
   }
   const props: string[] = [];
   if (limits.memoryMb !== undefined && caps.memory) {
-    const bytes = Math.max(1024 * 1024, Math.round(limits.memoryMb * 1024 * 1024));
-    props.push("-p", `MemoryMax=${bytes}`, "-p", "MemorySwapMax=0");
+    const bytes = clampMemoryBytes(limits.memoryMb);
+    if (bytes > 0) props.push("-p", `MemoryMax=${bytes}`, "-p", "MemorySwapMax=0");
   }
   if (limits.cpuPercent !== undefined && caps.cpu) {
-    const pct = Math.max(1, Math.round(limits.cpuPercent));
+    const pct = Math.max(1, Math.min(1_000_000, Math.round(limits.cpuPercent)));
     props.push("-p", `CPUQuota=${pct}%`);
   }
   if (!props.length) return { command, args: [...args] };
   const unit = linuxScopeUnit(exec);
+  // Omit --collect so failed/oom-kill scopes retain their Result until checkLinuxScopeOom inspects and resets them
+  // (normal inactive scopes still unload automatically under systemd's default CollectMode=inactive).
   return {
     command: caps.systemdRun,
-    args: ["--user", "--scope", "--quiet", "--collect", "--unit", unit, ...props, "--", command, ...args],
+    args: ["--user", "--scope", "--quiet", "--unit", unit, ...props, "--", command, ...args],
     unit,
   };
 }
@@ -201,8 +215,13 @@ export async function checkLinuxScopeOom(unit: string | undefined, env: NodeJS.P
   const systemctl = findOnPath("systemctl", env.PATH, { platform: "linux" });
   if (!systemctl) return false;
   try {
-    const { stdout } = await exec(systemctl, ["--user", "show", "-p", "Result", "--value", unit], { env, timeout: 1500 });
-    return stdout.trim() === "oom-kill";
+    const { stdout } = await exec(systemctl, ["--user", "show", "-p", "Result", "-p", "ActiveState", unit], { env, timeout: 1500 });
+    const result = /^Result=(.*)$/m.exec(stdout)?.[1]?.trim();
+    const active = /^ActiveState=(.*)$/m.exec(stdout)?.[1]?.trim();
+    if (active === "failed" || result === "oom-kill") {
+      await exec(systemctl, ["--user", "reset-failed", unit], { env, timeout: 1500 }).catch(() => {});
+    }
+    return result === "oom-kill";
   } catch {
     return false;
   }

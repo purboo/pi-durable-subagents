@@ -65,6 +65,33 @@ test("probeKernelLimits detects Linux delegated unified cgroup v2 vs hybrid/non-
   assert.equal(noDelegate.backend, "none");
   assert.match(String(noDelegate.reason), /delegation/);
 
+  // An empty user@<uid>.service/cgroup.controllers is authoritative and must NOT fall through to /proc/self/cgroup.
+  const emptyAuthoritative = probeKernelLimits({
+    platform: "linux",
+    env: { PATH: "/usr/bin", XDG_RUNTIME_DIR: "/run/user/1000" },
+    uid: () => 1000,
+    findBin: () => "/usr/bin/systemd-run",
+    exists: p => p === "/run/user/1000/bus" || p === "/sys/fs/cgroup/cgroup.controllers",
+    readText: p => p.endsWith("user@1000.service/cgroup.controllers") ? "" : p === "/proc/self/cgroup" ? "0::/user.slice/session-1.scope\n" : "cpu memory pids\n",
+  });
+  assert.equal(emptyAuthoritative.backend, "none");
+  assert.equal(emptyAuthoritative.memory, false);
+
+  // Root cgroup "/" in /proc/self/cgroup is never accepted as user delegation.
+  const rootCg = probeKernelLimits({
+    platform: "linux",
+    env: { PATH: "/usr/bin", XDG_RUNTIME_DIR: "/run/user/1000" },
+    uid: () => 1000,
+    findBin: () => "/usr/bin/systemd-run",
+    exists: p => p === "/run/user/1000/bus" || p === "/sys/fs/cgroup/cgroup.controllers",
+    readText: p => {
+      if (p.endsWith("user@1000.service/cgroup.controllers")) throw new Error("ENOENT");
+      if (p === "/proc/self/cgroup") return "0::/\n";
+      return "cpu memory pids\n";
+    },
+  });
+  assert.equal(rootCg.backend, "none");
+
   // Missing user D-Bus session falls back cleanly.
   const noBus = probeKernelLimits({
     platform: "linux",
@@ -106,11 +133,16 @@ test("wrapLinuxScope wraps commands in transient systemd scopes only when cgroup
   assert.equal(wrapped.command, "/usr/bin/systemd-run");
   assert.equal(wrapped.unit, linuxScopeUnit("W@1/a@1#1.1"));
   assert.deepEqual(wrapped.args, [
-    "--user", "--scope", "--quiet", "--collect", "--unit", wrapped.unit!,
+    "--user", "--scope", "--quiet", "--unit", wrapped.unit!,
     "-p", String(`MemoryMax=${512 * 1024 * 1024}`), "-p", "MemorySwapMax=0",
     "-p", "CPUQuota=150%",
     "--", "/usr/bin/pi", "--mode", "rpc",
   ]);
+
+  // Very large memoryMb clamps to safe decimal integer (no scientific notation).
+  const huge = wrapLinuxScope("W@1/a@1#1.1", "/usr/bin/pi", [], { memoryMb: 1e20 }, caps);
+  const memArg = huge.args.find(a => a.startsWith("MemoryMax="));
+  assert.equal(memArg, `MemoryMax=${Number.MAX_SAFE_INTEGER}`);
 
   // Only maxProcesses requested -> no cgroup properties to wrap, leave original command untouched.
   const unwrapped = wrapLinuxScope("W@1/a@1#1.1", "/usr/bin/pi", ["--mode", "rpc"], { maxProcesses: 16 }, caps);
@@ -137,6 +169,10 @@ test("jobSpecText emits DSAJOB1 without limits and DSAJOB2 with encoded resource
   assert.equal(limited.at(-2), "5");
   const cpuRate = Number(limited.at(-1));
   assert.ok(Number.isInteger(cpuRate) && cpuRate >= 1 && cpuRate <= 10_000);
+
+  // Huge memoryMb never emits scientific notation into DSAJOB2.
+  const hugeSpec = jobSpecText({ ...base, limits: { memoryMb: 1e20 } }).trim().split("\n");
+  assert.equal(hugeSpec.at(-3), String(Number.MAX_SAFE_INTEGER));
 });
 
 test("ProcessTable collects rssBytes on Linux, macOS (new and legacy ps formats) and Windows (6-col and legacy 5-col)", async () => {

@@ -1724,10 +1724,11 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       // shim it must run may be the call's own.
       const childEnv: Record<string, string> = { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(Object.keys(patterns).length ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}), ...(exactTools && t.exactCapture ? { DSA_EXACT_CAPTURE: t.exactCapture.path, DSA_EXACT_TOOLS: JSON.stringify(exactTools) } : {}) };
       let scopeUnit: string | undefined;
+      const fullChildEnv: NodeJS.ProcessEnv = { ...process.env, ...childEnv };
       try {
         const target = execTarget(piCommand, [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}), ...(t.exactMode?.mode === "exact" ? { thinking: (await readPinnedCapture(t.exactCapture?.path))?.thinking ?? false } : {}) }), "-e", extension], { env: childEnv });
         const wrapped = launchLimits && process.platform === "linux"
-          ? wrapLinuxScope(exec, target.command, target.args, launchLimits, probeKernelLimits({ platform: "linux", env: childEnv, kind: "agent" }))
+          ? wrapLinuxScope(exec, target.command, target.args, launchLimits, probeKernelLimits({ platform: "linux", env: fullChildEnv, kind: "agent" }))
           : { command: target.command, args: target.args };
         scopeUnit = wrapped.unit;
         child = await containment.spawn({ exec, command: wrapped.command, args: wrapped.args, cwd, env: childEnv, ...(target.verbatim && !wrapped.unit ? { windowsVerbatimArguments: true } : {}) });
@@ -1783,7 +1784,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           switched: event => switched(exec!, journal, event), answered: event => answered(t, exec!, event), pendingSwitch: () => pendingSwitch(exec!),
           limits: effectiveLimits,
         });
-        if (scopeUnit && !has(journal, "resource-limit", exec) && await checkLinuxScopeOom(scopeUnit, childEnv)) {
+        if (scopeUnit && !has(journal, "resource-limit", exec) && await checkLinuxScopeOom(scopeUnit, fullChildEnv)) {
           const lim = effectiveLimits();
           const message = `Resource limit exceeded: killed by Linux cgroup OOM (memoryMb limit: ${lim?.memoryMb ?? "?"} MiB)`;
           await serial(async () => {
