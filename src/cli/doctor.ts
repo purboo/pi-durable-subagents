@@ -8,6 +8,7 @@ import { readJournalSnapshot } from "../kernel/journal.ts";
 import { reduceLifecycle, type DecisionRecord } from "../kernel/lifecycle.ts";
 import { scanInbox } from "../kernel/mailbox.ts";
 import { OsLock } from "../platform/lock.ts";
+import { describeKernelLimits, probeKernelLimits } from "../platform/limits.ts";
 import { journalPath, orchInbox, orchLedger, orchLock } from "../paths.ts";
 import { runningStats, snapshotFromEntries } from "../orchestrator/snapshot.ts";
 import { emptyLedger, foldLedger } from "../orchestrator/ledger.ts";
@@ -37,6 +38,8 @@ export interface DoctorReport {
   /** What the running orchestrator costs (see status --json), when it published it. */
   orchestratorStats?: OrchestratorStats;
   service: "installed" | "not installed" | "unavailable";
+  /** Active per-subagent resource-limit enforcement backend (Layer 1 monitor + optional Layer 2 OS kernel limits). */
+  resourceLimits: string;
   findings: Finding[];
 }
 const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -64,7 +67,7 @@ export async function doctor(home: string, env: NodeJS.ProcessEnv = process.env,
   const ledger = readJournalSnapshot(orchLedger(home));
   const pruned = new Set(ledger.filter(e => e.type === "pruned").map(e => String(e.wid)));
   const report: DoctorReport = { home, bytes: await diskUsage(home), workflows: {}, ledger: { entries: ledger.length, bytes: await diskUsage(orchLedger(home)) },
-    largestJournals: [], parked: [], attention: [], fenceFailed: [], orphanStaging: [], tmpFiles: [], orchestrator: await lockHeld(home), service: "unavailable", findings: [], ...runningStats(home) };
+    largestJournals: [], parked: [], attention: [], fenceFailed: [], orphanStaging: [], tmpFiles: [], orchestrator: await lockHeld(home), service: "unavailable", resourceLimits: describeKernelLimits(probeKernelLimits({ env })), findings: [], ...runningStats(home) };
   const last = foldLedger(emptyLedger(), ledger), o = last.orchestrator;
   if (o && o.pi !== undefined) report.pi = o.pi;
   if (o && report.orchestrator === "not running") {
@@ -155,6 +158,7 @@ export function renderDoctor(r: DoctorReport): string {
     `orchestrator: ${r.orchestrator === "running" ? "running (holds the lock)" : r.orchestrator}${r.lastExit ? `; ${exitLine(r.lastExit)}` : ""}${r.orchestratorStats ? `; ${statsLine(r.orchestratorStats)}` : ""}`,
     ...(r.pi !== undefined ? [`pi: ${r.pi ?? "not found (subagents launch \`pi\` from PATH; set DSA_PI_BIN)"}`] : []),
     `service: ${r.service}`,
+    `resource limits: ${r.resourceLimits}`,
     ...(r.findings.length ? [`${r.findings.length} actionable finding(s):`, ...r.findings.flatMap(f => [`  ${f.kind}: ${f.detail}`, `    ${f.command}`])] : ["nothing actionable"]),
   ].join("\n");
 }

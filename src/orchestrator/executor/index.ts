@@ -29,6 +29,7 @@
 import { mkdir, open, readdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { watch, type FSWatcher } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
+import { performance } from "node:perf_hooks";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,9 +68,13 @@ import { failedModel, modelFailures, MODEL_RETRY_MS, parentPinned, spillCandidat
 import { PENDING_NOTE, UNDELIVERED_FOLLOW_UP } from "../notes.ts";
 import { COMMAND_LOG, exitMeaning, prepareCancelled, prepareCommand as stageCommand, readExitRecord, readTail, spawnCommand, type CommandPrep, type CommandSpawn, type SpawnedCommand } from "../../platform/command.ts";
 import { captureStart } from "../../platform/proctable.ts";
-import { IS_WINDOWS, sameCreation } from "../../platform/windows.ts";
+import { IS_WINDOWS, sameCreation, scannedCommand } from "../../platform/windows.ts";
+import { commandLine } from "../../platform/cmdline.ts";
+import { checkLinuxScopeOom, kernelLimitsSatisfied, mergeLimits, probeKernelLimits, wrapLinuxScope } from "../../platform/limits.ts";
+import { readJobLimitExceeded } from "../../platform/job.ts";
 import { heldIn } from "../snapshot.ts";
-import { COMMAND_INTENT, COMMAND_SPAWN_FAILED, COMMAND_STARTED, COMMAND_TIMEOUT, COMMAND_WITHDRAWN, commandDirName, commandEnvironment, commandId, retiredCommandAttempts } from "./command.ts";
+import { COMMAND_INTENT, COMMAND_RESOURCE_LIMIT, COMMAND_SPAWN_FAILED, COMMAND_STARTED, COMMAND_TIMEOUT, COMMAND_WITHDRAWN, commandDirName, commandEnvironment, commandId, retiredCommandAttempts } from "./command.ts";
+import { formatResourceViolation, ResourceMonitor, type TopProcess } from "./resources.ts";
 
 type Envelope = Pick<Request, "to" | "kind" | "body" | "cond">;
 type Active = { ticket: CallTicket; controller: AbortController; promise: Promise<CallResult>; wake: () => void; stopped: boolean; retired?: boolean; suspended?: boolean; commandStarting?: boolean;
@@ -1109,8 +1114,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
   };
   /** The processes of an attempt: tagged with its id, the wrapper while it lives, and their live descendants. A scan that
    *  fails transiently is not an empty result (`undefined`): an attempt is never called gone because the observer failed. */
-  async function commandProcesses(id: string, known: ProcInfo[]): Promise<ProcInfo[] | undefined> {
-    try { return (await containment.scan(new Map([[id, known]]), { fresh: true })).get(id) ?? []; }
+  async function commandProcesses(id: string, known: ProcInfo[], scanOptions: { fresh?: boolean; maxAgeMs?: number } = { fresh: true }): Promise<ProcInfo[] | undefined> {
+    try { return (await containment.scan(new Map([[id, known]]), scanOptions)).get(id) ?? []; }
     catch (error) { if (closed) throw error; return undefined; }
   }
   /** The same, for a decision that may not proceed on an unobserved attempt: retried until the table answers (the fence
@@ -1160,8 +1165,10 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       if (closed || retiredCall(journal, call)) throw shutdownError();
       const started = entriesFor(journal, call).findLast(e => e.type === COMMAND_STARTED && e.id === id);
       let { status, error } = outcome;
+      const limitHit = entriesFor(journal, call).findLast(e => e.type === COMMAND_RESOURCE_LIMIT && e.id === id);
       if (hasStopIntent(journal, call)) { status = "stopped"; error = undefined; }
       else if (entriesFor(journal, call).some(e => e.type === COMMAND_TIMEOUT && e.id === id)) { status = "timeout"; error = `Command timed out after ${t.spec.timeoutMs} ms`; }
+      else if (limitHit) { status = "failed"; error = String(limitHit.message ?? "Resource limit exceeded"); }
       const durationMs = started ? Math.max(0, Math.round((outcome.at ?? Date.now()) - started.ts)) : 0;
       const result: CallResult = { ...buildCallResult({ key: t.key, gen: t.gen, status, output, ...(error ? { error } : {}) }),
         data: { exitCode: outcome.exitCode ?? null, signal: outcome.signal ?? null, durationMs }, usage: { input: 0, output: 0, costUsd: 0 } };
@@ -1230,8 +1237,9 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         else if (closed || a.retired || retiredCall(t.journal, t.callId)) refused = "withdrawn";
         return refused === undefined;
       };
+      const limits = mergeLimits(settings().limits, t.spec.limits);
       const result = await spawnCommand({ command: t.spec.command!, cwd: t.cwd, dir, proceed, exec: id,
-        ...(prepared ? { prepared } : {}), env: commandEnvironment(home, id, t.callId, t.spec.env) });
+        ...(limits ? { limits } : {}), ...(prepared ? { prepared } : {}), env: commandEnvironment(home, id, t.callId, t.spec.env) });
       if (!result) {
         if (refused === "withdrawn") await serial(() => t.journal.append(COMMAND_WITHDRAWN, { call: t.callId, id }));
         // Nothing of the attempt exists: what the preparation staged is of no use.
@@ -1244,7 +1252,7 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       return undefined;
     }
     await serial(() => t.journal.append(COMMAND_STARTED, { call: t.callId, id, pid: spawned.pid, start: spawned.start, dir,
-      ...(spawned.group ? { group: spawned.group } : {}), ...(spawned.uncertain ? { uncertain: spawned.uncertain } : {}) }));
+      ...(spawned.group ? { group: spawned.group } : {}), ...(spawned.scopeUnit ? { scopeUnit: spawned.scopeUnit } : {}), ...(spawned.uncertain ? { uncertain: spawned.uncertain } : {}) }));
     return spawned;
   }
   /** Run, adopt or settle a command call (see the journal records at the top). One attempt runs at a time; a lost first
@@ -1269,10 +1277,16 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
      *  aborted it), the revocation decides the attempt and a rejection on the way out is never sealed failed. */
     const start = async (a: Active, id: string, dir: string): Promise<Start> => {
       const blocked = commandBlocked(a); if (blocked) return { blocked };
+      const env = commandEnvironment(home, id, call, t.spec.env);
+      const limits = mergeLimits(settings().limits, t.spec.limits);
+      if (limits?.strict) {
+        const problem = kernelLimitsSatisfied(limits, probeKernelLimits({ kind: "command", env }));
+        if (problem) return { failure: problem };
+      }
       let prepared: CommandPrep | undefined;
       try {
         prepared = await prepareStart({ command: t.spec.command!, cwd: t.cwd, dir, exec: id,
-          env: commandEnvironment(home, id, call, t.spec.env), signal: a.controller.signal });
+          ...(limits ? { limits } : {}), env, signal: a.controller.signal });
       } catch (error) {
         // The revocation is the cause, so it decides the attempt: the rejection cannot be told apart from one the abort
         // produced (a cancelled publication, a compiler this process ended), and sealing it failed would report a failure
@@ -1351,9 +1365,28 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         throw error;
       }
     };
-    const settleExit = async (exit: { status: number; at: number }, known: ProcInfo[], deadline: number | undefined): Promise<CallResult> => {
+    const monitor = new ResourceMonitor(mergeLimits(settings().limits, t.spec.limits));
+    const settleExit = async (exit: { status: number; at: number }, known: ProcInfo[], deadline: number | undefined, scopeUnit?: string): Promise<CallResult> => {
       // Processes the command left behind (background ones included) end with it, as a call's processes always do.
       if (!closed) await endCommand(id, known);
+      if (exit.status !== 0 && !entriesFor(journal, call).some(e => e.type === COMMAND_RESOURCE_LIMIT && e.id === id)) {
+        const lim = mergeLimits(settings().limits, t.spec.limits);
+        const winHit = IS_WINDOWS ? await readJobLimitExceeded(dir) : undefined;
+        if (winHit) {
+          const peakMb = Math.round((winHit.peakBytes / (1024 * 1024)) * 10) / 10;
+          const message = `Resource limit exceeded: killed by Windows Job Object ${winHit.kind} limit (memoryMb limit: ${lim?.memoryMb ?? "?"} MiB${peakMb > 0 ? `, peak ${peakMb} MiB` : ""})`;
+          await serial(async () => {
+            if (!entriesFor(journal, call).some(e => e.type === COMMAND_RESOURCE_LIMIT && e.id === id))
+              await journal.append(COMMAND_RESOURCE_LIMIT, { call, id, kind: winHit.kind, limit: lim?.memoryMb, peak: peakMb, message });
+          });
+        } else if (scopeUnit && await checkLinuxScopeOom(scopeUnit)) {
+          const message = `Resource limit exceeded: killed by Linux cgroup OOM (memoryMb limit: ${lim?.memoryMb ?? "?"} MiB)`;
+          await serial(async () => {
+            if (!entriesFor(journal, call).some(e => e.type === COMMAND_RESOURCE_LIMIT && e.id === id))
+              await journal.append(COMMAND_RESOURCE_LIMIT, { call, id, kind: "memory", limit: lim?.memoryMb, message });
+          });
+        }
+      }
       // An exit after the deadline (seen late: the orchestrator was down) is a timeout, with the record's data.
       const late = deadline !== undefined && exit.at > deadline;
       return await sealCommand(journal, t, id, { status: late ? "timeout" : exit.status === 0 ? "ok" : "failed", ...exitResult(exit.status),
@@ -1362,11 +1395,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
     try {
       for (;;) {
         const started = entriesFor(journal, call).findLast(e => e.type === COMMAND_STARTED && e.id === id), known = commandKnown(started);
+        const scopeUnit = typeof started?.scopeUnit === "string" ? started.scopeUnit : undefined;
         // The timeout is wall clock from the start (command-started, else the intent: a crash before the started record),
         // downtime included.
         const deadline = t.spec.timeoutMs !== undefined ? (started ?? intent).ts + t.spec.timeoutMs : undefined;
         const exit = await readExit();
-        if (exit) return await settleExit(exit, known, deadline);
+        if (exit) return await settleExit(exit, known, deadline, scopeUnit);
         if (closed) throw shutdownError();
         if (a.retired || retiredCall(journal, call)) { await endCommand(id, known); throw shutdownError(); }
         if (hasStopIntent(journal, call)) { await endCommand(id, known); return await sealCommand(journal, t, id, { status: "stopped" }, dir); }
@@ -1375,15 +1409,59 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
           await endCommand(id, known);
           return await sealCommand(journal, t, id, { status: "timeout" }, dir);
         }
+        const priorLimit = entriesFor(journal, call).findLast(e => e.type === COMMAND_RESOURCE_LIMIT && e.id === id);
+        if (priorLimit) {
+          await endCommand(id, known);
+          return await sealCommand(journal, t, id, { status: "failed", error: String(priorLimit.message ?? "Resource limit exceeded") }, dir);
+        }
+        const limits = mergeLimits(settings().limits, t.spec.limits);
         const observedStart = started?.start ? await captureStart(Number(started.pid)).catch(() => "") : "";
         const wrapper = !!started?.start && (IS_WINDOWS ? sameCreation(observedStart, String(started.start)) : observedStart === started.start);
         // A failed observation is not a loss: the attempt stays tracked and is watched again (never started over).
-        const live = wrapper ? undefined : await commandProcesses(id, known);
+        const live = wrapper
+          ? (limits ? await commandProcesses(id, known, { maxAgeMs: commandTick() }) : undefined)
+          : await commandProcesses(id, known);
+        if (limits && live && live.length) {
+          monitor.setLimits(limits);
+          const overhead = new Set(known.map(p => p.pid));
+          const { violation } = monitor.sample(live, performance.now(), overhead);
+          if (violation) {
+            const byPid = new Map(live.map(p => [p.pid, p]));
+            const ctl = new AbortController();
+            const timer = setTimeout(() => ctl.abort(), 500);
+            let top: TopProcess[] = violation.top;
+            try {
+              top = await Promise.all(violation.top.map(async item => {
+                const p = byPid.get(item.pid);
+                const scanned = p ? scannedCommand(p) : undefined;
+                const cmd = scanned !== undefined ? scanned : await commandLine(item.pid, ctl.signal).catch(() => "");
+                return cmd ? { ...item, command: cmd } : item;
+              }));
+            } finally { clearTimeout(timer); }
+            const message = formatResourceViolation({ ...violation, top });
+            await serial(async () => {
+              if (!entriesFor(journal, call).some(e => e.type === COMMAND_RESOURCE_LIMIT && e.id === id)) {
+                await journal.append(COMMAND_RESOURCE_LIMIT, { call, id, kind: violation.kind, limit: violation.limit,
+                  observed: violation.observed, peak: violation.peak, processes: violation.processes, top, message });
+              }
+            });
+            await endCommand(id, known);
+            return await sealCommand(journal, t, id, { status: "failed", error: message }, dir);
+          }
+        }
         if (!wrapper && live !== undefined && !live.length) {
           // The wrapper may have written its record just before it ended (or a Windows scanner may briefly hold it).
           const late = await readExit();
-          if (!late) return "lost";
-          return await settleExit(late, known, deadline);
+          if (late) return await settleExit(late, known, deadline, scopeUnit);
+          if (scopeUnit && await checkLinuxScopeOom(scopeUnit)) {
+            const message = `Resource limit exceeded: killed by Linux cgroup OOM (memoryMb limit: ${limits?.memoryMb ?? "?"} MiB)`;
+            await serial(async () => {
+              if (!entriesFor(journal, call).some(e => e.type === COMMAND_RESOURCE_LIMIT && e.id === id))
+                await journal.append(COMMAND_RESOURCE_LIMIT, { call, id, kind: "memory", limit: limits?.memoryMb, message });
+            });
+            return await sealCommand(journal, t, id, { status: "failed", error: message }, dir);
+          }
+          return "lost";
         }
         const wait = Math.max(1, Math.min(commandTick(), deadline !== undefined ? deadline - Date.now() : Infinity));
         await new Promise<void>(resolve => { const timer = setTimeout(resolve, wait); a.wake = () => { clearTimeout(timer); resolve(); }; });
@@ -1515,6 +1593,8 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
         if (has(journal, "timeout-intent", exec) || t.spec.timeoutMs !== undefined && activeTotal(journal.entries(), t.callId) >= t.spec.timeoutMs)
           return finish(journal, t.callId, exec, makeResult("timeout"));
         if (ev.budget || reached(totalUsage(journal.entries(), t.callId), t.spec.budget)) return finish(journal, t.callId, exec, makeResult("budget"));
+        const limitHit = entriesOf(journal, "resource-limit", exec).at(-1);
+        if (limitHit) return finish(journal, t.callId, exec, makeResult("failed", "", String(limitHit.message ?? "Resource limit exceeded")));
         const textFailure = entries.findLast(e => e.type === "custom" && e.customType === CT.exhausted && e.data?.exec === exec)?.data;
         if (textFailure) {
           const provider = String(textFailure.provider), text = String(textFailure.text).slice(0, 200);
@@ -1579,6 +1659,12 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       await serial(() => journal.append(JT.exec, { exec, call: t.callId }));
       if (interrupted(a)) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("stopped")); }
       if (await serial(() => workflowReached(t))) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", "workflow budget reached")); }
+      const effectiveLimits = () => mergeLimits(settings().limits, t.spec.limits);
+      const launchLimits = effectiveLimits();
+      if (launchLimits?.strict) {
+        const problem = kernelLimitsSatisfied(launchLimits, probeKernelLimits({ kind: "agent" }));
+        if (problem) { await fence(journal, exec, { park: a }); return finish(journal, t.callId, exec, makeResult("failed", "", problem)); }
+      }
       let decision: Awaited<ReturnType<typeof acquire>>;
       try {
         decision = await acquire(a, exec, () => launchModel(t, entries, previous), writer ??= await writerRoot(t, cwd));
@@ -1637,9 +1723,14 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
       // PATH without node (a service's). execTarget resolves a bare `pi` on this PATH too, not on the orchestrator's: the
       // shim it must run may be the call's own.
       const childEnv: Record<string, string> = { DSA_HOME: home, PATH: [binDir(home), dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), DSA_EXEC: exec, DSA_CALL: t.callId, DSA_INBOX: inbox(t.callId), DSA_JOURNAL: journal.path, DSA_ASK_REQUIRE_DECISION: String(config.askRequireDecision ?? false), ...(Object.keys(patterns).length ? { DSA_EXHAUSTED_PATTERNS: JSON.stringify(patterns) } : {}), ...(t.spec.schema !== undefined ? { DSA_SCHEMA: schema } : {}), ...(t.spec.budget ? { DSA_BUDGET: JSON.stringify(t.spec.budget) } : {}), ...(model.provider && model.id ? { DSA_MODEL: `${model.provider}/${model.id}` } : {}), ...(exactTools && t.exactCapture ? { DSA_EXACT_CAPTURE: t.exactCapture.path, DSA_EXACT_TOOLS: JSON.stringify(exactTools) } : {}) };
+      let scopeUnit: string | undefined;
       try {
         const target = execTarget(piCommand, [...buildPiArgs(t.agent, t.spec, { sessionPath: session, systemPromptPath: prompt, continuation: decision.continuation, controlTools: t.spec.schema === undefined ? ["ask"] : ["ask", "report"], ...(model.id ? { model } : {}), ...(t.exactMode?.mode === "exact" ? { thinking: (await readPinnedCapture(t.exactCapture?.path))?.thinking ?? false } : {}) }), "-e", extension], { env: childEnv });
-        child = await containment.spawn({ exec, command: target.command, args: target.args, cwd, env: childEnv, ...(target.verbatim ? { windowsVerbatimArguments: true } : {}) });
+        const wrapped = launchLimits && process.platform === "linux"
+          ? wrapLinuxScope(exec, target.command, target.args, launchLimits, probeKernelLimits({ platform: "linux", env: childEnv, kind: "agent" }))
+          : { command: target.command, args: target.args };
+        scopeUnit = wrapped.unit;
+        child = await containment.spawn({ exec, command: wrapped.command, args: wrapped.args, cwd, env: childEnv, ...(target.verbatim && !wrapped.unit ? { windowsVerbatimArguments: true } : {}) });
       } catch (error) {
         const environment = environmentSpawnError(error);
         if (environment) await serial(() => spawnEnvRecord(t, exec!, error));
@@ -1690,7 +1781,17 @@ export default function createExecutor(ledgers: Ledgers, options: { memory?: () 
               cacheWrite: usage.cacheWrite ?? 0, output: usage.output ?? 0, costUsd: usage.cost?.total ?? 0 }));
           },
           switched: event => switched(exec!, journal, event), answered: event => answered(t, exec!, event), pendingSwitch: () => pendingSwitch(exec!),
+          limits: effectiveLimits,
         });
+        if (scopeUnit && !has(journal, "resource-limit", exec) && await checkLinuxScopeOom(scopeUnit, childEnv)) {
+          const lim = effectiveLimits();
+          const message = `Resource limit exceeded: killed by Linux cgroup OOM (memoryMb limit: ${lim?.memoryMb ?? "?"} MiB)`;
+          await serial(async () => {
+            if (!has(journal, "resource-limit", exec!)) {
+              await journal.append("resource-limit", { exec, call: t.callId, kind: "memory", limit: lim?.memoryMb, message });
+            }
+          });
+        }
       } finally { await fence(journal, exec, { child, park: a }); a.live = undefined; }
     }
   }

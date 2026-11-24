@@ -5,13 +5,16 @@ import { join } from "node:path";
 import { stat as fileStat } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
-import { CT, JT, attentionEntries, type Entry, type ProcInfo, type Spawned } from "../../types.ts";
+import { CT, JT, attentionEntries, type Entry, type ProcInfo, type ResourceLimits, type Spawned } from "../../types.ts";
+import { commandLine } from "../../platform/cmdline.ts";
+import { scannedCommand } from "../../platform/windows.ts";
 import { callDir, callSession } from "../../paths.ts";
 import { monotoneTime } from "../../kernel/guards.ts";
 import type { CallTicket, OrchestratorConfig } from "../contract.ts";
 import { readSession, type SessionEntry } from "./session.ts";
 import { entriesOf } from "./indexes.ts";
 import { ActiveTime, activeTotal } from "./time.ts";
+import { formatResourceViolation, ResourceMonitor, type TopProcess } from "./resources.ts";
 import { entryUsage, observation, reached, sessionUsage, totalUsage, type Usage } from "./usage.ts";
 
 const UPDATE = '{"type":"tool_execution_update",';
@@ -37,6 +40,10 @@ type Dependencies = {
   exactUsage?(event: Record<string, unknown>): Promise<void>;
   wrote?(path: string): Promise<void>;
   pendingSwitch(): Entry | undefined;
+  /** Effective per-call process-tree resource limits (re-read on each scan to pick up live config reloads). */
+  limits?(): ResourceLimits | undefined;
+  /** Test seam: read a top offending process's command line (default: platform commandLine). */
+  readCommand?: (pid: number, signal?: AbortSignal) => Promise<string>;
 };
 /** A tool call's command for a status line: bash's command, else its arguments, on one line and clipped. */
 export function toolCommand(args: unknown): string {
@@ -49,6 +56,7 @@ export function toolCommand(args: unknown): string {
 export async function observeExecution(d: Dependencies) {
   const { home, config, ticket: t, exec, child, serial } = d;
   const session = callSession(home, t.wid, t.key, t.gen), clock = new ActiveTime(), started = clock.last;
+  const monitor = new ResourceMonitor(d.limits?.());
   let progress = started, providerError: string | undefined;
   // Diagnostic metadata only: checkpoint the latest received stream update, never its content.
   let lastStream: { type: string; receivedAt: number } | undefined;
@@ -65,7 +73,8 @@ export async function observeExecution(d: Dependencies) {
   const saveTime = () => serial(async () => {
     const previous = entriesOf(t.journal, "time", exec).at(-1);
     if (!monotoneTime({ active: Number(previous?.active ?? 0) }, { active: clock.active })) throw new Error("Nonmonotone active time");
-    await t.journal.append("time", { exec, active: clock.active, ...(lastStream ? { lastStream } : {}) });
+    const resources = monitor.latest();
+    await t.journal.append("time", { exec, active: clock.active, ...(lastStream ? { lastStream } : {}), ...(resources ? { resources } : {}) });
   });
   const limits = async () => {
     if (t.spec.timeoutMs !== undefined && prior + clock.active >= t.spec.timeoutMs) {
@@ -175,7 +184,39 @@ export async function observeExecution(d: Dependencies) {
       // 2 s deadline right after the orchestrator was stopped or the machine slept (seen on CI as a spurious loss and
       // a rerun). Only a scan that keeps failing for a minute ends the observation.
       // Measured in elapsed time: the scan period is fixed at start while k.trackerMs can be reloaded.
-      try { if (processes) { clock.scan(await d.track()); failingSince = undefined; } }
+      try {
+        if (processes) {
+          const procs = await d.track();
+          clock.scan(procs);
+          failingSince = undefined;
+          monitor.setLimits(d.limits?.());
+          const { violation } = monitor.sample(procs, performance.now());
+          if (violation && !ending && !has("resource-limit")) {
+            const byPid = new Map(procs.map(p => [p.pid, p]));
+            const readCmd = d.readCommand ?? commandLine;
+            const ctl = new AbortController();
+            const timer = setTimeout(() => ctl.abort(), 500);
+            let top: TopProcess[] = violation.top;
+            try {
+              top = await Promise.all(violation.top.map(async item => {
+                const p = byPid.get(item.pid);
+                const scanned = p ? scannedCommand(p) : undefined;
+                const cmd = scanned !== undefined ? scanned : await readCmd(item.pid, ctl.signal).catch(() => "");
+                return cmd ? { ...item, command: cmd } : item;
+              }));
+            } finally { clearTimeout(timer); }
+            const message = formatResourceViolation({ ...violation, top });
+            await serial(async () => {
+              if (!has("resource-limit")) {
+                await t.journal.append("resource-limit", { exec, call: t.callId, kind: violation.kind, limit: violation.limit,
+                  observed: violation.observed, peak: violation.peak, processes: violation.processes, top, message });
+              }
+            });
+            signal();
+            return;
+          }
+        }
+      }
       catch (error) { failingSince ??= performance.now(); if (performance.now() - failingSince >= 60_000) throw error; }
       const nextSize = (await fileStat(session).catch(() => ({ size: 0 }))).size;
       if (nextSize > size) { clock.evidence(); size = nextSize; }

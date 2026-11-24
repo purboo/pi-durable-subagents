@@ -319,6 +319,30 @@ export interface AttentionItem extends StructuredAskFields {
 // Call spec and result (compat with pi-subagents runs.run; spec mapping table)
 // ---------------------------------------------------------------------------
 
+/** Per-call process-tree resource limits (global defaults in config.json `limits`, overridden per call). */
+export interface ResourceLimits {
+  /** Max total resident memory (RSS / WorkingSet) across the call's entire process tree, in MiB. */
+  memoryMb?: number;
+  /** Max concurrent processes in the call's process tree (prevents fork bombs / runaway spawns). */
+  maxProcesses?: number;
+  /** Max CPU usage across the call's process tree as a percentage of one CPU core (e.g. 200 = 2 cores). */
+  cpuPercent?: number;
+  /** Consecutive milliseconds a limit must stay exceeded before fencing (default: 5000). */
+  graceMs?: number;
+  /** When true, refuse to launch unless OS kernel hard limits (Linux cgroup v2 or Windows Job Object) cover the requested limits. */
+  strict?: boolean;
+}
+
+/** Observed process-tree resource usage of one execution (checkpointed into `time` entries for status/UI). */
+export interface ResourceStats {
+  memoryMb: number;
+  peakMemoryMb: number;
+  processes: number;
+  peakProcesses: number;
+  cpuPercent?: number;
+  peakCpuPercent?: number;
+}
+
 export interface CallSpec {
   /** Agent calls only; absent in a command call (see isCommandCall). */
   agent: string;
@@ -353,6 +377,8 @@ export interface CallSpec {
   /** Writer lock: whether the call writes in its cwd's worktree. Default: its tools include edit or write (pi's default
    *  tools do). One writer per worktree runs at a time; false opts out (e.g. a reviewer writing its report elsewhere). */
   writer?: boolean;
+  /** Per-call process-tree resource limits (merges over config.json `limits`). */
+  limits?: ResourceLimits;
 }
 
 /** A command call (CallSpec.command): no agent, task or model at runtime even though the type declares them. */
@@ -412,6 +438,8 @@ export interface ProcInfo {
   tag?: string;
   /** Cumulative CPU time in ms, if available. */
   cpuMs?: number;
+  /** Resident set size (RSS / WorkingSet) in bytes, if available. */
+  rssBytes?: number;
 }
 
 export interface ProcessTable {

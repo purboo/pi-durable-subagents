@@ -25,6 +25,7 @@ export const COMMAND_INTENT = "command-intent";
 export const COMMAND_STARTED = "command-started";
 export const COMMAND_SPAWN_FAILED = "command-spawn-failed";
 export const COMMAND_TIMEOUT = "command-timeout";
+export const COMMAND_RESOURCE_LIMIT = "command-resource-limit";
 export const COMMAND_WITHDRAWN = "command-withdrawn";
 /** The attempt id (and process tag DSA_EXEC) of attempt `n` of a command call. */
 export const commandId = (call: string, n: number) => `command:${call}#${n}`;

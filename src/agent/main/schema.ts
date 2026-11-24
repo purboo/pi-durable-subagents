@@ -2,8 +2,8 @@
 // package, which the CLI (sharing tool.ts) must not import: it runs from the package directory.
 import { Type } from "@earendil-works/pi-ai";
 
-const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, schema?, gate?, isolation?, context?, budget?, once?, tools?, skills?, writer?, key?} " +
-  "or command specs {command, cwd?, timeoutMs?, env?, rerun?, writer?, key?}; " +
+const stepsDoc = "Call specs {agent, task, model?, cwd?, timeoutMs?, output?, schema?, gate?, isolation?, context?, budget?, limits?, once?, tools?, skills?, writer?, key?} " +
+  "or command specs {command, cwd?, timeoutMs?, limits?, env?, rerun?, writer?, key?}; " +
   "each call is addressed as '<wid>/<key>', where key is the step's own unique key or else 'tasks:<i>' / 'chain:<i>'.";
 
 export const parameters = Type.Object({
@@ -25,6 +25,13 @@ export const parameters = Type.Object({
   name: Type.Optional(Type.String()),
   labels: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "run: your labels, e.g. {node, attempt}: at most 32 keys [A-Za-z0-9_.:-]{1,64}, string values of at most 256 characters, 4096 bytes of JSON; part of the request's content (spec_digest), shown by describe and on its events." })),
   timeoutMs: Type.Optional(Type.Number({ description: "Per-call limit on active time in milliseconds (a number; a command call: wall-clock time since it started). Omit unless a hard limit is needed; prefer budgets." })),
+  limits: Type.Optional(Type.Object({
+    memoryMb: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Max resident memory (MiB) across the call's process tree." })),
+    maxProcesses: Type.Optional(Type.Integer({ minimum: 1, description: "Max concurrent processes in the call's process tree." })),
+    cpuPercent: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Max CPU usage across the call's process tree (% of one core, e.g. 200 = 2 cores)." })),
+    graceMs: Type.Optional(Type.Number({ minimum: 0, description: "Consecutive ms a limit may be exceeded before fencing (default 5000)." })),
+    strict: Type.Optional(Type.Boolean({ description: "Refuse to launch if OS kernel hard limits (Linux cgroup v2 / Windows Job Object) are unavailable." })),
+  }, { additionalProperties: false, description: "Per-call process-tree resource limits (overrides config.json limits)." })),
   key: Type.Optional(Type.String({ description: "A single agent/task run: the call's key. status with wid: that call's full result." })),
   tail: Type.Optional(Type.Integer({ minimum: 1, description: "status with wid: the last N lines of each call's result (unclipped, at most 4000 characters per call)." })),
   grep: Type.Optional(Type.String({ description: "status with wid: only the lines of each call's result matching this case-sensitive JS regular expression, run in-process: avoid nested quantifiers such as (a+)+; it tests the first 2000 characters of a line and the last 5000 lines (with tail: grep first, then the last N)." })),

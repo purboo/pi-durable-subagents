@@ -63,6 +63,7 @@ export class ProcessTable implements Table {
   scans = 0;
   private tags = new Map<string, string | undefined>();
   private ticks?: Promise<number>;
+  private pageSize?: Promise<number>;
   private platform: NodeJS.Platform;
   private ps: () => Promise<string>;
   private winRows: () => Promise<WinProcessRow[]>;
@@ -73,7 +74,7 @@ export class ProcessTable implements Table {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(this.tagName)) throw new Error("Invalid process tag name");
     this.platform = options.platform ?? process.platform;
     this.ps = options.ps ?? (async () => (await exec(PS,
-      ["-axEww", "-o", "pid=,ppid=,lstart=,time=,stat=,command="],
+      ["-axEww", "-o", "pid=,ppid=,lstart=,time=,rss=,stat=,command="],
       // The whole table with environments is large; 2 s proved too short on loaded macOS machines.
       { env: { ...process.env, LC_ALL: "C" }, timeout: 10_000, maxBuffer: 32 * 1024 * 1024 })).stdout);
     this.winRows = options.winRows ?? (() => winProcessRows());
@@ -135,6 +136,7 @@ export class ProcessTable implements Table {
       const tag = winTag(row.command, this.tagName);
       return attachScannedCommand({ pid: row.pid, ppid: row.ppid, start: row.start,
         ...(row.cpuMs !== undefined ? { cpuMs: row.cpuMs } : {}),
+        ...(row.rssBytes !== undefined ? { rssBytes: row.rssBytes } : {}),
         ...(tag ? { tag } : {}) }, row.command);
     });
     if (this.platform === "darwin") return this.ps();
@@ -144,7 +146,11 @@ export class ProcessTable implements Table {
       if (!(value > 0)) throw new Error("C2: invalid CLK_TCK");
       return value;
     });
-    const ticks = await this.ticks;
+    this.pageSize ??= exec("getconf", ["PAGESIZE"], { timeout: 2000 }).then(({ stdout }) => {
+      const value = Number(stdout.trim());
+      return value > 0 ? value : 4096;
+    }).catch(() => 4096);
+    const [ticks, pageSize] = await Promise.all([this.ticks, this.pageSize]);
     const result: ProcInfo[] = [];
     const cache = new Map<string, string | undefined>();
     for (const name of await readdir("/proc")) {
@@ -168,8 +174,10 @@ export class ProcessTable implements Table {
           if (check.slice(check.lastIndexOf(")") + 2).split(" ")[19] !== start) continue;
         }
         cache.set(key, tag);
+        const rssPages = Number(fields[21]);
         result.push({ pid: Number(name), ppid: Number(fields[1]), start, tag,
-          cpuMs: (Number(fields[11]) + Number(fields[12])) * 1000 / ticks });
+          cpuMs: (Number(fields[11]) + Number(fields[12])) * 1000 / ticks,
+          ...(Number.isFinite(rssPages) && rssPages >= 0 ? { rssBytes: rssPages * pageSize } : {}) });
       } catch (error) { if (!vanished(error)) throw error; }
     }
     this.tags = cache;
@@ -179,14 +187,18 @@ export class ProcessTable implements Table {
   private mac(stdout: string, knownExecs: ReadonlySet<string>): Observation[] {
     const result: Observation[] = [];
     for (const line of stdout.split("\n")) {
-      const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\w+\s+\w+\s+\d+\s+[\d:]+\s+\d+)\s+([\d:.-]+)\s+(\S+)\s+(.*)$/);
-      if (!match || match[5]!.startsWith("Z")) continue;
+      // Matches both `rss=,stat=,command=` (current ps invocation) and legacy `stat=,command=` test fixtures
+      // (macOS stat always starts with a process-state letter, never a digit).
+      const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\w+\s+\w+\s+\d+\s+[\d:]+\s+\d+)\s+([\d:.-]+)(?:\s+(\d+))?\s+([A-Za-z]\S*)\s+(.*)$/);
+      if (!match || match[6]!.startsWith("Z")) continue;
       const parts = match[4]!.split(":").map(Number);
       const seconds = parts.reduce((total, part) => total * 60 + part, 0);
-      const tags = new Set([...match[6]!.matchAll(new RegExp(`(?:^|\\s)${this.tagName}=([^\\s]*)`, "g"))]
+      const rssKb = match[5] !== undefined ? Number(match[5]) : undefined;
+      const tags = new Set([...match[7]!.matchAll(new RegExp(`(?:^|\\s)${this.tagName}=([^\\s]*)`, "g"))]
         .map(token => token[1]!).filter(tag => knownExecs.has(tag)));
       result.push({ pid: Number(match[1]), ppid: Number(match[2]), start: match[3]!.replace(/\s+/g, " "),
         tag: tags.size === 1 ? tags.values().next().value : undefined, cpuMs: seconds * 1000,
+        ...(rssKb !== undefined && Number.isFinite(rssKb) ? { rssBytes: rssKb * 1024 } : {}),
         ...(tags.size > 1 ? { ambiguous: true as const } : {}) });
     }
     return result;
